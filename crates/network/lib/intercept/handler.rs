@@ -425,9 +425,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn intercepts_matching_request_with_no_body() {
-        // /bin/cat echoes stdin → response = request, good enough for
-        // the state machine test.
+    async fn dispatches_matching_request_with_no_body() {
+        // /bin/cat echoes stdin, so the hook's stdout is the request
+        // itself. Under the three-shape stdout contract that is the
+        // "modified passthrough" verdict (stdout that doesn't start
+        // with `HTTP/` is a rewritten *request*), not a synthesized
+        // response — good enough to prove the state machine buffered
+        // the request and ran the hook on it.
         let mut i = Interceptor::new(
             cfg(vec![InterceptRule {
                 host: "platform.claude.com".into(),
@@ -444,10 +448,10 @@ mod tests {
             .await
             .unwrap();
         match v {
-            Verdict::Intercept(resp) => {
-                assert!(String::from_utf8_lossy(&resp).contains("POST /v1/oauth/token"));
+            Verdict::ForwardBuffered(req) => {
+                assert!(String::from_utf8_lossy(&req).contains("POST /v1/oauth/token"));
             }
-            _ => panic!("expected Intercept, got something else"),
+            _ => panic!("expected ForwardBuffered (hook echoed the request back)"),
         }
     }
 
@@ -492,7 +496,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn buffers_split_request_then_intercepts() {
+    async fn buffers_split_request_then_dispatches() {
         let mut i = Interceptor::new(
             cfg(vec![InterceptRule {
                 host: "platform.claude.com".into(),
@@ -507,7 +511,14 @@ mod tests {
         let chunk3 = b"0123456789";
         assert!(matches!(i.process_chunk(chunk1).await.unwrap(), Verdict::Hold));
         assert!(matches!(i.process_chunk(chunk2).await.unwrap(), Verdict::Hold));
-        let v = i.process_chunk(chunk3).await.unwrap();
-        assert!(matches!(v, Verdict::Intercept(_)));
+        // Hook is /bin/cat, so stdout is the request → modified
+        // passthrough. The body must have been reassembled across all
+        // three chunks before the hook saw it.
+        match i.process_chunk(chunk3).await.unwrap() {
+            Verdict::ForwardBuffered(req) => {
+                assert!(String::from_utf8_lossy(&req).ends_with("0123456789"));
+            }
+            _ => panic!("expected ForwardBuffered (hook echoed the request back)"),
+        }
     }
 }

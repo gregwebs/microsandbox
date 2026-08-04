@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 /// first decrypted plaintext bytes (the HTTP request line + Host /
 /// :authority header). On a match the connection switches to "buffer
 /// until the request body is fully received, then hand it to `hook`."
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct InterceptConfig {
     /// Routes to intercept. Empty disables the interceptor entirely.
     #[serde(default)]
@@ -62,9 +62,53 @@ fn default_max_request_bytes() -> usize {
     64 * 1024
 }
 
+/// Hand-written so `max_request_bytes` matches the serde default.
+/// `#[derive(Default)]` would zero it — serde's `default = "…"` only
+/// fills the field when it is *missing* from the input, so a config
+/// built through [`InterceptBuilder`](crate::builder::InterceptBuilder)
+/// (which starts from `Default`) carried a 0 cap, and every request
+/// large enough to span two chunks blew past it on the first one.
+///
+/// [`InterceptBuilder`]: crate::builder::InterceptBuilder
+impl Default for InterceptConfig {
+    fn default() -> Self {
+        Self {
+            rules: Vec::new(),
+            hook: None,
+            max_request_bytes: default_max_request_bytes(),
+        }
+    }
+}
+
 impl InterceptConfig {
     /// Active = at least one rule and a hook command.
     pub fn is_active(&self) -> bool {
         !self.rules.is_empty() && self.hook.is_some()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The builder path starts from `Default`; if that leaves the cap
+    /// at 0 every buffered request overflows immediately.
+    #[test]
+    fn default_cap_matches_serde_default() {
+        assert_eq!(
+            InterceptConfig::default().max_request_bytes,
+            default_max_request_bytes()
+        );
+        let from_json: InterceptConfig = serde_json::from_str("{}").unwrap();
+        assert_eq!(
+            from_json.max_request_bytes,
+            InterceptConfig::default().max_request_bytes
+        );
+        // A config that has been through a serialize/deserialize round
+        // trip (as it is on the way to the sandbox) keeps the cap.
+        let round_tripped: InterceptConfig =
+            serde_json::from_value(serde_json::to_value(InterceptConfig::default()).unwrap())
+                .unwrap();
+        assert_eq!(round_tripped.max_request_bytes, default_max_request_bytes());
     }
 }
