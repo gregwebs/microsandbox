@@ -155,14 +155,30 @@ impl Interceptor {
                     accumulated = accumulated.len(),
                     chunk = chunk.len(),
                     max = self.config.max_request_bytes,
-                    "interceptor: request exceeded max_request_bytes; disabling",
+                    "interceptor: request exceeded max_request_bytes; refusing",
                 );
-                // Flush what we held plus this chunk to upstream so the
-                // request can complete the slow way.
-                let mut to_forward = std::mem::take(accumulated);
-                to_forward.extend_from_slice(chunk);
+                // Fail CLOSED. A rule matched this request, so the hook
+                // owns the decision about it — and we can no longer get
+                // one, because we'd have to hand the hook a truncated
+                // body. Forwarding the held bytes instead (what this
+                // did before) means the request reaches upstream with
+                // the secret-substitution layer swapping the guest's
+                // placeholder for the real credential and no policy
+                // applied at all. That is a bypass anything in the
+                // guest can trigger deliberately: pad a request past
+                // the cap and the interceptor steps aside while the
+                // token still goes out.
+                //
+                // Bodies this large are not the traffic these rules are
+                // for (OAuth refreshes and API calls are ~KB); pack
+                // uploads use `dispatch_on_headers` rules, which decide
+                // from the request line and never buffer a body. Raise
+                // `max_request_bytes` if a legitimate flow needs more
+                // room.
                 self.state = State::Disabled;
-                return Ok(Verdict::ForwardBuffered(to_forward));
+                return Ok(Verdict::Intercept(too_large_response(
+                    self.config.max_request_bytes,
+                )));
             }
             accumulated.extend_from_slice(chunk);
         }
@@ -306,6 +322,29 @@ async fn run_hook(
     Ok(output.stdout)
 }
 
+/// Synthesized `413` for a matched request that outgrew
+/// `max_request_bytes`. Sent to the guest in place of forwarding an
+/// unvetted request upstream — see the call site for why this fails
+/// closed.
+fn too_large_response(max: usize) -> Vec<u8> {
+    let body = format!(
+        "{{\"error\":\"intercepted request exceeds max_request_bytes ({max}); \
+         refused rather than forwarded unfiltered\"}}"
+    );
+    let head = format!(
+        "HTTP/1.1 413 Content Too Large\r\n\
+         Content-Type: application/json\r\n\
+         Content-Length: {}\r\n\
+         Connection: close\r\n\
+         \r\n",
+        body.len()
+    );
+    let mut out = Vec::with_capacity(head.len() + body.len());
+    out.extend_from_slice(head.as_bytes());
+    out.extend_from_slice(body.as_bytes());
+    out
+}
+
 fn parse_request_line(line: &str) -> Option<(&str, &str)> {
     let mut parts = line.split(' ');
     let method = parts.next()?;
@@ -410,6 +449,46 @@ mod tests {
             }
             _ => panic!("expected Intercept, got something else"),
         }
+    }
+
+    /// A matched request that outgrows the buffer must NOT reach
+    /// upstream. Forwarding it (the old behaviour) let anything in the
+    /// guest opt out of the hook's policy on demand — pad a request
+    /// past the cap and it goes upstream unfiltered, with the secret
+    /// layer still substituting the real credential for the guest's
+    /// placeholder.
+    #[tokio::test]
+    async fn oversized_matched_request_is_refused_not_forwarded() {
+        let mut i = Interceptor::new(
+            InterceptConfig {
+                rules: vec![InterceptRule {
+                    host: "api.github.com".into(),
+                    method: "POST".into(),
+                    path_prefix: "/".into(),
+                    dispatch_on_headers: false,
+                }],
+                hook: Some(vec!["/bin/cat".to_string()]),
+                max_request_bytes: 1024,
+            },
+            "api.github.com",
+        );
+        let head = b"POST /graphql HTTP/1.1\r\nHost: api.github.com\r\nContent-Length: 100000\r\n\r\n";
+        assert!(matches!(i.process_chunk(head).await.unwrap(), Verdict::Hold));
+
+        let v = i.process_chunk(&vec![b'a'; 4096]).await.unwrap();
+        match v {
+            Verdict::Intercept(resp) => {
+                let s = String::from_utf8_lossy(&resp);
+                assert!(s.starts_with("HTTP/1.1 413"), "expected 413, got: {s}");
+            }
+            Verdict::ForwardBuffered(_) | Verdict::Forward => {
+                panic!("oversized matched request was forwarded upstream unfiltered")
+            }
+            Verdict::Hold => panic!("expected a refusal, got Hold"),
+        }
+        // The proxy closes the connection on `Intercept`, so the rest
+        // of the oversized body never reaches the interceptor (and the
+        // request head was never forwarded upstream).
     }
 
     #[tokio::test]
