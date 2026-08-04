@@ -415,6 +415,18 @@ pub struct NetworkSpec {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub secrets: Option<Value>,
 
+    /// Request-interceptor hook subdocument (rules + hook argv).
+    ///
+    /// Must be carried here for the same reason as `tls` and
+    /// `secrets`: `SandboxConfig::set_local_network_config` round-trips
+    /// the whole `NetworkConfig` through this spec, so a subdocument
+    /// missing from `NetworkSpec` is silently dropped on the way to
+    /// the sandbox. Omitting it disabled request interception
+    /// entirely while leaving secret substitution active — i.e. the
+    /// real token still went upstream, just with no policy applied.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub intercept: Option<Value>,
+
     /// Max concurrent guest connections.
     pub max_connections: Option<usize>,
 
@@ -1020,6 +1032,7 @@ impl Default for NetworkSpec {
             dns: None,
             tls: None,
             secrets: None,
+            intercept: None,
             max_connections: None,
             trust_host_cas: false,
         }

@@ -314,6 +314,18 @@ tls: JsonValue | null,
  */
 secrets: JsonValue | null,
 /**
+ * Request-interceptor hook subdocument (rules + hook argv).
+ *
+ * Must be carried here for the same reason as `tls` and
+ * `secrets`: `SandboxConfig::set_local_network_config` round-trips
+ * the whole `NetworkConfig` through this spec, so a subdocument
+ * missing from `NetworkSpec` is silently dropped on the way to
+ * the sandbox. Omitting it disabled request interception
+ * entirely while leaving secret substitution active — i.e. the
+ * real token still went upstream, just with no policy applied.
+ */
+intercept: JsonValue | null,
+/**
  * Max concurrent guest connections.
  */
 max_connections: number | null,
