@@ -65,6 +65,11 @@ enum State {
         /// Content-Length'd in practice).
         content_length: Option<usize>,
     },
+    /// Policed SNI, request head not yet complete. We cannot latch to
+    /// `Forwarding` here (that is the bypass described on
+    /// [`Interceptor::process_first_chunk`]), so hold until there is
+    /// enough of the head to decide.
+    AwaitingHead { accumulated: Vec<u8> },
     /// Terminal: hit the byte cap or some other unrecoverable parse
     /// state. Stop trying.
     Disabled,
@@ -85,66 +90,133 @@ impl Interceptor {
             State::Pristine => self.process_first_chunk(chunk).await,
             State::Forwarding | State::Disabled => Ok(Verdict::Forward),
             State::Buffering { .. } => self.process_buffer_chunk(chunk).await,
+            State::AwaitingHead { accumulated } => {
+                if accumulated.len() + chunk.len() > self.config.max_request_bytes {
+                    self.state = State::Disabled;
+                    return Ok(Verdict::Intercept(too_large_response(
+                        self.config.max_request_bytes,
+                    )));
+                }
+                accumulated.extend_from_slice(chunk);
+                let buf = std::mem::take(accumulated);
+                self.evaluate_head(buf).await
+            }
         }
     }
 
+    /// First chunk on a connection.
+    ///
+    /// The fast path — latch to `Forwarding` and stream everything
+    /// unchanged — is only safe when no rule could ever match this
+    /// SNI. On a **policed** SNI it is a complete bypass of whatever
+    /// policy the hook enforces, because HTTP/1.1 carries many
+    /// requests per connection and the latch is per connection: send
+    /// one request the rules don't cover (an unlisted method such as
+    /// `HEAD`, or a one-byte write that defers the request line to the
+    /// next chunk) and every later request on that connection is
+    /// forwarded without the hook ever running — while the secret
+    /// layer still substitutes the real credential. Anything in the
+    /// guest can do this deliberately.
+    ///
+    /// So: unpoliced SNI keeps the zero-copy fast path; policed SNI
+    /// goes through [`Self::evaluate_head`], which never latches
+    /// without either running the hook or forcing the connection
+    /// closed after this one request.
     async fn process_first_chunk(&mut self, chunk: &[u8]) -> std::io::Result<Verdict> {
         if !self.config.is_active() {
             self.state = State::Forwarding;
             return Ok(Verdict::Forward);
         }
 
-        // Need at least one line + the `\r\n` separator to parse the
-        // request line. If we don't have it, just stream the chunk
-        // (in practice the request line lands in the very first
-        // plaintext chunk every time).
-        let Some(eol) = find_subsequence(chunk, b"\r\n") else {
+        if !self.sni_is_policed() {
+            // No rule can ever match this host. Latching is safe and
+            // keeps long-lived streaming connections (agent APIs) on
+            // the zero-copy path.
             self.state = State::Forwarding;
             return Ok(Verdict::Forward);
+        }
+
+        self.evaluate_head(chunk.to_vec()).await
+    }
+
+    /// True iff any rule targets this connection's SNI.
+    fn sni_is_policed(&self) -> bool {
+        self.config
+            .rules
+            .iter()
+            .any(|r| r.host.eq_ignore_ascii_case(&self.sni))
+    }
+
+    /// Decide what to do with a request head on a policed SNI, given
+    /// everything buffered so far. Holds until the head is complete
+    /// enough to decide; never latches to plain forwarding without
+    /// first making the connection single-request.
+    async fn evaluate_head(&mut self, buf: Vec<u8>) -> std::io::Result<Verdict> {
+        let Some(eol) = find_subsequence(&buf, b"\r\n") else {
+            // Not even a request line yet. Hold — latching here is the
+            // one-byte-first bypass.
+            self.state = State::AwaitingHead { accumulated: buf };
+            return Ok(Verdict::Hold);
         };
-        let request_line = std::str::from_utf8(&chunk[..eol]).unwrap_or("");
+        let request_line = std::str::from_utf8(&buf[..eol]).unwrap_or("");
 
         let Some((method, path)) = parse_request_line(request_line) else {
-            self.state = State::Forwarding;
-            return Ok(Verdict::Forward);
+            // Not HTTP/1.x we can parse, on a host we are supposed to
+            // police. Refuse rather than stream it through blind.
+            tracing::warn!(
+                sni = %self.sni,
+                "interceptor: unparseable request line on a policed host; refusing",
+            );
+            self.state = State::Disabled;
+            return Ok(Verdict::Intercept(bad_request_response()));
         };
 
-        let Some(rule) = self.find_matching_rule(method, path) else {
-            self.state = State::Forwarding;
-            return Ok(Verdict::Forward);
-        };
-        let rule = rule.clone();
+        if let Some(rule) = self.find_matching_rule(method, path) {
+            let rule = rule.clone();
+            tracing::debug!(
+                sni = %self.sni,
+                method,
+                path = %sanitize(path),
+                "interceptor: rule matched, buffering request",
+            );
+            let (body_start, content_length) = match find_subsequence(&buf, b"\r\n\r\n") {
+                Some(p) => {
+                    let start = p + 4;
+                    let cl = parse_content_length(&buf[..start]);
+                    (Some(start), cl)
+                }
+                None => (None, None),
+            };
+            self.state = State::Buffering {
+                rule,
+                accumulated: buf,
+                body_start,
+                content_length,
+            };
+            return self.maybe_dispatch().await;
+        }
 
-        // Match. Switch to buffering. We need the full request
-        // (headers + body) before invoking the hook.
+        // No rule covers this request, but the host is policed, so a
+        // later request on this connection might be covered. We cannot
+        // re-arm mid-stream without tracking request framing (chunked
+        // bodies make that its own parser), so instead make the
+        // connection single-request: inject `Connection: close` and let
+        // the server tear it down after one response. Requires the
+        // whole header block.
+        let Some(hdr_end) = find_subsequence(&buf, b"\r\n\r\n") else {
+            self.state = State::AwaitingHead { accumulated: buf };
+            return Ok(Verdict::Hold);
+        };
+        let _ = hdr_end;
         tracing::debug!(
             sni = %self.sni,
             method,
             path = %sanitize(path),
-            "interceptor: rule matched, buffering request",
+            "interceptor: no rule matched on a policed host; forcing connection close",
         );
-
-        let mut accumulated = Vec::with_capacity(chunk.len().max(2048));
-        accumulated.extend_from_slice(chunk);
-        // We may already have a complete request in this single chunk.
-        let (body_start, content_length) = match find_subsequence(&accumulated, b"\r\n\r\n") {
-            Some(p) => {
-                let start = p + 4;
-                let cl = parse_content_length(&accumulated[..start]);
-                (Some(start), cl)
-            }
-            None => (None, None),
-        };
-
-        self.state = State::Buffering {
-            rule,
-            accumulated,
-            body_start,
-            content_length,
-        };
-
-        // Maybe the first chunk already had the whole request.
-        self.maybe_dispatch().await
+        let rewritten = force_connection_close(&buf);
+        self.state = State::Forwarding;
+        Ok(Verdict::ForwardBuffered(rewritten))
     }
 
     async fn process_buffer_chunk(&mut self, chunk: &[u8]) -> std::io::Result<Verdict> {
@@ -320,6 +392,72 @@ async fn run_hook(
         )));
     }
     Ok(output.stdout)
+}
+
+/// Rewrite a request's header block so the connection carries exactly
+/// one request: drop any `Connection` / `Keep-Alive` /
+/// `Proxy-Connection` header and append `Connection: close`.
+///
+/// Used for a request no rule matched on a policed SNI — the server
+/// closes after responding, so a later request on the same connection
+/// cannot slip past the interceptor's per-connection state.
+fn force_connection_close(request: &[u8]) -> Vec<u8> {
+    let Some(hdr_end) = find_subsequence(request, b"\r\n\r\n") else {
+        return request.to_vec();
+    };
+    let (head, rest) = request.split_at(hdr_end);
+    let mut kept: Vec<&[u8]> = Vec::new();
+    let mut cursor = 0usize;
+    while cursor < head.len() {
+        let (line, next) = match find_subsequence(&head[cursor..], b"\r\n") {
+            Some(p) => (&head[cursor..cursor + p], cursor + p + 2),
+            None => (&head[cursor..], head.len()),
+        };
+        let drop = line
+            .iter()
+            .position(|&b| b == b':')
+            .map(|colon| {
+                let name = &line[..colon];
+                name.eq_ignore_ascii_case(b"connection")
+                    || name.eq_ignore_ascii_case(b"keep-alive")
+                    || name.eq_ignore_ascii_case(b"proxy-connection")
+            })
+            .unwrap_or(false);
+        if !drop {
+            kept.push(line);
+        }
+        cursor = next;
+    }
+    let mut out = Vec::with_capacity(request.len() + 24);
+    for (i, line) in kept.iter().enumerate() {
+        if i > 0 {
+            out.extend_from_slice(b"\r\n");
+        }
+        out.extend_from_slice(line);
+    }
+    if !kept.is_empty() {
+        out.extend_from_slice(b"\r\n");
+    }
+    out.extend_from_slice(b"Connection: close");
+    out.extend_from_slice(rest);
+    out
+}
+
+/// Synthesized `400` for a request we cannot parse on a policed host.
+fn bad_request_response() -> Vec<u8> {
+    let body = b"{\"error\":\"unparseable HTTP request on an intercepted host; refused\"}";
+    let head = format!(
+        "HTTP/1.1 400 Bad Request\r\n\
+         Content-Type: application/json\r\n\
+         Content-Length: {}\r\n\
+         Connection: close\r\n\
+         \r\n",
+        body.len()
+    );
+    let mut out = Vec::with_capacity(head.len() + body.len());
+    out.extend_from_slice(head.as_bytes());
+    out.extend_from_slice(body);
+    out
 }
 
 /// Synthesized `413` for a matched request that outgrew
@@ -573,6 +711,95 @@ mod tests {
                 "pack data must stream through, not hit the request cap"
             );
         }
+    }
+
+    /// The per-connection latch was a complete bypass of whatever the
+    /// hook enforces: HTTP/1.1 carries many requests per connection, so
+    /// one request the rules don't cover used to disable the hook for
+    /// every request after it — with the secret layer still swapping in
+    /// the real credential. Two ways in, both guest-controlled.
+    #[tokio::test]
+    async fn unlisted_method_cannot_disable_the_hook_for_the_connection() {
+        let mut i = Interceptor::new(
+            cfg(vec![InterceptRule {
+                host: "api.github.com".into(),
+                // Only GET is policed, as agent-vm registers a fixed
+                // method list.
+                method: "GET".into(),
+                path_prefix: "/".into(),
+                dispatch_on_headers: false,
+            }]),
+            "api.github.com",
+        );
+        // A method no rule covers must not latch the connection open.
+        match i
+            .process_chunk(b"HEAD / HTTP/1.1\r\nHost: api.github.com\r\n\r\n")
+            .await
+            .unwrap()
+        {
+            Verdict::ForwardBuffered(req) => {
+                let s = String::from_utf8_lossy(&req);
+                assert!(
+                    s.contains("Connection: close"),
+                    "unmatched request on a policed host must force the connection closed: {s}"
+                );
+            }
+            Verdict::Forward => panic!("unmatched request latched the connection into forwarding"),
+            _ => panic!("expected a forced-close passthrough"),
+        }
+    }
+
+    #[tokio::test]
+    async fn one_byte_first_write_cannot_disable_the_hook() {
+        let mut i = Interceptor::new(
+            cfg(vec![InterceptRule {
+                host: "api.github.com".into(),
+                method: "GET".into(),
+                path_prefix: "/".into(),
+                dispatch_on_headers: false,
+            }]),
+            "api.github.com",
+        );
+        // The guest controls TLS record boundaries, so it can defer the
+        // request line past the first chunk. That used to latch.
+        assert!(
+            matches!(i.process_chunk(b"G").await.unwrap(), Verdict::Hold),
+            "a partial request line must be held, not forwarded"
+        );
+        // The rest of the request arrives and is policed normally.
+        let v = i
+            .process_chunk(b"ET /repos/victim/private HTTP/1.1\r\nHost: api.github.com\r\n\r\n")
+            .await
+            .unwrap();
+        assert!(
+            matches!(v, Verdict::ForwardBuffered(_) | Verdict::Intercept(_)),
+            "the reassembled request must reach the hook"
+        );
+    }
+
+    /// An unpoliced SNI keeps the zero-copy fast path — long-lived
+    /// streaming connections to agent APIs must not start buffering.
+    #[tokio::test]
+    async fn unpoliced_sni_keeps_the_zero_copy_fast_path() {
+        let mut i = Interceptor::new(
+            cfg(vec![InterceptRule {
+                host: "api.github.com".into(),
+                method: "GET".into(),
+                path_prefix: "/".into(),
+                dispatch_on_headers: false,
+            }]),
+            "api.anthropic.com",
+        );
+        assert!(matches!(
+            i.process_chunk(b"P").await.unwrap(),
+            Verdict::Forward
+        ));
+        assert!(matches!(
+            i.process_chunk(b"OST /v1/messages HTTP/1.1\r\n\r\n")
+                .await
+                .unwrap(),
+            Verdict::Forward
+        ));
     }
 
     #[tokio::test]
