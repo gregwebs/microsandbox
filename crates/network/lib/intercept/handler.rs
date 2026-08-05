@@ -24,6 +24,10 @@ use tokio::process::Command;
 
 use super::config::{InterceptConfig, InterceptRule};
 
+/// Wall-clock cap on one hook invocation. The hook runs on the host,
+/// so an unbounded one lets the guest pin a host core per connection.
+const HOOK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(90);
+
 /// What the proxy should do with the chunk it just fed in.
 pub enum Verdict {
     /// Forward the chunk the caller already has — zero-copy hot path.
@@ -171,7 +175,13 @@ impl Interceptor {
             return Ok(Verdict::Intercept(bad_request_response()));
         };
 
-        if let Some(rule) = self.find_matching_rule(method, path) {
+        // RFC 7230 5.3.2 absolute-form (`GET https://host/path`) is a
+        // legal request target that GitHub accepts, and its path does
+        // not start with `/` — so a prefix rule of `/` matched nothing
+        // and the request escaped the policy entirely. Normalise to
+        // origin-form before matching.
+        let target = normalize_request_target(path);
+        if let Some(rule) = self.find_matching_rule(method, target) {
             let rule = rule.clone();
             tracing::debug!(
                 sni = %self.sni,
@@ -196,27 +206,27 @@ impl Interceptor {
             return self.maybe_dispatch().await;
         }
 
-        // No rule covers this request, but the host is policed, so a
-        // later request on this connection might be covered. We cannot
-        // re-arm mid-stream without tracking request framing (chunked
-        // bodies make that its own parser), so instead make the
-        // connection single-request: inject `Connection: close` and let
-        // the server tear it down after one response. Requires the
-        // whole header block.
-        let Some(hdr_end) = find_subsequence(&buf, b"\r\n\r\n") else {
-            self.state = State::AwaitingHead { accumulated: buf };
-            return Ok(Verdict::Hold);
-        };
-        let _ = hdr_end;
-        tracing::debug!(
+        // No rule covers this request and the host is policed, so
+        // REFUSE it. Forwarding is not an option: the secret layer runs
+        // before the interceptor, so by this point the guest's
+        // placeholder has already become the real credential. Letting
+        // an unpoliced request through "just once per connection" is
+        // still one credentialed request the hook never saw, and the
+        // guest can open a connection per request.
+        //
+        // What lands here after `normalize_request_target` has done its
+        // job is a method no rule covers (callers register a fixed
+        // list) or a request-target shape we don't recognise. Both are
+        // outside anything gh or git sends, so a 403 is the honest
+        // answer rather than a silent credentialed forward.
+        tracing::warn!(
             sni = %self.sni,
             method,
             path = %sanitize(path),
-            "interceptor: no rule matched on a policed host; forcing connection close",
+            "interceptor: no rule matched on a policed host; refusing",
         );
-        let rewritten = force_connection_close(&buf);
-        self.state = State::Forwarding;
-        Ok(Verdict::ForwardBuffered(rewritten))
+        self.state = State::Disabled;
+        Ok(Verdict::Intercept(unpoliced_request_response(method, path)))
     }
 
     async fn process_buffer_chunk(&mut self, chunk: &[u8]) -> std::io::Result<Verdict> {
@@ -384,7 +394,18 @@ async fn run_hook(
         stdin.shutdown().await.ok();
     }
 
-    let output = child.wait_with_output().await?;
+    // Bound the hook. It runs on the HOST, outside the guest's CPU and
+    // memory limits, so a request that makes the hook expensive is a
+    // host-side DoS the sandbox does not otherwise contain.
+    let output = match tokio::time::timeout(HOOK_TIMEOUT, child.wait_with_output()).await {
+        Ok(res) => res?,
+        Err(_) => {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                format!("intercept hook exceeded {HOOK_TIMEOUT:?}"),
+            ));
+        }
+    };
     if !output.status.success() {
         return Err(std::io::Error::other(format!(
             "intercept hook exited with {}",
@@ -394,58 +415,59 @@ async fn run_hook(
     Ok(output.stdout)
 }
 
-/// Rewrite a request's header block so the connection carries exactly
-/// one request: drop any `Connection` / `Keep-Alive` /
-/// `Proxy-Connection` header and append `Connection: close`.
+/// Normalise a request target to origin-form for rule matching.
 ///
-/// Used for a request no rule matched on a policed SNI — the server
-/// closes after responding, so a later request on the same connection
-/// cannot slip past the interceptor's per-connection state.
-fn force_connection_close(request: &[u8]) -> Vec<u8> {
-    let Some(hdr_end) = find_subsequence(request, b"\r\n\r\n") else {
-        return request.to_vec();
-    };
-    let (head, rest) = request.split_at(hdr_end);
-    let mut kept: Vec<&[u8]> = Vec::new();
-    let mut cursor = 0usize;
-    while cursor < head.len() {
-        let (line, next) = match find_subsequence(&head[cursor..], b"\r\n") {
-            Some(p) => (&head[cursor..cursor + p], cursor + p + 2),
-            None => (&head[cursor..], head.len()),
-        };
-        let drop = line
-            .iter()
-            .position(|&b| b == b':')
-            .map(|colon| {
-                let name = &line[..colon];
-                name.eq_ignore_ascii_case(b"connection")
-                    || name.eq_ignore_ascii_case(b"keep-alive")
-                    || name.eq_ignore_ascii_case(b"proxy-connection")
-            })
-            .unwrap_or(false);
-        if !drop {
-            kept.push(line);
+/// `GET https://api.github.com/repos/x HTTP/1.1` is legal HTTP/1.1
+/// (RFC 7230 5.3.2), is accepted by GitHub, and has a target that does
+/// not begin with `/`. Prefix rules are written against the path, so
+/// without this an absolute-form request matches no rule at all.
+/// Asterisk-form (`OPTIONS *`) and anything else unrecognised is
+/// returned unchanged and will simply not match.
+fn normalize_request_target(target: &str) -> &str {
+    for scheme in ["http://", "https://"] {
+        if let Some(rest) = target
+            .get(..scheme.len())
+            .filter(|p| p.eq_ignore_ascii_case(scheme))
+            .and_then(|_| target.get(scheme.len()..))
+        {
+            // Strip the authority; the path starts at the next `/`.
+            return match rest.find('/') {
+                Some(slash) => &rest[slash..],
+                // `https://host` with no path is the origin itself.
+                None => "/",
+            };
         }
-        cursor = next;
     }
-    let mut out = Vec::with_capacity(request.len() + 24);
-    for (i, line) in kept.iter().enumerate() {
-        if i > 0 {
-            out.extend_from_slice(b"\r\n");
-        }
-        out.extend_from_slice(line);
-    }
-    if !kept.is_empty() {
-        out.extend_from_slice(b"\r\n");
-    }
-    out.extend_from_slice(b"Connection: close");
-    out.extend_from_slice(rest);
+    target
+}
+
+/// Synthesized `403` for a request on a policed host that no rule
+/// covers. See the call site: forwarding it would send the real
+/// credential upstream with no policy applied.
+fn unpoliced_request_response(method: &str, path: &str) -> Vec<u8> {
+    let body = format!(
+        "{{\"message\":\"agent-vm: {} {} matches no intercept rule on this host; \
+         refused rather than forwarded with credentials\"}}",
+        sanitize(method),
+        sanitize(path)
+    );
+    let head = format!(
+        "HTTP/1.1 403 Forbidden\r\n\
+         Content-Type: application/json\r\n\
+         Content-Length: {}\r\n\
+         Connection: close\r\n\
+         \r\n",
+        body.len()
+    );
+    let mut out = Vec::with_capacity(head.len() + body.len());
+    out.extend_from_slice(head.as_bytes());
+    out.extend_from_slice(body.as_bytes());
     out
 }
 
 /// Synthesized `400` for a request we cannot parse on a policed host.
 fn bad_request_response() -> Vec<u8> {
-    let body = b"{\"error\":\"unparseable HTTP request on an intercepted host; refused\"}";
+    let body = b"{\"message\":\"agent-vm: unparseable HTTP request on an intercepted host; refused\"}";
     let head = format!(
         "HTTP/1.1 400 Bad Request\r\n\
          Content-Type: application/json\r\n\
@@ -466,7 +488,7 @@ fn bad_request_response() -> Vec<u8> {
 /// closed.
 fn too_large_response(max: usize) -> Vec<u8> {
     let body = format!(
-        "{{\"error\":\"intercepted request exceeds max_request_bytes ({max}); \
+        "{{\"message\":\"agent-vm: request exceeds max_request_bytes ({max}); \
          refused rather than forwarded unfiltered\"}}"
     );
     let head = format!(
@@ -737,15 +759,13 @@ mod tests {
             .await
             .unwrap()
         {
-            Verdict::ForwardBuffered(req) => {
-                let s = String::from_utf8_lossy(&req);
-                assert!(
-                    s.contains("Connection: close"),
-                    "unmatched request on a policed host must force the connection closed: {s}"
-                );
+            Verdict::Intercept(resp) => {
+                assert!(String::from_utf8_lossy(&resp).starts_with("HTTP/1.1 403"));
             }
-            Verdict::Forward => panic!("unmatched request latched the connection into forwarding"),
-            _ => panic!("expected a forced-close passthrough"),
+            Verdict::Forward | Verdict::ForwardBuffered(_) => {
+                panic!("unmatched request latched the connection open / was forwarded")
+            }
+            Verdict::Hold => panic!("expected a refusal"),
         }
     }
 
@@ -775,6 +795,79 @@ mod tests {
             matches!(v, Verdict::ForwardBuffered(_) | Verdict::Intercept(_)),
             "the reassembled request must reach the hook"
         );
+    }
+
+    /// RFC 7230 absolute-form is legal HTTP/1.1, GitHub accepts it, and
+    /// its target does not start with `/` — so a `/` prefix rule
+    /// matched nothing and the request escaped policy entirely. Worse,
+    /// the old unmatched branch *forwarded* it, and secret substitution
+    /// runs before the interceptor, so it went upstream carrying the
+    /// real credential.
+    #[tokio::test]
+    async fn absolute_form_request_target_is_still_policed() {
+        let mut i = Interceptor::new(
+            cfg(vec![InterceptRule {
+                host: "api.github.com".into(),
+                method: "GET".into(),
+                path_prefix: "/".into(),
+                dispatch_on_headers: false,
+            }]),
+            "api.github.com",
+        );
+        let v = i
+            .process_chunk(
+                b"GET https://api.github.com/repos/victim/private HTTP/1.1\r\nHost: api.github.com\r\n\r\n",
+            )
+            .await
+            .unwrap();
+        match v {
+            // Normalised to origin-form, so the rule matches and the
+            // hook (here /bin/cat) gets to rule on it.
+            Verdict::ForwardBuffered(req) => {
+                assert!(String::from_utf8_lossy(&req).contains("/repos/victim/private"));
+            }
+            _ => panic!("absolute-form request must reach the hook, not bypass it"),
+        }
+    }
+
+    #[test]
+    fn normalize_request_target_strips_scheme_and_authority() {
+        assert_eq!(normalize_request_target("https://api.github.com/repos/a/b"), "/repos/a/b");
+        assert_eq!(normalize_request_target("HTTPS://api.github.com/x?y=1"), "/x?y=1");
+        assert_eq!(normalize_request_target("http://github.com"), "/");
+        assert_eq!(normalize_request_target("/repos/a/b"), "/repos/a/b");
+        assert_eq!(normalize_request_target("*"), "*");
+    }
+
+    /// A method no rule covers must be refused, not forwarded. The
+    /// credential is already substituted by the time the interceptor
+    /// sees the bytes, so "forward it just once per connection" is one
+    /// credentialed request the hook never saw — and the guest can open
+    /// a connection per request.
+    #[tokio::test]
+    async fn unmatched_method_on_a_policed_host_is_refused() {
+        let mut i = Interceptor::new(
+            cfg(vec![InterceptRule {
+                host: "api.github.com".into(),
+                method: "GET".into(),
+                path_prefix: "/".into(),
+                dispatch_on_headers: false,
+            }]),
+            "api.github.com",
+        );
+        match i
+            .process_chunk(b"HEAD /repos/victim/private HTTP/1.1\r\nHost: api.github.com\r\n\r\n")
+            .await
+            .unwrap()
+        {
+            Verdict::Intercept(resp) => {
+                assert!(String::from_utf8_lossy(&resp).starts_with("HTTP/1.1 403"));
+            }
+            Verdict::Forward | Verdict::ForwardBuffered(_) => {
+                panic!("unmatched request on a policed host was forwarded with credentials")
+            }
+            Verdict::Hold => panic!("expected a refusal"),
+        }
     }
 
     /// An unpoliced SNI keeps the zero-copy fast path — long-lived
