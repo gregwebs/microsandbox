@@ -392,9 +392,13 @@ mod tests {
     use super::*;
 
     fn cfg(rules: Vec<InterceptRule>) -> InterceptConfig {
+        cfg_with_hook(rules, vec!["/bin/cat".to_string()])
+    }
+
+    fn cfg_with_hook(rules: Vec<InterceptRule>, hook: Vec<String>) -> InterceptConfig {
         InterceptConfig {
             rules,
-            hook: Some(vec!["/bin/cat".to_string()]),
+            hook: Some(hook),
             max_request_bytes: 64 * 1024,
         }
     }
@@ -493,6 +497,82 @@ mod tests {
         // The proxy closes the connection on `Intercept`, so the rest
         // of the oversized body never reaches the interceptor (and the
         // request head was never forwarded upstream).
+    }
+
+    /// The deny path: a hook whose stdout starts with `HTTP/` has
+    /// synthesized a response, which goes back to the guest and closes
+    /// the connection. This is what a repo allow-list rejection rides
+    /// on, so it needs its own coverage — every other test here uses a
+    /// hook that echoes the request back instead.
+    #[tokio::test]
+    async fn hook_synthesized_response_is_returned_to_the_guest() {
+        let mut i = Interceptor::new(
+            cfg_with_hook(
+                vec![InterceptRule {
+                    host: "api.github.com".into(),
+                    method: "GET".into(),
+                    path_prefix: "/".into(),
+                    dispatch_on_headers: false,
+                }],
+                vec![
+                    "/bin/sh".to_string(),
+                    "-c".to_string(),
+                    "printf 'HTTP/1.1 403 Forbidden\\r\\nContent-Length: 0\\r\\n\\r\\n'".to_string(),
+                ],
+            ),
+            "api.github.com",
+        );
+        let v = i
+            .process_chunk(b"GET /repos/victim/private HTTP/1.1\r\nHost: api.github.com\r\n\r\n")
+            .await
+            .unwrap();
+        match v {
+            Verdict::Intercept(resp) => {
+                assert!(String::from_utf8_lossy(&resp).starts_with("HTTP/1.1 403"));
+            }
+            _ => panic!("expected Intercept for a hook-synthesized response"),
+        }
+    }
+
+    /// `dispatch_on_headers` rules decide from the request line and must
+    /// never buffer the body — that is what keeps multi-MB git pushes
+    /// off the `max_request_bytes` path, and what the fail-closed
+    /// overflow refusal relies on to not break them. Assert both
+    /// halves: the hook fires as soon as the headers land, and the body
+    /// that follows streams through even though it dwarfs the cap.
+    #[tokio::test]
+    async fn streaming_rule_dispatches_on_headers_and_streams_body_past_the_cap() {
+        let mut i = Interceptor::new(
+            InterceptConfig {
+                rules: vec![InterceptRule {
+                    host: "github.com".into(),
+                    method: "POST".into(),
+                    path_prefix: "/".into(),
+                    dispatch_on_headers: true,
+                }],
+                hook: Some(vec!["/bin/cat".to_string()]),
+                max_request_bytes: 1024,
+            },
+            "github.com",
+        );
+        // Headers only, declaring a body far over the cap.
+        let head = b"POST /o/r.git/git-receive-pack HTTP/1.1\r\nHost: github.com\r\nContent-Length: 10000000\r\n\r\n";
+        match i.process_chunk(head).await.unwrap() {
+            Verdict::ForwardBuffered(req) => {
+                assert!(String::from_utf8_lossy(&req).contains("git-receive-pack"));
+            }
+            _ => panic!("streaming rule should dispatch as soon as the headers are complete"),
+        }
+        // Pack data now streams: never buffered, so never refused.
+        for _ in 0..4 {
+            assert!(
+                matches!(
+                    i.process_chunk(&vec![b'p'; 32 * 1024]).await.unwrap(),
+                    Verdict::Forward
+                ),
+                "pack data must stream through, not hit the request cap"
+            );
+        }
     }
 
     #[tokio::test]
