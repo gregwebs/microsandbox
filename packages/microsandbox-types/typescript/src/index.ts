@@ -314,6 +314,20 @@ tls: JsonValue | null,
  */
 secrets: JsonValue | null,
 /**
+ * Request-interceptor hook subdocument (rules + hook argv).
+ *
+ * Every subdocument of `NetworkConfig` must have a field here:
+ * `SandboxConfig::set_local_network_config` round-trips the whole
+ * config through this spec, so anything the spec does not name is
+ * silently dropped on the way to the sandbox. See the round-trip
+ * guard tests in `sdk/rust`.
+ */
+intercept: JsonValue | null,
+/**
+ * Auto-publish loop subdocument (poll interval + host bind).
+ */
+auto_publish: JsonValue | null,
+/**
  * Max concurrent guest connections.
  */
 max_connections: number | null,

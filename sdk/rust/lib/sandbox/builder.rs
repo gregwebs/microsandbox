@@ -1461,6 +1461,46 @@ mod tests {
         assert_eq!(network.max_connections, Some(128));
     }
 
+    /// The builder round-trips `NetworkConfig` through `NetworkSpec` on
+    /// every `.network()` call, so a subdocument that `NetworkSpec`
+    /// doesn't carry is silently dropped. That happened to `intercept`:
+    /// rules and hook vanished on the way to the sandbox while
+    /// `secrets` survived, leaving substitution active with no policy
+    /// applied. Assert the interceptor config survives the round trip.
+    #[cfg(feature = "net")]
+    #[tokio::test]
+    async fn test_builder_network_preserves_intercept_config() {
+        let config = SandboxBuilder::new("test")
+            .image("alpine")
+            .network(|n| {
+                n.tls(|t| t).intercept(|i| {
+                    i.hook(vec!["/usr/bin/hook".to_string(), "--flag".to_string()])
+                        .rule("api.github.com", "GET", "/")
+                })
+            })
+            // A second `.network()` call forces another spec round trip:
+            // the real launcher configures ports/secrets/intercept across
+            // several builder calls.
+            .network(|n| n.max_connections(64))
+            .build()
+            .await
+            .unwrap();
+
+        let network = config.local_network_config().unwrap();
+        assert!(
+            network.intercept.is_active(),
+            "intercept config was dropped in the NetworkSpec round trip"
+        );
+        assert_eq!(
+            network.intercept.hook.as_deref(),
+            Some(["/usr/bin/hook".to_string(), "--flag".to_string()].as_slice())
+        );
+        assert_eq!(network.intercept.rules.len(), 1);
+        assert_eq!(network.intercept.rules[0].host, "api.github.com");
+        assert_eq!(network.intercept.rules[0].method, "GET");
+        assert_eq!(network.intercept.rules[0].path_prefix, "/");
+    }
+
     #[cfg(feature = "net")]
     #[tokio::test]
     async fn test_builder_rejects_invalid_secret_config() {
