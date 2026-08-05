@@ -316,15 +316,17 @@ secrets: JsonValue | null,
 /**
  * Request-interceptor hook subdocument (rules + hook argv).
  *
- * Must be carried here for the same reason as `tls` and
- * `secrets`: `SandboxConfig::set_local_network_config` round-trips
- * the whole `NetworkConfig` through this spec, so a subdocument
- * missing from `NetworkSpec` is silently dropped on the way to
- * the sandbox. Omitting it disabled request interception
- * entirely while leaving secret substitution active — i.e. the
- * real token still went upstream, just with no policy applied.
+ * Every subdocument of `NetworkConfig` must have a field here:
+ * `SandboxConfig::set_local_network_config` round-trips the whole
+ * config through this spec, so anything the spec does not name is
+ * silently dropped on the way to the sandbox. See the round-trip
+ * guard tests in `sdk/rust`.
  */
 intercept: JsonValue | null,
+/**
+ * Auto-publish loop subdocument (poll interval + host bind).
+ */
+auto_publish: JsonValue | null,
 /**
  * Max concurrent guest connections.
  */

@@ -1369,3 +1369,102 @@ mod tests {
         assert!(config.spec.mounts.is_empty());
     }
 }
+
+#[cfg(all(test, feature = "net"))]
+mod network_roundtrip_tests {
+    use super::{network_config_from_spec, network_spec_from_config};
+    use microsandbox_network::config::*;
+
+    /// A `NetworkConfig` with every field set to a non-default value,
+    /// so the round-trip tests below notice a subdocument that goes
+    /// missing rather than one that happens to match its default.
+    fn fully_populated() -> NetworkConfig {
+        let mut cfg = NetworkConfig::default();
+        cfg.enabled = true;
+        cfg.interface.mtu = Some(9000);
+        cfg.interface.mac = Some([2, 0, 0, 0, 0, 1]);
+        cfg.interface.ipv4_address = Some("172.16.5.9".parse().unwrap());
+        cfg.ports.push(PublishedPort {
+            host_port: 8080,
+            guest_port: 80,
+            protocol: PortProtocol::Udp,
+            host_bind: "0.0.0.0".parse().unwrap(),
+        });
+        cfg.dns.rebind_protection = false;
+        cfg.dns.query_timeout_ms = 1234;
+        cfg.tls.enabled = true;
+        cfg.intercept.hook = Some(vec!["/usr/bin/hook".into()]);
+        cfg.intercept
+            .rules
+            .push(microsandbox_network::intercept::config::InterceptRule {
+                host: "api.github.com".into(),
+                method: "POST".into(),
+                path_prefix: "/graphql".into(),
+                dispatch_on_headers: true,
+            });
+        cfg.intercept.max_request_bytes = 4242;
+        cfg.max_connections = Some(64);
+        cfg.trust_host_cas = true;
+        cfg.auto_publish = Some(AutoPublishConfig {
+            poll_interval_ms: 777,
+            host_bind: "127.0.0.2".parse().unwrap(),
+        });
+        cfg
+    }
+
+    /// `SandboxConfig::set_local_network_config` round-trips the whole
+    /// `NetworkConfig` through `NetworkSpec`, so any subdocument the
+    /// spec doesn't name is dropped on the way to the sandbox — with
+    /// no error. That silently disabled request interception
+    /// (`intercept`) and port auto-publishing (`auto_publish`).
+    ///
+    /// Compared as JSON because `NetworkConfig` has no `PartialEq`.
+    #[test]
+    fn fully_populated_network_config_survives_spec_roundtrip() {
+        let cfg = fully_populated();
+        let back = network_config_from_spec(&network_spec_from_config(&cfg).unwrap()).unwrap();
+
+        let before = serde_json::to_value(&cfg).unwrap();
+        let after = serde_json::to_value(&back).unwrap();
+
+        // Report the differing keys rather than a wall of JSON.
+        let (bo, ao) = (before.as_object().unwrap(), after.as_object().unwrap());
+        let lost: Vec<String> = bo
+            .iter()
+            .filter(|(k, v)| ao.get(*k) != Some(*v))
+            .map(|(k, v)| format!("  {k}: {v} -> {:?}", ao.get(k)))
+            .collect();
+        assert!(
+            lost.is_empty(),
+            "fields lost in the NetworkSpec round trip:\n{}",
+            lost.join("\n")
+        );
+    }
+
+    /// Fails the moment `NetworkConfig` grows a field that `NetworkSpec`
+    /// has no counterpart for — the shape of the bug above, caught at
+    /// the point the field is added rather than in production.
+    ///
+    /// The spec's key set is derived from a populated config (not a
+    /// hand-maintained list) so that `skip_serializing_if` can't hide a
+    /// name and the test can't rot.
+    #[test]
+    fn network_spec_carries_every_network_config_field() {
+        let cfg = fully_populated();
+        let spec_json = serde_json::to_value(network_spec_from_config(&cfg).unwrap()).unwrap();
+        let cfg_json = serde_json::to_value(&cfg).unwrap();
+
+        let spec_keys = spec_json.as_object().unwrap();
+        let missing: Vec<&String> = cfg_json
+            .as_object()
+            .unwrap()
+            .keys()
+            .filter(|k| !spec_keys.contains_key(*k))
+            .collect();
+        assert!(
+            missing.is_empty(),
+            "NetworkConfig fields with no NetworkSpec counterpart: {missing:?} \
+             (add them to NetworkSpec, or they are dropped en route to the sandbox)"
+        );
+    }
+}

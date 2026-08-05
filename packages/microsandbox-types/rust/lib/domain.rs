@@ -417,15 +417,17 @@ pub struct NetworkSpec {
 
     /// Request-interceptor hook subdocument (rules + hook argv).
     ///
-    /// Must be carried here for the same reason as `tls` and
-    /// `secrets`: `SandboxConfig::set_local_network_config` round-trips
-    /// the whole `NetworkConfig` through this spec, so a subdocument
-    /// missing from `NetworkSpec` is silently dropped on the way to
-    /// the sandbox. Omitting it disabled request interception
-    /// entirely while leaving secret substitution active — i.e. the
-    /// real token still went upstream, just with no policy applied.
+    /// Every subdocument of `NetworkConfig` must have a field here:
+    /// `SandboxConfig::set_local_network_config` round-trips the whole
+    /// config through this spec, so anything the spec does not name is
+    /// silently dropped on the way to the sandbox. See the round-trip
+    /// guard tests in `sdk/rust`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub intercept: Option<Value>,
+
+    /// Auto-publish loop subdocument (poll interval + host bind).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub auto_publish: Option<Value>,
 
     /// Max concurrent guest connections.
     pub max_connections: Option<usize>,
@@ -1033,6 +1035,7 @@ impl Default for NetworkSpec {
             tls: None,
             secrets: None,
             intercept: None,
+            auto_publish: None,
             max_connections: None,
             trust_host_cas: false,
         }
