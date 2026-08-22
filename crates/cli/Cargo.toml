@@ -59,14 +59,15 @@ tokio.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 
-# Use jemalloc instead of the system (glibc) allocator on Unix. The `msb`
-# sandbox supervisor is a tokio multi-threaded VMM + network proxy; on
-# many-core hosts glibc keeps up to `8 * ncpu` malloc arenas, each able to
-# grow a 64 MiB heap that it never returns to the OS once touched. Under
-# bursty concurrent allocation (the Rust network stack) that balloons host
-# RSS to 10-20+ GiB even for a sandbox capped at `--memory 4`. jemalloc's
-# background purge returns freed pages to the OS, so RSS tracks the live set.
-[target.'cfg(any(target_os = "linux", target_os = "macos"))'.dependencies]
+# Use jemalloc instead of glibc on Linux. The `msb` sandbox supervisor is a
+# tokio multi-threaded VMM + network proxy; on many-core hosts glibc keeps up to
+# `8 * ncpu` malloc arenas, each able to grow a 64 MiB heap that it never
+# returns to the OS once touched. Under bursty concurrent allocation (the Rust
+# network stack) that balloons host RSS to 10-20+ GiB even for a sandbox capped
+# at `--memory 4`. jemalloc's background purge returns freed pages to the OS,
+# so RSS tracks the live set. macOS uses its native allocator; jemalloc's
+# `background_thread` option is unsupported there and warns during startup.
+[target.'cfg(target_os = "linux")'.dependencies]
 tikv-jemallocator = { workspace = true }
 
 [dev-dependencies]

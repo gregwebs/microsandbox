@@ -12,7 +12,7 @@ use microsandbox_cli::{
     sandbox_cmd::{self, SandboxArgs},
 };
 
-/// Replace glibc malloc with jemalloc on Unix.
+/// Replace glibc malloc with jemalloc on Linux.
 ///
 /// The `msb sandbox` supervisor is a tokio multi-threaded VMM + network
 /// proxy. On many-core hosts, glibc's malloc keeps up to `8 * ncpu`
@@ -27,7 +27,9 @@ use microsandbox_cli::{
 /// so host RSS tracks the live working set instead of the high-water mark.
 /// Kept Rust-side (default symbol prefix); libkrun's C allocations are
 /// unaffected and the measured balloon is entirely Rust-side anyway.
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+/// macOS uses its native allocator because jemalloc background threads are
+/// unsupported there.
+#[cfg(target_os = "linux")]
 #[global_allocator]
 static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
