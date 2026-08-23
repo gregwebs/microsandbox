@@ -166,3 +166,7 @@ parking_lot = "0.12"
 rpassword = "7"
 russh = "0.61.1"
 russh-sftp = "2.3.0"
+
+# Temporary test pin: the executed `msb` graph must use the console-fix cohort.
+[patch.crates-io]
+msb_krun = { git = "https://github.com/gregwebs/libkrun", rev = "846d527335a4921ddc372d6889f3a887ce05966f" }
