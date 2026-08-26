@@ -805,10 +805,11 @@ impl Sandbox {
     /// Request graceful shutdown and return once the request is sent.
     ///
     /// Routes through the backend trait. On local this connects to the agent
-    /// endpoint and sends `core.shutdown` (agentd runs `sync()` +
-    /// `reboot(RB_POWER_OFF)` for a clean ext4 unmount), falling back to
-    /// platform process termination via PID if the endpoint is unreachable. On
-    /// cloud this issues `POST /v1/sandboxes/by-name/:name/stop`.
+    /// endpoint and sends `core.shutdown` (agentd tears down filesystems —
+    /// sync + remount read-only — for a clean ext4 unmount, then exits so
+    /// libkrun tears the VM down), falling back to platform process
+    /// termination via PID if the endpoint is unreachable. On cloud this
+    /// issues `POST /v1/sandboxes/by-name/:name/stop`.
     pub async fn request_stop(&self) -> MicrosandboxResult<()> {
         tracing::debug!(sandbox = %self.name, "stop: dispatching");
         self.backend

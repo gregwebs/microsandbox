@@ -177,10 +177,11 @@ impl LocalBackend {
     /// Local lifecycle: stop a sandbox by name.
     ///
     /// Tries the configured agent relay socket candidates, connects, sends
-    /// `MessageType::Shutdown`, and lets agentd run an in-guest `sync()` +
-    /// `reboot(RB_POWER_OFF)` so ext4 unmounts cleanly (no journal replay on
-    /// next boot). Falls back to platform process termination via PID if the
-    /// agent endpoint is unreachable (agentd wedged, sandbox just
+    /// `MessageType::Shutdown`, and lets agentd run an in-guest filesystem
+    /// teardown (sync + remount read-only) so ext4 unmounts cleanly (no
+    /// journal replay on next boot), then exit its own process so libkrun
+    /// tears the VM down. Falls back to platform process termination via PID
+    /// if the agent endpoint is unreachable (agentd wedged, sandbox just
     /// transitioning, etc.).
     ///
     /// No-op when the sandbox isn't in Running/Draining.

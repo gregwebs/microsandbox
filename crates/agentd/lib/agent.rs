@@ -1259,12 +1259,22 @@ fn write_to_fd(fd: i32, buf: &[u8]) -> std::io::Result<usize> {
 fn request_guest_poweroff() -> AgentdResult<()> {
     if crate::handoff::is_pid_1() {
         // PID 1 mode (no handoff): tear down filesystems so block-backed
-        // mounts reach a clean terminal state, then power the kernel off.
+        // mounts reach a clean terminal state, then return so agentd — which
+        // IS the libkrun init/workload in this mode — exits via main's
+        // `process::exit(0)`. libkrun tears the VM down as soon as its
+        // workload exits, so this is the fast, clean shutdown path.
+        //
+        // We deliberately do NOT `reboot(RB_POWER_OFF)` here: the libkrunfw
+        // guest kernel has no power-off method, so that call prints
+        // "reboot: Power off not available: System halted instead" and parks
+        // the vCPUs in a HLT loop *without ever returning* — agentd never
+        // gets to exit, the VMM never sees the workload leave, and the host
+        // is forced to wait out the full shutdown flush timeout (~8s) on
+        // every stop. `teardown_filesystems(true)` above already syncs and
+        // remounts read-only before we return, so nothing is lost by exiting
+        // instead of powering off. (Handoff mode, below, is unchanged: there
+        // a real init owns PID 1, so we signal it rather than exiting agentd.)
         crate::teardown::teardown_filesystems(true);
-        let ret = unsafe { libc::reboot(libc::RB_POWER_OFF) };
-        if ret != 0 {
-            return Err(std::io::Error::last_os_error().into());
-        }
         return Ok(());
     }
 
