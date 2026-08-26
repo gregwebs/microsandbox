@@ -4097,6 +4097,7 @@ dependencies = [
  "smoltcp",
  "socket2",
  "system-configuration",
+ "tempfile",
  "thiserror",
  "time",
  "tokio",

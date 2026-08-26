@@ -1011,6 +1011,9 @@ fn secret_material(spec: &SecretModificationPatch) -> MicrosandboxResult<Option<
     }
     match &spec.source {
         Some(source @ SecretSource::Env { .. }) => Ok(Some(SecretMaterial::Source(source.clone()))),
+        Some(source @ SecretSource::File { .. }) => {
+            Ok(Some(SecretMaterial::Source(source.clone())))
+        }
         Some(SecretSource::Store { .. }) => Err(crate::MicrosandboxError::Custom(format!(
             "secret {}: store-backed secret sources are not supported yet",
             spec.name
@@ -1191,6 +1194,10 @@ fn resolve_secret_source_value(
         }
         Some(SecretSource::Store { .. }) => Err(crate::MicrosandboxError::Custom(format!(
             "secret {name}: store-backed secret sources are not supported yet"
+        ))),
+        Some(SecretSource::File { .. }) => Err(crate::MicrosandboxError::Custom(format!(
+            "secret {name}: file-backed secrets rotate by editing the file; \
+             control-socket rotate is not applicable"
         ))),
         None => Err(crate::MicrosandboxError::Custom(format!(
             "secret {name} needs a host-side source or value to rotate"
@@ -4034,6 +4041,47 @@ mod tests {
         let message = error.to_string();
         assert!(message.contains("API_KEY_MODIFY_LEAK_TEST_MISSING"));
         assert!(!message.contains(SECRET_SENTINEL));
+    }
+
+    /// A File-source patch is a valid modify material: `secret_material`
+    /// carries it through as a reference (never resolving it host-side), so
+    /// `msb modify` can still change a File secret's allowed-hosts or
+    /// placeholder without needing to read the file.
+    #[cfg(feature = "net")]
+    #[test]
+    fn secret_material_carries_file_source_through_as_reference() {
+        let spec = SecretModificationPatch {
+            name: "FILE_SECRET".to_string(),
+            source: Some(SecretSource::File {
+                path: "/run/creds/token".into(),
+            }),
+            allowed_hosts: vec!["api.example.com".to_string()],
+            ..SecretModificationPatch::default()
+        };
+
+        let material = secret_material(&spec).unwrap();
+        assert!(matches!(
+            material,
+            Some(SecretMaterial::Source(SecretSource::File { .. }))
+        ));
+    }
+
+    /// Control-socket rotate is meaningless for a File source (the file
+    /// rotates itself, picked up per connection): resolving it errors, and
+    /// the error names only the secret, never the path.
+    #[cfg(feature = "net")]
+    #[test]
+    fn resolve_secret_source_value_rejects_file_source() {
+        let error = resolve_secret_source_value(
+            "FILE_SECRET",
+            Some(&SecretSource::File {
+                path: "/run/creds/token".into(),
+            }),
+        )
+        .unwrap_err();
+        let message = error.to_string();
+        assert!(message.contains("FILE_SECRET"));
+        assert!(!message.contains("/run/creds/token"));
     }
 
     #[cfg(feature = "net")]

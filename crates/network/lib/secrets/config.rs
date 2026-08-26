@@ -7,8 +7,8 @@
 //! engine-internal query helpers used by the proxy.
 
 pub use microsandbox_types::{
-    HostPattern, MAX_SECRET_PLACEHOLDER_BYTES, SecretConfigError, SecretEntry, SecretInjection,
-    SecretSource, SecretsConfig, ViolationAction,
+    HostPattern, MAX_SECRET_FILE_BYTES, MAX_SECRET_PLACEHOLDER_BYTES, SecretConfigError,
+    SecretEntry, SecretInjection, SecretSource, SecretsConfig, ViolationAction,
 };
 
 //--------------------------------------------------------------------------------------------------

@@ -1018,6 +1018,13 @@ impl SecretEntryConfigPatch {
         self
     }
 
+    /// Read the value from a host file, re-read on every eligible connection
+    /// so a rotated credential takes effect without a sandbox restart. Thin
+    /// sugar over `.source(SecretSource::File { path })`.
+    pub fn file(self, path: impl Into<std::path::PathBuf>) -> Self {
+        self.source(SecretSource::File { path: path.into() })
+    }
+
     /// Replace allowed host patterns.
     pub fn allowed_hosts(mut self, value: Vec<HostPattern>) -> Self {
         self.allowed_hosts = Some(value);

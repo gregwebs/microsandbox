@@ -648,6 +648,13 @@ pub(crate) fn resolve_config_secret_sources(
                     secret.env_var
                 )));
             }
+            SecretSource::File { .. } => {
+                // File-backed secrets are resolved lazily in the network
+                // engine on each connection; leave `source`/empty `value` so
+                // only the path persists and rotation is picked up without a
+                // restart.
+                continue;
+            }
         }
     }
     if !resolved_any {
@@ -1839,6 +1846,106 @@ mod tests {
         let network = config.local_network_config().unwrap();
         assert_eq!(network.secrets.secrets[0].value.as_str(), SECRET_SENTINEL);
     }
+
+    /// File-backed secrets are never resolved at spawn: the resolver must
+    /// skip them entirely (no host env var lookup, no error) and leave the
+    /// `source`/empty `value` untouched so per-connection resolution in the
+    /// network engine is what performs the read.
+    #[cfg(feature = "net")]
+    #[test]
+    fn spawn_resolver_skips_file_backed_secret() {
+        use microsandbox_network::secrets::config::{
+            HostPattern, SecretEntry, SecretInjection, SecretSource,
+        };
+
+        let mut config = SandboxConfig::default();
+        config.spec.network.enabled = true;
+        let mut network = config.local_network_config().unwrap();
+        network.secrets.secrets.push(SecretEntry {
+            env_var: "FILE_SECRET".into(),
+            value: zeroize::Zeroizing::new(String::new()),
+            source: Some(SecretSource::File {
+                path: "/run/creds/token".into(),
+            }),
+            placeholder: "$MSB_FILE_SECRET".into(),
+            allowed_hosts: vec![HostPattern::Exact("api.example.com".into())],
+            injection: SecretInjection::default(),
+            on_violation: None,
+            require_tls_identity: true,
+        });
+        config.set_local_network_config(network).unwrap();
+
+        let resolved = super::resolve_config_secret_sources(&config).unwrap();
+        assert!(
+            resolved.is_none(),
+            "a File-only config needs no spawn-time resolution"
+        );
+
+        let network = config.local_network_config().unwrap();
+        assert!(network.secrets.secrets[0].value.is_empty());
+        assert!(matches!(
+            network.secrets.secrets[0].source,
+            Some(SecretSource::File { .. })
+        ));
+    }
+
+    /// A config mixing an Env reference and a File reference resolves the Env
+    /// entry and leaves the File entry's value empty (its source is resolved
+    /// lazily, per connection, in the network engine).
+    #[cfg(feature = "net")]
+    #[test]
+    fn spawn_resolver_resolves_env_and_skips_file_in_mixed_config() {
+        use microsandbox_network::secrets::config::{
+            HostPattern, SecretEntry, SecretInjection, SecretSource,
+        };
+
+        let _env_guard = crate::test_support::lock_env();
+        // SAFETY: every environment-mutating SDK unit test holds the shared lock.
+        unsafe { std::env::set_var("MSB_TEST_MIXED_ENV_SOURCE", SECRET_SENTINEL) };
+
+        let mut config = SandboxConfig::default();
+        config.spec.network.enabled = true;
+        let mut network = config.local_network_config().unwrap();
+        network.secrets.secrets.push(SecretEntry {
+            env_var: "ENV_SECRET".into(),
+            value: zeroize::Zeroizing::new(String::new()),
+            source: Some(SecretSource::Env {
+                var: "MSB_TEST_MIXED_ENV_SOURCE".into(),
+            }),
+            placeholder: "$MSB_ENV_SECRET".into(),
+            allowed_hosts: vec![HostPattern::Exact("api.example.com".into())],
+            injection: SecretInjection::default(),
+            on_violation: None,
+            require_tls_identity: true,
+        });
+        network.secrets.secrets.push(SecretEntry {
+            env_var: "FILE_SECRET".into(),
+            value: zeroize::Zeroizing::new(String::new()),
+            source: Some(SecretSource::File {
+                path: "/run/creds/token".into(),
+            }),
+            placeholder: "$MSB_FILE_SECRET".into(),
+            allowed_hosts: vec![HostPattern::Exact("api.example.com".into())],
+            injection: SecretInjection::default(),
+            on_violation: None,
+            require_tls_identity: true,
+        });
+        config.set_local_network_config(network).unwrap();
+
+        let resolved = super::resolve_config_secret_sources(&config)
+            .unwrap()
+            .expect("the Env entry requires resolution");
+        let network = resolved.local_network_config().unwrap();
+        assert_eq!(network.secrets.secrets[0].value.as_str(), SECRET_SENTINEL);
+        assert!(network.secrets.secrets[1].value.is_empty());
+        assert!(matches!(
+            network.secrets.secrets[1].source,
+            Some(SecretSource::File { .. })
+        ));
+
+        unsafe { std::env::remove_var("MSB_TEST_MIXED_ENV_SOURCE") };
+    }
+
     #[test]
     fn test_sandbox_config_deserializes_legacy_readonly_mounts() {
         let json = r#"{"name":"legacy","mounts":[{"type":"Tmpfs","guest":"/tmp","size_mib":512,"readonly":false}]}"#;
