@@ -24,7 +24,7 @@ use std::net::{IpAddr, SocketAddr};
 use ipnetwork::IpNetwork;
 use serde::{Deserialize, Serialize};
 
-use crate::shared::SharedState;
+use crate::netstack::shared::SharedState;
 
 use super::destination::{matches_cidr, matches_group};
 use super::name::{DomainName, DomainNameError};
@@ -49,7 +49,7 @@ pub struct NetworkPolicy {
 
     /// Default action for ingress traffic not matching any rule. The
     /// per-field serde default is `Deny` so partially-specified JSON
-    /// fails closed; permissive presets like [`NetworkPolicy::public_only`]
+    /// fails closed; profile policies built by [`NetworkPolicy::from_profiles`]
     /// flip this back to `Allow` explicitly.
     #[serde(default = "Action::deny")]
     pub default_ingress: Action,
@@ -57,6 +57,24 @@ pub struct NetworkPolicy {
     /// Ordered list of rules, evaluated first-match-wins per direction.
     #[serde(default)]
     pub rules: Vec<Rule>,
+}
+
+/// A composable high-level network access profile.
+///
+/// Profiles expand into ordinary first-match-wins policy rules. Every non-empty
+/// profile set includes exactly one narrow DNS rule for the sandbox gateway;
+/// the requested destination groups then follow in canonical order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NetworkProfile {
+    /// Public internet addresses.
+    Public,
+
+    /// Private/LAN address ranges (RFC 1918, RFC 4193 ULA, and CGN).
+    Private,
+
+    /// The sandbox host via its gateway addresses.
+    Host,
 }
 
 /// Action to take on matched traffic.
@@ -214,9 +232,10 @@ pub enum HostnameSource<'a> {
     Sni(&'a str),
     /// No SNI — match `Domain` rules via the resolved-hostname cache.
     CacheOnly,
-    /// SYN time, before SNI is known. A matching `Domain` /
-    /// `DomainSuffix` rule short-circuits to
-    /// [`EgressEvaluation::DeferUntilHostname`].
+    /// SYN time, before SNI is known. `Domain` / `DomainSuffix`
+    /// allow rules defer only when the resolved-hostname cache already
+    /// ties the destination IP to that rule; deny rules defer only when
+    /// the remaining policy could otherwise allow the flow.
     Deferred,
 }
 
@@ -267,32 +286,47 @@ impl NetworkPolicy {
         }
     }
 
-    /// Public internet only — allow egress to public IPs, deny private,
-    /// loopback, link-local, and metadata. Ingress defaults to allow
-    /// (preserves today's unfiltered published-port behavior).
-    pub fn public_only() -> Self {
-        Self {
-            default_egress: Action::Deny,
-            default_ingress: Action::Allow,
-            rules: vec![
-                Rule::allow_dns(),
-                Rule::allow_egress(Destination::Group(DestinationGroup::Public)),
-            ],
-        }
-    }
+    /// Build a deny-by-default policy from composable profiles.
+    ///
+    /// Duplicate profiles are ignored and input order does not affect the
+    /// resulting rule order. An empty profile set permits no egress and does
+    /// not add DNS; ingress remains allowed to preserve published-port
+    /// behavior.
+    pub fn from_profiles<I>(profiles: I) -> Self
+    where
+        I: IntoIterator<Item = NetworkProfile>,
+    {
+        let mut public = false;
+        let mut private = false;
+        let mut host = false;
 
-    /// Non-local network access — allow public internet and private/LAN
-    /// egress; deny loopback, link-local, and metadata. Ingress defaults
-    /// to allow.
-    pub fn non_local() -> Self {
+        for profile in profiles {
+            match profile {
+                NetworkProfile::Public => public = true,
+                NetworkProfile::Private => private = true,
+                NetworkProfile::Host => host = true,
+            }
+        }
+
+        let mut rules =
+            Vec::with_capacity(1 + usize::from(public) + usize::from(private) + usize::from(host));
+        if public || private || host {
+            rules.push(Rule::allow_dns());
+        }
+        for (enabled, group) in [
+            (public, DestinationGroup::Public),
+            (private, DestinationGroup::Private),
+            (host, DestinationGroup::Host),
+        ] {
+            if enabled {
+                rules.push(Rule::allow_egress(Destination::Group(group)));
+            }
+        }
+
         Self {
             default_egress: Action::Deny,
             default_ingress: Action::Allow,
-            rules: vec![
-                Rule::allow_dns(),
-                Rule::allow_egress(Destination::Group(DestinationGroup::Public)),
-                Rule::allow_egress(Destination::Group(DestinationGroup::Private)),
-            ],
+            rules,
         }
     }
 
@@ -330,6 +364,34 @@ impl NetworkPolicy {
             .into()
     }
 
+    /// Evaluate only explicit, address-only egress rules and ignore the
+    /// policy default. DNS rebinding protection uses this distinction so an
+    /// explicit private profile can admit internal answers without making an
+    /// `allow_all` default disable rebinding protection implicitly.
+    pub(crate) fn evaluate_explicit_egress_ip(
+        &self,
+        addr: IpAddr,
+        protocol: Protocol,
+        shared: &SharedState,
+    ) -> Option<Action> {
+        for rule in &self.rules {
+            if !matches!(rule.direction, Direction::Egress | Direction::Any)
+                || !matches!(
+                    rule.destination,
+                    Destination::Cidr(_) | Destination::Group(_)
+                )
+                || !rule.ports.is_empty()
+                || (!rule.protocols.is_empty() && !rule.protocols.contains(&protocol))
+            {
+                continue;
+            }
+            if matches_destination(&rule.destination, addr, shared) {
+                return Some(rule.action);
+            }
+        }
+        None
+    }
+
     /// Evaluate an outbound connection with an explicit
     /// [`HostnameSource`] for `Domain` / `DomainSuffix` matching.
     /// Walk order and protocol/port filtering are identical across
@@ -354,7 +416,7 @@ impl NetworkPolicy {
         shared: &SharedState,
         source: HostnameSource<'_>,
     ) -> EgressEvaluation {
-        for rule in &self.rules {
+        for (idx, rule) in self.rules.iter().enumerate() {
             if !matches!(rule.direction, Direction::Egress | Direction::Any) {
                 continue;
             }
@@ -377,11 +439,62 @@ impl NetworkPolicy {
                 source,
             ) {
                 DestinationMatch::Match => return rule.action.into(),
-                DestinationMatch::Defer => return EgressEvaluation::DeferUntilHostname,
+                DestinationMatch::Defer => {
+                    if rule.action.is_deny()
+                        && !self.deferred_tail_can_allow(idx + 1, addr, port, protocol, shared)
+                    {
+                        return EgressEvaluation::Deny;
+                    }
+                    return EgressEvaluation::DeferUntilHostname;
+                }
                 DestinationMatch::NoMatch => continue,
             }
         }
         self.default_egress.into()
+    }
+
+    /// Return whether the rules after a deferred deny-domain rule could
+    /// still allow this flow. If not, SYN-time evaluation can deny
+    /// immediately instead of deferring only to rediscover the default
+    /// deny path after first flight.
+    fn deferred_tail_can_allow(
+        &self,
+        start: usize,
+        addr: IpAddr,
+        port: Option<u16>,
+        protocol: Protocol,
+        shared: &SharedState,
+    ) -> bool {
+        for rule in self.rules.iter().skip(start) {
+            if !matches!(rule.direction, Direction::Egress | Direction::Any) {
+                continue;
+            }
+            if !rule.protocols.is_empty() && !rule.protocols.contains(&protocol) {
+                continue;
+            }
+            if !rule.ports.is_empty() {
+                let Some(p) = port else {
+                    continue;
+                };
+                if !rule.ports.iter().any(|range| range.contains(p)) {
+                    continue;
+                }
+            }
+
+            match matches_egress_destination_with_source(
+                &rule.destination,
+                rule.action,
+                addr,
+                shared,
+                HostnameSource::Deferred,
+            ) {
+                DestinationMatch::Match => return rule.action.is_allow(),
+                DestinationMatch::Defer if rule.action.is_allow() => return true,
+                DestinationMatch::Defer | DestinationMatch::NoMatch => continue,
+            }
+        }
+
+        self.default_egress.is_allow()
     }
 
     /// Evaluate an inbound connection against the rule list.
@@ -610,7 +723,7 @@ impl From<EgressEvaluation> for Action {
 
 impl Default for NetworkPolicy {
     fn default() -> Self {
-        Self::public_only()
+        Self::from_profiles([NetworkProfile::Public])
     }
 }
 
@@ -681,6 +794,17 @@ impl Rule {
             protocols: vec![Protocol::Udp, Protocol::Tcp],
             ports: vec![PortRange::single(53)],
             action: Action::Allow,
+        }
+    }
+
+    /// Deny plain DNS (UDP/53 and TCP/53) to the sandbox gateway.
+    ///
+    /// This is the deny counterpart to [`Self::allow_dns`] and is useful as
+    /// an override placed before profile-generated rules.
+    pub fn deny_dns() -> Self {
+        Self {
+            action: Action::Deny,
+            ..Self::allow_dns()
         }
     }
 }
@@ -784,8 +908,12 @@ impl From<bool> for DestinationMatch {
 ///   connecting, populating the cache.
 /// - [`HostnameSource::CacheOnly`]: query the resolved-hostname cache
 ///   on `shared` for any prior resolution of `addr` that matches.
-/// - [`HostnameSource::Deferred`]: short-circuits to
-///   [`DestinationMatch::Defer`].
+/// - [`HostnameSource::Deferred`]: deny rules produce
+///   [`DestinationMatch::Defer`] so the rule walk can decide whether
+///   later policy could otherwise allow the flow; allow rules require
+///   the same DNS-cache binding as [`HostnameSource::CacheOnly`] before
+///   they defer. This keeps domain rules from making unrelated raw IP
+///   connects look reachable before first-flight policy runs.
 fn matches_egress_destination_with_source(
     dest: &Destination,
     action: Action,
@@ -807,7 +935,9 @@ fn matches_egress_destination_with_source(
             HostnameSource::CacheOnly => shared
                 .any_resolved_hostname(addr, |hostname| hostname == domain.as_str())
                 .into(),
-            HostnameSource::Deferred => DestinationMatch::Defer,
+            HostnameSource::Deferred => {
+                deferred_domain_match(action, addr, shared, |hostname| hostname == domain.as_str())
+            }
         },
         Destination::DomainSuffix(suffix) => match source {
             HostnameSource::Sni(name) => {
@@ -822,8 +952,29 @@ fn matches_egress_destination_with_source(
             HostnameSource::CacheOnly => shared
                 .any_resolved_hostname(addr, |hostname| matches_suffix(hostname, suffix.as_str()))
                 .into(),
-            HostnameSource::Deferred => DestinationMatch::Defer,
+            HostnameSource::Deferred => deferred_domain_match(action, addr, shared, |hostname| {
+                matches_suffix(hostname, suffix.as_str())
+            }),
         },
+    }
+}
+
+/// Deferred SYN-time matching for domain rules.
+///
+/// Deny rules defer without a cache binding so a direct-IP connection
+/// with blocked SNI can still be refused later. Allow rules are stricter:
+/// without DNS evidence tying the IP to the allowed domain, the SYN can
+/// be denied immediately instead of producing fake reachability.
+fn deferred_domain_match(
+    action: Action,
+    addr: IpAddr,
+    shared: &SharedState,
+    matches_hostname: impl Fn(&str) -> bool,
+) -> DestinationMatch {
+    if action.is_deny() || shared.any_resolved_hostname(addr, matches_hostname) {
+        DestinationMatch::Defer
+    } else {
+        DestinationMatch::NoMatch
     }
 }
 
@@ -862,13 +1013,17 @@ fn matches_suffix(hostname: &str, suffix: &str) -> bool {
     false
 }
 
+//--------------------------------------------------------------------------------------------------
+// Tests
+//--------------------------------------------------------------------------------------------------
+
 #[cfg(test)]
 mod tests {
     use std::net::{Ipv4Addr, Ipv6Addr};
     use std::time::Duration;
 
     use super::*;
-    use crate::shared::ResolvedHostnameFamily;
+    use crate::netstack::shared::ResolvedHostnameFamily;
 
     const PYPI_V4: &str = "151.101.0.223";
     const FILES_V4: &str = "151.101.64.223";
@@ -913,6 +1068,73 @@ mod tests {
             default_ingress: Action::Allow,
             rules: vec![Rule::allow_egress(dest)],
         }
+    }
+
+    #[test]
+    fn profiles_are_deduplicated_and_expanded_in_canonical_order() {
+        let policy = NetworkPolicy::from_profiles([
+            NetworkProfile::Host,
+            NetworkProfile::Private,
+            NetworkProfile::Public,
+            NetworkProfile::Private,
+        ]);
+
+        assert_eq!(policy.default_egress, Action::Deny);
+        assert_eq!(policy.default_ingress, Action::Allow);
+        assert_eq!(policy.rules.len(), 4);
+        assert_eq!(policy.rules[0].protocols, [Protocol::Udp, Protocol::Tcp]);
+        assert_eq!(policy.rules[0].ports, [PortRange::single(53)]);
+        for (rule, expected) in policy.rules[1..].iter().zip([
+            DestinationGroup::Public,
+            DestinationGroup::Private,
+            DestinationGroup::Host,
+        ]) {
+            assert!(matches!(rule.destination, Destination::Group(group) if group == expected));
+        }
+    }
+
+    #[test]
+    fn empty_profile_set_has_no_implicit_dns_or_egress() {
+        let policy = NetworkPolicy::from_profiles([]);
+        assert_eq!(policy.default_egress, Action::Deny);
+        assert_eq!(policy.default_ingress, Action::Allow);
+        assert!(policy.rules.is_empty());
+    }
+
+    #[test]
+    fn default_policy_is_the_public_profile() {
+        let policy = NetworkPolicy::default();
+        assert_eq!(policy.rules.len(), 2);
+        assert!(matches!(
+            policy.rules[1].destination,
+            Destination::Group(DestinationGroup::Public)
+        ));
+    }
+
+    #[test]
+    fn profile_wire_names_are_stable() {
+        assert_eq!(
+            serde_json::to_string(&NetworkProfile::Public).unwrap(),
+            "\"public\""
+        );
+        assert_eq!(
+            serde_json::from_str::<NetworkProfile>("\"private\"").unwrap(),
+            NetworkProfile::Private
+        );
+    }
+
+    #[test]
+    fn deny_dns_is_the_exact_action_inverse_of_allow_dns() {
+        let allow = Rule::allow_dns();
+        let deny = Rule::deny_dns();
+        assert_eq!(deny.action, Action::Deny);
+        assert_eq!(deny.direction, allow.direction);
+        assert_eq!(deny.protocols, allow.protocols);
+        assert_eq!(deny.ports, allow.ports);
+        assert!(matches!(
+            deny.destination,
+            Destination::Group(DestinationGroup::Host)
+        ));
     }
 
     /// Outbound TCP/443 allow rule pinned to a specific hostname,
@@ -1187,9 +1409,9 @@ mod tests {
     }
 
     #[test]
-    fn public_only_preset_denies_host_gateway() {
+    fn public_profile_denies_host_gateway() {
         let (shared, gw4, gw6) = shared_with_gateway();
-        let policy = NetworkPolicy::public_only();
+        let policy = NetworkPolicy::from_profiles([NetworkProfile::Public]);
 
         let v4 = SocketAddr::new(IpAddr::V4(gw4), 80);
         assert_eq!(
@@ -1207,7 +1429,7 @@ mod tests {
     }
 
     #[test]
-    fn allow_all_preset_permits_host_gateway() {
+    fn allow_all_policy_permits_host_gateway() {
         let (shared, gw4, _) = shared_with_gateway();
         let policy = NetworkPolicy::allow_all();
         let v4 = SocketAddr::new(IpAddr::V4(gw4), 80);
@@ -1220,7 +1442,7 @@ mod tests {
     #[test]
     fn group_host_allow_overrides_private_deny_when_ordered_first() {
         let (shared, gw4, _) = shared_with_gateway();
-        let mut policy = NetworkPolicy::public_only();
+        let mut policy = NetworkPolicy::from_profiles([NetworkProfile::Public]);
         policy.rules.insert(
             0,
             Rule::allow_egress(Destination::Group(DestinationGroup::Host)),
@@ -1451,6 +1673,9 @@ mod tests {
         assert!(egress_tcp(&policy, "127.0.0.1", &shared).is_deny());
         // Metadata is not in Public.
         assert!(egress_tcp(&policy, "169.254.169.254", &shared).is_deny());
+        // Unspecified addresses are reserved and do not belong to Public.
+        assert!(egress_tcp(&policy, "0.0.0.0", &shared).is_deny());
+        assert!(egress_tcp(&policy, "::", &shared).is_deny());
     }
 
     //----------------------------------------------------------------------------------------------
@@ -1860,10 +2085,11 @@ mod tests {
         assert_eq!(eval, EgressEvaluation::Deny);
     }
 
-    /// Deferred mode: a matching `Domain` rule short-circuits the walk
-    /// with `DeferUntilHostname` regardless of the rule's action.
+    /// Deferred mode: an allow-Domain rule without a DNS-cache binding
+    /// does not defer. The SYN can be denied immediately instead of
+    /// making an unrelated raw IP look reachable.
     #[test]
-    fn deferred_returns_defer_for_first_matching_domain_rule() {
+    fn deferred_allow_domain_without_cache_binding_falls_to_default() {
         let shared = SharedState::new(4);
         let policy = NetworkPolicy {
             default_egress: Action::Deny,
@@ -1876,7 +2102,213 @@ mod tests {
             &shared,
             HostnameSource::Deferred,
         );
+        assert_eq!(eval, EgressEvaluation::Deny);
+    }
+
+    /// Deferred mode: an allow-Domain rule with a DNS-cache binding
+    /// still defers so first-flight SNI can disambiguate shared IPs.
+    #[test]
+    fn deferred_allow_domain_with_cache_binding_defers() {
+        let shared = shared_with_host("pypi.org", PYPI_V4);
+        let policy = NetworkPolicy {
+            default_egress: Action::Deny,
+            default_ingress: Action::Allow,
+            rules: vec![Rule::allow_egress(Destination::Domain(name("pypi.org")))],
+        };
+        let eval = policy.evaluate_egress_with_source(
+            sock(PYPI_V4, 443),
+            Protocol::Tcp,
+            &shared,
+            HostnameSource::Deferred,
+        );
         assert_eq!(eval, EgressEvaluation::DeferUntilHostname);
+    }
+
+    /// Deferred allow rules apply the DNS-cache requirement to native
+    /// IPv6 addresses too; an unpinned AAAA target must not look
+    /// reachable just because a domain allow rule exists.
+    #[test]
+    fn deferred_allow_domain_ipv6_requires_cache_binding() {
+        let empty = SharedState::new(4);
+        let cached = SharedState::new(4);
+        cache(
+            &cached,
+            "cloudflare.com",
+            ResolvedHostnameFamily::Ipv6,
+            CLOUDFLARE_V6,
+        );
+        let policy = NetworkPolicy {
+            default_egress: Action::Deny,
+            default_ingress: Action::Allow,
+            rules: vec![Rule::allow_egress(Destination::Domain(name(
+                "cloudflare.com",
+            )))],
+        };
+
+        let without_cache = policy.evaluate_egress_with_source(
+            sock(CLOUDFLARE_V6, 443),
+            Protocol::Tcp,
+            &empty,
+            HostnameSource::Deferred,
+        );
+        assert_eq!(without_cache, EgressEvaluation::Deny);
+
+        let with_cache = policy.evaluate_egress_with_source(
+            sock(CLOUDFLARE_V6, 443),
+            Protocol::Tcp,
+            &cached,
+            HostnameSource::Deferred,
+        );
+        assert_eq!(with_cache, EgressEvaluation::DeferUntilHostname);
+    }
+
+    /// Deferred allow rules also rely on normalized address matching:
+    /// an IPv4-mapped IPv6 spelling must not bypass the DNS-cache
+    /// requirement, but a cache entry for the embedded IPv4 address
+    /// should still permit deferral.
+    #[test]
+    fn deferred_allow_domain_ipv4_mapped_requires_cache_binding() {
+        let mapped = "::ffff:151.101.0.223";
+        let empty = SharedState::new(4);
+        let cached = shared_with_host("pypi.org", PYPI_V4);
+        let policy = NetworkPolicy {
+            default_egress: Action::Deny,
+            default_ingress: Action::Allow,
+            rules: vec![Rule::allow_egress(Destination::Domain(name("pypi.org")))],
+        };
+
+        let without_cache = policy.evaluate_egress_with_source(
+            sock(mapped, 443),
+            Protocol::Tcp,
+            &empty,
+            HostnameSource::Deferred,
+        );
+        assert_eq!(without_cache, EgressEvaluation::Deny);
+
+        let with_cache = policy.evaluate_egress_with_source(
+            sock(mapped, 443),
+            Protocol::Tcp,
+            &cached,
+            HostnameSource::Deferred,
+        );
+        assert_eq!(with_cache, EgressEvaluation::DeferUntilHostname);
+    }
+
+    /// Deferred mode: suffix allow rules use the same DNS-cache
+    /// requirement so unrelated IPs do not inherit suffix reachability.
+    #[test]
+    fn deferred_allow_domain_suffix_requires_cache_binding() {
+        let empty = SharedState::new(4);
+        let cached = shared_with_host("files.pythonhosted.org", FILES_V4);
+        let policy = NetworkPolicy {
+            default_egress: Action::Deny,
+            default_ingress: Action::Allow,
+            rules: vec![Rule::allow_egress(Destination::DomainSuffix(name(
+                ".pythonhosted.org",
+            )))],
+        };
+
+        let without_cache = policy.evaluate_egress_with_source(
+            sock(FILES_V4, 443),
+            Protocol::Tcp,
+            &empty,
+            HostnameSource::Deferred,
+        );
+        assert_eq!(without_cache, EgressEvaluation::Deny);
+
+        let with_cache = policy.evaluate_egress_with_source(
+            sock(FILES_V4, 443),
+            Protocol::Tcp,
+            &cached,
+            HostnameSource::Deferred,
+        );
+        assert_eq!(with_cache, EgressEvaluation::DeferUntilHostname);
+    }
+
+    /// Deferred mode: a deny-Domain rule under default-deny does not
+    /// defer unless the remaining policy could allow the flow anyway.
+    /// If every first-flight outcome is denied, SYN can be denied too.
+    #[test]
+    fn deferred_deny_domain_without_tail_allow_falls_to_default_deny() {
+        let shared = SharedState::new(4);
+        let policy = NetworkPolicy {
+            default_egress: Action::Deny,
+            default_ingress: Action::Allow,
+            rules: vec![Rule::deny_egress(Destination::Domain(name("evil.com")))],
+        };
+        let eval = policy.evaluate_egress_with_source(
+            sock(PYPI_V4, 443),
+            Protocol::Tcp,
+            &shared,
+            HostnameSource::Deferred,
+        );
+        assert_eq!(eval, EgressEvaluation::Deny);
+    }
+
+    /// Deferred mode: deny-Domain rules still defer under default-allow
+    /// so direct-IP connections can be blocked once SNI appears.
+    #[test]
+    fn deferred_deny_domain_with_default_allow_still_defers() {
+        let shared = SharedState::new(4);
+        let policy = NetworkPolicy {
+            default_egress: Action::Allow,
+            default_ingress: Action::Allow,
+            rules: vec![Rule::deny_egress(Destination::Domain(name("evil.com")))],
+        };
+        let eval = policy.evaluate_egress_with_source(
+            sock(PYPI_V4, 443),
+            Protocol::Tcp,
+            &shared,
+            HostnameSource::Deferred,
+        );
+        assert_eq!(eval, EgressEvaluation::DeferUntilHostname);
+    }
+
+    /// Deferred mode: a deny-Domain rule before an IP-layer allow must
+    /// defer so SNI can choose between the domain deny and the later
+    /// raw-IP allow.
+    #[test]
+    fn deferred_deny_domain_with_later_ip_allow_defers() {
+        let shared = SharedState::new(4);
+        let policy = NetworkPolicy {
+            default_egress: Action::Deny,
+            default_ingress: Action::Allow,
+            rules: vec![
+                Rule::deny_egress(Destination::Domain(name("evil.com"))),
+                Rule::allow_egress(Destination::Cidr("151.101.0.0/16".parse().unwrap())),
+            ],
+        };
+        let eval = policy.evaluate_egress_with_source(
+            sock(PYPI_V4, 443),
+            Protocol::Tcp,
+            &shared,
+            HostnameSource::Deferred,
+        );
+        assert_eq!(eval, EgressEvaluation::DeferUntilHostname);
+    }
+
+    /// Deferred mode: if the tail would hit an IP-layer deny before any
+    /// allow, a preceding deny-Domain rule does not need first-flight
+    /// evidence because the flow is denied either way.
+    #[test]
+    fn deferred_deny_domain_with_later_ip_deny_does_not_defer() {
+        let shared = SharedState::new(4);
+        let policy = NetworkPolicy {
+            default_egress: Action::Deny,
+            default_ingress: Action::Allow,
+            rules: vec![
+                Rule::deny_egress(Destination::Domain(name("evil.com"))),
+                Rule::deny_egress(Destination::Cidr("151.101.0.0/16".parse().unwrap())),
+                Rule::allow_egress(Destination::Any),
+            ],
+        };
+        let eval = policy.evaluate_egress_with_source(
+            sock(PYPI_V4, 443),
+            Protocol::Tcp,
+            &shared,
+            HostnameSource::Deferred,
+        );
+        assert_eq!(eval, EgressEvaluation::Deny);
     }
 
     /// An earlier matching IP-layer allow wins before the deferred

@@ -21,9 +21,11 @@ pub mod handoff;
 pub mod heartbeat;
 pub mod init;
 pub mod network;
+pub mod process;
 pub mod serial;
 pub mod session;
 pub mod tcp;
+pub mod teardown;
 pub mod tls;
 
 pub use config::{AgentdConfig, BootParams, HandoffInit, SecurityProfile};

@@ -8,10 +8,7 @@ use std::time::Instant;
 use clap::{Args, Subcommand, ValueEnum};
 use console::style;
 use microsandbox::image::Image;
-use microsandbox_image::{
-    CachedImageMetadata, ImageArchiveFormat, ImageLoadOptions, ImageSaveConfig, ImageSaveLayer,
-    ImageSaveRequest, Registry,
-};
+use microsandbox_image::{ImageArchiveFormat, ImageLoadOptions, Registry};
 
 use crate::ui;
 
@@ -156,6 +153,13 @@ pub struct ImagePruneArgs {
     pub quiet: bool,
 }
 
+/// Optional settings supplied by callers that need more than the normal pull defaults.
+#[derive(Default)]
+struct PullOverrides {
+    materialization: Option<pull::PullMaterialization>,
+    explicit_auth: Option<microsandbox_image::RegistryAuth>,
+}
+
 //--------------------------------------------------------------------------------------------------
 // Functions
 //--------------------------------------------------------------------------------------------------
@@ -171,6 +175,10 @@ pub async fn run(args: ImageArgs) -> anyhow::Result<()> {
                 args.insecure,
                 args.ca_certs,
                 microsandbox_image::PullPolicy::IfMissing,
+                PullOverrides {
+                    materialization: args.materialize,
+                    ..PullOverrides::default()
+                },
             )
             .await
         }
@@ -192,6 +200,10 @@ pub async fn run_pull(args: pull::PullArgs) -> anyhow::Result<()> {
         args.insecure,
         args.ca_certs,
         microsandbox_image::PullPolicy::IfMissing,
+        PullOverrides {
+            materialization: args.materialize,
+            ..PullOverrides::default()
+        },
     )
     .await
 }
@@ -204,19 +216,30 @@ async fn run_pull_inner(
     insecure: bool,
     cli_ca_certs: Option<String>,
     pull_policy: microsandbox_image::PullPolicy,
+    pull_overrides: PullOverrides,
 ) -> anyhow::Result<()> {
     let start = Instant::now();
+    let PullOverrides {
+        materialization,
+        explicit_auth,
+    } = pull_overrides;
 
     let backend = crate::commands::common::resolve_local_backend()?;
     let local = crate::commands::common::local_backend_ref(&backend)?;
     let global = local.config();
+    let oci_defaults = &global.sandbox_defaults.oci;
+    let materialization = resolve_pull_materialization(materialization, oci_defaults)?;
     let cache = microsandbox_image::GlobalCache::new(&local.cache_dir())?;
     let platform = microsandbox_image::Platform::host_linux();
     let image_ref: microsandbox_image::Reference = reference
         .parse()
         .map_err(|e| anyhow::anyhow!("invalid image reference: {e}"))?;
 
-    let options = microsandbox_image::PullOptions { pull_policy, force };
+    let options = microsandbox_image::PullOptions {
+        pull_policy,
+        force,
+        materialization: materialization.image_materialization(),
+    };
 
     if let Some((result, metadata)) =
         microsandbox_image::Registry::pull_cached(&cache, &image_ref, &options)?
@@ -266,7 +289,10 @@ async fn run_pull_inner(
 
     let _ = display_ready_rx.recv();
 
-    let auth = global.resolve_registry_auth(image_ref.registry())?;
+    let auth = match explicit_auth {
+        Some(auth) => auth,
+        None => global.resolve_registry_auth(image_ref.registry())?,
+    };
     let mut ca_certs = global.resolve_ca_certs().await?;
     if let Some(path) = &cli_ca_certs {
         let data = tokio::fs::read(path)
@@ -358,7 +384,21 @@ async fn run_pull_inner(
 /// printed, because the caller already has its own UI (e.g. the Starting
 /// spinner in `resolve_and_start`). Only falls through to the full pull UI
 /// when there's actual work to do.
-pub(crate) async fn pull_if_missing(reference: &str, quiet: bool) -> anyhow::Result<()> {
+pub(crate) async fn pull_if_missing(
+    reference: &str,
+    quiet: bool,
+    materialization: pull::PullMaterialization,
+) -> anyhow::Result<()> {
+    pull_if_missing_with_auth(reference, quiet, materialization, None).await
+}
+
+/// Pull an image if missing, honoring an explicit per-sandbox registry credential.
+pub(crate) async fn pull_if_missing_with_auth(
+    reference: &str,
+    quiet: bool,
+    materialization: pull::PullMaterialization,
+    explicit_auth: Option<microsandbox_image::RegistryAuth>,
+) -> anyhow::Result<()> {
     // Local paths (directories, disk images) are not pullable.
     if reference.starts_with('.') || reference.starts_with('/') {
         return Ok(());
@@ -373,6 +413,7 @@ pub(crate) async fn pull_if_missing(reference: &str, quiet: bool) -> anyhow::Res
     let options = microsandbox_image::PullOptions {
         pull_policy: microsandbox_image::PullPolicy::IfMissing,
         force: false,
+        materialization: materialization.image_materialization(),
     };
 
     if let Some((_, metadata)) =
@@ -391,6 +432,10 @@ pub(crate) async fn pull_if_missing(reference: &str, quiet: bool) -> anyhow::Res
         false,
         None,
         microsandbox_image::PullPolicy::IfMissing,
+        PullOverrides {
+            materialization: Some(materialization),
+            explicit_auth,
+        },
     )
     .await
 }
@@ -399,7 +444,7 @@ pub(crate) async fn pull_if_missing(reference: &str, quiet: bool) -> anyhow::Res
 pub async fn run_list(args: ImageListArgs) -> anyhow::Result<()> {
     let backend = crate::commands::common::resolve_local_backend()?;
     let local = crate::commands::common::local_backend_ref(&backend)?;
-    let images = Image::list(local).await?;
+    let images = Image::list_local(local).await?;
 
     if args.format.as_deref() == Some("json") {
         let entries: Vec<serde_json::Value> = images
@@ -460,7 +505,7 @@ pub async fn run_list(args: ImageListArgs) -> anyhow::Result<()> {
 pub async fn run_inspect(args: ImageInspectArgs) -> anyhow::Result<()> {
     let backend = crate::commands::common::resolve_local_backend()?;
     let local = crate::commands::common::local_backend_ref(&backend)?;
-    let detail = Image::inspect(local, &args.reference).await?;
+    let detail = Image::inspect_local(local, &args.reference).await?;
 
     if args.format.as_deref() == Some("json") {
         let layers_json: Vec<serde_json::Value> = detail
@@ -585,6 +630,34 @@ pub async fn run_load(args: ImageLoadArgs) -> anyhow::Result<()> {
     let backend = crate::commands::common::resolve_local_backend()?;
     let local = crate::commands::common::local_backend_ref(&backend)?;
     let cache_dir = local.cache_dir();
+    // Start the progress display before reading the archive, so a piped
+    // `docker save | msb load` shows activity while stdin is consumed.
+    let quiet = args.quiet;
+    let label = args
+        .tag
+        .first()
+        .cloned()
+        .or_else(|| {
+            args.input
+                .as_ref()
+                .and_then(|p| p.file_name())
+                .map(|name| name.to_string_lossy().into_owned())
+        })
+        .unwrap_or_else(|| "archive".to_string());
+    let (progress, sender) = microsandbox_image::progress_channel();
+    let (display_ready_tx, display_ready_rx) = mpsc::sync_channel(1);
+    let display_thread = std::thread::spawn(move || -> anyhow::Result<()> {
+        let mut display = ui::PullProgressDisplay::load(&label, quiet);
+        let _ = display_ready_tx.send(());
+        let mut receiver = progress.into_receiver();
+        while let Some(event) = receiver.blocking_recv() {
+            display.handle_event(event);
+        }
+        display.finish();
+        Ok(())
+    });
+    let _ = display_ready_rx.recv();
+
     let temp_input;
     let input_path = if let Some(path) = args.input.as_ref() {
         path
@@ -602,9 +675,17 @@ pub async fn run_load(args: ImageLoadArgs) -> anyhow::Result<()> {
         input_path,
         ImageLoadOptions {
             tags: args.tag.clone(),
+            progress: Some(sender),
         },
     )
-    .await?;
+    .await;
+
+    match display_thread.join() {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => tracing::warn!(error = %error, "failed to render load progress"),
+        Err(_) => tracing::warn!("load progress thread panicked"),
+    }
+    let loaded = loaded?;
 
     for image in &loaded {
         Image::persist(local, &image.reference, image.metadata.clone()).await?;
@@ -628,31 +709,6 @@ pub async fn run_load(args: ImageLoadArgs) -> anyhow::Result<()> {
 pub async fn run_save(args: ImageSaveArgs) -> anyhow::Result<()> {
     let backend = crate::commands::common::resolve_local_backend()?;
     let local = crate::commands::common::local_backend_ref(&backend)?;
-    let cache_dir = local.cache_dir();
-    let cache = microsandbox_image::GlobalCache::new(&cache_dir)?;
-    let mut requests = Vec::with_capacity(args.references.len());
-
-    for reference in &args.references {
-        let parsed: microsandbox_image::Reference = reference.parse()?;
-        let metadata = cache
-            .read_image_metadata(&parsed)?
-            .ok_or_else(|| anyhow::anyhow!("image metadata not cached: {reference}"))?;
-        let config = save_config_from_metadata(&metadata);
-        let layers = metadata
-            .layers
-            .iter()
-            .map(|layer| ImageSaveLayer {
-                diff_id: layer.diff_id.clone(),
-            })
-            .collect();
-
-        requests.push(ImageSaveRequest {
-            reference: reference.clone(),
-            config,
-            raw_config_json: metadata.raw_config_json,
-            layers,
-        });
-    }
 
     let temp_output;
     let output_path = if let Some(path) = args.output.as_ref() {
@@ -661,18 +717,12 @@ pub async fn run_save(args: ImageSaveArgs) -> anyhow::Result<()> {
         temp_output = tempfile::NamedTempFile::new()?;
         temp_output.path()
     };
-    let output_path_for_task = output_path.to_path_buf();
     let format = match args.format {
         ImageSaveFormat::Docker => ImageArchiveFormat::Docker,
         ImageSaveFormat::Oci => ImageArchiveFormat::Oci,
     };
 
-    tokio::task::spawn_blocking(move || {
-        let cache = microsandbox_image::GlobalCache::new(&cache_dir)?;
-        microsandbox_image::save_archive(&cache, &output_path_for_task, &requests, format)
-    })
-    .await
-    .map_err(|e| anyhow::anyhow!("save task panicked: {e}"))??;
+    Image::save_local(local, &args.references, output_path, format).await?;
 
     if args.output.is_none() {
         let mut file = std::fs::File::open(output_path)?;
@@ -704,7 +754,7 @@ pub async fn run_remove(args: ImageRemoveArgs) -> anyhow::Result<()> {
             ui::Spinner::start("Removing", reference)
         };
 
-        match Image::remove(local, reference, args.force).await {
+        match Image::remove_local(local, reference, args.force).await {
             Ok(()) => {
                 spinner.finish_success("Removed");
             }
@@ -748,7 +798,7 @@ pub async fn run_prune(args: ImagePruneArgs) -> anyhow::Result<()> {
         }
     }
 
-    let report = Image::prune(local).await?;
+    let report = Image::prune_local(local).await?;
 
     if args.format.as_deref() == Some("json") {
         let json = serde_json::json!({
@@ -818,6 +868,36 @@ fn pull_failure_line(quiet: bool, reference: &str) {
     }
 }
 
+fn resolve_pull_materialization(
+    requested: Option<pull::PullMaterialization>,
+    defaults: &microsandbox::config::OciSandboxDefaults,
+) -> anyhow::Result<pull::PullMaterialization> {
+    if defaults.upper_size_mib.is_some() && defaults.root_disk.is_some() {
+        anyhow::bail!(
+            "sandbox_defaults.oci.root_disk and deprecated sandbox_defaults.oci.upper_size_mib are mutually exclusive"
+        );
+    }
+    if matches!(
+        defaults.root_disk,
+        Some(microsandbox::sandbox::RootDisk::DiskImage { .. })
+    ) {
+        anyhow::bail!(
+            "sandbox_defaults.oci.root_disk cannot be a shared disk-image; specify user-owned disk images per sandbox"
+        );
+    }
+
+    Ok(requested.unwrap_or({
+        if matches!(
+            defaults.root_disk,
+            Some(microsandbox::sandbox::RootDisk::Flat { .. })
+        ) {
+            pull::PullMaterialization::Flat
+        } else {
+            pull::PullMaterialization::Layered
+        }
+    }))
+}
+
 /// Truncate a digest to a short form (first 12 hex chars after algorithm prefix).
 fn truncate_digest(digest: &str) -> String {
     if let Some(hex) = digest.strip_prefix("sha256:") {
@@ -827,39 +907,33 @@ fn truncate_digest(digest: &str) -> String {
     }
 }
 
-fn save_config_from_metadata(metadata: &CachedImageMetadata) -> ImageSaveConfig {
-    let (architecture, os) = raw_config_platform(&metadata.raw_config_json);
+//--------------------------------------------------------------------------------------------------
+// Tests
+//--------------------------------------------------------------------------------------------------
 
-    ImageSaveConfig {
-        architecture,
-        os,
-        env: metadata.config.env.clone(),
-        entrypoint: metadata.config.entrypoint.clone(),
-        cmd: metadata.config.cmd.clone(),
-        working_dir: metadata.config.working_dir.clone(),
-        user: metadata.config.user.clone(),
-        labels: metadata
-            .config
-            .labels
-            .iter()
-            .map(|(key, value)| (key.clone(), value.clone()))
-            .collect(),
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pull_materialization_inherits_flat_only_when_not_explicit() {
+        let defaults = microsandbox::config::OciSandboxDefaults {
+            upper_size_mib: None,
+            root_disk: Some(microsandbox::sandbox::RootDisk::Flat {
+                size_mib: Some(8192),
+                fstype: None,
+                clone: microsandbox::sandbox::FlatClone::Auto,
+            }),
+        };
+
+        assert_eq!(
+            resolve_pull_materialization(None, &defaults).unwrap(),
+            pull::PullMaterialization::Flat
+        );
+        assert_eq!(
+            resolve_pull_materialization(Some(pull::PullMaterialization::Layered), &defaults)
+                .unwrap(),
+            pull::PullMaterialization::Layered
+        );
     }
-}
-
-fn raw_config_platform(raw_config_json: &str) -> (Option<String>, Option<String>) {
-    let Ok(value) = serde_json::from_str::<serde_json::Value>(raw_config_json) else {
-        return (None, None);
-    };
-
-    let architecture = value
-        .get("architecture")
-        .and_then(serde_json::Value::as_str)
-        .map(ToOwned::to_owned);
-    let os = value
-        .get("os")
-        .and_then(serde_json::Value::as_str)
-        .map(ToOwned::to_owned);
-
-    (architecture, os)
 }

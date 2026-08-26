@@ -3,10 +3,12 @@
 use std::io::{IsTerminal, Write};
 
 use clap::{CommandFactory, Parser, Subcommand};
+use console::style;
 use microsandbox_cli::{
     commands::{
-        copy, create, exec, image, inspect, install, list, logs, metrics, ps, pull, registry,
-        remove, run, self_cmd, snapshot, start, stop, uninstall, volume,
+        completion, context, copy, create, exec, image, inspect, install, list, logs, metrics,
+        modify, ping, ps, pull, registry, remove, restart, run, self_cmd, snapshot, start, stop,
+        touch, uninstall, volume,
     },
     log_args::{self, LogArgs},
     sandbox_cmd::{self, SandboxArgs},
@@ -20,8 +22,8 @@ const TOP_LEVEL_COMMAND_GROUPS: &[CommandGroup] = &[
     CommandGroup {
         heading: "Sandboxes",
         commands: &[
-            "run", "create", "start", "stop", "list", "status", "metrics", "remove", "exec",
-            "copy", "logs", "ssh", "inspect",
+            "run", "create", "modify", "start", "stop", "restart", "ping", "touch", "list",
+            "status", "metrics", "remove", "exec", "copy", "logs", "ssh", "inspect",
         ],
     },
     CommandGroup {
@@ -34,7 +36,15 @@ const TOP_LEVEL_COMMAND_GROUPS: &[CommandGroup] = &[
     },
     CommandGroup {
         heading: "Installation",
-        commands: &["install", "uninstall", "doctor", "self"],
+        commands: &[
+            "install",
+            "uninstall",
+            "doctor",
+            "update",
+            "downgrade",
+            "self",
+            "completion",
+        ],
     },
 ];
 
@@ -69,17 +79,43 @@ enum Commands {
     #[command(hide = true)]
     Sandbox(Box<SandboxArgs>),
 
+    /// Print the schema baseline owned by this binary (internal).
+    #[command(name = "__schema-baseline", hide = true)]
+    SchemaBaseline(self_cmd::SchemaBaselineArgs),
+
+    /// Show the active backend and its selection source.
+    #[command(visible_alias = "ctx")]
+    Context(context::ContextArgs),
+
+    /// Complete a deferred Windows self-update or self-downgrade swap (internal).
+    #[cfg(windows)]
+    #[command(name = "__windows-self-swap", hide = true)]
+    WindowsSelfSwap(self_cmd::WindowsSelfSwapArgs),
+
     /// Create a sandbox from an image and run a command in it.
     Run(run::RunArgs),
 
     /// Create a sandbox and boot it in the background.
     Create(create::CreateArgs),
 
+    /// Modify sandbox configuration.
+    #[command(visible_alias = "mod")]
+    Modify(modify::ModifyArgs),
+
     /// Start a stopped sandbox.
     Start(start::StartArgs),
 
     /// Stop one or more running sandboxes.
     Stop(stop::StopArgs),
+
+    /// Restart one or more sandboxes.
+    Restart(restart::RestartArgs),
+
+    /// Check whether one or more sandbox agents are reachable.
+    Ping(ping::PingArgs),
+
+    /// Refresh idle activity for one or more running sandboxes.
+    Touch(touch::TouchArgs),
 
     /// List all sandboxes.
     #[command(visible_alias = "ls")]
@@ -129,6 +165,18 @@ enum Commands {
     #[command(hide = true)]
     Images(image::ImageListArgs),
 
+    /// List named volumes (alias for `volume ls`).
+    #[command(alias = "vols", hide = true)]
+    Volumes(volume::VolumeListArgs),
+
+    /// List disk snapshots (alias for `snapshot ls`).
+    #[command(alias = "snaps", hide = true)]
+    Snapshots(snapshot::SnapshotListArgs),
+
+    /// List configured registries (alias for `registry ls`).
+    #[command(alias = "regs", hide = true)]
+    Registries(registry::RegistryListArgs),
+
     /// Remove a cached image (alias for `image rm`).
     #[command(hide = true)]
     Rmi(image::ImageRemoveArgs),
@@ -153,9 +201,19 @@ enum Commands {
     /// Check local runtime and host virtualization prerequisites.
     Doctor(self_cmd::DoctorArgs),
 
+    /// Update msb and libkrunfw to the latest release (alias for `self update`).
+    #[command(visible_alias = "upgrade")]
+    Update(self_cmd::SelfUpdateArgs),
+
+    /// Downgrade msb and local state to an older supported release (alias for `self downgrade`).
+    Downgrade(self_cmd::SelfDowngradeArgs),
+
     /// Manage the msb installation.
     #[command(name = "self")]
     Self_(self_cmd::SelfArgs),
+
+    /// Generate a shell completion script.
+    Completion(completion::CompletionArgs),
 }
 
 /// A visual group for top-level command help.
@@ -172,9 +230,7 @@ struct CommandHelpLine {
 }
 
 /// ANSI styling state for custom top-level help.
-struct HelpStyles {
-    enabled: bool,
-}
+struct HelpStyles {}
 
 //--------------------------------------------------------------------------------------------------
 // Methods
@@ -183,44 +239,26 @@ struct HelpStyles {
 impl HelpStyles {
     /// Detect whether custom help should include ANSI styling.
     fn detect() -> Self {
-        Self {
-            enabled: std::io::stdout().is_terminal() && std::env::var_os("NO_COLOR").is_none(),
-        }
+        Self {}
     }
 
     /// Style a help heading like clap's configured header style.
     fn header(&self, value: &str) -> String {
-        if !self.enabled {
-            return value.to_string();
-        }
-
-        format!("\x1b[1;33m{value}\x1b[0m")
+        style(value).yellow().bold().to_string()
     }
 
     /// Style a command or flag literal like clap's configured literal style.
     fn literal(&self, value: &str) -> String {
-        if !self.enabled {
-            return value.to_string();
-        }
-
-        format!("\x1b[1;34m{value}\x1b[0m")
+        style(value).blue().bold().to_string()
     }
 
     /// Add light styling to the default clap help fragments we preserve.
     fn style_default_help_fragment(&self, value: &str) -> String {
-        if !self.enabled {
-            return value.to_string();
-        }
-
         value.replacen("Usage:", &self.header("Usage:"), 1)
     }
 
     /// Style alias annotations in the same literal color as command names.
     fn style_aliases(&self, value: &str) -> String {
-        if !self.enabled {
-            return value.to_string();
-        }
-
         let Some((help, aliases)) = value.split_once(" [aliases: ") else {
             return value.to_string();
         };
@@ -286,7 +324,7 @@ fn main() {
             // Honor TTY detection + NO_COLOR; we set `ansi` explicitly
             // since with_ansi(true) overrides tracing-subscriber's
             // built-in detection.
-            let ansi = std::io::stderr().is_terminal() && std::env::var_os("NO_COLOR").is_none();
+            let ansi = std::io::stderr().is_terminal() && console::colors_enabled_stderr();
             log_args::init_tracing(log_level, ansi);
             match run_async_command_anyhow(command, log_level) {
                 Ok(()) => 0,
@@ -450,6 +488,13 @@ fn format_command_help_line(
 /// `MicrosandboxError::ExecFailed`. Returns the appropriate exit
 /// code so callers don't conflate "rendered an error" with "1".
 fn render_anyhow_error(err: &anyhow::Error) -> i32 {
+    if err.chain().any(|cause| {
+        cause
+            .downcast_ref::<microsandbox_cli::ui::AlreadyRenderedError>()
+            .is_some()
+    }) {
+        return 1;
+    }
     if let Some((name, boot_err)) = find_boot_start_in_chain(err) {
         microsandbox_cli::boot_error_render::render(&name, &boot_err);
         return 1;
@@ -578,6 +623,13 @@ fn run_async_command_anyhow(
     command: Commands,
     log_level: Option<microsandbox::LogLevel>,
 ) -> anyhow::Result<()> {
+    // Internal maintenance commands do not execute sandbox operations and
+    // must remain usable while diagnosing an invalid backend configuration.
+    let command = match command {
+        Commands::SchemaBaseline(args) => return self_cmd::run_schema_baseline(args),
+        command => command,
+    };
+
     // Pull and create can overlap network I/O, decompression, and progress UI.
     // Use a small-but-not-tiny worker pool so foreground UI tasks still get
     // scheduled while multiple layers are downloading and materializing.
@@ -594,13 +646,29 @@ fn run_async_command_anyhow(
         // runtime processes (`msb sandbox`) now, not the CLI; see
         // `microsandbox_runtime::maintenance`. The CLI no longer spawns a
         // reaper here.
+        if !is_backend_independent_maintenance_command(&command) {
+            // Resolve once, fallibly, before backend-dependent dispatch. Unlike
+            // the SDK's ambient convenience fallback, the CLI must not run a
+            // sandbox operation locally after an invalid explicit cloud selection.
+            let backend = microsandbox::resolve_default_backend()?;
+            microsandbox::set_default_backend(backend);
+        }
+
         match command {
             Commands::Sandbox(_) => unreachable!("handled before Tokio starts"),
+            Commands::SchemaBaseline(_) => unreachable!("handled before backend resolution"),
+            Commands::Context(args) => context::run(args),
+            #[cfg(windows)]
+            Commands::WindowsSelfSwap(args) => self_cmd::run_windows_self_swap(args).await,
 
             Commands::Run(args) => run::run(args, log_level).await,
             Commands::Create(args) => create::run(args, log_level).await,
+            Commands::Modify(args) => modify::run(args).await,
             Commands::Start(args) => start::run(args).await,
             Commands::Stop(args) => stop::run(args).await,
+            Commands::Restart(args) => restart::run(args).await,
+            Commands::Ping(args) => ping::run(args).await,
+            Commands::Touch(args) => touch::run(args).await,
             Commands::List(args) => list::run(args).await,
             Commands::Status(args) => ps::run(args).await,
             Commands::Metrics(args) => metrics::run(args).await,
@@ -616,6 +684,24 @@ fn run_async_command_anyhow(
             #[cfg(feature = "ssh")]
             Commands::Ssh(args) => microsandbox_cli::commands::ssh::run(args).await,
             Commands::Images(args) => image::run_list(args).await,
+            Commands::Volumes(args) => {
+                volume::run(volume::VolumeArgs {
+                    command: volume::VolumeCommands::List(args),
+                })
+                .await
+            }
+            Commands::Snapshots(args) => {
+                snapshot::run(snapshot::SnapshotArgs {
+                    command: snapshot::SnapshotCommands::List(args),
+                })
+                .await
+            }
+            Commands::Registries(args) => {
+                registry::run(registry::RegistryArgs {
+                    command: registry::RegistryCommands::List(args),
+                })
+                .await
+            }
             Commands::Rmi(args) => image::run_remove(args).await,
             Commands::Inspect(args) => inspect::run(args).await,
             Commands::Volume(args) => volume::run(args).await,
@@ -623,9 +709,93 @@ fn run_async_command_anyhow(
             Commands::Install(args) => install::run(args).await,
             Commands::Uninstall(args) => uninstall::run(args).await,
             Commands::Doctor(args) => self_cmd::run_doctor(args),
+            Commands::Update(args) => self_cmd::run_update(args).await,
+            Commands::Downgrade(args) => self_cmd::run_downgrade(args).await,
             Commands::Self_(args) => self_cmd::run(args).await,
+            Commands::Completion(args) => completion::run(args, Cli::command()),
         }
     })
+}
+
+/// Return whether a command manages the CLI installation rather than a backend.
+///
+/// These commands are deliberately available even when backend configuration is
+/// invalid so users can diagnose, repair, downgrade, or uninstall that setup.
+fn is_backend_independent_maintenance_command(command: &Commands) -> bool {
+    match command {
+        Commands::SchemaBaseline(_)
+        | Commands::Doctor(_)
+        | Commands::Update(_)
+        | Commands::Downgrade(_)
+        | Commands::Self_(_)
+        | Commands::Completion(_) => true,
+        #[cfg(windows)]
+        Commands::WindowsSelfSwap(_) => true,
+        _ => false,
+    }
+}
+
+#[cfg(test)]
+mod command_tests {
+    use super::*;
+
+    #[test]
+    fn maintenance_commands_do_not_require_backend_resolution() {
+        let maintenance_commands = [
+            Cli::try_parse_from(["msb", "doctor"]).unwrap().command,
+            Cli::try_parse_from(["msb", "update"]).unwrap().command,
+            Cli::try_parse_from(["msb", "downgrade", "0.6.0"])
+                .unwrap()
+                .command,
+            Cli::try_parse_from(["msb", "self", "doctor"])
+                .unwrap()
+                .command,
+            Cli::try_parse_from(["msb", "completion", "bash"])
+                .unwrap()
+                .command,
+        ];
+
+        for command in &maintenance_commands {
+            assert!(is_backend_independent_maintenance_command(command));
+        }
+
+        let context = Cli::try_parse_from(["msb", "context"]).unwrap();
+        let create = Cli::try_parse_from(["msb", "create", "alpine:3.19"]).unwrap();
+        assert!(!is_backend_independent_maintenance_command(
+            &context.command
+        ));
+        assert!(!is_backend_independent_maintenance_command(&create.command));
+    }
+
+    #[test]
+    fn command_aliases_route_to_their_canonical_commands() {
+        let context = Cli::try_parse_from(["msb", "ctx"]).unwrap();
+        let modify = Cli::try_parse_from(["msb", "mod", "demo", "--cpus", "2"]).unwrap();
+
+        assert!(matches!(context.command, Commands::Context(_)));
+        assert!(matches!(modify.command, Commands::Modify(_)));
+    }
+
+    #[test]
+    fn plural_resource_commands_route_to_list_actions() {
+        let cli = Cli::try_parse_from(["msb", "images"]).unwrap();
+        assert!(matches!(cli.command, Commands::Images(_)));
+
+        for command in ["volumes", "vols"] {
+            let cli = Cli::try_parse_from(["msb", command]).unwrap();
+            assert!(matches!(cli.command, Commands::Volumes(_)));
+        }
+
+        for command in ["snapshots", "snaps"] {
+            let cli = Cli::try_parse_from(["msb", command]).unwrap();
+            assert!(matches!(cli.command, Commands::Snapshots(_)));
+        }
+
+        for command in ["registries", "regs"] {
+            let cli = Cli::try_parse_from(["msb", command]).unwrap();
+            assert!(matches!(cli.command, Commands::Registries(_)));
+        }
+    }
 }
 
 #[cfg(all(test, windows))]

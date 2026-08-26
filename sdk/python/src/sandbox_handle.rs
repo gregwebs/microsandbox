@@ -5,8 +5,11 @@ use pyo3::types::{PyBool, PyDict, PyList};
 use tokio::sync::Mutex;
 
 use crate::error::to_py_err;
+use crate::helpers::{extract_str_enum, str_enum_member};
 use crate::metrics::convert_metrics;
-use crate::sandbox::{PySandbox, PySandboxStopResult, optional_duration};
+use crate::sandbox::{
+    PySandbox, PySandboxPingResult, PySandboxStopResult, PySandboxTouchResult, optional_duration,
+};
 
 //--------------------------------------------------------------------------------------------------
 // Types
@@ -14,6 +17,7 @@ use crate::sandbox::{PySandbox, PySandboxStopResult, optional_duration};
 
 /// A lightweight handle to a sandbox from the database.
 #[pyclass(name = "SandboxHandle")]
+#[derive(Clone)]
 pub struct PySandboxHandle {
     inner: Arc<Mutex<microsandbox::sandbox::SandboxHandle>>,
 }
@@ -42,14 +46,28 @@ impl PySandboxHandle {
         Ok(guard.name().to_string())
     }
 
-    /// Status: "running", "stopped", "crashed", "draining", or "paused".
+    /// Current sandbox lifecycle status.
     #[getter]
-    fn status(&self) -> PyResult<String> {
+    fn status(&self, py: Python<'_>) -> PyResult<PyObject> {
         let guard = self
             .inner
             .try_lock()
             .map_err(|_| pyo3::exceptions::PyRuntimeError::new_err("handle is busy"))?;
-        Ok(format!("{:?}", guard.status_snapshot()).to_lowercase())
+        str_enum_member(
+            py,
+            "SandboxStatus",
+            &format!("{:?}", guard.status_snapshot()).to_lowercase(),
+        )
+    }
+
+    /// Backend retained by this handle (`"local"` or `"cloud"`).
+    #[getter]
+    fn backend_kind(&self) -> PyResult<String> {
+        let guard = self
+            .inner
+            .try_lock()
+            .map_err(|_| pyo3::exceptions::PyRuntimeError::new_err("handle is busy"))?;
+        Ok(guard.backend_kind().as_str().to_string())
     }
 
     /// Raw config JSON string.
@@ -113,6 +131,109 @@ impl PySandboxHandle {
         })
     }
 
+    /// Check whether agentd is reachable without refreshing idle activity.
+    ///
+    /// Connects to an already-running sandbox; stopped sandboxes are not
+    /// started implicitly.
+    fn ping<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let inner = self.inner.clone();
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let guard = inner.lock().await;
+            let result = guard.ping().await.map_err(to_py_err)?;
+            Ok(PySandboxPingResult::from_rust(result))
+        })
+    }
+
+    /// Explicitly refresh this sandbox's idle activity timer.
+    ///
+    /// Connects to an already-running sandbox; stopped sandboxes are not
+    /// started implicitly.
+    fn touch<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let inner = self.inner.clone();
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let guard = inner.lock().await;
+            let result = guard.touch().await.map_err(to_py_err)?;
+            Ok(PySandboxTouchResult::from_rust(result))
+        })
+    }
+
+    /// Plan or apply a sandbox modification. Returns the plan as a dict.
+    ///
+    /// `memory` / `max_memory` are in MiB. `policy` is a
+    /// `ModificationPolicy`; with `dry_run=True` the plan is computed without
+    /// applying anything.
+    ///
+    /// `secrets` maps secret names to spec dicts with at most one of
+    /// `"env"` / `"value"` / `"store"`, plus optional `"placeholder"` and
+    /// `"allowed_hosts"`. `secrets_rm` removes secrets by name.
+    #[pyo3(signature = (
+        *,
+        cpus = None,
+        max_cpus = None,
+        memory = None,
+        max_memory = None,
+        root_disk_size = None,
+        env = None,
+        env_rm = None,
+        labels = None,
+        labels_rm = None,
+        workdir = None,
+        secrets = None,
+        secrets_rm = None,
+        policy = None,
+        dry_run = false,
+    ))]
+    #[allow(clippy::too_many_arguments)]
+    fn modify<'py>(
+        &self,
+        py: Python<'py>,
+        cpus: Option<u8>,
+        max_cpus: Option<u8>,
+        memory: Option<u32>,
+        max_memory: Option<u32>,
+        root_disk_size: Option<u32>,
+        env: Option<std::collections::HashMap<String, String>>,
+        env_rm: Option<Vec<String>>,
+        labels: Option<std::collections::HashMap<String, String>>,
+        labels_rm: Option<Vec<String>>,
+        workdir: Option<String>,
+        secrets: Option<
+            std::collections::HashMap<String, std::collections::HashMap<String, Py<PyAny>>>,
+        >,
+        secrets_rm: Option<Vec<String>>,
+        policy: Option<Py<PyAny>>,
+        dry_run: bool,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let inner = self.inner.clone();
+        let secrets = crate::sandbox::build_secret_patches(py, secrets)?;
+        let patch = crate::sandbox::build_modify_patch(
+            cpus,
+            max_cpus,
+            memory,
+            max_memory,
+            root_disk_size,
+            env,
+            env_rm,
+            labels,
+            labels_rm,
+            workdir,
+            secrets,
+            secrets_rm,
+        );
+        let policy = policy
+            .as_ref()
+            .map(|value| extract_str_enum(value.bind(py), "ModificationPolicy"))
+            .transpose()?;
+        let policy = crate::sandbox::parse_modify_policy(policy.as_deref())?;
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let guard = inner.lock().await;
+            let builder =
+                crate::sandbox::apply_modify_policy(guard.modify().with_patch(patch), policy);
+            drop(guard);
+            crate::sandbox::run_modify(builder, dry_run).await
+        })
+    }
+
     /// Read captured output from `exec.log`.
     ///
     /// Works without starting the sandbox. Defaults to `stdout +
@@ -124,10 +245,10 @@ impl PySandboxHandle {
         tail: Option<usize>,
         since_ms: Option<f64>,
         until_ms: Option<f64>,
-        sources: Option<Vec<String>>,
+        sources: Option<Vec<Py<PyAny>>>,
     ) -> PyResult<Bound<'py, PyAny>> {
         let inner = self.inner.clone();
-        let opts = crate::logs::parse_log_options(tail, since_ms, until_ms, sources)?;
+        let opts = crate::logs::parse_log_options(py, tail, since_ms, until_ms, sources)?;
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
             let guard = inner.lock().await;
             let entries = guard.logs(&opts).await.map_err(to_py_err)?;
@@ -154,7 +275,7 @@ impl PySandboxHandle {
     fn log_stream<'py>(
         &self,
         py: Python<'py>,
-        sources: Option<Vec<String>>,
+        sources: Option<Vec<Py<PyAny>>>,
         since_ms: Option<f64>,
         from_cursor: Option<String>,
         until_ms: Option<f64>,
@@ -162,6 +283,7 @@ impl PySandboxHandle {
     ) -> PyResult<Bound<'py, PyAny>> {
         let inner = self.inner.clone();
         let opts = crate::logs::parse_log_stream_options(
+            py,
             sources,
             since_ms,
             from_cursor,
@@ -289,27 +411,13 @@ impl PySandboxHandle {
     }
 
     /// Snapshot this (stopped) sandbox under a bare name. Resolves
-    /// under `~/.microsandbox/snapshots/<name>/`. For an explicit
-    /// filesystem destination, see `snapshot_to`.
+    /// under `~/.microsandbox/snapshots/<name>/`. Move artifacts with
+    /// `Snapshot.save`/`Snapshot.load`.
     fn snapshot<'py>(&self, py: Python<'py>, name: String) -> PyResult<Bound<'py, PyAny>> {
         let inner = self.inner.clone();
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
             let guard = inner.lock().await;
             let snap = guard.snapshot(&name).await.map_err(to_py_err)?;
-            Ok(crate::snapshot::PySnapshot::from_rust(snap))
-        })
-    }
-
-    /// Snapshot this (stopped) sandbox to an explicit filesystem path.
-    fn snapshot_to<'py>(
-        &self,
-        py: Python<'py>,
-        path: std::path::PathBuf,
-    ) -> PyResult<Bound<'py, PyAny>> {
-        let inner = self.inner.clone();
-        pyo3_async_runtimes::tokio::future_into_py(py, async move {
-            let guard = inner.lock().await;
-            let snap = guard.snapshot_to(path).await.map_err(to_py_err)?;
             Ok(crate::snapshot::PySnapshot::from_rust(snap))
         })
     }
@@ -319,7 +427,7 @@ impl PySandboxHandle {
 // Functions
 //--------------------------------------------------------------------------------------------------
 
-fn json_value_to_py(py: Python<'_>, value: serde_json::Value) -> PyResult<PyObject> {
+pub(crate) fn json_value_to_py(py: Python<'_>, value: serde_json::Value) -> PyResult<PyObject> {
     match value {
         serde_json::Value::Null => Ok(py.None()),
         serde_json::Value::Bool(value) => Ok(PyBool::new(py, value).to_owned().unbind().into()),

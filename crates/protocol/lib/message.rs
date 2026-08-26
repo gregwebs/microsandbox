@@ -9,7 +9,7 @@ use crate::error::ProtocolResult;
 //--------------------------------------------------------------------------------------------------
 
 /// Current protocol version.
-pub const PROTOCOL_VERSION: u8 = 5;
+pub const PROTOCOL_VERSION: u8 = 7;
 
 /// Frame flag: this is the last message for the given correlation ID.
 ///
@@ -118,6 +118,22 @@ pub enum MessageType {
     #[strum(serialize = "core.clock.sync")]
     ClockSync,
 
+    /// Host checks whether the guest agent is reachable.
+    #[strum(serialize = "core.ping")]
+    Ping,
+
+    /// Guest confirms that the guest agent is reachable.
+    #[strum(serialize = "core.pong")]
+    Pong,
+
+    /// Host explicitly records sandbox activity.
+    #[strum(serialize = "core.touch")]
+    Touch,
+
+    /// Guest confirms that sandbox activity was recorded.
+    #[strum(serialize = "core.touched")]
+    Touched,
+
     /// Peer reports a recoverable protocol-level error.
     #[strum(serialize = "core.error")]
     CoreError,
@@ -206,6 +222,10 @@ pub enum MessageType {
     /// Guest reports that a TCP session failed. Terminal.
     #[strum(serialize = "core.tcp.failed")]
     TcpFailed,
+
+    /// Host supplies one-shot guest bootstrap configuration.
+    #[strum(serialize = "core.bootstrap")]
+    Bootstrap,
 }
 
 //--------------------------------------------------------------------------------------------------
@@ -253,7 +273,9 @@ impl MessageType {
     /// Computes the frame flags byte for this message type.
     pub fn flags(&self) -> u8 {
         match self {
-            Self::CoreError
+            Self::Pong
+            | Self::Touched
+            | Self::CoreError
             | Self::ExecExited
             | Self::ExecFailed
             | Self::FsResponse
@@ -278,7 +300,8 @@ impl MessageType {
     /// Filesystem streaming did not exist in the pre-0.5 legacy protocol
     /// (generation 1), so the `Fs*` types require generation 2 or newer.
     /// TCP forwarding was introduced in generation 4. `core.error` was
-    /// introduced in generation 5.
+    /// introduced in generation 5. Reachability checks and explicit idle
+    /// refreshes were introduced in generation 6.
     ///
     /// There is deliberately no wildcard arm: adding a new `MessageType` must
     /// force a conscious choice of the generation that introduced it (and a
@@ -304,6 +327,8 @@ impl MessageType {
             | Self::ExecSignal => 1,
             Self::FsRequest | Self::FsResponse | Self::FsData => 2,
             Self::CoreError => 5,
+            Self::Ping | Self::Pong | Self::Touch | Self::Touched => 6,
+            Self::Bootstrap => 7,
             Self::TcpConnect
             | Self::TcpConnected
             | Self::TcpData
@@ -376,6 +401,7 @@ mod tests {
     #[test]
     fn test_message_type_roundtrip() {
         let types = [
+            (MessageType::Bootstrap, "core.bootstrap"),
             (MessageType::Ready, "core.ready"),
             (MessageType::InitResolved, "core.init.resolved"),
             (MessageType::InitAck, "core.init.ack"),
@@ -385,6 +411,10 @@ mod tests {
                 "core.relay.client.disconnected",
             ),
             (MessageType::ClockSync, "core.clock.sync"),
+            (MessageType::Ping, "core.ping"),
+            (MessageType::Pong, "core.pong"),
+            (MessageType::Touch, "core.touch"),
+            (MessageType::Touched, "core.touched"),
             (MessageType::CoreError, "core.error"),
             (MessageType::ExecRequest, "core.exec.request"),
             (MessageType::ExecStarted, "core.exec.started"),
@@ -417,12 +447,17 @@ mod tests {
     #[test]
     fn test_message_type_serde_roundtrip() {
         let types = [
+            MessageType::Bootstrap,
             MessageType::Ready,
             MessageType::InitResolved,
             MessageType::InitAck,
             MessageType::Shutdown,
             MessageType::RelayClientDisconnected,
             MessageType::ClockSync,
+            MessageType::Ping,
+            MessageType::Pong,
+            MessageType::Touch,
+            MessageType::Touched,
             MessageType::CoreError,
             MessageType::ExecRequest,
             MessageType::ExecStarted,
@@ -481,14 +516,19 @@ mod tests {
         assert_eq!(MessageType::FsResponse.flags(), FLAG_TERMINAL);
         assert_eq!(MessageType::TcpClosed.flags(), FLAG_TERMINAL);
         assert_eq!(MessageType::TcpFailed.flags(), FLAG_TERMINAL);
+        assert_eq!(MessageType::Pong.flags(), FLAG_TERMINAL);
+        assert_eq!(MessageType::Touched.flags(), FLAG_TERMINAL);
         assert_eq!(MessageType::ExecRequest.flags(), FLAG_SESSION_START);
         assert_eq!(MessageType::FsRequest.flags(), FLAG_SESSION_START);
         assert_eq!(MessageType::TcpConnect.flags(), FLAG_SESSION_START);
         assert_eq!(MessageType::Ready.flags(), 0);
+        assert_eq!(MessageType::Bootstrap.flags(), 0);
         assert_eq!(MessageType::InitResolved.flags(), 0);
         assert_eq!(MessageType::InitAck.flags(), 0);
         assert_eq!(MessageType::Shutdown.flags(), FLAG_SHUTDOWN);
         assert_eq!(MessageType::ClockSync.flags(), 0);
+        assert_eq!(MessageType::Ping.flags(), 0);
+        assert_eq!(MessageType::Touch.flags(), 0);
         assert_eq!(MessageType::ExecStarted.flags(), 0);
         assert_eq!(MessageType::ExecStdin.flags(), 0);
         assert_eq!(MessageType::ExecStdout.flags(), 0);
@@ -547,6 +587,13 @@ mod tests {
         assert!(!MessageType::FsRequest.is_available_at(1));
         assert!(MessageType::FsRequest.is_available_at(2));
         assert!(MessageType::FsRequest.is_available_at(PROTOCOL_VERSION));
+        // Ping/touch are generation-6 core capabilities.
+        assert!(!MessageType::Ping.is_available_at(5));
+        assert!(MessageType::Ping.is_available_at(6));
+        assert!(MessageType::Ping.is_available_at(PROTOCOL_VERSION));
+        // Bootstrap is internal to generation-7 host/agent boot.
+        assert!(!MessageType::Bootstrap.is_available_at(6));
+        assert!(MessageType::Bootstrap.is_available_at(PROTOCOL_VERSION));
     }
 
     #[test]
@@ -584,6 +631,17 @@ mod tests {
         ] {
             assert_eq!(mt.min_protocol_version(), 2, "{mt:?} should require gen 2");
         }
+
+        for mt in [
+            MessageType::Ping,
+            MessageType::Pong,
+            MessageType::Touch,
+            MessageType::Touched,
+        ] {
+            assert_eq!(mt.min_protocol_version(), 6, "{mt:?} should require gen 6");
+        }
+
+        assert_eq!(MessageType::Bootstrap.min_protocol_version(), 7);
 
         // Every current type must be sendable to a current peer.
         assert!(MessageType::FsRequest.min_protocol_version() <= PROTOCOL_VERSION);

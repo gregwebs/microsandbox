@@ -4,14 +4,15 @@ use std::path::PathBuf;
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
 
-use microsandbox::snapshot::ExportOpts as RustExportOpts;
+use microsandbox::snapshot::SaveOpts as RustSaveOpts;
 use microsandbox::{
-    Snapshot as RustSnapshot, SnapshotDestination as RustSnapshotDestination,
-    SnapshotFormat as RustSnapshotFormat, SnapshotHandle as RustSnapshotHandle,
+    Snapshot as RustSnapshot, SnapshotFormat as RustSnapshotFormat,
+    SnapshotHandle as RustSnapshotHandle, SnapshotScope as RustSnapshotScope,
     UpperVerifyStatus as RustUpperVerifyStatus,
 };
 
 use crate::error::to_py_err;
+use crate::helpers::str_enum_member;
 
 //--------------------------------------------------------------------------------------------------
 // Types
@@ -35,46 +36,38 @@ pub struct PySnapshotHandle {
 
 #[pymethods]
 impl PySnapshot {
-    /// Create a snapshot from a stopped sandbox.
+    /// Create a snapshot named `name` from a stopped sandbox.
     ///
-    /// Exactly one of `name=` (resolved under
-    /// `~/.microsandbox/snapshots/<name>/`) or `path=` (explicit
-    /// filesystem destination) must be provided.
+    /// The artifact is created under `~/.microsandbox/snapshots/<name>/`,
+    /// or under `dest_dir=` when given; move artifacts with `save`/`load`.
+    // PyO3 kwargs map one-to-one onto function parameters; the count is the contract.
+    #[allow(clippy::too_many_arguments)]
     #[staticmethod]
     #[pyo3(signature = (
-        source_sandbox,
+        name,
         *,
-        name = None,
-        path = None,
+        from_sandbox,
+        dest_dir = None,
         labels = None,
         force = false,
         record_integrity = false,
+        resumable = false,
     ))]
     fn create<'py>(
         py: Python<'py>,
-        source_sandbox: String,
-        name: Option<String>,
-        path: Option<PathBuf>,
+        name: String,
+        from_sandbox: String,
+        dest_dir: Option<PathBuf>,
         labels: Option<HashMap<String, String>>,
         force: bool,
         record_integrity: bool,
+        resumable: bool,
     ) -> PyResult<Bound<'py, PyAny>> {
-        let dest = match (name, path) {
-            (Some(n), None) => RustSnapshotDestination::Name(n),
-            (None, Some(p)) => RustSnapshotDestination::Path(p),
-            (Some(_), Some(_)) => {
-                return Err(pyo3::exceptions::PyValueError::new_err(
-                    "Snapshot.create: pass either name= or path=, not both",
-                ));
-            }
-            (None, None) => {
-                return Err(pyo3::exceptions::PyValueError::new_err(
-                    "Snapshot.create: name= or path= is required",
-                ));
-            }
-        };
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
-            let mut builder = RustSnapshot::builder(&source_sandbox).destination(dest);
+            let mut builder = RustSnapshot::builder(name).from_sandbox(&from_sandbox);
+            if let Some(dest_dir) = dest_dir {
+                builder = builder.dest_dir(dest_dir);
+            }
             if let Some(labels) = labels {
                 for (k, v) in labels {
                     builder = builder.label(k, v);
@@ -85,6 +78,9 @@ impl PySnapshot {
             }
             if record_integrity {
                 builder = builder.record_integrity();
+            }
+            if resumable {
+                builder = builder.resumable();
             }
             let snap = builder.create().await.map_err(to_py_err)?;
             Ok(PySnapshot::from_rust(snap))
@@ -125,7 +121,7 @@ impl PySnapshot {
         })
     }
 
-    /// Walk `dir` and parse each subdirectory's `manifest.json`. Does
+    /// Walk `dir` and parse each subdirectory's `snapshot.json`. Does
     /// not touch the local index — useful for inspecting external
     /// snapshot collections (e.g. a mounted volume of artifacts that
     /// were never imported).
@@ -177,8 +173,8 @@ impl PySnapshot {
 
     /// Bundle a snapshot into a `.tar.zst` archive.
     ///
-    /// When the snapshot has no integrity hash yet, one is computed
-    /// and embedded in the bundled manifest.
+    /// The recorded manifest is archived as-is, so create the snapshot
+    /// with `record_integrity=True` if receivers must verify content.
     #[staticmethod]
     #[pyo3(signature = (
         name_or_path,
@@ -188,7 +184,7 @@ impl PySnapshot {
         with_image = false,
         plain_tar = false,
     ))]
-    fn export<'py>(
+    fn save<'py>(
         py: Python<'py>,
         name_or_path: String,
         out: PathBuf,
@@ -197,12 +193,12 @@ impl PySnapshot {
         plain_tar: bool,
     ) -> PyResult<Bound<'py, PyAny>> {
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
-            let opts = RustExportOpts {
+            let opts = RustSaveOpts {
                 with_parents,
                 with_image,
                 plain_tar,
             };
-            RustSnapshot::export(&name_or_path, &out, opts)
+            RustSnapshot::save(&name_or_path, &out, opts)
                 .await
                 .map_err(to_py_err)?;
             Ok(())
@@ -210,19 +206,17 @@ impl PySnapshot {
     }
 
     /// Unpack a snapshot archive (`.tar.zst` or `.tar`) into the
-    /// snapshots directory, verifying recorded integrity on the way
-    /// in.
-    ///
-    /// Note: spelled `import_` because `import` is a Python keyword.
+    /// snapshots directory, preserving recorded integrity for explicit
+    /// verification.
     #[staticmethod]
-    #[pyo3(name = "import_", signature = (archive, *, dest = None))]
-    fn import_method<'py>(
+    #[pyo3(signature = (archive, *, dest = None))]
+    fn load<'py>(
         py: Python<'py>,
         archive: PathBuf,
         dest: Option<PathBuf>,
     ) -> PyResult<Bound<'py, PyAny>> {
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
-            let h = RustSnapshot::import(&archive, dest.as_deref())
+            let h = RustSnapshot::load(&archive, dest.as_deref())
                 .await
                 .map_err(to_py_err)?;
             Ok(PySnapshotHandle::from_rust(h))
@@ -247,7 +241,7 @@ impl PySnapshot {
 
     /// Apparent size of the captured upper layer in bytes.
     #[getter]
-    fn size_bytes(&self) -> u64 {
+    fn size_bytes(&self) -> Option<u64> {
         self.inner.size_bytes()
     }
 
@@ -263,22 +257,68 @@ impl PySnapshot {
         &self.inner.manifest().image.manifest_digest
     }
 
-    /// On-disk format of the upper layer (`"raw"` or `"qcow2"`).
+    /// Closed descriptor state kind (`"file"` or `"checkpoint"`).
     #[getter]
-    fn format(&self) -> &'static str {
-        format_str(self.inner.manifest().format)
+    fn state_kind(&self, py: Python<'_>) -> PyResult<PyObject> {
+        str_enum_member(py, "SnapshotStateKind", self.inner.manifest().state.kind())
+    }
+
+    /// On-disk format for file state.
+    #[getter]
+    fn format(&self, py: Python<'_>) -> PyResult<Option<PyObject>> {
+        self.inner
+            .manifest()
+            .state
+            .as_file()
+            .map(|state| format_str(state.format))
+            .map(|format| str_enum_member(py, "SnapshotFormat", format))
+            .transpose()
     }
 
     /// Filesystem type inside the upper (e.g. `"ext4"`).
     #[getter]
-    fn fstype(&self) -> &str {
-        &self.inner.manifest().fstype
+    fn fstype(&self) -> Option<&str> {
+        self.inner
+            .manifest()
+            .state
+            .as_file()
+            .map(|state| state.fstype.as_str())
+    }
+
+    /// Checkpoint id for checkpoint state.
+    #[getter]
+    fn checkpoint_id(&self) -> Option<&str> {
+        self.inner
+            .manifest()
+            .state
+            .as_checkpoint()
+            .map(|state| state.checkpoint_id.as_str())
+    }
+
+    /// Checkpoint manifest digest for checkpoint state.
+    #[getter]
+    fn checkpoint_manifest_digest(&self) -> Option<&str> {
+        self.inner
+            .manifest()
+            .state
+            .as_checkpoint()
+            .map(|state| state.manifest.as_str())
     }
 
     /// Manifest digest of the parent snapshot, or `None` for a root.
     #[getter]
     fn parent(&self) -> Option<&str> {
         self.inner.manifest().parent.as_deref()
+    }
+
+    /// Snapshot payload scope as a `SnapshotScope` member (`DISK` today).
+    #[getter]
+    fn scope(&self, py: Python<'_>) -> PyResult<PyObject> {
+        str_enum_member(
+            py,
+            "SnapshotScope",
+            format_scope(self.inner.manifest().scope),
+        )
     }
 
     /// RFC 3339 timestamp when the snapshot was created.
@@ -306,8 +346,8 @@ impl PySnapshot {
 
     /// Verify recorded content integrity.
     ///
-    /// Returns a dict with `kind` (`"not_recorded"` or `"verified"`)
-    /// and, when verified, `algorithm` and `digest`.
+    /// Returns `kind="not_recorded"` when no integrity was requested, or
+    /// `kind="verified"` with the matching algorithm and digest.
     fn verify<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
         let snap = self.inner.clone();
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
@@ -362,18 +402,62 @@ impl PySnapshotHandle {
     }
 
     #[getter]
+    fn scope(&self, py: Python<'_>) -> PyResult<PyObject> {
+        str_enum_member(py, "SnapshotScope", format_scope(self.inner.scope()))
+    }
+
+    #[getter]
     fn image_ref(&self) -> &str {
         self.inner.image_ref()
     }
 
     #[getter]
-    fn format(&self) -> &'static str {
-        format_str(self.inner.format())
+    fn state_kind(&self, py: Python<'_>) -> PyResult<PyObject> {
+        str_enum_member(py, "SnapshotStateKind", self.inner.state_kind())
+    }
+
+    #[getter]
+    fn format(&self, py: Python<'_>) -> PyResult<Option<PyObject>> {
+        self.inner
+            .format()
+            .map(format_str)
+            .map(|format| str_enum_member(py, "SnapshotFormat", format))
+            .transpose()
+    }
+
+    #[getter]
+    fn fstype(&self) -> Option<&str> {
+        self.inner.fstype()
+    }
+
+    #[getter]
+    fn checkpoint_manifest_digest(&self) -> Option<&str> {
+        self.inner.checkpoint_manifest_digest()
     }
 
     #[getter]
     fn size_bytes(&self) -> Option<u64> {
         self.inner.size_bytes()
+    }
+
+    #[getter]
+    fn locality(&self) -> &str {
+        self.inner.locality()
+    }
+
+    #[getter]
+    fn availability(&self) -> &str {
+        self.inner.availability()
+    }
+
+    #[getter]
+    fn migration_state(&self) -> &str {
+        self.inner.migration_state()
+    }
+
+    #[getter]
+    fn migration_error_code(&self) -> Option<&str> {
+        self.inner.migration_error_code()
     }
 
     #[getter]
@@ -420,5 +504,12 @@ fn format_str(f: RustSnapshotFormat) -> &'static str {
     match f {
         RustSnapshotFormat::Raw => "raw",
         RustSnapshotFormat::Qcow2 => "qcow2",
+    }
+}
+
+fn format_scope(scope: RustSnapshotScope) -> &'static str {
+    match scope {
+        RustSnapshotScope::Disk => "disk",
+        RustSnapshotScope::Resumable => "resumable",
     }
 }

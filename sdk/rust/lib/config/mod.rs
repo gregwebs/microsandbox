@@ -2,7 +2,8 @@
 //!
 //! [`LocalConfig`] is the persisted schema for `~/.microsandbox/config.json`.
 //! It is owned by [`LocalBackend`](crate::backend::LocalBackend); accessors
-//! live on the backend, not on a process-wide static. See D6.7 Layer 2a in
+//! live on explicit backend instances, with [`config`] providing an ambient
+//! helper for the active local backend. See D6.7 Layer 2a in
 //! `planning/microsandbox/design/api/local-cloud-backend.md`.
 //!
 //! Layer 1 process-wide knobs ([`set_sdk_msb_path`],
@@ -11,17 +12,21 @@
 //! one resolved `msb` binary).
 
 use std::{
-    collections::HashMap,
+    collections::{BTreeMap, HashMap},
     num::NonZero,
     path::{Path, PathBuf},
-    sync::OnceLock,
+    sync::{Arc, OnceLock},
 };
 
 use docker_credential::{CredentialRetrievalError, DockerCredential};
 use microsandbox_image::RegistryAuth;
 use microsandbox_runtime::logging::LogLevel;
+use microsandbox_types::{
+    CpuPlacement, DeploymentProfile, PlacementProfile, RootDisk, TransparentHugePagePolicy,
+};
 use serde::{Deserialize, Serialize};
 
+use crate::error::Operation;
 use crate::{MicrosandboxError, MicrosandboxResult};
 
 //--------------------------------------------------------------------------------------------------
@@ -43,6 +48,9 @@ pub(crate) const DEFAULT_CONNECT_TIMEOUT_SECS: u64 = 30;
 /// Default sandbox metrics sampling interval in milliseconds.
 pub const DEFAULT_METRICS_SAMPLE_INTERVAL_MS: u64 = 1000;
 
+/// Default SSH session inactivity timeout in seconds.
+pub const DEFAULT_SSH_INACTIVITY_TIMEOUT_SECS: u64 = 600;
+
 /// Default value for `metrics_sample_interval_ms` fields.
 pub fn default_metrics_sample_interval() -> Option<NonZero<u64>> {
     NonZero::new(DEFAULT_METRICS_SAMPLE_INTERVAL_MS)
@@ -59,6 +67,40 @@ pub(crate) mod metrics_interval_serde {
 
     pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Option<NonZero<u64>>, D::Error> {
         Ok(NonZero::new(u64::deserialize(d)?))
+    }
+}
+
+/// Serde adapter for the human-facing deployment profile names used in `config.json`.
+///
+/// Sandbox wire data uses snake_case, while the CLI and SDKs expose kebab-case
+/// names. Accepting both forms keeps existing serialized values readable and
+/// gives the hand-edited global config one canonical spelling.
+mod deployment_profile_serde {
+    use microsandbox_types::DeploymentProfile;
+    use serde::{Deserialize, Deserializer, Serializer, de::Error as _};
+
+    pub fn serialize<S: Serializer>(
+        profile: &Option<DeploymentProfile>,
+        serializer: S,
+    ) -> Result<S::Ok, S::Error> {
+        match profile {
+            Some(DeploymentProfile::SingleTenant) => serializer.serialize_some("single-tenant"),
+            Some(DeploymentProfile::MultiTenant) => serializer.serialize_some("multi-tenant"),
+            None => serializer.serialize_none(),
+        }
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<Option<DeploymentProfile>, D::Error> {
+        match Option::<String>::deserialize(deserializer)?.as_deref() {
+            Some("single-tenant" | "single_tenant") => Ok(Some(DeploymentProfile::SingleTenant)),
+            Some("multi-tenant" | "multi_tenant") => Ok(Some(DeploymentProfile::MultiTenant)),
+            Some(other) => Err(D::Error::custom(format!(
+                "unknown deployment profile {other:?}; expected `single-tenant` or `multi-tenant`"
+            ))),
+            None => Ok(None),
+        }
     }
 }
 
@@ -106,6 +148,18 @@ pub struct LocalConfig {
     /// per-sandbox.
     pub log_level: Option<LogLevel>,
 
+    /// Authoritative host-runtime isolation profile for local sandboxes.
+    ///
+    /// When set, this operator policy overrides the profile requested by an
+    /// individual sandbox on create and restart. `None` preserves per-sandbox
+    /// selection and its built-in `single-tenant` default.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "deployment_profile_serde"
+    )]
+    pub deployment_profile: Option<DeploymentProfile>,
+
     /// Database configuration.
     pub database: DatabaseConfig,
 
@@ -115,11 +169,27 @@ pub struct LocalConfig {
     /// Default values for sandbox configuration.
     pub sandbox_defaults: SandboxDefaults,
 
+    /// Host runtime performance policy.
+    pub runtime: RuntimeConfig,
+
     /// Registry authentication configuration.
     pub registries: RegistriesConfig,
 
+    /// SSH session defaults.
+    pub ssh: SshConfig,
+
     /// Live metrics registry configuration.
     pub metrics: MetricsConfig,
+}
+
+/// Default settings for host-side SSH sessions.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SshConfig {
+    /// Disconnect an SSH session after this many seconds without SSH traffic.
+    ///
+    /// A value of `0` disables the inactivity timeout.
+    pub inactivity_timeout_secs: u64,
 }
 
 /// Live metrics registry configuration.
@@ -204,6 +274,15 @@ pub struct SandboxDefaults {
     /// Default guest memory in MiB.
     pub memory_mib: u32,
 
+    /// Default host CPU placement policy.
+    pub cpu_placement: CpuPlacement,
+
+    /// Default host-defined placement profile name.
+    pub placement_profile: Option<String>,
+
+    /// Default guest transparent huge-page policy.
+    pub thp: TransparentHugePagePolicy,
+
     /// Default OCI rootfs settings.
     pub oci: OciSandboxDefaults,
 
@@ -233,6 +312,48 @@ pub struct OciSandboxDefaults {
     ///
     /// `None` uses microsandbox's built-in formatter default.
     pub upper_size_mib: Option<u32>,
+
+    /// Default writable root disk for OCI sandboxes.
+    ///
+    /// This is mutually exclusive with the deprecated [`Self::upper_size_mib`] field. `None`
+    /// preserves the managed layered root disk default.
+    pub root_disk: Option<RootDisk>,
+}
+
+/// Host runtime performance policy.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct RuntimeConfig {
+    /// Buffered host writeback containment and pressure-sharing policy.
+    pub block_writeback: BlockWritebackConfig,
+
+    /// Host-owned placement profiles selectable by sandbox name.
+    pub placement_profiles: BTreeMap<String, PlacementProfile>,
+}
+
+/// Controls buffered host dirty data for writable raw disks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "mode", rename_all = "lowercase", deny_unknown_fields)]
+pub enum BlockWritebackConfig {
+    /// Use the measured per-disk maximum and share the aggregate pool under pressure.
+    Auto {
+        /// Optional host-global dirty-credit pressure-pool override in MiB.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pool_mib: Option<NonZero<u64>>,
+    },
+
+    /// Use an explicit per-disk maximum and derive the pressure pool unless overridden.
+    Fixed {
+        /// Maximum page-aligned dirty data charged to one writable raw disk, in MiB.
+        per_disk_mib: NonZero<u64>,
+
+        /// Optional host-global dirty-credit pressure-pool override in MiB.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pool_mib: Option<NonZero<u64>>,
+    },
+
+    /// Disable bounded writeback without changing guest-visible durability semantics.
+    Off {},
 }
 
 /// Registry configuration.
@@ -312,6 +433,46 @@ struct KeyringRegistryCredential {
 //--------------------------------------------------------------------------------------------------
 
 impl LocalConfig {
+    /// Validate defaults that affect sandbox construction.
+    pub(crate) fn validate_sandbox_defaults(&self) -> MicrosandboxResult<()> {
+        let oci = &self.sandbox_defaults.oci;
+        if oci.upper_size_mib.is_some() && oci.root_disk.is_some() {
+            return Err(MicrosandboxError::InvalidConfig(
+                "sandbox_defaults.oci.root_disk and deprecated sandbox_defaults.oci.upper_size_mib are mutually exclusive".into(),
+            ));
+        }
+
+        if matches!(oci.root_disk, Some(RootDisk::DiskImage { .. })) {
+            return Err(MicrosandboxError::InvalidConfig(
+                "sandbox_defaults.oci.root_disk cannot be a shared disk-image; specify user-owned disk images per sandbox".into(),
+            ));
+        }
+
+        if let Some(profile_name) = &self.sandbox_defaults.placement_profile {
+            self.resolve_placement_profile(profile_name)?;
+        }
+
+        Ok(())
+    }
+
+    /// Resolve and structurally validate a host-owned placement profile.
+    pub(crate) fn resolve_placement_profile(
+        &self,
+        name: &str,
+    ) -> MicrosandboxResult<PlacementProfile> {
+        let profile = self
+            .runtime
+            .placement_profiles
+            .get(name)
+            .copied()
+            .ok_or_else(|| {
+                MicrosandboxError::InvalidConfig(format!(
+                    "placement profile `{name}` is not defined in runtime.placement_profiles"
+                ))
+            })?;
+        Ok(profile)
+    }
+
     /// Get the resolved home directory.
     pub fn home(&self) -> PathBuf {
         self.home.clone().unwrap_or_else(resolve_default_home)
@@ -405,8 +566,34 @@ impl LocalConfig {
         }
     }
 
-    /// Resolve registry transport for a given hostname from the global config.
-    /// Load additional CA root certificates from the global `registries.ca_certs` path.
+    /// Resolve the path to the `msb` binary for this local config.
+    ///
+    /// Resolution order:
+    /// 1. `MSB_PATH` environment variable
+    /// 2. SDK-provided runtime path
+    /// 3. `self.paths.msb`
+    /// 4. workspace-local `build/msb` or `target/debug/msb` (debug builds only)
+    /// 5. `~/.microsandbox/bin/msb`
+    /// 6. `which::which("msb")`
+    pub fn resolve_msb_path(&self) -> MicrosandboxResult<PathBuf> {
+        resolve_msb_path_for_config(self)
+    }
+
+    /// Resolve the path to `libkrunfw` for this local config.
+    ///
+    /// Resolution order (highest first):
+    /// 1. `MSB_LIBKRUNFW_PATH` environment variable
+    /// 2. SDK-provided runtime path set via [`set_sdk_libkrunfw_path`]
+    /// 3. `self.paths.libkrunfw`
+    /// 4. A sibling of the resolved `msb` binary (for `build/msb`)
+    /// 5. `../lib/` next to the resolved `msb` binary (for installed layouts)
+    /// 6. `{home}/lib/libkrunfw.{so,dylib}`
+    pub fn resolve_libkrunfw_path(&self) -> MicrosandboxResult<PathBuf> {
+        resolve_libkrunfw_path_for_config(self)
+    }
+
+    /// Resolve registry transport for a given hostname from this config.
+    /// Load additional CA root certificates from `registries.ca_certs`.
     ///
     /// Returns an empty vec if no path is configured.
     pub async fn resolve_ca_certs(&self) -> MicrosandboxResult<Vec<Vec<u8>>> {
@@ -553,17 +740,36 @@ impl Default for DatabaseConfig {
     }
 }
 
+impl Default for SshConfig {
+    fn default() -> Self {
+        Self {
+            inactivity_timeout_secs: DEFAULT_SSH_INACTIVITY_TIMEOUT_SECS,
+        }
+    }
+}
+
 impl Default for SandboxDefaults {
     fn default() -> Self {
         Self {
             cpus: DEFAULT_CPUS,
             memory_mib: DEFAULT_MEMORY_MIB,
+            cpu_placement: CpuPlacement::Inherit,
+            placement_profile: None,
+            thp: TransparentHugePagePolicy::Madvise,
             oci: OciSandboxDefaults::default(),
             shell: "/bin/sh".into(),
             workdir: None,
             metrics_sample_interval_ms: default_metrics_sample_interval(),
             disable_metrics_sample: false,
         }
+    }
+}
+
+impl Default for BlockWritebackConfig {
+    fn default() -> Self {
+        // Auto is portable: Linux bounds dirty data and shares a derived pool, while other hosts
+        // treat the unconfigured policy as a no-op.
+        Self::Auto { pool_mib: None }
     }
 }
 
@@ -636,6 +842,19 @@ fn docker_credential_servers(hostname: &str) -> Vec<String> {
     servers
 }
 
+/// Return the active default backend's local config.
+///
+/// This is the ambient convenience path for callers that do not explicitly
+/// construct a [`LocalBackend`](crate::backend::LocalBackend). It returns
+/// [`MicrosandboxError::Unsupported`] when the active backend is cloud.
+pub fn config() -> MicrosandboxResult<Arc<LocalConfig>> {
+    let backend = crate::backend::default_backend();
+    let local = backend
+        .as_local()
+        .ok_or_else(|| MicrosandboxError::local_only(Operation::Config))?;
+    Ok(local.config_handle())
+}
+
 /// Resolve the path to the persisted local config file.
 pub fn config_path() -> PathBuf {
     // Honour MSB_CONFIG_PATH if set — same env var the SDK config loader
@@ -706,6 +925,11 @@ pub fn set_sdk_msb_path(path: impl Into<PathBuf>) {
     let _ = SDK_MSB_PATH.set(path.into());
 }
 
+/// Resolve the path to the `msb` binary for the ambient local config.
+pub fn resolve_msb_path() -> MicrosandboxResult<PathBuf> {
+    config()?.resolve_msb_path()
+}
+
 /// Resolve the path to the `msb` binary against the supplied [`LocalConfig`].
 ///
 /// Resolution order:
@@ -715,7 +939,7 @@ pub fn set_sdk_msb_path(path: impl Into<PathBuf>) {
 /// 4. workspace-local `build/msb` or `target/debug/msb` (debug builds only)
 /// 5. `~/.microsandbox/bin/msb`
 /// 6. `which::which("msb")`
-pub fn resolve_msb_path(config: &LocalConfig) -> MicrosandboxResult<PathBuf> {
+fn resolve_msb_path_for_config(config: &LocalConfig) -> MicrosandboxResult<PathBuf> {
     let env_msb = std::env::var("MSB_PATH").ok();
     let sdk_msb = SDK_MSB_PATH.get().cloned();
     let config_msb = config.paths.msb.clone();
@@ -815,6 +1039,11 @@ pub fn set_sdk_libkrunfw_path(path: impl Into<PathBuf>) {
     let _ = SDK_LIBKRUNFW_PATH.set(path.into());
 }
 
+/// Resolve the path to `libkrunfw` for the ambient local config.
+pub fn resolve_libkrunfw_path() -> MicrosandboxResult<PathBuf> {
+    config()?.resolve_libkrunfw_path()
+}
+
 /// Resolve the path to `libkrunfw` against the supplied [`LocalConfig`].
 ///
 /// Resolution order (highest first):
@@ -825,7 +1054,7 @@ pub fn set_sdk_libkrunfw_path(path: impl Into<PathBuf>) {
 /// 4. A sibling of the resolved `msb` binary (for `build/msb`).
 /// 5. `../lib/` next to the resolved `msb` binary (for installed layouts).
 /// 6. `{home}/lib/libkrunfw.{so,dylib}`.
-pub fn resolve_libkrunfw_path(config: &LocalConfig) -> MicrosandboxResult<PathBuf> {
+fn resolve_libkrunfw_path_for_config(config: &LocalConfig) -> MicrosandboxResult<PathBuf> {
     if let Ok(env_path) = std::env::var("MSB_LIBKRUNFW_PATH") {
         let path = PathBuf::from(env_path);
         if path.is_file() {
@@ -862,7 +1091,7 @@ pub fn resolve_libkrunfw_path(config: &LocalConfig) -> MicrosandboxResult<PathBu
         .join(&filename);
 
     let mut candidates = Vec::new();
-    if let Ok(msb_path) = resolve_msb_path(config) {
+    if let Ok(msb_path) = config.resolve_msb_path() {
         candidates.extend(libkrunfw_candidates_from_msb(&msb_path, &filename));
     }
     candidates.push(home_fallback);
@@ -1102,16 +1331,31 @@ mod tests {
         let cfg = LocalConfig::default();
         assert_eq!(cfg.sandbox_defaults.cpus, 1);
         assert_eq!(cfg.sandbox_defaults.memory_mib, 512);
+        assert_eq!(cfg.sandbox_defaults.cpu_placement, CpuPlacement::Inherit);
+        assert_eq!(cfg.sandbox_defaults.placement_profile, None);
+        assert_eq!(cfg.sandbox_defaults.thp, TransparentHugePagePolicy::Madvise);
         assert_eq!(cfg.sandbox_defaults.oci.upper_size_mib, None);
+        assert_eq!(cfg.sandbox_defaults.oci.root_disk, None);
         assert_eq!(cfg.sandbox_defaults.shell, "/bin/sh");
         assert_eq!(
             cfg.sandbox_defaults.metrics_sample_interval_ms,
             NonZero::new(DEFAULT_METRICS_SAMPLE_INTERVAL_MS)
         );
         assert_eq!(cfg.log_level, None);
+        assert_eq!(cfg.deployment_profile, None);
         assert_eq!(cfg.database.max_connections, 5);
         assert_eq!(cfg.database.connect_timeout_secs, 30);
         assert_eq!(cfg.database.busy_timeout_secs, 5);
+        assert_eq!(cfg.ssh.inactivity_timeout_secs, 600);
+        assert_eq!(
+            cfg.runtime.block_writeback,
+            BlockWritebackConfig::Auto { pool_mib: None }
+        );
+        assert!(cfg.runtime.placement_profiles.is_empty());
+        assert_eq!(
+            serde_json::to_value(cfg.runtime.block_writeback).unwrap(),
+            serde_json::json!({ "mode": "auto" })
+        );
     }
 
     #[test]
@@ -1119,6 +1363,10 @@ mod tests {
         let cfg: LocalConfig = serde_json::from_str("{}").unwrap();
         assert_eq!(cfg.sandbox_defaults.cpus, 1);
         assert!(cfg.home.is_none());
+        assert_eq!(
+            cfg.runtime.block_writeback,
+            BlockWritebackConfig::Auto { pool_mib: None }
+        );
     }
 
     #[test]
@@ -1127,6 +1375,190 @@ mod tests {
         let cfg: LocalConfig = serde_json::from_str(json).unwrap();
         assert_eq!(cfg.sandbox_defaults.cpus, 4);
         assert_eq!(cfg.sandbox_defaults.memory_mib, 512);
+    }
+
+    #[test]
+    fn test_deployment_profile_uses_human_facing_config_values() {
+        let cfg: LocalConfig =
+            serde_json::from_str(r#"{"deployment_profile":"multi-tenant"}"#).unwrap();
+        assert_eq!(cfg.deployment_profile, Some(DeploymentProfile::MultiTenant));
+
+        let json = serde_json::to_value(cfg).unwrap();
+        assert_eq!(json["deployment_profile"], "multi-tenant");
+    }
+
+    #[test]
+    fn test_deployment_profile_accepts_snake_case_wire_values() {
+        let cfg: LocalConfig =
+            serde_json::from_str(r#"{"deployment_profile":"single_tenant"}"#).unwrap();
+        assert_eq!(
+            cfg.deployment_profile,
+            Some(DeploymentProfile::SingleTenant)
+        );
+    }
+
+    #[test]
+    fn test_deployment_profile_rejects_unknown_values() {
+        let error =
+            serde_json::from_str::<LocalConfig>(r#"{"deployment_profile":"shared"}"#).unwrap_err();
+        assert!(error.to_string().contains("unknown deployment profile"));
+    }
+
+    #[test]
+    fn test_deserialize_performance_defaults() {
+        let json = r#"{
+            "sandbox_defaults": {
+                "cpu_placement": "spread",
+                "thp": "always",
+                "oci": {
+                    "root_disk": {
+                        "kind": "flat",
+                        "size_mib": 8192,
+                        "clone": "copy"
+                    }
+                }
+            },
+            "runtime": { "block_writeback": { "mode": "off" } }
+        }"#;
+
+        let cfg: LocalConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(cfg.sandbox_defaults.cpu_placement, CpuPlacement::Spread);
+        assert_eq!(cfg.sandbox_defaults.thp, TransparentHugePagePolicy::Always);
+        assert_eq!(
+            cfg.sandbox_defaults.oci.root_disk,
+            Some(RootDisk::Flat {
+                size_mib: Some(8192),
+                fstype: None,
+                clone: microsandbox_types::FlatClone::Copy,
+            })
+        );
+        assert_eq!(cfg.runtime.block_writeback, BlockWritebackConfig::Off {});
+    }
+
+    #[test]
+    fn test_placement_profile_round_trip_and_default_resolution() {
+        let json = r#"{
+            "sandbox_defaults": {
+                "cpu_placement": "auto",
+                "placement_profile": "latency"
+            },
+            "runtime": {
+                "placement_profiles": {
+                    "latency": {
+                        "numa": { "mode": "prefer_single" },
+                        "memory": { "mode": "follow_cpu" }
+                    }
+                }
+            }
+        }"#;
+        let cfg: LocalConfig = serde_json::from_str(json).unwrap();
+
+        cfg.validate_sandbox_defaults().unwrap();
+        assert_eq!(
+            cfg.sandbox_defaults.placement_profile.as_deref(),
+            Some("latency")
+        );
+        let profile = cfg.resolve_placement_profile("latency").unwrap();
+        assert_eq!(
+            profile.numa,
+            microsandbox_types::NumaPlacement::PreferSingle
+        );
+        assert_eq!(
+            profile.memory,
+            microsandbox_types::MemoryPlacement::FollowCpu
+        );
+
+        let round: LocalConfig =
+            serde_json::from_value(serde_json::to_value(cfg).unwrap()).unwrap();
+        assert_eq!(
+            round.sandbox_defaults.placement_profile.as_deref(),
+            Some("latency")
+        );
+    }
+
+    #[test]
+    fn test_validate_rejects_unknown_default_placement_profile() {
+        let cfg: LocalConfig =
+            serde_json::from_str(r#"{"sandbox_defaults":{"placement_profile":"missing"}}"#)
+                .unwrap();
+
+        let error = cfg.validate_sandbox_defaults().unwrap_err();
+        assert!(
+            error.to_string().contains(
+                "placement profile `missing` is not defined in runtime.placement_profiles"
+            )
+        );
+    }
+
+    #[test]
+    fn test_block_writeback_fixed_round_trip() {
+        let json = r#"{
+            "runtime": {
+                "block_writeback": {
+                    "mode": "fixed",
+                    "per_disk_mib": 1280,
+                    "pool_mib": 5120
+                }
+            }
+        }"#;
+        let cfg: LocalConfig = serde_json::from_str(json).unwrap();
+
+        assert_eq!(
+            cfg.runtime.block_writeback,
+            BlockWritebackConfig::Fixed {
+                per_disk_mib: NonZero::new(1280).unwrap(),
+                pool_mib: NonZero::new(5120),
+            }
+        );
+
+        let serialized = serde_json::to_value(&cfg.runtime.block_writeback).unwrap();
+        assert_eq!(
+            serialized,
+            serde_json::json!({
+                "mode": "fixed",
+                "per_disk_mib": 1280,
+                "pool_mib": 5120
+            })
+        );
+    }
+
+    #[test]
+    fn test_block_writeback_modes_reject_incompatible_fields() {
+        let auto_with_fixed_limit = r#"{
+            "runtime": {
+                "block_writeback": {
+                    "mode": "auto",
+                    "per_disk_mib": 1536
+                }
+            }
+        }"#;
+        let off_with_pool = r#"{
+            "runtime": {
+                "block_writeback": {
+                    "mode": "off",
+                    "pool_mib": 4096
+                }
+            }
+        }"#;
+
+        assert!(serde_json::from_str::<LocalConfig>(auto_with_fixed_limit).is_err());
+        assert!(serde_json::from_str::<LocalConfig>(off_with_pool).is_err());
+    }
+
+    #[test]
+    fn test_validate_rejects_legacy_and_typed_root_disk_defaults() {
+        let json = r#"{
+            "sandbox_defaults": {
+                "oci": {
+                    "upper_size_mib": 4096,
+                    "root_disk": { "kind": "flat" }
+                }
+            }
+        }"#;
+        let cfg: LocalConfig = serde_json::from_str(json).unwrap();
+
+        let error = cfg.validate_sandbox_defaults().unwrap_err();
+        assert!(error.to_string().contains("mutually exclusive"));
     }
 
     #[test]
@@ -1230,6 +1662,20 @@ mod tests {
         assert_eq!(cfg.database.max_connections, 9);
         assert_eq!(cfg.database.connect_timeout_secs, 7);
         assert_eq!(cfg.database.busy_timeout_secs, 12);
+    }
+
+    #[test]
+    fn test_deserialize_ssh_config() {
+        let json = r#"{"ssh": {"inactivity_timeout_secs": 1800}}"#;
+        let cfg: LocalConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(cfg.ssh.inactivity_timeout_secs, 1800);
+    }
+
+    #[test]
+    fn test_deserialize_ssh_timeout_disabled() {
+        let json = r#"{"ssh": {"inactivity_timeout_secs": 0}}"#;
+        let cfg: LocalConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(cfg.ssh.inactivity_timeout_secs, 0);
     }
 
     #[test]
@@ -1369,7 +1815,7 @@ mod tests {
         } else if cfg!(target_os = "macos") {
             assert!(filename.ends_with(".dylib"));
         } else {
-            assert!(filename.ends_with(".so.5.2.1"));
+            assert!(filename.ends_with(".so.5.6.1"));
         }
     }
 
@@ -1451,6 +1897,40 @@ mod tests {
             error
                 .to_string()
                 .contains("entry defines multiple credential sources")
+        );
+    }
+
+    #[cfg(not(all(
+        feature = "keyring",
+        any(target_os = "linux", target_os = "macos", target_os = "windows")
+    )))]
+    #[test]
+    fn test_resolve_configured_registry_auth_reports_disabled_keyring() {
+        let cfg = LocalConfig {
+            registries: registries(vec![(
+                "ghcr.io",
+                RegistryEntry {
+                    auth: Some(RegistryAuthEntry {
+                        username: "user".to_string(),
+                        store: Some(RegistryCredentialStore::Keyring),
+                        password_env: None,
+                        secret_name: None,
+                    }),
+                    ..Default::default()
+                },
+            )]),
+            ..Default::default()
+        };
+
+        let error = cfg.resolve_configured_registry_auth("ghcr.io").unwrap_err();
+        assert!(matches!(error, MicrosandboxError::InvalidConfig(_)));
+        assert!(
+            error
+                .to_string()
+                .contains("secure OS credential storage is disabled")
+                || error
+                    .to_string()
+                    .contains("secure OS credential storage is not supported")
         );
     }
 

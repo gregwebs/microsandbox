@@ -44,7 +44,10 @@
 ## <a href="./#gh-dark-mode-only" target="_blank"><img height="13" src="https://octicons-col.vercel.app/rocket/ffffff" alt="rocket-dark"></a><a href="./#gh-light-mode-only" target="_blank"><img height="13" src="https://octicons-col.vercel.app/rocket/000000" alt="rocket"></a>&nbsp;&nbsp;Getting Started
 
 #### <img height="14" src="https://octicons-col.vercel.app/move-to-bottom/A770EF">&nbsp;&nbsp;Install the SDK
-
+> ```sh
+> npm i microsandbox                                       # 🟦 TypeScript
+> ```
+>
 > ```sh
 > cargo add microsandbox                                   # 🦀 Rust
 > ```
@@ -54,13 +57,8 @@
 > ```
 >
 > ```sh
-> npm i microsandbox                                       # 🟦 TypeScript
-> ```
->
-> ```sh
 > go get github.com/superradcompany/microsandbox/sdk/go    # 🐹 Go
 > ```
-
 #### <img height="14" src="https://octicons-col.vercel.app/download/A770EF">&nbsp;&nbsp;Install the CLI
 
 > Boot a microVM in a single command:
@@ -88,10 +86,6 @@
 >
 > ```sh
 > brew install superradcompany/tap/microsandbox
-> ```
->
-> ```sh
-> winget install SuperRadCompany.Microsandbox
 > ```
 >
 > ```sh
@@ -130,11 +124,31 @@
 
 ## <a href="./#gh-dark-mode-only" target="_blank"><img height="18" src="https://octicons-col.vercel.app/package-dependencies/ffffff" alt="sdk-dark"></a><a href="./#gh-light-mode-only" target="_blank"><img height="18" src="https://octicons-col.vercel.app/package-dependencies/000000" alt="sdk"></a>&nbsp;&nbsp;SDK
 
-The SDK lets you create and control sandboxes directly from your application. `Sandbox::builder("...").create()` boots a microVM as a child process. No infrastructure required.
+The SDK lets you create and control sandboxes directly from your application. `Sandbox.builder("...").create()` boots a microVM as a child process. No infrastructure required.
 
 #### <img height="14" src="https://octicons-col.vercel.app/play/A770EF">&nbsp;&nbsp;Run Code in a Sandbox
 
-> ```rs
+> ```typescript
+> import { Sandbox } from "microsandbox";
+>
+> await using sandbox = await Sandbox.builder("my-sandbox")
+>   .image("python")
+>   .cpus(1)
+>   .memory(512)
+>   .create();
+>
+> const output = await sandbox.exec("python", [
+>   "-c",
+>   "print('Hello from a microVM!')",
+> ]);
+>
+> console.log(output.stdout());
+> ```
+>
+> <details>
+> <summary><b>&nbsp;Rust Example →</b></summary>
+>
+> ```rust
 > use microsandbox::Sandbox;
 >
 > #[tokio::main]
@@ -158,6 +172,7 @@ The SDK lets you create and control sandboxes directly from your application. `S
 > }
 > ```
 >
+> </details>
 > <details>
 > <summary><b>&nbsp;Python Example →</b></summary>
 >
@@ -183,26 +198,36 @@ The SDK lets you create and control sandboxes directly from your application. `S
 > ```
 >
 > </details>
->
 > <details>
-> <summary><b>&nbsp;TypeScript Example →</b></summary>
+> <summary><b>&nbsp;Ruby Example →</b></summary>
 >
-> ```typescript
-> import { Sandbox } from "microsandbox";
+> ```ruby
+> require "microsandbox"
 >
-> await using sandbox = await Sandbox.builder("my-sandbox")
->   .image("python")
->   .cpus(1)
->   .memory(512)
->   .create();
+> sandbox = Microsandbox::Sandbox.create(
+>   "my-sandbox",
+>   image: "python",
+>   cpus: 1,
+>   memory: 512,
+>   network: {
+>     allowed_hosts: ["api.openai.com"],
+>     allowed_ports: [443]
+>   },
+>   secrets: [{
+>     env: "OPENAI_API_KEY",
+>     value: ENV.fetch("OPENAI_API_KEY"),
+>     allowed_host: "api.openai.com"
+>   }]
+> )
 >
-> const output = await sandbox.exec("python", [
->   "-c",
->   "print('Hello from a microVM!')",
-> ]);
+> output = sandbox.exec("python", ["-c", "print('Hello from a microVM!')"])
+> puts output.stdout
 >
-> console.log(output.stdout());
+> sandbox.stop
 > ```
+>
+> See the [Ruby SDK guide](./sdk/ruby/README.md) for installation, lifecycle,
+> networking, and backend details.
 >
 > </details>
 >
@@ -295,6 +320,32 @@ The `msb` CLI provides a complete interface for managing sandboxes, images, and 
 > msb image rm python       # Remove an image
 > ```
 
+#### <img height="14" src="https://octicons-col.vercel.app/file-code/A770EF">&nbsp;&nbsp;Configuration File
+
+> ```sh
+> msb run --conf sandbox.yaml -- octocat
+> ```
+>
+> ```yaml
+> # sandbox.yaml
+> image: python:3.12
+> network:
+>   allow:
+>     - api.github.com
+> scripts:
+>   octocat: |
+>     python - <<'PY'
+>     import urllib.request
+>
+>     request = urllib.request.Request(
+>         "https://api.github.com/octocat",
+>         headers={"User-Agent": "microsandbox-example"},
+>     )
+>     with urllib.request.urlopen(request) as response:
+>         print(response.read().decode())
+>     PY
+> ```
+
 #### <img height="14" src="https://octicons-col.vercel.app/download/A770EF">&nbsp;&nbsp;Install & Uninstall Sandboxes
 
 > ```sh
@@ -325,6 +376,24 @@ The `msb` CLI provides a complete interface for managing sandboxes, images, and 
 
 <br />
 
+## <a href="./#gh-dark-mode-only" target="_blank"><img height="18" src="https://octicons-col.vercel.app/beaker/ffffff" alt="beaker-dark"></a><a href="./#gh-light-mode-only" target="_blank"><img height="18" src="https://octicons-col.vercel.app/beaker/000000" alt="beaker"></a>&nbsp;&nbsp;Examples
+
+Practical ways to put microsandbox to work:
+
+> • <img height="14" src="https://octicons-col.vercel.app/container/A770EF"> **[Docker in a Sandbox](https://docs.microsandbox.dev/examples/docker/docker-in-sandbox)**: Run Docker without touching the host daemon.<br />
+> • <img height="14" src="https://octicons-col.vercel.app/code/A770EF"> **[OpenCode](https://docs.microsandbox.dev/examples/agents/opencode)**: Give a coding agent an isolated project workspace.<br />
+> • <img height="14" src="https://octicons-col.vercel.app/globe/A770EF"> **[Playwright](https://docs.microsandbox.dev/examples/browser-automation/playwright)**: Run headless browser jobs inside a microVM.<br />
+> • <img height="14" src="https://octicons-col.vercel.app/cache/A770EF"> **[Warm Workers](https://docs.microsandbox.dev/examples/sandboxing/warm-workers)**: Snapshot a toolchain and launch clean workers.<br />
+> • <img height="14" src="https://octicons-col.vercel.app/database/A770EF"> **[Migration Rehearsal](https://docs.microsandbox.dev/examples/data/migration-rehearsal)**: Test a database migration, then restore the baseline.<br />
+> • <img height="14" src="https://octicons-col.vercel.app/workflow/A770EF"> **[GitHub Actions Runner](https://docs.microsandbox.dev/examples/ci-cd/github-actions-runner)**: Run each self-hosted job in a disposable microVM.<br />
+> • <img height="14" src="https://octicons-col.vercel.app/file/A770EF"> **[Documents to PDF](https://docs.microsandbox.dev/examples/file-processing/libreoffice-pdf)**: Convert untrusted documents in a fresh offline worker.
+
+<br />
+
+<a href="https://docs.microsandbox.dev/examples/overview"><img src="https://img.shields.io/badge/Browse_Examples-%E2%86%92-A770EF?style=flat-square&labelColor=2b2b2b" alt="Browse Examples"></a>
+
+<br />
+
 ## <a href="./#gh-dark-mode-only" target="_blank"><img height="18" src="https://octicons-col.vercel.app/dependabot/ffffff" alt="agents-dark"></a><a href="./#gh-light-mode-only" target="_blank"><img height="18" src="https://octicons-col.vercel.app/dependabot/000000" alt="agents"></a>&nbsp;&nbsp;AI Agents
 
 #### <img height="14" src="https://octicons-col.vercel.app/book/A770EF">&nbsp;&nbsp;Agent Skills
@@ -343,6 +412,23 @@ The `msb` CLI provides a complete interface for managing sandboxes, images, and 
 > # Claude Code
 > claude mcp add --transport stdio microsandbox -- npx -y microsandbox-mcp
 > ```
+
+<br />
+
+## <a href="./#gh-dark-mode-only" target="_blank"><img height="18" src="https://octicons-col.vercel.app/people/ffffff" alt="people-dark"></a><a href="./#gh-light-mode-only" target="_blank"><img height="18" src="https://octicons-col.vercel.app/people/000000" alt="people"></a>&nbsp;&nbsp;Projects using microsandbox
+
+> ⏵ **[Eve by Vercel](https://eve.dev/docs/sandbox#microsandbox)**<br />
+> ⏵ **[GSA TTS Agentic Coding Quickstart](https://github.com/GSA-TTS/agentic-coding-quickstart)**<br />
+> ⏵ **[agent-compose by Chaitin](https://github.com/chaitin/agent-compose)**<br />
+> ⏵ **[Condukt](https://github.com/tuist/condukt) and [Once](https://github.com/tuist/once) by Tuist**<br />
+> ⏵ **[h5i](https://github.com/h5i-dev/h5i)**<br />
+> ⏵ **[Smithers](https://github.com/smithersai/smithers)**<br />
+> ⏵ **[sandboxed-lit by LlamaIndex](https://github.com/run-llama/sandboxed-lit)**<br />
+> ⏵ **[Agentic Usability by PSPDFKit Labs](https://github.com/PSPDFKit-labs/agentic-usability)**<br />
+> ⏵ **[Agent VM by Wiren Board](https://github.com/wirenboard/agent-vm)**<br />
+> ⏵ **[Devsy](https://github.com/devsy-org/devsy)**
+
+> Built something with microsandbox? [Share it with us on Discord](https://discord.gg/T95Y3XnEAK). We’d love to feature it here.
 
 <br />
 

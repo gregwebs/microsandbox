@@ -3,6 +3,22 @@ name: Release
 on:
   push:
     tags: ["v*"]
+  pull_request:
+    paths:
+      - .github/workflows/release.yml
+      - .github/workflows/release-linux.yml
+      - .github/workflows/release-macos.yml
+      - .github/workflows/release-windows.yml
+      - .github/actions/cache-libkrunfw-kernel/action.yml
+      - scripts/ci/publish-crates.py
+      - scripts/ci/validate-release-artifacts.py
+      - scripts/ci/test_validate_release_artifacts.py
+      - scripts/ci/validate_linux_glibc.py
+      - scripts/ci/test_validate_linux_glibc.py
+      - scripts/ci/wait-for-npm-packages.mjs
+  # Manual runs exercise the full release build and validation graph. Every
+  # irreversible job below is independently guarded to tag pushes only.
+  workflow_dispatch:
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -13,31 +29,308 @@ env:
   CARGO_NET_RETRY: "10"
   CARGO_HTTP_TIMEOUT: "120"
   CARGO_HTTP_MULTIPLEXING: "false"
-  LIBKRUNFW_VERSION: "5.2.1"
+  CARGO_INCREMENTAL: "0"
+  LIBKRUNFW_VERSION: "5.6.1"
   LIBKRUNFW_ABI: "5"
 
 permissions:
-  contents: write
-  packages: write
+  contents: read
 
 jobs:
-  # ---------------------------------------------------------------------------
-  # Build kernel.c on Linux for macOS libkrunfw linking
-  # ---------------------------------------------------------------------------
-  build-kernel:
-    name: Build kernel.c (aarch64)
+  # Fetch and verify the large kernel archive once, then fan it out to both
+  # firmware architectures over GitHub's artifact network.
+  kernel-sources:
+    name: Kernel sources
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Checkout libkrunfw sources
+        run: git submodule update --init --depth 1 vendor/libkrunfw
+
+      - name: Prepare kernel source
+        uses: ./.github/actions/cache-libkrunfw-kernel
+
+      - name: Upload kernel source archive
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: kernel-source
+          path: vendor/libkrunfw/tarballs/*.tar.gz
+          compression-level: 0
+
+  # Build each firmware bundle once. Platform workflows consume the generated
+  # kernel.c; Linux relinks it inside its baseline container.
+  firmware-aarch64:
+    name: Firmware (aarch64)
+    needs: kernel-sources
     runs-on: ubuntu-24.04-arm
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Checkout libkrunfw sources
+        run: git submodule update --init --depth 1 vendor/libkrunfw
+
+      - name: Cache firmware
+        id: cache-firmware
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            vendor/libkrunfw/kernel.c
+            vendor/libkrunfw/libkrunfw.so.${{ env.LIBKRUNFW_VERSION }}
+          key: release-firmware-aarch64-${{ hashFiles('vendor/libkrunfw/**') }}
+
+      - name: Install firmware build dependencies
+        if: steps.cache-firmware.outputs.cache-hit != 'true'
+        run: sudo apt-get update && sudo apt-get install -y libcap-ng-dev gcc make flex bison libelf-dev bc python3-pyelftools
+
+      - name: Download kernel source archive
+        if: steps.cache-firmware.outputs.cache-hit != 'true'
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: kernel-source
+          path: vendor/libkrunfw/tarballs
+
+      - name: Build firmware
+        if: steps.cache-firmware.outputs.cache-hit != 'true'
+        working-directory: vendor/libkrunfw
+        run: make -j$(nproc)
+
+      - name: Upload firmware
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: firmware-aarch64
+          path: |
+            vendor/libkrunfw/kernel.c
+            vendor/libkrunfw/libkrunfw.so.${{ env.LIBKRUNFW_VERSION }}
+          compression-level: 0
+
+  firmware-x86_64:
+    name: Firmware (x86_64)
+    needs: kernel-sources
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Checkout libkrunfw sources
+        run: git submodule update --init --depth 1 vendor/libkrunfw
+
+      - name: Cache firmware
+        id: cache-firmware
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            vendor/libkrunfw/kernel.c
+            vendor/libkrunfw/libkrunfw.so.${{ env.LIBKRUNFW_VERSION }}
+          key: release-firmware-x86_64-${{ hashFiles('vendor/libkrunfw/**') }}
+
+      - name: Install firmware build dependencies
+        if: steps.cache-firmware.outputs.cache-hit != 'true'
+        run: sudo apt-get update && sudo apt-get install -y libcap-ng-dev gcc make flex bison libelf-dev bc python3-pyelftools
+
+      - name: Download kernel source archive
+        if: steps.cache-firmware.outputs.cache-hit != 'true'
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: kernel-source
+          path: vendor/libkrunfw/tarballs
+
+      - name: Build firmware
+        if: steps.cache-firmware.outputs.cache-hit != 'true'
+        working-directory: vendor/libkrunfw
+        run: make -j$(nproc)
+
+      - name: Upload firmware
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: firmware-x86_64
+          path: |
+            vendor/libkrunfw/kernel.c
+            vendor/libkrunfw/libkrunfw.so.${{ env.LIBKRUNFW_VERSION }}
+          compression-level: 0
+
+  # The guest daemon is independent from each host build, so compile it once
+  # per guest architecture and fan it out to every matching host platform.
+  agentd-aarch64:
+    name: Agentd (aarch64-linux-musl)
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+        with:
+          targets: aarch64-unknown-linux-musl
+
+      - uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16 # v2
+        with:
+          cache-bin: false
+          cache-targets: true
+          shared-key: release-agentd-aarch64
+
+      - name: Install musl toolchain
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+
+      - name: Build agentd
+        run: cargo build --release --manifest-path crates/agentd/Cargo.toml --target aarch64-unknown-linux-musl
+
+      - name: Upload agentd
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: agentd-aarch64-linux-musl
+          path: target/aarch64-unknown-linux-musl/release/agentd
+          compression-level: 0
+
+  agentd-x86_64:
+    name: Agentd (x86_64-linux-musl)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+        with:
+          targets: x86_64-unknown-linux-musl
+
+      - uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16 # v2
+        with:
+          cache-bin: false
+          cache-targets: true
+          shared-key: release-agentd-x86_64
+
+      - name: Install musl toolchain
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+
+      - name: Build agentd
+        run: cargo build --release --manifest-path crates/agentd/Cargo.toml --target x86_64-unknown-linux-musl
+
+      - name: Upload agentd
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: agentd-x86_64-linux-musl
+          path: target/x86_64-unknown-linux-musl/release/agentd
+          compression-level: 0
+
+  linux-x86_64:
+    name: Linux x86_64
+    needs: [firmware-x86_64, agentd-x86_64]
+    uses: ./.github/workflows/release-linux.yml
+    with:
+      target: linux-x86_64
+      runner: ubuntu-latest
+      manylinux_image: quay.io/pypa/manylinux_2_28_x86_64@sha256:0c87ccb5996dab6c3b7612ee4fda7b80c4ab3c44a86c2541e4a872afdf4f131b
+      arch: x86_64
+      agentd_artifact: agentd-x86_64-linux-musl
+      firmware_artifact: firmware-x86_64
+      libkrunfw_file: libkrunfw.so.5.6.1
+      libkrunfw_asset: libkrunfw-linux-x86_64.so
+      napi_target: x86_64-unknown-linux-gnu
+      node_file: microsandbox.linux-x64-gnu.node
+      npm_dir: linux-x64-gnu
+      go_ffi_file: libmicrosandbox_go_ffi.so
+      go_bundle_name: libmicrosandbox_go_ffi-linux-amd64.so
+
+  linux-aarch64:
+    name: Linux aarch64
+    needs: [firmware-aarch64, agentd-aarch64]
+    uses: ./.github/workflows/release-linux.yml
+    with:
+      target: linux-aarch64
+      runner: ubuntu-24.04-arm
+      manylinux_image: quay.io/pypa/manylinux_2_28_aarch64@sha256:561427136aabf3787bffb294b3515748241e0962d1527ae28bea1e076bfb9d99
+      arch: aarch64
+      agentd_artifact: agentd-aarch64-linux-musl
+      firmware_artifact: firmware-aarch64
+      libkrunfw_file: libkrunfw.so.5.6.1
+      libkrunfw_asset: libkrunfw-linux-aarch64.so
+      napi_target: aarch64-unknown-linux-gnu
+      node_file: microsandbox.linux-arm64-gnu.node
+      npm_dir: linux-arm64-gnu
+      go_ffi_file: libmicrosandbox_go_ffi.so
+      go_bundle_name: libmicrosandbox_go_ffi-linux-arm64.so
+
+  darwin-aarch64:
+    name: macOS aarch64
+    needs: [firmware-aarch64, agentd-aarch64]
+    uses: ./.github/workflows/release-macos.yml
+    with:
+      target: darwin-aarch64
+      runner: macos-14
+      os: darwin
+      arch: aarch64
+      agentd_artifact: agentd-aarch64-linux-musl
+      firmware_artifact: firmware-aarch64
+      libkrunfw_file: libkrunfw.5.dylib
+      libkrunfw_asset: libkrunfw-darwin-aarch64.dylib
+      napi_target: aarch64-apple-darwin
+      node_file: microsandbox.darwin-arm64.node
+      npm_dir: darwin-arm64
+      go_ffi_file: libmicrosandbox_go_ffi.dylib
+      go_bundle_name: libmicrosandbox_go_ffi-darwin-arm64.dylib
+
+  windows-x86_64:
+    name: Windows x86_64
+    needs: [firmware-x86_64, agentd-x86_64]
+    uses: ./.github/workflows/release-windows.yml
+    with:
+      target: windows-x86_64
+      runner: windows-latest
+      rust_target: x86_64-pc-windows-msvc
+      firmware_artifact: firmware-x86_64
+      agentd_artifact: agentd-x86_64-linux-musl
+      vs_arch: amd64
+      vs_host_arch: amd64
+      napi_target: x86_64-pc-windows-msvc
+      node_file: microsandbox.win32-x64-msvc.node
+      npm_dir: win32-x64-msvc
+      msb_asset: msb-windows-x86_64.exe
+      metrics_asset: msb-metrics-windows-x86_64.exe
+      libkrunfw_asset: libkrunfw-windows-x86_64.dll
+      go_bundle_name: libmicrosandbox_go_ffi-windows-amd64.dll
+
+  windows-aarch64:
+    name: Windows aarch64
+    needs: [firmware-aarch64, agentd-aarch64]
+    uses: ./.github/workflows/release-windows.yml
+    with:
+      target: windows-aarch64
+      runner: windows-11-arm
+      rust_target: aarch64-pc-windows-msvc
+      firmware_artifact: firmware-aarch64
+      agentd_artifact: agentd-aarch64-linux-musl
+      vs_arch: arm64
+      vs_host_arch: arm64
+      napi_target: aarch64-pc-windows-msvc
+      node_file: microsandbox.win32-arm64-msvc.node
+      npm_dir: win32-arm64-msvc
+      msb_asset: msb-windows-aarch64.exe
+      metrics_asset: msb-metrics-windows-aarch64.exe
+      libkrunfw_asset: libkrunfw-windows-aarch64.dll
+      go_bundle_name: libmicrosandbox_go_ffi-windows-arm64.dll
+
+  # ---------------------------------------------------------------------------
+  # Legacy tag-release graph. Keep this disabled as an in-file rollback
+  # reference until the optimized graph has proven itself on live tags.
+  # ---------------------------------------------------------------------------
+  # Build kernel.c on Linux for macOS libkrunfw linking
+  build-kernel:
+    name: Build kernel.c (aarch64)
+    if: ${{ false }}
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           submodules: true
 
       - name: Cache kernel.c
         id: cache-kernel
-        uses: actions/cache@2c8a9bd7457de244a408f35966fab2fb45fda9c8 # v6.0.0
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: vendor/libkrunfw/kernel.c
-          key: kernel-c-aarch64-${{ hashFiles('vendor/libkrunfw/**') }}
+          # The build recipe is inline below, so hash this workflow along with
+          # the source to prevent reusing output built with stale flags.
+          key: kernel-c-aarch64-${{ hashFiles('vendor/libkrunfw/**', '.github/actions/cache-libkrunfw-kernel/action.yml', '.github/workflows/release.yml') }}
+
+      - name: Prepare kernel source
+        if: steps.cache-kernel.outputs.cache-hit != 'true'
+        uses: ./.github/actions/cache-libkrunfw-kernel
 
       - name: Install kernel build deps
         if: steps.cache-kernel.outputs.cache-hit != 'true'
@@ -57,18 +350,25 @@ jobs:
 
   build-kernel-x86_64:
     name: Build kernel.c (x86_64)
+    if: ${{ false }}
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           submodules: true
 
       - name: Cache kernel.c
         id: cache-kernel
-        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: vendor/libkrunfw/kernel.c
-          key: kernel-c-x86_64-${{ hashFiles('vendor/libkrunfw/**') }}
+          # The build recipe is inline below, so hash this workflow along with
+          # the source to prevent reusing output built with stale flags.
+          key: kernel-c-x86_64-${{ hashFiles('vendor/libkrunfw/**', '.github/actions/cache-libkrunfw-kernel/action.yml', '.github/workflows/release.yml') }}
+
+      - name: Prepare kernel source
+        if: steps.cache-kernel.outputs.cache-hit != 'true'
+        uses: ./.github/actions/cache-libkrunfw-kernel
 
       - name: Install kernel build deps
         if: steps.cache-kernel.outputs.cache-hit != 'true'
@@ -91,15 +391,16 @@ jobs:
   # ---------------------------------------------------------------------------
   build-agentd-aarch64:
     name: Build agentd (aarch64-linux-musl)
+    if: ${{ false }}
     runs-on: ubuntu-24.04-arm
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           submodules: true
 
       - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
 
-      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16 # v2
         with:
           cache-bin: false
 
@@ -121,15 +422,16 @@ jobs:
 
   build-agentd-x86_64:
     name: Build agentd (x86_64-linux-musl)
+    if: ${{ false }}
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           submodules: true
 
       - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
 
-      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16 # v2
         with:
           cache-bin: false
 
@@ -155,7 +457,7 @@ jobs:
   build:
     name: Build (${{ matrix.target }})
     needs: [build-kernel, build-agentd-aarch64]
-    if: always()
+    if: ${{ false }}
     runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
@@ -166,7 +468,7 @@ jobs:
             arch: x86_64
             os: linux
             agentd_target: x86_64-unknown-linux-musl
-            libkrunfw_file: libkrunfw.so.5.2.1
+            libkrunfw_file: libkrunfw.so.5.6.1
             libkrunfw_asset: libkrunfw-linux-x86_64.so
             napi_target: x86_64-unknown-linux-gnu
             node_file: microsandbox.linux-x64-gnu.node
@@ -176,7 +478,7 @@ jobs:
             arch: aarch64
             os: linux
             agentd_target: aarch64-unknown-linux-musl
-            libkrunfw_file: libkrunfw.so.5.2.1
+            libkrunfw_file: libkrunfw.so.5.6.1
             libkrunfw_asset: libkrunfw-linux-aarch64.so
             napi_target: aarch64-unknown-linux-gnu
             node_file: microsandbox.linux-arm64-gnu.node
@@ -193,13 +495,13 @@ jobs:
             npm_dir: darwin-arm64
 
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           submodules: true
 
       - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
 
-      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16 # v2
         with:
           cache-bin: false
 
@@ -228,10 +530,16 @@ jobs:
       # -- libkrunfw (cached) --
       - name: Cache libkrunfw
         id: cache-libkrunfw
-        uses: actions/cache@2c8a9bd7457de244a408f35966fab2fb45fda9c8 # v6.0.0
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: build/libkrunfw*
-          key: libkrunfw-${{ matrix.target }}-${{ hashFiles('vendor/libkrunfw/**') }}
+          # Include the inline build recipe and ABI/version environment in the
+          # key as well as the libkrunfw source.
+          key: libkrunfw-${{ matrix.target }}-${{ hashFiles('vendor/libkrunfw/**', '.github/actions/cache-libkrunfw-kernel/action.yml', '.github/workflows/release.yml') }}
+
+      - name: Prepare kernel source (Linux)
+        if: steps.cache-libkrunfw.outputs.cache-hit != 'true' && matrix.os == 'linux'
+        uses: ./.github/actions/cache-libkrunfw-kernel
 
       - name: Build libkrunfw (Linux)
         if: steps.cache-libkrunfw.outputs.cache-hit != 'true' && matrix.os == 'linux'
@@ -294,7 +602,7 @@ jobs:
         run: codesign --entitlements msb-entitlements.plist --force -s - build/msb
 
       # -- Node SDK --
-      - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: 22
 
@@ -323,7 +631,7 @@ jobs:
             sdk/node-ts/npm/${{ matrix.npm_dir }}/lib/*
 
       # -- Python SDK --
-      - uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39 # v8.2.0
+      - uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
         with:
           enable-cache: true
           cache-dependency-glob: "sdk/python/uv.lock"
@@ -402,6 +710,7 @@ jobs:
   build-windows:
     name: Build Windows (${{ matrix.target }})
     needs: [build-kernel, build-kernel-x86_64, build-agentd-aarch64, build-agentd-x86_64]
+    if: ${{ false }}
     runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
@@ -435,7 +744,7 @@ jobs:
             libkrunfw_asset: libkrunfw-windows-x86_64.dll
 
     steps:
-      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           submodules: true
 
@@ -443,7 +752,7 @@ jobs:
         with:
           targets: ${{ matrix.rust_target }}
 
-      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16 # v2
         with:
           cache-bin: false
 
@@ -475,6 +784,8 @@ jobs:
 
       - name: Build msb
         shell: pwsh
+        env:
+          RUSTFLAGS: -C target-feature=+crt-static
         run: |
           $ErrorActionPreference = "Stop"
           . "$env:GITHUB_WORKSPACE\vendor\libkrunfw\scripts\msvc-env.ps1"
@@ -485,6 +796,8 @@ jobs:
 
       - name: Build msb-metrics
         shell: pwsh
+        env:
+          RUSTFLAGS: -C target-feature=+crt-static
         run: |
           $ErrorActionPreference = "Stop"
           . "$env:GITHUB_WORKSPACE\vendor\libkrunfw\scripts\msvc-env.ps1"
@@ -493,8 +806,21 @@ jobs:
           New-Item -ItemType Directory -Force -Path build | Out-Null
           Copy-Item target\${{ matrix.rust_target }}\release\msb-metrics.exe build\msb-metrics.exe -Force
 
+      # -- Go FFI cdylib --
+      - name: Build microsandbox-go
+        shell: pwsh
+        env:
+          RUSTFLAGS: -C target-feature=+crt-static
+        run: |
+          $ErrorActionPreference = "Stop"
+          . "$env:GITHUB_WORKSPACE\vendor\libkrunfw\scripts\msvc-env.ps1"
+          Set-MsvcEnvironment -Architecture ${{ matrix.vs_arch }} -HostArchitecture ${{ matrix.vs_host_arch }}
+          cargo build --release -p microsandbox-go --target ${{ matrix.rust_target }}
+          New-Item -ItemType Directory -Force -Path build | Out-Null
+          Copy-Item target\${{ matrix.rust_target }}\release\microsandbox_go_ffi.dll build\microsandbox_go_ffi.dll -Force
+
       # -- Node SDK --
-      - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: 22
 
@@ -528,7 +854,7 @@ jobs:
             sdk/node-ts/npm/${{ matrix.npm_dir }}/lib/*
 
       # -- Python SDK --
-      - uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39 # v8.2.0
+      - uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
         with:
           enable-cache: true
           cache-dependency-glob: "sdk/python/uv.lock"
@@ -565,6 +891,11 @@ jobs:
           Copy-Item build\libkrunfw.dll artifacts\${{ matrix.libkrunfw_asset }} -Force
           Compress-Archive -Path build\msb.exe, build\libkrunfw.dll -DestinationPath artifacts\microsandbox-${{ matrix.target }}.zip -Force
           tar.exe -czf artifacts\microsandbox-${{ matrix.target }}.tar.gz -C build msb.exe libkrunfw.dll
+          # Go FFI cdylib: the Windows cargo artifact has no "lib" prefix; rename it
+          # to the unified bundle asset name (lib prefix + Go arch) that the
+          # go-sdk-tag job drops into sdk/go/internal/bundle/bundles/.
+          $goArch = if ("${{ matrix.target }}" -eq "windows-x86_64") { "amd64" } else { "arm64" }
+          Copy-Item build\microsandbox_go_ffi.dll "artifacts\libmicrosandbox_go_ffi-windows-$goArch.dll" -Force
 
       - name: Upload artifacts
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
@@ -572,15 +903,89 @@ jobs:
           name: release-${{ matrix.target }}
           path: artifacts/
 
+  # Completeness barrier: no publisher may run until every platform and SDK
+  # payload has been built and the exact release manifest has been verified.
+  release-ready:
+    name: Validate complete release
+    if: always()
+    needs:
+      - linux-x86_64
+      - linux-aarch64
+      - darwin-aarch64
+      - windows-x86_64
+      - windows-aarch64
+    runs-on: ubuntu-latest
+    steps:
+      - name: Assert every platform build succeeded
+        run: |
+          test "${{ needs.linux-x86_64.result }}" = success
+          test "${{ needs.linux-aarch64.result }}" = success
+          test "${{ needs.darwin-aarch64.result }}" = success
+          test "${{ needs.windows-x86_64.result }}" = success
+          test "${{ needs.windows-aarch64.result }}" = success
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Download release assets
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          path: release-artifacts
+          pattern: release-*
+          merge-multiple: true
+
+      - name: Download Node SDK artifacts
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          path: node-artifacts
+          pattern: node-sdk-*
+
+      - name: Download Python SDK wheels
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          path: python-artifacts
+          pattern: python-sdk-*
+          merge-multiple: true
+
+      - name: Validate artifact manifest
+        run: |
+          python3 -m unittest scripts.ci.test_validate_release_artifacts
+          python3 scripts/ci/validate-release-artifacts.py \
+            --release-dir release-artifacts \
+            --node-dir node-artifacts \
+            --python-dir python-artifacts \
+            --manifest release-validation/manifest.json
+
+      - name: Validate Linux glibc baseline
+        run: |
+          python3 -m unittest scripts.ci.test_validate_linux_glibc
+          python3 scripts/ci/validate_linux_glibc.py \
+            --max-version 2.28 \
+            --installer scripts/install.sh \
+            release-artifacts node-artifacts python-artifacts
+
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+
+      - name: Validate crates.io publication graph and package manifests
+        run: python3 scripts/ci/publish-crates.py --validate-only
+
+      - name: Upload validation manifest
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: release-validation
+          path: release-validation/manifest.json
+
   # ---------------------------------------------------------------------------
   # Assemble: collect all artifacts, generate checksums, create GitHub release
   # ---------------------------------------------------------------------------
   assemble:
     name: Assemble Release
-    needs: [build, build-windows]
+    needs: release-ready
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Download all artifacts
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
@@ -624,19 +1029,24 @@ jobs:
   #
   # mintlify is the docs deploy branch. it tracks the released commit but may
   # also carry docs that were merged into it directly. we merge the release
-  # commit forward instead of hard-resetting, so those docs survive. a clean
-  # merge is pushed straight to mintlify; a conflicting merge opens a pr so the
-  # releaser resolves it by hand instead of losing work silently.
+  # commit forward instead of hard-resetting, so those docs survive. mintlify
+  # requires a merge queue that always creates a merge commit, so the sync
+  # lands as a pr: a clean merge is enqueued automatically, a conflicting one
+  # is left for the releaser to resolve by hand instead of losing work
+  # silently. the queue keeps the history shared with main intact; squashing
+  # these prs is what used to turn every following sync into a wall of false
+  # conflicts.
   # ---------------------------------------------------------------------------
   sync-mintlify:
     name: Sync mintlify branch
     needs: assemble
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     permissions:
       contents: write
       pull-requests: write
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: mintlify
           fetch-depth: 0
@@ -646,32 +1056,42 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
 
-      - name: Merge release commit into mintlify
+      - name: Check whether the release commit merges cleanly
         id: merge
         run: |
-          if git merge --no-edit ${{ github.sha }}; then
+          if git merge-base --is-ancestor ${{ github.sha }} HEAD; then
+            echo "result=uptodate" >> "$GITHUB_OUTPUT"
+          elif git merge --no-commit --no-ff ${{ github.sha }}; then
+            git merge --abort
             echo "result=clean" >> "$GITHUB_OUTPUT"
           else
             git merge --abort
             echo "result=conflict" >> "$GITHUB_OUTPUT"
           fi
 
-      - name: Push merged mintlify
-        if: steps.merge.outputs.result == 'clean'
-        run: git push origin HEAD:refs/heads/mintlify
-
-      - name: Open reconciliation PR on conflict
-        if: steps.merge.outputs.result == 'conflict'
+      - name: Open sync PR
+        if: steps.merge.outputs.result != 'uptodate'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           branch="mintlify-sync-${{ github.ref_name }}"
           git push --force origin ${{ github.sha }}:refs/heads/"$branch"
+          if [ "${{ steps.merge.outputs.result }}" = "clean" ]; then
+            body="Syncs mintlify to ${{ github.ref_name }}. The release commit merges cleanly, so this PR was enqueued automatically; the merge queue lands it as a merge commit."
+          else
+            body="Releasing ${{ github.ref_name }} could not merge into mintlify cleanly. mintlify carries docs that conflict with this release. Resolve by merging mintlify into this branch and pushing, then add the PR to the merge queue (merge when ready). The queue lands it as a merge commit, which keeps the history shared with main intact. Do not bypass the queue with a squash: that erases the shared history and turns the next sync into a wall of false conflicts."
+          fi
           gh pr create \
             --base mintlify \
             --head "$branch" \
             --title "sync mintlify to ${{ github.ref_name }}" \
-            --body "Releasing ${{ github.ref_name }} could not merge into mintlify cleanly. mintlify carries docs that conflict with this release. Resolve the conflicts and merge to publish the released docs."
+            --body "$body"
+
+      - name: Enqueue clean sync PR
+        if: steps.merge.outputs.result == 'clean'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh pr merge --auto --merge "mintlify-sync-${{ github.ref_name }}"
 
   # ---------------------------------------------------------------------------
   # Update Homebrew formula in the tap repo
@@ -679,6 +1099,7 @@ jobs:
   update-homebrew:
     name: Update Homebrew Formula
     needs: assemble
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     steps:
       - name: Dispatch to homebrew tap
@@ -691,16 +1112,69 @@ jobs:
             -f "client_payload[version]=$VERSION"
 
   # ---------------------------------------------------------------------------
+  # Submit the new version to the Windows Package Manager (winget-pkgs)
+  #
+  # winget-releaser runs Komac, which copies the previous version's manifests
+  # from microsoft/winget-pkgs, bumps the version, and rewrites the installer
+  # URLs and SHA256 hashes from this release's Windows .zip assets, then opens a
+  # PR against microsoft/winget-pkgs from a fork.
+  #
+  # One-time preconditions:
+  #   - At least one version of SuperRadCompany.Microsandbox must already exist
+  #     in winget-pkgs. The first release is submitted by hand from the staged
+  #     manifests under packaging/winget/ (see packaging/winget/README.md);
+  #     Komac errors out if the package is not yet present.
+  #   - WINGET_TOKEN: a classic PAT with `public_repo` scope whose owner has a
+  #     fork of microsoft/winget-pkgs. Set the WINGET_FORK_USER repository
+  #     variable if that fork lives under a different account than this repo's
+  #     owner.
+  #   - WINGET_RELEASE_ENABLED: set this repository variable to `true` only
+  #     after the first package version is accepted into winget-pkgs.
+  #
+  # The job is skipped unless publishing is enabled, and the submit step is a
+  # no-op when WINGET_TOKEN is unset. This keeps releases from failing before
+  # the initial package is accepted or for forks that have not configured
+  # winget publishing. Prerelease tags (rc/alpha/beta/dev) are skipped to match
+  # the assemble job's --prerelease detection.
+  # ---------------------------------------------------------------------------
+  update-winget:
+    name: Update winget package
+    needs: assemble
+    if: >-
+      github.event_name == 'push'
+      && startsWith(github.ref, 'refs/tags/v')
+      && vars.WINGET_RELEASE_ENABLED == 'true'
+      && !contains(github.ref_name, '-rc')
+      && !contains(github.ref_name, '-alpha')
+      && !contains(github.ref_name, '-beta')
+      && !contains(github.ref_name, '-dev')
+    runs-on: ubuntu-latest
+    env:
+      WINGET_TOKEN: ${{ secrets.WINGET_TOKEN }}
+    steps:
+      - name: Submit to winget-pkgs
+        if: env.WINGET_TOKEN != ''
+        uses: vedantmgoyal9/winget-releaser@4ffc7888bffd451b357355dc214d43bb9f23917e # v2
+        with:
+          identifier: SuperRadCompany.Microsandbox
+          installers-regex: 'microsandbox-windows-.+\.zip$'
+          release-tag: ${{ github.ref_name }}
+          release-notes-url: https://github.com/superradcompany/microsandbox/releases/tag/${{ github.ref_name }}
+          fork-user: ${{ vars.WINGET_FORK_USER || github.repository_owner }}
+          token: ${{ secrets.WINGET_TOKEN }}
+
+  # ---------------------------------------------------------------------------
   # Publish Node SDK to npm
   # ---------------------------------------------------------------------------
   npm-publish:
     name: Publish npm packages
-    needs: [build, build-windows]
+    needs: release-ready
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: 22
           registry-url: https://registry.npmjs.org
@@ -769,7 +1243,14 @@ jobs:
           done
 
       - name: Wait for npm to index platform packages
-        run: sleep 30
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          node scripts/ci/wait-for-npm-packages.mjs "$VERSION" \
+            @superradcompany/microsandbox-darwin-arm64 \
+            @superradcompany/microsandbox-linux-arm64-gnu \
+            @superradcompany/microsandbox-linux-x64-gnu \
+            @superradcompany/microsandbox-win32-arm64-msvc \
+            @superradcompany/microsandbox-win32-x64-msvc
 
       - name: Verify root package platform dependencies
         working-directory: sdk/node-ts
@@ -809,21 +1290,29 @@ jobs:
   refresh-lockfile:
     name: Refresh npm lockfile
     needs: npm-publish
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     permissions:
       contents: write
       pull-requests: write
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: main
 
-      - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: 22
 
       - name: Wait for npm to index platform packages
-        run: sleep 60
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          node scripts/ci/wait-for-npm-packages.mjs "$VERSION" \
+            @superradcompany/microsandbox-darwin-arm64 \
+            @superradcompany/microsandbox-linux-arm64-gnu \
+            @superradcompany/microsandbox-linux-x64-gnu \
+            @superradcompany/microsandbox-win32-arm64-msvc \
+            @superradcompany/microsandbox-win32-x64-msvc
 
       - name: Regenerate lockfile
         working-directory: sdk/node-ts
@@ -846,16 +1335,22 @@ jobs:
   mcp-publish:
     name: Publish MCP server
     needs: npm-publish
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           submodules: true
 
-      - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: 22
           registry-url: https://registry.npmjs.org
+
+      - name: Wait for the root SDK package
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          node scripts/ci/wait-for-npm-packages.mjs "$VERSION" microsandbox
 
       - name: Build and publish MCP server
         env:
@@ -872,56 +1367,37 @@ jobs:
   # ---------------------------------------------------------------------------
   crates-publish:
     name: Publish crates
-    needs: build
+    needs: release-ready
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
-        with:
-          submodules: true
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
 
       - name: Publish to crates.io
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
-        run: |
-          for crate in \
-            microsandbox-utils \
-            microsandbox-types \
-            microsandbox-protocol \
-            microsandbox-agent-client \
-            microsandbox-agentd \
-            microsandbox-db \
-            microsandbox-migration \
-            microsandbox-image \
-            microsandbox-filesystem \
-            microsandbox-network \
-            microsandbox-metrics \
-            microsandbox-metrics-collector \
-            microsandbox-runtime \
-            microsandbox \
-            microsandbox-cli; do
-            echo "Publishing $crate..."
-            cargo publish -p "$crate" --no-verify
-            sleep 60
-          done
+        run: python3 scripts/ci/publish-crates.py
 
   # ---------------------------------------------------------------------------
   # Publish Python SDK to PyPI
   # ---------------------------------------------------------------------------
   pypi-publish:
     name: Publish Python SDK
-    needs: [build, build-windows]
+    needs: release-ready
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     permissions:
+      contents: read
       id-token: write
     environment:
       name: pypi
       url: https://pypi.org/p/microsandbox
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      - uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39 # v8.2.0
+      - uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
 
       - name: Download Python SDK wheels
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
@@ -953,11 +1429,12 @@ jobs:
   go-sdk-tag:
     name: Tag Go SDK module
     needs: assemble
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
 
@@ -986,6 +1463,10 @@ jobs:
             sdk/go/internal/bundle/bundles/libmicrosandbox_go_ffi-linux-arm64.so
           install -m644 release-dl/libmicrosandbox_go_ffi-darwin-arm64.dylib \
             sdk/go/internal/bundle/bundles/libmicrosandbox_go_ffi-darwin-arm64.dylib
+          install -m644 release-dl/libmicrosandbox_go_ffi-windows-amd64.dll \
+            sdk/go/internal/bundle/bundles/libmicrosandbox_go_ffi-windows-amd64.dll
+          install -m644 release-dl/libmicrosandbox_go_ffi-windows-arm64.dll \
+            sdk/go/internal/bundle/bundles/libmicrosandbox_go_ffi-windows-arm64.dll
 
           git config user.name  "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
@@ -1013,8 +1494,12 @@ jobs:
   # ---------------------------------------------------------------------------
   docker-build:
     name: Docker (${{ matrix.arch }})
-    needs: build
+    needs: release-ready
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
     runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: read
+      packages: write
     strategy:
       matrix:
         include:
@@ -1029,7 +1514,7 @@ jobs:
             msb_asset: msb-linux-aarch64
             libkrunfw_asset: libkrunfw-linux-aarch64.so
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Download build artifacts
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
@@ -1044,15 +1529,15 @@ jobs:
           cp release-artifacts/${{ matrix.libkrunfw_asset }} packaging/docker/build/${{ matrix.arch }}/libkrunfw.so.${{ env.LIBKRUNFW_VERSION }}
           chmod +x packaging/docker/build/${{ matrix.arch }}/msb
 
-      - uses: docker/setup-buildx-action@d7f5e7f509e45cec5c76c4d5afdd7de93d0b3df5 # v4.1.0
+      - uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
 
-      - uses: docker/login-action@650006c6eb7dba73a995cc03b0b2d7f5ca915bee # v4.2.0
+      - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - uses: docker/build-push-action@f9f3042f7e2789586610d6e8b85c8f03e5195baf # v7.2.0
+      - uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
         id: push
         with:
           context: packaging/docker
@@ -1078,7 +1563,10 @@ jobs:
   docker-manifest:
     name: Docker manifest
     needs: docker-build
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
+    permissions:
+      packages: write
     steps:
       - name: Download digests
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
@@ -1087,13 +1575,13 @@ jobs:
           pattern: docker-digest-*
           merge-multiple: true
 
-      - uses: docker/login-action@650006c6eb7dba73a995cc03b0b2d7f5ca915bee # v4.2.0
+      - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - uses: docker/metadata-action@80c7e94dd9b9319bd5eb7a0e0fe9291e23a2a2e9 # v6.1.0
+      - uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6.2.0
         id: meta
         with:
           images: ghcr.io/superradcompany/microsandbox

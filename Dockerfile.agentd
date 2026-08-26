@@ -29,6 +29,7 @@ edition = "2024"
 base64 = "0.22"
 chrono = { version = "0.4", features = ["serde"] }
 ciborium = "0.2"
+ipnetwork = { version = "0.21.0", features = ["serde"] }
 libc = "0.2"
 microsandbox-protocol = { path = "crates/protocol" }
 microsandbox-types = { path = "packages/microsandbox-types/rust" }
@@ -41,6 +42,8 @@ strum = { version = "0.28", features = ["derive"] }
 thiserror = "2.0"
 tokio = { version = "1.52", features = ["full"] }
 ts-rs = "12.0.1"
+typed-path = "0.12"
+zeroize = { version = "1.8", features = ["derive", "serde"] }
 EOF
 
 RUN cargo build --release --manifest-path crates/agentd/Cargo.toml

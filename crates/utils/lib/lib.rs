@@ -1,9 +1,12 @@
 //! Shared constants and utilities for the microsandbox project.
 
 pub mod copy;
+pub mod extent;
 pub mod format;
 pub mod log_text;
 pub mod process;
+pub mod process_lock;
+pub mod secret;
 pub mod size;
 pub mod ttl_reverse_index;
 pub mod wake_pipe;
@@ -84,7 +87,7 @@ pub const MSB_BINARY: &str = "msb";
 pub const PREBUILT_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// libkrunfw release version. Keep in sync with justfile.
-pub const LIBKRUNFW_VERSION: &str = "5.2.1";
+pub const LIBKRUNFW_VERSION: &str = "5.6.1";
 
 /// libkrunfw ABI version (soname major). Keep in sync with justfile.
 pub const LIBKRUNFW_ABI: &str = "5";

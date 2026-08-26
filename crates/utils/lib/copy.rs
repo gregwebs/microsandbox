@@ -8,11 +8,11 @@
 //!    on APFS, btrfs, XFS (with `reflink=1`), and bcachefs. Returns
 //!    `EOPNOTSUPP` (or similar) on ext4 and other non-COW filesystems.
 //!
-//! 2. **Sparse-aware copy**. POSIX `SEEK_DATA` / `SEEK_HOLE` walk of
-//!    the source's allocation map, with `copy_file_range(2)` on Linux
-//!    for in-kernel zero-copy of data extents. The destination is
-//!    `ftruncate`d to the source size up front so unallocated regions
-//!    stay holes.
+//! 2. **Sparse-aware copy**. Walks the source's allocation map with
+//!    POSIX `SEEK_DATA` / `SEEK_HOLE` or Windows
+//!    `FSCTL_QUERY_ALLOCATED_RANGES`, then copies only allocated
+//!    extents. The destination is extended to the source size up
+//!    front so unallocated regions stay holes.
 //!
 //! Never falls back to a naive byte-for-byte copy — that would
 //! densify a 4 GiB sparse file with a few MB of data into 4 GiB on
@@ -35,11 +35,57 @@ use std::path::Path;
 use std::ptr;
 
 #[cfg(windows)]
+use crate::extent::{ExtentMap, mark_sparse};
+#[cfg(windows)]
 use windows_sys::Win32::Foundation::HANDLE;
+#[cfg(windows)]
+use windows_sys::Win32::Storage::FileSystem::GetVolumeInformationByHandleW;
 #[cfg(windows)]
 use windows_sys::Win32::System::IO::DeviceIoControl;
 #[cfg(windows)]
-use windows_sys::Win32::System::Ioctl::FSCTL_SET_SPARSE;
+use windows_sys::Win32::System::Ioctl::{
+    DUPLICATE_EXTENTS_DATA, FSCTL_DUPLICATE_EXTENTS_TO_FILE, FSCTL_GET_INTEGRITY_INFORMATION,
+    FSCTL_GET_INTEGRITY_INFORMATION_BUFFER, FSCTL_SET_INTEGRITY_INFORMATION,
+    FSCTL_SET_INTEGRITY_INFORMATION_BUFFER,
+};
+#[cfg(windows)]
+use windows_sys::Win32::System::SystemServices::FILE_SUPPORTS_BLOCK_REFCOUNTING;
+
+//--------------------------------------------------------------------------------------------------
+// Constants
+//--------------------------------------------------------------------------------------------------
+
+/// ReFS supports 4 KiB and 64 KiB clusters. Aligning to the larger unit is valid on both.
+#[cfg(windows)]
+const WINDOWS_CLONE_ALIGNMENT: u64 = 64 * 1024;
+
+/// Windows requires each duplicate-extents request to be strictly smaller than 4 GiB.
+#[cfg(windows)]
+const WINDOWS_MAX_CLONE_CHUNK: u64 =
+    (u32::MAX as u64 / WINDOWS_CLONE_ALIGNMENT) * WINDOWS_CLONE_ALIGNMENT;
+
+//--------------------------------------------------------------------------------------------------
+// Types
+//--------------------------------------------------------------------------------------------------
+
+/// Strategy that successfully created a destination in [`fast_copy_with_strategy`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FastCopyStrategy {
+    /// The destination shares source extents through filesystem copy-on-write.
+    Reflink,
+    /// The destination is an independent sparse-aware copy.
+    SparseCopy,
+}
+
+/// Windows strategy used to materialize the sparse destination's data.
+#[cfg(windows)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WindowsSparseCopyStrategy {
+    /// Copy the filesystem-allocated ranges reported by `FSCTL_QUERY_ALLOCATED_RANGES`.
+    AllocatedRanges,
+    /// Preserve holes by finding non-zero byte runs when allocation metadata is unavailable.
+    NonzeroRuns,
+}
 
 //--------------------------------------------------------------------------------------------------
 // Functions
@@ -55,6 +101,11 @@ use windows_sys::Win32::System::Ioctl::FSCTL_SET_SPARSE;
 /// **Blocking.** Callers in async contexts should wrap in
 /// `tokio::task::spawn_blocking`.
 pub fn fast_copy(src: &Path, dst: &Path) -> io::Result<u64> {
+    fast_copy_with_strategy(src, dst).map(|(len, _)| len)
+}
+
+/// Copy using the fastest safe strategy and report which strategy resolved.
+pub fn fast_copy_with_strategy(src: &Path, dst: &Path) -> io::Result<(u64, FastCopyStrategy)> {
     // Stat the source up front. This makes the missing-source error
     // kind platform-consistent (`NotFound` everywhere); without it,
     // reflink-copy on Linux surfaces `InvalidInput` with no errno
@@ -65,18 +116,25 @@ pub fn fast_copy(src: &Path, dst: &Path) -> io::Result<u64> {
     // Tier 1: reflink. Errors on unsupported FSes; we fall through to
     // Tier 2. We do NOT use `reflink_or_copy`, which densifies on
     // fallback via `std::fs::copy`.
-    match reflink_copy::reflink(src, dst) {
-        Ok(()) => return Ok(src_len),
+    match reflink_impl(src, dst) {
+        Ok(()) => return Ok((src_len, FastCopyStrategy::Reflink)),
         Err(e) if is_reflink_unsupported(&e) => {
             // fall through to sparse copy
         }
         Err(e) => return Err(e),
     }
 
-    sparse_copy(src, dst)
+    sparse_copy(src, dst).map(|len| (len, FastCopyStrategy::SparseCopy))
 }
 
-/// Sparse-aware copy via `SEEK_DATA`/`SEEK_HOLE` and per-extent copy.
+/// Require a filesystem copy-on-write clone with no fallback.
+pub fn reflink(src: &Path, dst: &Path) -> io::Result<u64> {
+    let src_len = std::fs::metadata(src)?.len();
+    reflink_impl(src, dst)?;
+    Ok(src_len)
+}
+
+/// Sparse-aware copy via platform allocation metadata and per-extent copy.
 ///
 /// Public for callers that want to skip the reflink attempt — e.g.
 /// when they already know the destination filesystem doesn't support
@@ -134,6 +192,39 @@ fn sparse_copy_impl(src: &Path, dst: &Path) -> io::Result<u64> {
     Ok(len)
 }
 
+/// Use the platform's native copy-on-write file-clone primitive.
+#[cfg(unix)]
+fn reflink_impl(src: &Path, dst: &Path) -> io::Result<()> {
+    reflink_copy::reflink(src, dst)
+}
+
+/// Clone a file on a Windows volume that explicitly supports block refcounting.
+#[cfg(windows)]
+fn reflink_impl(src: &Path, dst: &Path) -> io::Result<()> {
+    let mut src_file = File::open(src)?;
+    let mut dst_file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create_new(true)
+        .open(dst)?;
+
+    let result = reflink_windows_files(&mut src_file, &mut dst_file);
+    drop(dst_file);
+    drop(src_file);
+    if result.is_err() {
+        let _ = std::fs::remove_file(dst);
+    }
+    result
+}
+
+#[cfg(not(any(unix, windows)))]
+fn reflink_impl(_src: &Path, _dst: &Path) -> io::Result<()> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "filesystem reflinks are unsupported on this platform",
+    ))
+}
+
 #[cfg(windows)]
 fn sparse_copy_impl(src: &Path, dst: &Path) -> io::Result<u64> {
     const BUF_SIZE: usize = 1024 * 1024;
@@ -150,17 +241,7 @@ fn sparse_copy_impl(src: &Path, dst: &Path) -> io::Result<u64> {
     dst_file.set_len(len)?;
     mark_sparse(&dst_file)?;
 
-    let mut offset = 0u64;
-    let mut buf = vec![0u8; BUF_SIZE];
-    loop {
-        let n = src_file.read(&mut buf)?;
-        if n == 0 {
-            break;
-        }
-
-        write_nonzero_runs(&mut dst_file, offset, &buf[..n])?;
-        offset += n as u64;
-    }
+    copy_windows_sparse_data(&mut src_file, &mut dst_file, BUF_SIZE)?;
 
     dst_file.sync_all()?;
     Ok(len)
@@ -169,6 +250,234 @@ fn sparse_copy_impl(src: &Path, dst: &Path) -> io::Result<u64> {
 //--------------------------------------------------------------------------------------------------
 // Functions: Helpers
 //--------------------------------------------------------------------------------------------------
+
+#[cfg(windows)]
+fn reflink_windows_files(src: &mut File, dst: &mut File) -> io::Result<()> {
+    let src_volume = windows_volume_identity(src)?;
+    let dst_volume = windows_volume_identity(dst)?;
+    if src_volume.0 != dst_volume.0 {
+        return Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "Windows block cloning requires source and destination on the same volume",
+        ));
+    }
+    if src_volume.1 & FILE_SUPPORTS_BLOCK_REFCOUNTING == 0
+        || dst_volume.1 & FILE_SUPPORTS_BLOCK_REFCOUNTING == 0
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "destination volume does not advertise block-refcounting support",
+        ));
+    }
+
+    mark_sparse(dst)?;
+    match_windows_integrity(src, dst)?;
+
+    let len = src.metadata()?.len();
+    dst.set_len(len)?;
+    let clone_len = len / WINDOWS_CLONE_ALIGNMENT * WINDOWS_CLONE_ALIGNMENT;
+    let mut offset = 0u64;
+    while offset < clone_len {
+        let chunk = (clone_len - offset).min(WINDOWS_MAX_CLONE_CHUNK);
+        duplicate_windows_extents(src, dst, offset, chunk)?;
+        offset += chunk;
+    }
+    if clone_len < len {
+        copy_windows_tail(src, dst, clone_len, len - clone_len)?;
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn windows_volume_identity(file: &File) -> io::Result<(u32, u32)> {
+    let mut serial = 0u32;
+    let mut flags = 0u32;
+    let ok = unsafe {
+        GetVolumeInformationByHandleW(
+            file.as_raw_handle() as HANDLE,
+            ptr::null_mut(),
+            0,
+            &mut serial,
+            ptr::null_mut(),
+            &mut flags,
+            ptr::null_mut(),
+            0,
+        )
+    };
+    if ok == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok((serial, flags))
+}
+
+#[cfg(windows)]
+fn match_windows_integrity(src: &File, dst: &File) -> io::Result<()> {
+    let Some(src_info) = get_windows_integrity(src)? else {
+        return Ok(());
+    };
+    let Some(dst_info) = get_windows_integrity(dst)? else {
+        return Ok(());
+    };
+    if src_info.ChecksumAlgorithm == dst_info.ChecksumAlgorithm && src_info.Flags == dst_info.Flags
+    {
+        return Ok(());
+    }
+
+    let info = FSCTL_SET_INTEGRITY_INFORMATION_BUFFER {
+        ChecksumAlgorithm: src_info.ChecksumAlgorithm,
+        Reserved: 0,
+        Flags: src_info.Flags,
+    };
+    let mut returned = 0u32;
+    let ok = unsafe {
+        DeviceIoControl(
+            dst.as_raw_handle() as HANDLE,
+            FSCTL_SET_INTEGRITY_INFORMATION,
+            &info as *const _ as *const _,
+            size_of::<FSCTL_SET_INTEGRITY_INFORMATION_BUFFER>() as u32,
+            ptr::null_mut(),
+            0,
+            &mut returned,
+            ptr::null_mut(),
+        )
+    };
+    if ok == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn get_windows_integrity(
+    file: &File,
+) -> io::Result<Option<FSCTL_GET_INTEGRITY_INFORMATION_BUFFER>> {
+    let mut info = FSCTL_GET_INTEGRITY_INFORMATION_BUFFER::default();
+    let mut returned = 0u32;
+    let ok = unsafe {
+        DeviceIoControl(
+            file.as_raw_handle() as HANDLE,
+            FSCTL_GET_INTEGRITY_INFORMATION,
+            ptr::null(),
+            0,
+            &mut info as *mut _ as *mut _,
+            size_of::<FSCTL_GET_INTEGRITY_INFORMATION_BUFFER>() as u32,
+            &mut returned,
+            ptr::null_mut(),
+        )
+    };
+    if ok != 0 {
+        return Ok(Some(info));
+    }
+    let error = io::Error::last_os_error();
+    if is_reflink_unsupported(&error) {
+        Ok(None)
+    } else {
+        Err(error)
+    }
+}
+
+#[cfg(windows)]
+fn duplicate_windows_extents(src: &File, dst: &File, offset: u64, len: u64) -> io::Result<()> {
+    let request = DUPLICATE_EXTENTS_DATA {
+        FileHandle: src.as_raw_handle() as HANDLE,
+        SourceFileOffset: offset as i64,
+        TargetFileOffset: offset as i64,
+        ByteCount: len as i64,
+    };
+    let mut returned = 0u32;
+    let ok = unsafe {
+        DeviceIoControl(
+            dst.as_raw_handle() as HANDLE,
+            FSCTL_DUPLICATE_EXTENTS_TO_FILE,
+            &request as *const _ as *const _,
+            size_of::<DUPLICATE_EXTENTS_DATA>() as u32,
+            ptr::null_mut(),
+            0,
+            &mut returned,
+            ptr::null_mut(),
+        )
+    };
+    if ok == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn copy_windows_tail(src: &mut File, dst: &mut File, offset: u64, len: u64) -> io::Result<()> {
+    src.seek(SeekFrom::Start(offset))?;
+    dst.seek(SeekFrom::Start(offset))?;
+    let copied = io::copy(&mut src.take(len), dst)?;
+    if copied != len {
+        return Err(io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            format!("Windows reflink tail copied {copied} of {len} bytes"),
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn copy_windows_range(
+    src: &mut File,
+    dst: &mut File,
+    offset: u64,
+    len: u64,
+    buf: &mut [u8],
+) -> io::Result<()> {
+    src.seek(SeekFrom::Start(offset))?;
+    dst.seek(SeekFrom::Start(offset))?;
+
+    let mut remaining = len;
+    while remaining != 0 {
+        let chunk_len = remaining.min(buf.len() as u64) as usize;
+        src.read_exact(&mut buf[..chunk_len])?;
+        dst.write_all(&buf[..chunk_len])?;
+        remaining -= chunk_len as u64;
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn copy_windows_sparse_data(
+    src: &mut File,
+    dst: &mut File,
+    buf_size: usize,
+) -> io::Result<WindowsSparseCopyStrategy> {
+    if let Some(map) = ExtentMap::scan_file(src)? {
+        // NTFS can enumerate the ranges that actually occupy filesystem blocks. Copy those ranges
+        // wholesale: inspecting zero/non-zero byte runs inside an allocated extent turns raw disk
+        // images into millions of tiny seeks and writes.
+        let mut buf = vec![0u8; buf_size];
+        for (offset, extent_len) in map.extents {
+            copy_windows_range(src, dst, offset, extent_len, &mut buf)?;
+        }
+        Ok(WindowsSparseCopyStrategy::AllocatedRanges)
+    } else {
+        // Filesystems without FSCTL_QUERY_ALLOCATED_RANGES cannot expose their allocation map.
+        // Preserve sparseness there with the slower byte-run fallback instead of densifying the
+        // destination with a naive full-file copy.
+        copy_windows_nonzero_runs(src, dst, buf_size)?;
+        Ok(WindowsSparseCopyStrategy::NonzeroRuns)
+    }
+}
+
+#[cfg(windows)]
+fn copy_windows_nonzero_runs(src: &mut File, dst: &mut File, buf_size: usize) -> io::Result<()> {
+    src.seek(SeekFrom::Start(0))?;
+    let mut offset = 0u64;
+    let mut buf = vec![0u8; buf_size];
+    loop {
+        let n = src.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+
+        write_nonzero_runs(dst, offset, &buf[..n])?;
+        offset += n as u64;
+    }
+    Ok(())
+}
 
 /// Reflink can fail with several different errnos depending on the
 /// filesystem and platform. Treat them all as "fall through to Tier 2"
@@ -191,71 +500,40 @@ fn is_reflink_unsupported(e: &io::Error) -> bool {
     let aliases: &[i32] = &[libc::ENOTSUP, libc::EOPNOTSUPP, libc::EXDEV, libc::EINVAL];
     #[cfg(windows)]
     let aliases: &[i32] = &[
-        1,  // ERROR_INVALID_FUNCTION
-        17, // ERROR_NOT_SAME_DEVICE
-        50, // ERROR_NOT_SUPPORTED
-        87, // ERROR_INVALID_PARAMETER
+        1,   // ERROR_INVALID_FUNCTION
+        17,  // ERROR_NOT_SAME_DEVICE
+        50,  // ERROR_NOT_SUPPORTED
+        87,  // ERROR_INVALID_PARAMETER
+        124, // ERROR_INVALID_LEVEL
+        775, // ERROR_NOT_CAPABLE
     ];
 
     #[cfg(windows)]
     {
         let win32_code = (code as u32 & 0xffff) as i32;
-        return aliases.contains(&code) || aliases.contains(&win32_code);
+        aliases.contains(&code) || aliases.contains(&win32_code)
     }
 
     #[cfg(unix)]
     aliases.contains(&code)
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 fn copy_extent(src_fd: RawFd, dst_fd: RawFd, off: u64, len: u64) -> io::Result<()> {
-    let mut src_off = off as i64;
-    let mut dst_off = off as i64;
-    let mut remaining = len;
-
-    while remaining > 0 {
-        let chunk = remaining.min(usize::MAX as u64 / 2) as usize;
-        let n =
-            unsafe { libc::copy_file_range(src_fd, &mut src_off, dst_fd, &mut dst_off, chunk, 0) };
-        if n < 0 {
-            let err = io::Error::last_os_error();
-            // copy_file_range may not be supported on every kernel/FS
-            // combination (notably across-FS prior to 5.3, or older
-            // kernels). Fall back to pread/pwrite for the remainder of
-            // this extent.
-            if matches!(
-                err.raw_os_error(),
-                Some(libc::ENOSYS)
-                    | Some(libc::EXDEV)
-                    | Some(libc::EINVAL)
-                    | Some(libc::EOPNOTSUPP)
-            ) {
-                let consumed = len - remaining;
-                return read_write_extent(src_fd, dst_fd, off + consumed, remaining);
-            }
-            return Err(err);
-        }
-        if n == 0 {
-            // EOF — should not happen for a valid extent, but guard.
-            break;
-        }
-        remaining -= n as u64;
-    }
-    Ok(())
-}
-
-#[cfg(all(unix, not(target_os = "linux")))]
-fn copy_extent(src_fd: RawFd, dst_fd: RawFd, off: u64, len: u64) -> io::Result<()> {
+    // Explicit copy must never ask the filesystem to satisfy the transfer with shared COW extents.
     read_write_extent(src_fd, dst_fd, off, len)
 }
 
-/// Copy `len` bytes from `src_fd` at `off` to `dst_fd` at `off` using
-/// `pread`/`pwrite`. Universal fallback for `copy_extent` on platforms
-/// or filesystems where `copy_file_range` doesn't apply.
+/// Copy `len` bytes from `src_fd` at `off` to `dst_fd` at `off` with
+/// `pread`/`pwrite`.
+///
+/// This is the explicit-copy backend for `copy_extent`; avoiding clone and
+/// `copy_file_range` operations prevents the destination from sharing COW
+/// extents with the source.
 #[cfg(unix)]
 fn read_write_extent(src_fd: RawFd, dst_fd: RawFd, off: u64, len: u64) -> io::Result<()> {
-    const BUF_SIZE: usize = 64 * 1024;
-    let mut buf = [0u8; BUF_SIZE];
+    const BUF_SIZE: usize = 1024 * 1024;
+    let mut buf = vec![0u8; BUF_SIZE];
     let mut copied: u64 = 0;
 
     while copied < len {
@@ -308,28 +586,6 @@ fn read_write_extent(src_fd: RawFd, dst_fd: RawFd, off: u64, len: u64) -> io::Re
 }
 
 #[cfg(windows)]
-fn mark_sparse(file: &File) -> io::Result<()> {
-    let mut bytes_returned = 0;
-    let ok = unsafe {
-        DeviceIoControl(
-            file.as_raw_handle() as HANDLE,
-            FSCTL_SET_SPARSE,
-            ptr::null(),
-            0,
-            ptr::null_mut(),
-            0,
-            &mut bytes_returned,
-            ptr::null_mut(),
-        )
-    };
-    if ok == 0 {
-        return Err(io::Error::last_os_error());
-    }
-
-    Ok(())
-}
-
-#[cfg(windows)]
 fn write_nonzero_runs(dst: &mut File, base_offset: u64, bytes: &[u8]) -> io::Result<()> {
     let mut cursor = 0;
     while cursor < bytes.len() {
@@ -372,6 +628,8 @@ mod tests {
             .create(true)
             .truncate(true)
             .open(path)?;
+        #[cfg(windows)]
+        mark_sparse(&f)?;
         f.set_len(len)?;
         for &off in data_offsets {
             let buf = vec![0xAB_u8; 64 * 1024];
@@ -457,6 +715,35 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_sparse_copy_uses_allocated_ranges_when_available() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("src.bin");
+        let dst = dir.path().join("dst.bin");
+        let len = 8 * 1024 * 1024;
+
+        make_sparse(&src, len, &[0, 4 * 1024 * 1024]).unwrap();
+        let mut src_file = File::open(&src).unwrap();
+        if ExtentMap::scan_file(&src_file).unwrap().is_none() {
+            eprintln!("filesystem cannot enumerate allocated ranges; strategy not exercised");
+            return;
+        }
+
+        let mut dst_file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&dst)
+            .unwrap();
+        dst_file.set_len(len).unwrap();
+        mark_sparse(&dst_file).unwrap();
+
+        let strategy = copy_windows_sparse_data(&mut src_file, &mut dst_file, 1024 * 1024).unwrap();
+        assert_eq!(strategy, WindowsSparseCopyStrategy::AllocatedRanges);
     }
 
     #[test]

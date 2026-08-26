@@ -8,7 +8,17 @@ from contextlib import suppress
 import pytest
 
 from integration.helpers import IMAGE, remove_sandbox, stop_and_remove_sandbox
-from microsandbox import Sandbox, SandboxAlreadyExistsError, SandboxNotFoundError
+from microsandbox import (
+    ChangeKind,
+    ModificationDisposition,
+    ModificationPolicy,
+    PlannedChangeKind,
+    Sandbox,
+    SandboxAlreadyExistsError,
+    SandboxNotFoundError,
+    SandboxNotRunningError,
+    SandboxStatus,
+)
 
 
 @pytest.mark.asyncio
@@ -27,17 +37,55 @@ async def test_create_get_list_connect_stop_start_and_remove(sandbox_name):
             "request_kill",
             "request_drain",
             "wait_until_stopped",
+            "ping",
+            "touch",
         ):
             assert hasattr(sandbox, method_name)
 
-        handles = await Sandbox.list()
-        assert any(handle.name == name for handle in handles)
+        ping = await sandbox.ping()
+        assert ping.name == name
+        assert ping.latency_ms >= 0
+
+        touch = await sandbox.touch()
+        assert touch.name == name
+        assert touch.activity_seq > 0
+
+        page = await Sandbox.list()
+        assert any(handle.name == name for handle in page.sandboxes)
 
         handle = await Sandbox.get(name)
         assert handle.name == name
         assert handle.status
         assert handle.created_at is not None
         assert json.loads(handle.config_json)
+
+        handle_ping = await handle.ping()
+        assert handle_ping.name == name
+
+        handle_touch = await handle.touch()
+        assert handle_touch.name == name
+
+        plan = await sandbox.modify(
+            cpus=2, root_disk_size=8192, labels={"tier": "gold"}, dry_run=True
+        )
+        assert plan["sandbox"] == name
+        assert plan["applied"] is False
+        assert plan["status"] is SandboxStatus.RUNNING
+        assert plan["policy"] is ModificationPolicy.NO_RESTART
+        assert all(change["kind"] is PlannedChangeKind.CONFIG for change in plan["changes"])
+        assert all(isinstance(change["change"], ChangeKind) for change in plan["changes"])
+        assert all(
+            isinstance(change["disposition"], ModificationDisposition) for change in plan["changes"]
+        )
+        assert {change["field"] for change in plan["changes"]} >= {
+            "cpus",
+            "root_disk_size",
+            "label",
+        }
+
+        handle_plan = await handle.modify(env={"MODIFIED": "1"}, dry_run=True)
+        assert handle_plan["sandbox"] == name
+        assert handle_plan["applied"] is False
 
         connected = await handle.connect()
         try:
@@ -52,7 +100,13 @@ async def test_create_get_list_connect_stop_start_and_remove(sandbox_name):
 
         await sandbox.stop()
         result = await handle.refresh()
-        assert result.status == "stopped"
+        assert result.status is SandboxStatus.STOPPED
+
+        with pytest.raises(SandboxNotRunningError):
+            await handle.ping()
+        with pytest.raises(SandboxNotRunningError):
+            await result.touch()
+        assert (await handle.refresh()).status is SandboxStatus.STOPPED
 
         restarted = await Sandbox.start(name)
         try:
@@ -104,14 +158,14 @@ async def test_list_with_labels(sandbox_factory, sandbox_name):
     other_name = await other.name
 
     # Single selector → both of this owner's sandboxes, not the other's.
-    by_owner = {h.name for h in await Sandbox.list_with(labels={"owner": owner})}
+    by_owner = {h.name for h in (await Sandbox.list_with(labels={"owner": owner})).sandboxes}
     assert web_name in by_owner
     assert job_name in by_owner
     assert other_name not in by_owner
 
     # AND of two selectors → only the web sandbox.
     by_owner_web = {
-        h.name for h in await Sandbox.list_with(labels={"owner": owner, "tier": "web"})
+        h.name for h in (await Sandbox.list_with(labels={"owner": owner, "tier": "web"})).sandboxes
     }
     assert web_name in by_owner_web
     assert job_name not in by_owner_web

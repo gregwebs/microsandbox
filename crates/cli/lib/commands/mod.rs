@@ -9,6 +9,8 @@ use crate::ui;
 //--------------------------------------------------------------------------------------------------
 
 pub mod common;
+pub mod completion;
+pub mod context;
 pub mod copy;
 pub mod create;
 pub mod exec;
@@ -18,10 +20,13 @@ pub mod install;
 pub mod list;
 pub mod logs;
 pub mod metrics;
+pub mod modify;
+pub mod ping;
 pub mod ps;
 pub mod pull;
 pub mod registry;
 pub mod remove;
+pub mod restart;
 pub mod run;
 pub mod self_cmd;
 pub mod snapshot;
@@ -29,6 +34,7 @@ pub mod snapshot;
 pub mod ssh;
 pub mod start;
 pub mod stop;
+pub mod touch;
 pub mod uninstall;
 pub mod volume;
 
@@ -60,9 +66,10 @@ pub async fn resolve_and_start(name: &str, quiet: bool) -> anyhow::Result<Sandbo
 
     match handle.status_snapshot() {
         SandboxStatus::Running | SandboxStatus::Draining => {
-            // Connect to the running sandbox process via the agent relay.
+            // Rebuild a live sandbox. Local connects to the agent relay now;
+            // cloud agent operations establish their WebSocket lazily.
             let sandbox = handle.connect().await?;
-            if sandbox.client().is_legacy_protocol() && !quiet {
+            if sandbox.local().is_some() && sandbox.client().is_legacy_protocol() && !quiet {
                 // TODO(upgrade-0.6): Remove in 0.6.x or later once live-sandbox
                 // compatibility for versions before 0.5 is no longer supported.
                 ui::warn(&format!(
@@ -75,7 +82,15 @@ pub async fn resolve_and_start(name: &str, quiet: bool) -> anyhow::Result<Sandbo
             if let Ok(config) = handle.config()
                 && let RootfsSource::Oci(ref oci) = config.spec.image
             {
-                image::pull_if_missing(&oci.reference, quiet).await?;
+                let materialization = if matches!(
+                    &oci.root_disk,
+                    Some(microsandbox::sandbox::RootDisk::Flat { .. })
+                ) {
+                    pull::PullMaterialization::Flat
+                } else {
+                    pull::PullMaterialization::Layered
+                };
+                image::pull_if_missing(&oci.reference, quiet, materialization).await?;
             }
 
             let spinner = if quiet {

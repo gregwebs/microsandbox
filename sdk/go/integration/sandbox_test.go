@@ -152,12 +152,12 @@ func TestCreateSandboxAndClose(t *testing.T) {
 		t.Errorf("Name() = %q, want %q", sb.Name(), name)
 	}
 
-	handles, err := microsandbox.ListSandboxes(ctx)
+	page, err := microsandbox.ListSandboxes(ctx)
 	if err != nil {
 		t.Fatalf("ListSandboxes: %v", err)
 	}
 	found := false
-	for _, h := range handles {
+	for _, h := range page.Sandboxes {
 		if h.Name() == name {
 			found = true
 			break
@@ -577,7 +577,7 @@ func TestNetworkPolicyNone(t *testing.T) {
 
 	sb, err := createSandbox(t, ctx, name,
 		microsandbox.WithImage(goIntegrationImage),
-		microsandbox.WithNetwork(&microsandbox.NetworkConfig{Policy: "none"}),
+		microsandbox.WithNetwork(microsandbox.NetworkPolicy.None()),
 	)
 	if err != nil {
 		t.Fatalf("CreateSandbox with network none: %v", err)
@@ -590,7 +590,7 @@ func TestNetworkPolicyNone(t *testing.T) {
 	})
 
 	// TCP egress check (wget) rather than ICMP — see comment in
-	// TestNetworkPolicyNonLocal. Should fail under policy=none regardless.
+	// TestNetworkPolicyProfiles. Should fail under policy=none regardless.
 	out, err := sb.Shell(ctx, "wget -q -O - --timeout=3 http://1.1.1.1/",
 		microsandbox.WithExecTimeout(10*time.Second))
 	if err != nil {
@@ -611,7 +611,7 @@ func TestNetworkPolicyAllowAll(t *testing.T) {
 
 	sb, err := createSandbox(t, ctx, name,
 		microsandbox.WithImage(goIntegrationImage),
-		microsandbox.WithNetwork(&microsandbox.NetworkConfig{Policy: "allow-all"}),
+		microsandbox.WithNetwork(microsandbox.NetworkPolicy.AllowAll()),
 	)
 	if err != nil {
 		t.Fatalf("CreateSandbox allow-all: %v", err)
@@ -642,13 +642,12 @@ func TestNetworkPolicyAllowAll(t *testing.T) {
 func TestDNSBlockDomain(t *testing.T) {
 	ctx := integrationCtx(t)
 	name := "go-sdk-dns-" + t.Name()
+	network := microsandbox.NetworkPolicy.AllowAll()
+	network.DenyDomains = []string{"blocked-domain-test.example.com"}
 
 	sb, err := createSandbox(t, ctx, name,
 		microsandbox.WithImage(goIntegrationImage),
-		microsandbox.WithNetwork(&microsandbox.NetworkConfig{
-			Policy:      microsandbox.NetworkPolicyPresetAllowAll,
-			DenyDomains: []string{"blocked-domain-test.example.com"},
-		}),
+		microsandbox.WithNetwork(network),
 	)
 	if err != nil {
 		t.Fatalf("CreateSandbox with block_domains: %v", err)
@@ -679,13 +678,12 @@ func TestDNSBlockDomain(t *testing.T) {
 func TestDNSBlockDomainSuffix(t *testing.T) {
 	ctx := integrationCtx(t)
 	name := "go-sdk-dnssuffix-" + t.Name()
+	network := microsandbox.NetworkPolicy.AllowAll()
+	network.DenyDomainSuffixes = []string{".blocked-suffix-test.invalid"}
 
 	sb, err := createSandbox(t, ctx, name,
 		microsandbox.WithImage(goIntegrationImage),
-		microsandbox.WithNetwork(&microsandbox.NetworkConfig{
-			Policy:             microsandbox.NetworkPolicyPresetAllowAll,
-			DenyDomainSuffixes: []string{".blocked-suffix-test.invalid"},
-		}),
+		microsandbox.WithNetwork(network),
 	)
 	if err != nil {
 		t.Fatalf("CreateSandbox with block_domain_suffixes: %v", err)
@@ -1090,11 +1088,11 @@ func TestRemoveSandbox(t *testing.T) {
 		t.Fatalf("RemoveSandbox: %v", err)
 	}
 
-	handles, err := microsandbox.ListSandboxes(ctx)
+	page, err := microsandbox.ListSandboxes(ctx)
 	if err != nil {
 		t.Fatalf("ListSandboxes: %v", err)
 	}
-	for _, h := range handles {
+	for _, h := range page.Sandboxes {
 		if h.Name() == name {
 			t.Errorf("sandbox %q still present after RemoveSandbox", name)
 		}
@@ -1135,20 +1133,20 @@ func TestListSandboxesWithLabels(t *testing.T) {
 	create(mineJob, map[string]string{"owner": owner, "tier": "job"})
 	create(other, map[string]string{"owner": owner + "-someone-else"})
 
-	names := func(filter microsandbox.SandboxFilter) map[string]bool {
-		handles, err := microsandbox.ListSandboxesWith(ctx, filter)
+	names := func(labels map[string]string) map[string]bool {
+		page, err := microsandbox.ListSandboxesWith(ctx, microsandbox.WithListLabels(labels))
 		if err != nil {
 			t.Fatalf("ListSandboxesWith: %v", err)
 		}
-		set := make(map[string]bool, len(handles))
-		for _, h := range handles {
+		set := make(map[string]bool, len(page.Sandboxes))
+		for _, h := range page.Sandboxes {
 			set[h.Name()] = true
 		}
 		return set
 	}
 
 	// Single selector → both of mine, not the other owner's.
-	byOwner := names(microsandbox.NewSandboxFilter().WithLabels(map[string]string{"owner": owner}))
+	byOwner := names(map[string]string{"owner": owner})
 	if !byOwner[mineWeb] || !byOwner[mineJob] {
 		t.Errorf("owner filter missing own sandboxes: %v", byOwner)
 	}
@@ -1157,7 +1155,7 @@ func TestListSandboxesWithLabels(t *testing.T) {
 	}
 
 	// AND of two selectors → only the web one.
-	byOwnerWeb := names(microsandbox.NewSandboxFilter().WithLabels(map[string]string{"owner": owner, "tier": "web"}))
+	byOwnerWeb := names(map[string]string{"owner": owner, "tier": "web"})
 	if !byOwnerWeb[mineWeb] {
 		t.Errorf("owner+tier filter missing the web sandbox: %v", byOwnerWeb)
 	}

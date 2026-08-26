@@ -107,6 +107,27 @@ char *msb_sandbox_handle_wait_until_stopped(uint64_t cancel_id,
                                             unsigned char *buf,
                                             uintptr_t buf_len);
 
+char *msb_sandbox_handle_ping(uint64_t cancel_id,
+                              const char *name,
+                              unsigned char *buf,
+                              uintptr_t buf_len);
+
+char *msb_sandbox_handle_touch(uint64_t cancel_id,
+                               const char *name,
+                               unsigned char *buf,
+                               uintptr_t buf_len);
+
+/**
+ * Plan or apply a sandbox modification by name.
+ * Input: `{"patch":{...},"policy":"no_restart|next_start|restart","dry_run":bool}`
+ * Output: the serialized `SandboxModificationPlan`.
+ */
+char *msb_sandbox_handle_modify(uint64_t cancel_id,
+                                const char *name,
+                                const char *opts_json,
+                                unsigned char *buf,
+                                uintptr_t buf_len);
+
 char *msb_sandbox_close(uint64_t cancel_id, Handle handle, unsigned char *buf, uintptr_t buf_len);
 
 char *msb_sandbox_detach(uint64_t cancel_id, Handle handle, unsigned char *buf, uintptr_t buf_len);
@@ -163,6 +184,21 @@ char *msb_sandbox_wait_until_stopped(uint64_t cancel_id,
                                      Handle handle,
                                      unsigned char *buf,
                                      uintptr_t buf_len);
+
+char *msb_sandbox_ping(uint64_t cancel_id, Handle handle, unsigned char *buf, uintptr_t buf_len);
+
+char *msb_sandbox_touch(uint64_t cancel_id, Handle handle, unsigned char *buf, uintptr_t buf_len);
+
+/**
+ * Plan or apply a modification on a live sandbox handle.
+ * Input: `{"patch":{...},"policy":"no_restart|next_start|restart","dry_run":bool}`
+ * Output: the serialized `SandboxModificationPlan`.
+ */
+char *msb_sandbox_modify(uint64_t cancel_id,
+                         Handle handle,
+                         const char *opts_json,
+                         unsigned char *buf,
+                         uintptr_t buf_len);
 
 /**
  * Reports whether this handle owns the sandbox lifecycle (synchronous).
@@ -307,6 +343,15 @@ char *msb_sandbox_exec(uint64_t cancel_id,
                        const char *exec_opts_json,
                        unsigned char *buf,
                        uintptr_t buf_len);
+
+/**
+ * Execute the sandbox's effective OCI entrypoint and CMD with collected output.
+ */
+char *msb_sandbox_exec_default(uint64_t cancel_id,
+                               Handle handle,
+                               const char *exec_opts_json,
+                               unsigned char *buf,
+                               uintptr_t buf_len);
 
 char *msb_sandbox_metrics(uint64_t cancel_id, Handle handle, unsigned char *buf, uintptr_t buf_len);
 
@@ -471,6 +516,15 @@ char *msb_sandbox_exec_stream(uint64_t cancel_id,
                               uintptr_t buf_len);
 
 /**
+ * Start a streaming exec of the sandbox's effective OCI entrypoint and CMD.
+ */
+char *msb_sandbox_exec_default_stream(uint64_t cancel_id,
+                                      Handle handle,
+                                      const char *exec_opts_json,
+                                      unsigned char *buf,
+                                      uintptr_t buf_len);
+
+/**
  * Receive the next event from a streaming exec session.
  * Blocks until an event is available or the stream ends.
  * Returns {"event":"done"} when all events have been consumed.
@@ -498,6 +552,16 @@ char *msb_exec_id(Handle exec_handle, unsigned char *buf, uintptr_t buf_len);
 char *msb_exec_signal(uint64_t cancel_id,
                       Handle exec_handle,
                       int32_t signal,
+                      unsigned char *buf,
+                      uintptr_t buf_len);
+
+/**
+ * Resize the pseudo-terminal for a running exec session.
+ */
+char *msb_exec_resize(uint64_t cancel_id,
+                      Handle exec_handle,
+                      uint16_t rows,
+                      uint16_t cols,
                       unsigned char *buf,
                       uintptr_t buf_len);
 
@@ -571,11 +635,31 @@ char *msb_sandbox_remove_persisted(uint64_t cancel_id,
 char *msb_volume_get(uint64_t cancel_id, const char *name, unsigned char *buf, uintptr_t buf_len);
 
 /**
+ * Return the cloud account's always-present default volume metadata.
+ */
+char *msb_volume_get_default(uint64_t cancel_id, unsigned char *buf, uintptr_t buf_len);
+
+/**
+ * Dispatch a buffered volume filesystem operation for the Go binding.
+ */
+char *msb_volume_fs_op(uint64_t cancel_id,
+                       const char *target,
+                       const char *op,
+                       const char *args_json,
+                       unsigned char *buf,
+                       uintptr_t buf_len);
+
+/**
  * Returns the upstream `microsandbox` crate version this FFI was built against.
  * Synchronous; no Rust-side state is touched. The Go SDK exposes this so callers
  * can verify the loaded library matches the expected runtime.
  */
 char *msb_version(unsigned char *buf, uintptr_t buf_len);
+
+/**
+ * Return secret-safe information about the active default backend.
+ */
+char *msb_default_backend_info(unsigned char *buf, uintptr_t buf_len);
 
 char *msb_image_get(uint64_t cancel_id,
                     const char *reference,
@@ -595,23 +679,37 @@ char *msb_image_remove(uint64_t cancel_id,
                        unsigned char *buf,
                        uintptr_t buf_len);
 
-char *msb_image_gc_layers(uint64_t cancel_id, unsigned char *buf, uintptr_t buf_len);
-
-char *msb_image_gc(uint64_t cancel_id, unsigned char *buf, uintptr_t buf_len);
-
 char *msb_image_prune(uint64_t cancel_id, unsigned char *buf, uintptr_t buf_len);
+
+/**
+ * Load images from a local archive (`docker save` tarball or OCI Image
+ * Layout) into the cache. `tags_json` is a JSON array of extra references
+ * applied to the first image in the archive. Returns a JSON array of image
+ * handles, one per imported reference.
+ */
+char *msb_image_load(uint64_t cancel_id,
+                     const char *input_path,
+                     const char *tags_json,
+                     unsigned char *buf,
+                     uintptr_t buf_len);
+
+/**
+ * Save cached images to an archive file. `references_json` is a JSON array
+ * of image references; `format` is `"docker"` or `"oci"` (empty/null means
+ * docker).
+ */
+char *msb_image_save(uint64_t cancel_id,
+                     const char *references_json,
+                     const char *output_path,
+                     const char *format,
+                     unsigned char *buf,
+                     uintptr_t buf_len);
 
 char *msb_sandbox_handle_snapshot(uint64_t cancel_id,
                                   const char *sandbox_name,
                                   const char *snapshot_name,
                                   unsigned char *buf,
                                   uintptr_t buf_len);
-
-char *msb_sandbox_handle_snapshot_to(uint64_t cancel_id,
-                                     const char *sandbox_name,
-                                     const char *path,
-                                     unsigned char *buf,
-                                     uintptr_t buf_len);
 
 char *msb_snapshot_create(uint64_t cancel_id,
                           const char *source_sandbox,
@@ -782,6 +880,15 @@ char *msb_sandbox_attach(uint64_t cancel_id,
                          const char *opts_json,
                          unsigned char *buf,
                          uintptr_t buf_len);
+
+/**
+ * Attach to the sandbox's effective OCI entrypoint and CMD.
+ */
+char *msb_sandbox_attach_default(uint64_t cancel_id,
+                                 Handle handle,
+                                 const char *opts_json,
+                                 unsigned char *buf,
+                                 uintptr_t buf_len);
 
 /**
  * Attach to the sandbox's default shell.

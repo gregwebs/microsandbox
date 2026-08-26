@@ -8,56 +8,46 @@
 pub(crate) mod attach;
 mod builder;
 pub(crate) mod config;
+mod config_patch;
 pub mod exec;
+pub(crate) mod flat_rootfs;
 pub mod fs;
 mod handle;
 pub mod init;
 pub(crate) mod metrics;
+mod modify;
 mod patch;
+#[cfg(windows)]
+mod reap;
 #[cfg(feature = "ssh")]
 pub mod ssh;
+// Windows-only in shipping builds, but kept compiled under `test` so the
+// platform-independent encoding logic is covered on every host.
+#[cfg(any(windows, test))]
+pub(crate) mod terminal;
 mod types;
+pub(crate) mod upper;
 
-use std::{
-    collections::{BTreeMap, HashMap},
-    path::Path,
-    process::ExitStatus,
-    sync::Arc,
-};
+use std::{collections::BTreeMap, path::Path, process::ExitStatus, sync::Arc};
 
-use microsandbox_db::pool::DbPools;
-use microsandbox_db::{DbReadConnection, DbWriteConnection};
-use microsandbox_image::Registry;
+use microsandbox_db::DbReadConnection;
 use microsandbox_protocol::{
+    core::{CoreError, Ping, Pong, Touch, Touched},
     exec::{ExecRequest, ExecRlimit},
     message::MessageType,
 };
 use microsandbox_types::hostname_from_sandbox_name as derive_hostname;
-use sea_orm::{
-    ColumnTrait, ConnectionTrait, EntityTrait, QueryFilter, QueryOrder, Set, sea_query::Expr,
-};
-use tokio::sync::Mutex;
-#[cfg(windows)]
-use windows_sys::Win32::Foundation::CloseHandle;
-#[cfg(windows)]
-use windows_sys::Win32::System::Threading::{OpenProcess, PROCESS_TERMINATE, TerminateProcess};
+use sea_orm::{ColumnTrait, EntityTrait, QueryFilter, QueryOrder};
 
-use microsandbox_image::{
-    Digest, GlobalCache, PullOptions, PullProgressSender, PullResult, Reference, ext4,
-    progress_channel, tree,
-};
+use microsandbox_image::progress_channel;
 
 use crate::{
     MicrosandboxResult,
     agent::AgentClient,
     backend::LocalBackend,
-    db::entity::{
-        run as run_entity, sandbox as sandbox_entity, sandbox_rootfs as sandbox_rootfs_entity,
-    },
-    runtime::{
-        ProcessHandle, SpawnMode, ensure_named_volumes, rollback_created_named_volumes,
-        spawn_sandbox,
-    },
+    db::entity::{run as run_entity, sandbox as sandbox_entity},
+    error::{Operation, UnsupportedReason},
+    runtime::SpawnMode,
 };
 
 use self::exec::{ExecHandle, ExecOptions};
@@ -69,12 +59,6 @@ use self::exec::{ExecHandle, ExecOptions};
 /// Prefixes reserved for built-in identity/resource attributes.
 pub(crate) const RESERVED_LABEL_PREFIXES: [&str; 3] = ["sandbox.", "microsandbox.", "service."];
 
-/// Maximum time to wait for the sandbox process to expose the agent relay.
-const AGENT_RELAY_READY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(180);
-
-/// Maximum time to wait when connecting to the agent for lifecycle shutdown.
-const AGENT_SHUTDOWN_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
-
 //--------------------------------------------------------------------------------------------------
 // Functions: Validation
 //--------------------------------------------------------------------------------------------------
@@ -82,15 +66,6 @@ const AGENT_SHUTDOWN_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration:
 /// Validate a sandbox name used by CLI and SDK APIs.
 pub fn validate_sandbox_name(name: &str) -> MicrosandboxResult<()> {
     microsandbox_types::validate_sandbox_name(name).map_err(Into::into)
-}
-
-/// Validate sandbox-name-derived runtime paths using an explicit local backend.
-pub(super) fn validate_sandbox_name_for_runtime_with_backend(
-    local: &LocalBackend,
-    name: &str,
-) -> MicrosandboxResult<()> {
-    validate_sandbox_name(name)?;
-    crate::runtime::resolve_sandbox_agent_socket_path_for(local, name).map(|_| ())
 }
 
 /// Validate an explicit guest hostname before it is forwarded to agentd.
@@ -110,7 +85,13 @@ pub(crate) fn reserved_label_prefix(key: &str) -> Option<&'static str> {
         .find(|prefix| key.starts_with(prefix))
 }
 
+// `mod patch` and `mod types` are private; re-export the entry points the
+// local backend's lifecycle and create methods under `backend/local/` call.
+pub(crate) use patch::{apply_patches, build_upper_tree};
+#[cfg(windows)]
+pub(crate) use reap::reap_leaked_runtime_process;
 pub(crate) use types::validate_named_disk_mount_options;
+pub(crate) use types::validate_volume_mounts;
 
 //--------------------------------------------------------------------------------------------------
 // Re-Exports
@@ -121,51 +102,93 @@ pub use crate::logs::{LogEntry, LogOptions, LogSource, LogStreamOptions};
 pub use attach::AttachOptionsBuilder;
 pub use builder::{RegistryConfigBuilder, SandboxBuilder};
 pub use config::SandboxConfig;
+#[cfg(feature = "net")]
+pub use config_patch::{
+    DnsConfigPatch, NetworkConfigPatch, NetworkPolicyConfigPatch, SecretConfigPatch,
+    SecretEntryConfigPatch, TlsConfigPatch,
+};
+pub use config_patch::{
+    FilesystemConfigPatch, InitConfigPatch, ResourceConfigPatch, RuntimeConfigPatch,
+    SandboxConfigPatch, SandboxImagePatch, ScriptConfigPatch,
+};
 pub use exec::{ExecOptionsBuilder, ExecOutput, Rlimit, RlimitResource};
-pub use fs::{FsEntry, FsEntryKind, FsMetadata, FsReadStream, FsSetAttrs, FsWriteSink, SandboxFs};
+pub use fs::{
+    FsEntry, FsEntryKind, FsHandle, FsMetadata, FsOpenOptions, FsReadStream, FsSetAttrs,
+    FsWriteSink, SandboxFsOps,
+};
 pub use handle::{DEFAULT_KILL_TIMEOUT, DEFAULT_STOP_TIMEOUT, SandboxHandle};
 pub use init::{HandoffInit, InitOptionsBuilder};
-pub use metrics::{SandboxMetrics, all_sandbox_metrics};
+pub use metrics::{
+    SandboxMetrics, SandboxMetricsReport, SandboxMetricsState, all_sandbox_metrics,
+    all_sandbox_metrics_local, all_sandbox_metrics_reports_local, sandbox_metrics_report_local,
+};
 pub use microsandbox_image::{PullProgress, PullProgressHandle};
 #[cfg(feature = "net")]
 pub use microsandbox_network::builder::SecretBuilder;
 #[cfg(feature = "net")]
-pub use microsandbox_network::config::NetworkConfig;
+pub use microsandbox_network::config::{NetworkConfig, PublishedPort};
 #[cfg(feature = "net")]
-pub use microsandbox_network::policy::NetworkPolicy;
+pub use microsandbox_network::dns::Nameserver;
+#[cfg(feature = "net")]
+pub use microsandbox_network::policy::{
+    Action as NetworkAction, NetworkPolicy, NetworkProfile, Rule as NetworkRule,
+};
 pub use microsandbox_runtime::logging::LogLevel;
-pub use microsandbox_types::PullPolicy;
+pub use microsandbox_types::{CpuPlacement, PullPolicy};
 pub use microsandbox_types::{
     EnvVar, MAX_HOSTNAME_BYTES, MAX_SANDBOX_NAME_BYTES, NetworkSpec, PortProtocol,
     PublishedPortSpec, SandboxLogLevel, SandboxResources, SandboxRuntimeOptions, SandboxSpec,
+    TransparentHugePagePolicy, VsockRouteSpec, VsockSocketType, VsockSpec,
+};
+#[cfg(feature = "net")]
+pub use microsandbox_types::{HostPattern, SecretInjection};
+pub use modify::{
+    ChangeKind, ConfigPlannedChange, ModificationConflict, ModificationDisposition,
+    ModificationPolicy, ModificationWarning, PlannedChange, ResourceConvergenceState, ResourceKind,
+    ResourceResizeStatus, SandboxModificationBuilder, SandboxModificationPatch,
+    SandboxModificationPlan, SecretChangeKind, SecretModificationPatch, SecretPatchBuilder,
+    SecretPlannedChange, SecretSource,
 };
 #[cfg(feature = "ssh")]
 pub use ssh::{
-    DEFAULT_SSH_HOST, DEFAULT_SSH_PORT, SandboxSsh, SftpClient, SshAttachOptionsBuilder, SshClient,
-    SshClientOptionsBuilder, SshExecOptionsBuilder, SshOutput, SshServer, SshServerOptionsBuilder,
-    SshStdioStream,
+    DEFAULT_SSH_HOST, DEFAULT_SSH_PORT, SandboxSshOps, SftpClient, SshAttachOptionsBuilder,
+    SshClient, SshClientOptionsBuilder, SshExecOptionsBuilder, SshOutput, SshServer,
+    SshServerOptionsBuilder, SshStdioStream,
 };
 pub use types::{
-    DiskImageFormat, HostPermissions, ImageBuilder, ImageSource, IntoImage, MountBuilder,
-    MountOptions, NamedVolumeMode, OciRootfsSource, Patch, PatchBuilder, RootfsSource,
-    SecurityProfile, StatVirtualization, VolumeMount,
+    DeploymentProfile, DiskImageFormat, FlatClone, HostPermissions, ImageBuilder, ImageSource,
+    IntoImage, MountBuilder, MountOptions, NamedVolumeMode, OciRootfsSource, Patch, PatchBuilder,
+    RootDisk, RootDiskBuilder, RootfsSource, SecurityProfile, StatVirtualization, VolumeMount,
 };
+
+//--------------------------------------------------------------------------------------------------
+// Constants
+//--------------------------------------------------------------------------------------------------
+
+/// Default number of sandboxes returned by one list request.
+pub const DEFAULT_SANDBOX_LIST_LIMIT: u32 = 20;
+
+/// Maximum number of sandboxes returned by one list request.
+pub const MAX_SANDBOX_LIST_LIMIT: u32 = 100;
 
 //--------------------------------------------------------------------------------------------------
 // Types
 //--------------------------------------------------------------------------------------------------
 
-/// Transient registry overrides from the SDK, merged with global config at pull time.
-pub(crate) struct RegistryOverrides {
-    pub auth: Option<microsandbox_image::RegistryAuth>,
-    pub insecure: bool,
-    pub ca_certs: Vec<Vec<u8>>,
+/// Configures one paginated [`Sandbox::list_with`] request.
+#[derive(Debug, Clone)]
+pub struct SandboxListBuilder {
+    pub(crate) cursor: Option<String>,
+    pub(crate) limit: u32,
+    pub(crate) labels: BTreeMap<String, String>,
 }
 
-/// Filter for [`Sandbox::list_with`].
-#[derive(Debug, Default, Clone)]
-pub struct SandboxFilter {
-    labels: Vec<(String, String)>,
+/// One page of sandbox handles.
+pub struct SandboxPage {
+    /// Sandboxes in this page.
+    pub sandboxes: Vec<SandboxHandle>,
+    /// Opaque cursor for the next page, or `None` when this is the final page.
+    pub next_cursor: Option<String>,
 }
 
 /// A running sandbox.
@@ -208,6 +231,26 @@ pub struct SandboxStopResult {
     pub source: Option<String>,
 }
 
+/// Result returned by [`Sandbox::ping`] and [`SandboxHandle::ping`].
+#[derive(Debug, Clone)]
+pub struct SandboxPingResult {
+    /// Sandbox name that was pinged.
+    pub name: String,
+
+    /// Round-trip latency measured by the SDK.
+    pub latency: std::time::Duration,
+}
+
+/// Result returned by [`Sandbox::touch`] and [`SandboxHandle::touch`].
+#[derive(Debug, Clone)]
+pub struct SandboxTouchResult {
+    /// Sandbox name that was touched.
+    pub name: String,
+
+    /// Agent activity sequence after the explicit touch was recorded.
+    pub activity_seq: u64,
+}
+
 //--------------------------------------------------------------------------------------------------
 // Methods: Static
 //--------------------------------------------------------------------------------------------------
@@ -215,7 +258,12 @@ pub struct SandboxStopResult {
 impl Sandbox {
     /// Start building a new sandbox configuration.
     pub fn builder(name: impl Into<String>) -> SandboxBuilder {
-        SandboxBuilder::new(name)
+        let builder = SandboxBuilder::new(name);
+        let backend = crate::backend::default_backend();
+        match backend.as_local() {
+            Some(local) => builder.with_local_defaults(local.config()),
+            None => builder,
+        }
     }
 
     /// Create a sandbox from a config.
@@ -290,7 +338,12 @@ impl Sandbox {
             let backend = crate::backend::default_backend();
             match backend.kind() {
                 crate::backend::BackendKind::Local => {
-                    create_local(backend, config, mode, Some(sender)).await
+                    let local = backend.as_local().ok_or_else(|| {
+                        crate::MicrosandboxError::local_only(Operation::SandboxCreate)
+                    })?;
+                    local
+                        .create_sandbox(backend.clone(), config, mode, Some(sender))
+                        .await
                 }
                 crate::backend::BackendKind::Cloud => {
                     drop(sender); // close the channel — no per-layer events for cloud.
@@ -330,29 +383,26 @@ impl Sandbox {
         backend.sandboxes().get(backend.clone(), name).await
     }
 
-    /// List sandboxes via the ambient
-    /// [`default_backend`](crate::backend::default_backend). Pagination args
-    /// are forwarded to cloud; local backends ignore them.
-    pub async fn list() -> MicrosandboxResult<Vec<SandboxHandle>> {
-        let backend = crate::backend::default_backend();
-        let page = backend
-            .sandboxes()
-            .list(backend.clone(), None, None)
-            .await?;
-        Ok(page.sandboxes)
+    /// List the first page of sandboxes using the default page size.
+    pub async fn list() -> MicrosandboxResult<SandboxPage> {
+        Self::list_with(|list| list).await
     }
 
-    /// List sandboxes matching a filter.
-    pub async fn list_with(filter: SandboxFilter) -> MicrosandboxResult<Vec<SandboxHandle>> {
-        let handles = Self::list().await?;
-        if filter.is_empty() {
-            return Ok(handles);
+    /// List a configured page of sandboxes.
+    ///
+    /// Labels are AND-matched by the selected backend before pagination.
+    pub async fn list_with(
+        configure: impl FnOnce(SandboxListBuilder) -> SandboxListBuilder,
+    ) -> MicrosandboxResult<SandboxPage> {
+        let query = configure(SandboxListBuilder::default());
+        if !(1..=MAX_SANDBOX_LIST_LIMIT).contains(&query.limit) {
+            return Err(crate::MicrosandboxError::InvalidConfig(format!(
+                "sandbox list limit must be between 1 and {MAX_SANDBOX_LIST_LIMIT}"
+            )));
         }
 
-        Ok(handles
-            .into_iter()
-            .filter(|handle| sandbox_handle_matches_filter(handle, &filter))
-            .collect())
+        let backend = crate::backend::default_backend();
+        backend.sandboxes().list(backend.clone(), query).await
     }
 
     /// Remove a stopped sandbox by name via the ambient
@@ -364,18 +414,25 @@ impl Sandbox {
 }
 
 //--------------------------------------------------------------------------------------------------
-// Methods: SandboxFilter
+// Methods: SandboxListBuilder
 //--------------------------------------------------------------------------------------------------
 
-impl SandboxFilter {
-    /// Create an empty filter.
-    pub fn new() -> Self {
-        Self::default()
+impl SandboxListBuilder {
+    /// Set the maximum number of sandboxes returned in this page.
+    pub fn limit(mut self, limit: u32) -> Self {
+        self.limit = limit;
+        self
+    }
+
+    /// Continue listing after an opaque cursor returned by a previous page.
+    pub fn cursor(mut self, cursor: impl Into<String>) -> Self {
+        self.cursor = Some(cursor.into());
+        self
     }
 
     /// Require sandboxes to carry this `key=value` label.
     pub fn label(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
-        self.labels.push((key.into(), value.into()));
+        self.labels.insert(key.into(), value.into());
         self
     }
 
@@ -391,10 +448,19 @@ impl SandboxFilter {
         );
         self
     }
+}
 
-    /// Whether the filter has no criteria.
-    pub fn is_empty(&self) -> bool {
-        self.labels.is_empty()
+//--------------------------------------------------------------------------------------------------
+// Trait Implementations
+//--------------------------------------------------------------------------------------------------
+
+impl Default for SandboxListBuilder {
+    fn default() -> Self {
+        Self {
+            cursor: None,
+            limit: DEFAULT_SANDBOX_LIST_LIMIT,
+            labels: BTreeMap::new(),
+        }
     }
 }
 
@@ -417,613 +483,86 @@ impl Sandbox {
         }
     }
 
-    /// Build an outer `Sandbox` from a [`CloudSandbox`](crate::backend::CloudSandbox)
+    /// Build an outer `Sandbox` from a [`CloudCreateSandboxResponse`](crate::backend::CloudCreateSandboxResponse)
     /// HTTP response plus the originating [`SandboxConfig`].
     pub(crate) fn from_cloud(
         backend: Arc<dyn crate::backend::Backend>,
-        cloud: crate::backend::CloudSandbox,
+        cloud: crate::backend::CloudCreateSandboxResponse,
+        config: SandboxConfig,
+    ) -> Self {
+        let state = crate::backend::SandboxCloudState {
+            id: cloud.id,
+            org_id: cloud.org_id,
+            created_at: cloud.created_at,
+        };
+        Self::from_cloud_state(backend, state, cloud.name, config)
+    }
+
+    /// Build an outer `Sandbox` from cloud state already captured by a
+    /// [`SandboxHandle`]. Cloud agent operations establish their own
+    /// authenticated WebSocket lazily, so reconnecting does not need to hold
+    /// an eager agent client.
+    pub(crate) fn from_cloud_state(
+        backend: Arc<dyn crate::backend::Backend>,
+        state: crate::backend::SandboxCloudState,
+        name: String,
         config: SandboxConfig,
     ) -> Self {
         Self {
             backend,
-            inner: Arc::new(crate::backend::SandboxInner::Cloud(
-                crate::backend::SandboxCloudState {
-                    id: cloud.id,
-                    org_id: cloud.org_id,
-                    created_at: cloud.created_at,
-                },
-            )),
-            name: cloud.name,
+            inner: Arc::new(crate::backend::SandboxInner::Cloud(state)),
+            name,
             config,
         }
     }
 }
 
 //--------------------------------------------------------------------------------------------------
-// Functions: Local lifecycle (called from the LocalBackend SandboxBackend impl)
+// Functions: Agent Requests
 //--------------------------------------------------------------------------------------------------
 
-/// Local create path. Returns a complete [`Sandbox`] wrapping the supplied
-/// backend Arc. Called from the [`SandboxBackend`](crate::backend::SandboxBackend)
-/// trait impl on [`LocalBackend`](crate::backend::LocalBackend) and from the
-/// local pull-progress shim on [`Sandbox`].
-pub(crate) async fn create_local(
-    backend: Arc<dyn crate::backend::Backend>,
-    mut config: SandboxConfig,
-    mode: SpawnMode,
-    progress: Option<PullProgressSender>,
-) -> MicrosandboxResult<Sandbox> {
-    tracing::debug!(
-        sandbox = %config.spec.name,
-        image = ?config.spec.image,
-        mode = ?mode,
-        cpus = config.spec.resources.cpus,
-        memory_mib = config.spec.resources.memory_mib,
-        "create_local: starting"
-    );
-
-    let local_backend =
-        backend
-            .as_local()
-            .ok_or_else(|| crate::MicrosandboxError::Unsupported {
-                feature: "create_local".into(),
-                available_when: "with a LocalBackend".into(),
-            })?;
-
-    config.apply_rootfs_defaults(local_backend.config().sandbox_defaults.oci.upper_size_mib);
-
-    let mut pinned_manifest_digest: Option<String> = None;
-    let mut pinned_reference: Option<String> = None;
-
-    config.apply_runtime_defaults();
-    validate_sandbox_name_for_runtime_with_backend(local_backend, &config.spec.name)?;
-    validate_hostname(config.spec.runtime.hostname.as_deref())?;
-    validate_rootfs_source(&config.spec.image)?;
-    validate_env(&config.spec.env)?;
-    validate_labels(&config.spec.labels)?;
-    types::validate_volume_mounts(&config.spec.mounts)?;
-    if let Some(init) = &config.spec.init {
-        init::validate(init)?;
+async fn ping_agent(name: &str, client: &AgentClient) -> MicrosandboxResult<SandboxPingResult> {
+    let started_at = std::time::Instant::now();
+    let msg = client.request(MessageType::Ping, &Ping {}).await?;
+    let latency = started_at.elapsed();
+    if msg.t != MessageType::Pong {
+        return Err(unexpected_agent_response("ping", &msg));
     }
 
-    // Initialize the database before any expensive image pull so we can
-    // fail fast on conflicting persisted sandbox state.
-    let db = local_backend.db().await?;
-    let sandbox_dir = local_backend.sandboxes_dir().join(&config.spec.name);
-    prepare_create_target(db, &config, &sandbox_dir).await?;
+    let _: Pong = msg.payload()?;
+    Ok(SandboxPingResult {
+        name: name.to_string(),
+        latency,
+    })
+}
 
-    // Resolve OCI images before spawning the sandbox process.
-    if let RootfsSource::Oci(oci) = config.spec.image.clone() {
-        let reference = oci.reference;
-        let expected_snapshot_manifest_digest = config
-            .snapshot_upper_source
-            .as_ref()
-            .and(config.manifest_digest.clone());
-        let upper_size_mib = oci
-            .upper_size_mib
-            .unwrap_or(config::DEFAULT_OCI_UPPER_SIZE_MIB);
-        let overrides = RegistryOverrides {
-            auth: config.registry_auth.clone(),
-            insecure: config.insecure,
-            ca_certs: config.ca_certs.clone(),
-        };
-        let pull_result = pull_oci_image(
-            local_backend,
-            &reference,
-            config.spec.pull_policy,
-            overrides,
-            progress,
-        )
-        .await?;
-        if let Some(expected) = expected_snapshot_manifest_digest.as_deref()
-            && pull_result.manifest_digest.to_string() != expected
-        {
-            return Err(crate::MicrosandboxError::SnapshotIntegrity(format!(
-                "snapshot image digest mismatch: manifest pinned {}, resolved {}",
-                expected, pull_result.manifest_digest
-            )));
-        }
-
-        // Merge image config defaults under user-provided config.
-        config.merge_image_defaults(&pull_result.config);
-        if let Some(init) = &config.spec.init {
-            init::validate(init)?;
-        }
-
-        pinned_manifest_digest = Some(pull_result.manifest_digest.to_string());
-        pinned_reference = Some(reference.clone());
-
-        // Verify VMDK exists in the global cache.
-        let cache_dir = local_backend.cache_dir();
-        let cache = GlobalCache::new_async(&cache_dir).await?;
-
-        let vmdk_path = cache.vmdk_path(&pull_result.manifest_digest);
-        if tokio::fs::metadata(&vmdk_path).await.is_err() {
-            return Err(crate::MicrosandboxError::Custom(format!(
-                "VMDK not materialized: {}",
-                vmdk_path.display()
-            )));
-        }
-
-        // For patches, pass per-layer EROFS paths.
-        let layer_erofs_paths: Vec<std::path::PathBuf> = pull_result
-            .layer_diff_ids
-            .iter()
-            .map(|d| cache.layer_erofs_path(d))
-            .collect();
-
-        let upper_tree = if !config.spec.patches.is_empty() {
-            Some(patch::build_upper_tree(&config.spec.patches, &layer_erofs_paths).await?)
-        } else {
-            None
-        };
-
-        // Create upper.ext4 for the writable overlay upper layer.
-        tokio::fs::create_dir_all(&sandbox_dir).await?;
-        let upper_path = sandbox_dir.join("upper.ext4");
-        if let Some(snap_upper) = config.snapshot_upper_source.take() {
-            // Booting from a snapshot: copy the captured upper into
-            // place, preserving sparseness. Patches are not
-            // compatible with this path because they'd need to be
-            // re-baked into the snapshot's upper, which we don't do.
-            if upper_tree.is_some() {
-                return Err(crate::MicrosandboxError::InvalidConfig(
-                    "patches cannot be combined with from_snapshot".into(),
-                ));
-            }
-            let dst = upper_path.clone();
-            tokio::task::spawn_blocking(move || {
-                microsandbox_utils::copy::fast_copy(&snap_upper, &dst)
-            })
-            .await
-            .map_err(|e| crate::MicrosandboxError::Custom(format!("snapshot copy task: {e}")))??;
-        } else if !upper_path.exists() || upper_tree.is_some() {
-            create_upper_ext4(&upper_path, upper_size_mib, upper_tree).await?;
-        }
-
-        // Store manifest digest for spawn to derive paths.
-        config.manifest_digest = Some(pull_result.manifest_digest.to_string());
-
-        // Persist full image metadata to database.
-        if let Ok(image_ref) = reference.parse::<Reference>() {
-            match cache.read_image_metadata_async(&image_ref).await {
-                Ok(Some(metadata)) => {
-                    if let Err(e) =
-                        crate::image::Image::persist(local_backend, &reference, metadata).await
-                    {
-                        tracing::warn!(
-                            error = %e,
-                            "failed to persist image metadata to database"
-                        );
-                    }
-                }
-                Ok(None) => {}
-                Err(e) => {
-                    tracing::warn!(error = %e, "failed to read cached image metadata");
-                }
-            }
-        }
+async fn touch_agent(name: &str, client: &AgentClient) -> MicrosandboxResult<SandboxTouchResult> {
+    let msg = client.request(MessageType::Touch, &Touch {}).await?;
+    if msg.t != MessageType::Touched {
+        return Err(unexpected_agent_response("touch", &msg));
     }
 
-    // Apply rootfs patches before VM start (bind mounts only — OCI patches
-    // are baked into upper.ext4 above).
-    if !config.spec.patches.is_empty() && !matches!(config.spec.image, RootfsSource::Oci(_)) {
-        patch::apply_patches(&config.spec.image, &config.spec.patches).await?;
-    }
+    let touched: Touched = msg.payload()?;
+    Ok(SandboxTouchResult {
+        name: name.to_string(),
+        activity_seq: touched.activity_seq,
+    })
+}
 
-    // Sandbox-time named-volume creation is one-shot create intent. Provision
-    // before inserting the sandbox row so volume conflicts or incompatibilities
-    // cannot leave a stopped sandbox that never booted.
-    let created_named_volumes = ensure_named_volumes(local_backend, &config).await?;
-
-    // Insert the sandbox record and keep its stable database ID.
-    let write_db = db.write();
-    let persisted_config = config.clone_for_persistence();
-    let sandbox_id = match insert_sandbox_record(write_db, &persisted_config).await {
-        Ok(sandbox_id) => sandbox_id,
-        Err(err) => {
-            rollback_created_named_volumes(local_backend, &created_named_volumes).await;
-            return Err(err);
-        }
-    };
-    tracing::debug!(sandbox_id, sandbox = %config.spec.name, "create_local: db record inserted");
-
-    // Spawn the sandbox process and create the bridge. On failure, mark the sandbox
-    // as stopped so it doesn't appear as a phantom "Running" entry.
-    let (local_state, returned_config) =
-        match create_inner_local(local_backend, config, sandbox_id, mode).await {
-            Ok(pair) => pair,
-            Err(e) => {
-                if created_named_volumes.is_empty() {
-                    let _ =
-                        update_sandbox_status(write_db, sandbox_id, SandboxStatus::Stopped).await;
-                } else {
-                    rollback_created_named_volumes(local_backend, &created_named_volumes).await;
-                    let _ = delete_sandbox_record(write_db, sandbox_id).await;
-                }
-                return Err(e);
-            }
-        };
-    let sandbox = Sandbox::from_local(backend.clone(), local_state, returned_config);
-
-    if let (Some(_reference), Some(manifest_digest)) = (
-        pinned_reference.as_deref(),
-        pinned_manifest_digest.as_deref(),
-    ) && let Err(err) = persist_oci_manifest_pin(write_db, sandbox_id, manifest_digest).await
+fn unexpected_agent_response(
+    operation: &'static str,
+    msg: &microsandbox_protocol::message::Message,
+) -> crate::MicrosandboxError {
+    if msg.t == MessageType::CoreError
+        && let Ok(error) = msg.payload::<CoreError>()
     {
-        let _ = sandbox.stop().await;
-        if created_named_volumes.is_empty() {
-            let _ = update_sandbox_status(write_db, sandbox_id, SandboxStatus::Stopped).await;
-        } else {
-            rollback_created_named_volumes(local_backend, &created_named_volumes).await;
-            let _ = delete_sandbox_record(write_db, sandbox_id).await;
-        }
-        return Err(err);
+        return crate::MicrosandboxError::Runtime(format!(
+            "agent rejected {operation}: {:?}: {}",
+            error.kind, error.message
+        ));
     }
 
-    // Validate that the configured workdir exists inside the guest and is a
-    // directory before returning a ready sandbox. Shell/exec calls inherit this
-    // cwd, so accepting a regular file here leads to later, murkier failures.
-    if let Some(ref workdir) = sandbox.config.spec.runtime.workdir {
-        match sandbox.fs().stat(workdir).await {
-            Ok(metadata) if metadata.kind == FsEntryKind::Directory => {}
-            Ok(_) => {
-                let _ = sandbox.stop().await;
-                if created_named_volumes.is_empty() {
-                    let _ =
-                        update_sandbox_status(write_db, sandbox_id, SandboxStatus::Stopped).await;
-                } else {
-                    rollback_created_named_volumes(local_backend, &created_named_volumes).await;
-                    let _ = delete_sandbox_record(write_db, sandbox_id).await;
-                }
-                return Err(crate::MicrosandboxError::InvalidConfig(format!(
-                    "workdir is not a directory in guest: {workdir}"
-                )));
-            }
-            Err(_) => {
-                let _ = sandbox.stop().await;
-                if created_named_volumes.is_empty() {
-                    let _ =
-                        update_sandbox_status(write_db, sandbox_id, SandboxStatus::Stopped).await;
-                } else {
-                    rollback_created_named_volumes(local_backend, &created_named_volumes).await;
-                    let _ = delete_sandbox_record(write_db, sandbox_id).await;
-                }
-                return Err(crate::MicrosandboxError::InvalidConfig(format!(
-                    "workdir does not exist in guest: {workdir}"
-                )));
-            }
-        }
-    }
-
-    Ok(sandbox)
-}
-
-/// Local start path. Returns a complete [`Sandbox`] wrapping the supplied
-/// backend Arc.
-pub(crate) async fn start_local(
-    backend: Arc<dyn crate::backend::Backend>,
-    name: &str,
-    mode: SpawnMode,
-) -> MicrosandboxResult<Sandbox> {
-    tracing::debug!(sandbox = name, ?mode, "start_local: loading record");
-    let local_backend =
-        backend
-            .as_local()
-            .ok_or_else(|| crate::MicrosandboxError::Unsupported {
-                feature: "start_local".into(),
-                available_when: "with a LocalBackend".into(),
-            })?;
-    let pools = local_backend.db().await?;
-    let write_db = pools.write();
-    let model = load_sandbox_record_reconciled(pools, name).await?;
-    tracing::debug!(sandbox = name, status = ?model.status, "start_local: current status");
-
-    if model.status == SandboxStatus::Running || model.status == SandboxStatus::Draining {
-        return Err(crate::MicrosandboxError::SandboxStillRunning(format!(
-            "cannot start sandbox '{name}': already running"
-        )));
-    }
-
-    if model.status != SandboxStatus::Stopped && model.status != SandboxStatus::Crashed {
-        return Err(crate::MicrosandboxError::Custom(format!(
-            "cannot start sandbox '{name}': status is {:?} (expected Stopped or Crashed)",
-            model.status
-        )));
-    }
-
-    let mut config: SandboxConfig = serde_json::from_str(&model.config)?;
-    config.apply_runtime_defaults();
-    validate_sandbox_name_for_runtime_with_backend(local_backend, &config.spec.name)?;
-    validate_hostname(config.spec.runtime.hostname.as_deref())?;
-    validate_rootfs_source(&config.spec.image)?;
-    validate_env(&config.spec.env)?;
-    validate_labels(&config.spec.labels)?;
-    types::validate_volume_mounts(&config.spec.mounts)?;
-    validate_start_state(
-        local_backend,
-        &config,
-        &local_backend.sandboxes_dir().join(name),
-    )?;
-    update_sandbox_status(write_db, model.id, SandboxStatus::Running).await?;
-
-    match create_inner_local(local_backend, config, model.id, mode).await {
-        Ok((local_state, returned_config)) => {
-            Ok(Sandbox::from_local(backend, local_state, returned_config))
-        }
-        Err(err) => {
-            let _ = update_sandbox_status(write_db, model.id, SandboxStatus::Stopped).await;
-            Err(err)
-        }
-    }
-}
-
-/// Inner local create logic separated for error-cleanup wrapper. Returns
-/// the local-variant state plus the (possibly mutated) config.
-async fn create_inner_local(
-    local: &crate::backend::LocalBackend,
-    config: SandboxConfig,
-    sandbox_id: i32,
-    mode: SpawnMode,
-) -> MicrosandboxResult<(crate::backend::SandboxLocalState, SandboxConfig)> {
-    let (mut handle, agent_sock_path) = spawn_sandbox(local, &config, sandbox_id, mode).await?;
-    let log_dir = local.sandboxes_dir().join(&config.spec.name).join("logs");
-
-    // Wait for the relay socket to become available.
-    let client = wait_for_relay(&agent_sock_path, &log_dir, &mut handle, &config.spec.name).await?;
-
-    if let Ok(ready) = client.ready() {
-        tracing::info!(
-            boot_time_ms = ready.boot_time_ns / 1_000_000,
-            init_time_ms = ready.init_time_ns / 1_000_000,
-            ready_time_ms = ready.ready_time_ns / 1_000_000,
-            "sandbox ready",
-        );
-    }
-    let handle = if matches!(mode, SpawnMode::Detached) {
-        handle.disarm();
-        None
-    } else {
-        Some(Arc::new(Mutex::new(handle)))
-    };
-
-    Ok((
-        crate::backend::SandboxLocalState {
-            db_id: sandbox_id,
-            handle,
-            client: Arc::new(client),
-        },
-        config,
-    ))
-}
-
-/// Load the local DB row + active PID for a sandbox handle. Called from the
-/// `SandboxBackend::get` impl on `LocalBackend`.
-pub(crate) async fn get_local_handle_state(
-    local_backend: &crate::backend::LocalBackend,
-    name: &str,
-) -> MicrosandboxResult<(sandbox_entity::Model, Option<i32>)> {
-    let pools = local_backend.db().await?;
-    let model = sandbox_entity::Entity::find()
-        .filter(sandbox_entity::Column::Name.eq(name))
-        .one(pools.read())
-        .await?
-        .ok_or_else(|| crate::MicrosandboxError::SandboxNotFound(name.into()))?;
-    let model = reconcile_sandbox_runtime_state(pools, model).await?;
-    let run = load_active_run(pools.read(), model.id).await?;
-    let pid = pid_from_run(run.as_ref());
-    Ok((model, pid))
-}
-
-/// Load all local DB rows + their active PIDs. Called from the
-/// `SandboxBackend::list` impl on `LocalBackend`.
-pub(crate) async fn list_local_handle_state(
-    local_backend: &crate::backend::LocalBackend,
-) -> MicrosandboxResult<Vec<(sandbox_entity::Model, Option<i32>)>> {
-    let pools = local_backend.db().await?;
-    let sandboxes = sandbox_entity::Entity::find()
-        .order_by_desc(sandbox_entity::Column::CreatedAt)
-        .all(pools.read())
-        .await?;
-
-    let mut reconciled = Vec::with_capacity(sandboxes.len());
-    for sandbox in sandboxes {
-        let model = reconcile_sandbox_runtime_state(pools, sandbox).await?;
-        reconciled.push(model);
-    }
-
-    let sandbox_ids: Vec<i32> = reconciled.iter().map(|sandbox| sandbox.id).collect();
-    let active_pids = load_active_pids(pools.read(), &sandbox_ids).await?;
-    let mut out = Vec::with_capacity(reconciled.len());
-    for sandbox in reconciled {
-        let pid = active_pids.get(&sandbox.id).copied();
-        out.push((sandbox, pid));
-    }
-    Ok(out)
-}
-
-/// Local lifecycle: remove a stopped sandbox by name.
-pub(crate) async fn remove_local(
-    backend: Arc<dyn crate::backend::Backend>,
-    name: &str,
-) -> MicrosandboxResult<()> {
-    let local_backend =
-        backend
-            .as_local()
-            .ok_or_else(|| crate::MicrosandboxError::Unsupported {
-                feature: "remove_local".into(),
-                available_when: "with a LocalBackend".into(),
-            })?;
-    let (model, pid) = get_local_handle_state(local_backend, name).await?;
-    let handle = SandboxHandle::from_local_model(backend, model, pid);
-    handle.remove().await
-}
-
-/// Local lifecycle: stop a sandbox by name.
-///
-/// Tries the configured agent relay socket candidates, connects, sends
-/// `MessageType::Shutdown`, and lets agentd run an in-guest `sync()` +
-/// `reboot(RB_POWER_OFF)` so ext4 unmounts cleanly (no journal replay on next
-/// boot). Falls back to platform process termination via PID if the agent
-/// endpoint is unreachable (agentd wedged, sandbox just transitioning, etc.).
-///
-/// No-op when the sandbox isn't in Running/Draining.
-pub(crate) async fn stop_local(
-    backend: Arc<dyn crate::backend::Backend>,
-    name: &str,
-) -> MicrosandboxResult<()> {
-    let local_backend =
-        backend
-            .as_local()
-            .ok_or_else(|| crate::MicrosandboxError::Unsupported {
-                feature: "stop_local".into(),
-                available_when: "with a LocalBackend".into(),
-            })?;
-    let (model, pid) = get_local_handle_state(local_backend, name).await?;
-    if model.status != SandboxStatus::Running && model.status != SandboxStatus::Draining {
-        return Ok(());
-    }
-
-    if model.status == SandboxStatus::Running {
-        update_sandbox_status(
-            local_backend.db().await?.write(),
-            model.id,
-            SandboxStatus::Draining,
-        )
-        .await?;
-    }
-
-    match request_agent_shutdown(local_backend, name).await {
-        Ok(()) => Ok(()),
-        Err(e) => {
-            // Graceful degradation: agent endpoint unreachable (socket/pipe
-            // missing, ECONNREFUSED, handshake timeout) or shutdown delivery
-            // failed. Fall back to direct process termination so we still
-            // attempt a stop, at the cost of skipping the in-guest sync().
-            // The reaper updates DB status on PID exit.
-            tracing::warn!(
-                sandbox = %name,
-                error = %e,
-                "stop_local: agent endpoint unreachable; falling back to process termination",
-            );
-            if let Some(pid) = pid.filter(|p| pid_is_alive(*p)) {
-                terminate_pid_gracefully(pid)?;
-            }
-            Ok(())
-        }
-    }
-}
-
-/// Local lifecycle: kill a sandbox by name (SIGKILL).
-///
-/// Destructive by design — no clean-shutdown path. Signals SIGKILL to the
-/// libkrun PID, waits briefly for the process to exit, then marks the DB
-/// row Stopped if all signalled PIDs are confirmed dead.
-pub(crate) async fn kill_local(
-    backend: Arc<dyn crate::backend::Backend>,
-    name: &str,
-) -> MicrosandboxResult<()> {
-    let local_backend =
-        backend
-            .as_local()
-            .ok_or_else(|| crate::MicrosandboxError::Unsupported {
-                feature: "kill_local".into(),
-                available_when: "with a LocalBackend".into(),
-            })?;
-    let (model, pid) = get_local_handle_state(local_backend, name).await?;
-    if model.status != SandboxStatus::Running && model.status != SandboxStatus::Draining {
-        return Ok(());
-    }
-
-    let mut pids = Vec::new();
-    if let Some(pid) = pid.filter(|p| pid_is_alive(*p)) {
-        kill_pid(pid)?;
-        pids.push(pid);
-    }
-
-    if !pids.is_empty() {
-        let timeout = std::time::Duration::from_secs(5);
-        let start = std::time::Instant::now();
-        let poll_interval = std::time::Duration::from_millis(50);
-        while start.elapsed() < timeout {
-            if pids.iter().all(|pid| pid_is_dead_or_reaped(*pid)) {
-                break;
-            }
-            tokio::time::sleep(poll_interval).await;
-        }
-    }
-
-    let all_dead = pids.is_empty() || pids.iter().all(|pid| pid_is_dead_or_reaped(*pid));
-    if all_dead {
-        let db = local_backend.db().await?.write();
-        if let Err(e) = update_sandbox_status(db, model.id, SandboxStatus::Stopped).await {
-            tracing::warn!(sandbox = %name, error = %e, "failed to update sandbox status after kill");
-        }
-    }
-
-    Ok(())
-}
-
-/// Local lifecycle: drain a running sandbox by name.
-///
-/// Unix keeps the legacy SIGUSR1 drain path. Windows uses the existing
-/// `core.shutdown` agent message so the guest can sync and power off without
-/// pretending a direct process termination is graceful.
-pub(crate) async fn drain_local(
-    backend: Arc<dyn crate::backend::Backend>,
-    name: &str,
-) -> MicrosandboxResult<()> {
-    let local_backend =
-        backend
-            .as_local()
-            .ok_or_else(|| crate::MicrosandboxError::Unsupported {
-                feature: "drain_local".into(),
-                available_when: "with a LocalBackend".into(),
-            })?;
-    let (model, pid) = get_local_handle_state(local_backend, name).await?;
-    if model.status != SandboxStatus::Running && model.status != SandboxStatus::Draining {
-        return Ok(());
-    }
-
-    if model.status == SandboxStatus::Running {
-        update_sandbox_status(
-            local_backend.db().await?.write(),
-            model.id,
-            SandboxStatus::Draining,
-        )
-        .await?;
-    }
-
-    #[cfg(windows)]
-    {
-        if pid.is_some_and(pid_is_alive) {
-            request_agent_shutdown(local_backend, name).await.map_err(|err| {
-                crate::MicrosandboxError::Runtime(format!(
-                    "windows drain requires the agent shutdown path, but the agent endpoint is unavailable: {err}"
-                ))
-            })?;
-        }
-        return Ok(());
-    }
-
-    #[cfg(unix)]
-    {
-        if let Some(pid) = pid.filter(|p| pid_is_alive(*p)) {
-            drain_pid(pid)?;
-        }
-        Ok(())
-    }
-}
-
-async fn request_agent_shutdown(
-    local_backend: &crate::backend::LocalBackend,
-    name: &str,
-) -> MicrosandboxResult<()> {
-    let client =
-        fs::local::connect_agent_with_timeout(local_backend, name, AGENT_SHUTDOWN_CONNECT_TIMEOUT)
-            .await?;
-    client.send(0, MessageType::Shutdown, &()).await?;
-    Ok(())
+    crate::MicrosandboxError::Runtime(format!("agent returned {} to {operation}", msg.t.as_str()))
 }
 
 //--------------------------------------------------------------------------------------------------
@@ -1042,22 +581,14 @@ impl Sandbox {
     /// `Unsupported` error on cloud — the previous `self`-by-value
     /// signature consumed the sandbox even on the failing path.
     pub async fn remove_persisted(&self) -> MicrosandboxResult<()> {
-        let local = self.require_local("remove_persisted")?;
-        let local_backend =
-            self.backend
-                .as_local()
-                .ok_or_else(|| crate::MicrosandboxError::Unsupported {
-                    feature: "Sandbox::remove_persisted on cloud".into(),
-                    available_when: "never — cloud sandboxes are removed via the API".into(),
-                })?;
-        let pools = local_backend.db().await?;
-
-        remove_dir_if_exists(&local_backend.sandboxes_dir().join(&self.name))?;
-        sandbox_entity::Entity::delete_by_id(local.db_id)
-            .exec(pools.write())
-            .await?;
-
-        Ok(())
+        let local = self.require_local(Operation::SandboxRemovePersisted)?;
+        let local_backend = self.backend.as_local().ok_or_else(|| {
+            crate::MicrosandboxError::unsupported(
+                Operation::SandboxRemovePersisted,
+                UnsupportedReason::UseInstead(Operation::SandboxRemove),
+            )
+        })?;
+        remove_local_persisted_sandbox(local_backend, &self.name, local.db_id).await
     }
 
     /// Unique name identifying this sandbox.
@@ -1069,6 +600,15 @@ impl Sandbox {
     /// memory, env, mounts, etc.).
     pub fn config(&self) -> &SandboxConfig {
         &self.config
+    }
+
+    /// Start planning a sandbox modification.
+    ///
+    /// The returned builder owns the canonical SDK patch and dry-run
+    /// classification logic. It does not apply changes until later modify
+    /// phases wire the same plan model into persistence and runtime control.
+    pub fn modify(&self) -> SandboxModificationBuilder {
+        SandboxModificationBuilder::new(self.backend.clone(), self.name.clone())
     }
 
     /// Which backend variant this sandbox is bound to. Returns `Local` or
@@ -1106,13 +646,10 @@ impl Sandbox {
     /// for cloud sandboxes. Used by methods that have no cloud equivalent yet.
     fn require_local(
         &self,
-        method: &'static str,
+        op: Operation,
     ) -> MicrosandboxResult<&crate::backend::SandboxLocalState> {
         self.local()
-            .ok_or_else(|| crate::MicrosandboxError::Unsupported {
-                feature: format!("Sandbox::{method}"),
-                available_when: "when cloud exec/fs/logs/metrics land".into(),
-            })
+            .ok_or_else(|| crate::MicrosandboxError::local_only(op))
     }
 
     /// Live status from the backend. Always hits `backend.sandboxes().get(name)`
@@ -1121,7 +658,7 @@ impl Sandbox {
     ///
     /// Each call is a separate round-trip (DB read for local, HTTP GET for
     /// cloud). If you need to read multiple fields together (e.g. status +
-    /// last_error), call [`Sandbox::get`](Self::get) once and read off the
+    /// last failure message), call [`Sandbox::get`](Self::get) once and read off the
     /// returned [`SandboxHandle`]'s `*_snapshot` accessors instead.
     pub async fn status(&self) -> MicrosandboxResult<SandboxStatus> {
         let handle = self
@@ -1132,19 +669,19 @@ impl Sandbox {
         Ok(handle.status_snapshot())
     }
 
-    /// Live last-error string from the backend, when any. Always hits the
+    /// Live failure message from the backend, when any. Always hits the
     /// backend, never reads a cached field.
     ///
     /// Each call is a separate round-trip. If you need this alongside
     /// `status()`, fetch a fresh [`SandboxHandle`] via
     /// [`Sandbox::get`](Self::get) once and read both off the snapshot.
-    pub async fn last_error(&self) -> MicrosandboxResult<Option<String>> {
+    pub async fn last_failure_message(&self) -> MicrosandboxResult<Option<String>> {
         let handle = self
             .backend
             .sandboxes()
             .get(self.backend.clone(), &self.name)
             .await?;
-        Ok(handle.last_error_snapshot())
+        Ok(handle.last_failure_message_snapshot())
     }
 
     /// Read captured output from `exec.log` for this sandbox.
@@ -1173,6 +710,41 @@ impl Sandbox {
             .sandboxes()
             .log_stream(self.backend.clone(), &self.name, opts)
             .await
+    }
+
+    /// A local logger handle over this sandbox's on-disk logs.
+    ///
+    /// Used directly, followed streams each own a private filesystem watcher.
+    /// Register it with a [`LogRegistry`](crate::logs::LogRegistry) to share a
+    /// single watcher across many sandboxes. Cloud logs have no host directory
+    /// and continue to use [`log_stream`](Self::log_stream) over SSE.
+    pub fn logger(&self) -> MicrosandboxResult<crate::logs::SandboxLogger> {
+        self.require_local(Operation::SandboxLogger)?;
+        let local = self
+            .backend
+            .as_local()
+            .ok_or_else(|| crate::MicrosandboxError::local_only(Operation::SandboxLogger))?;
+        let log_dir = crate::logs::log_dir_for_local(local, &self.name);
+        Ok(crate::logs::SandboxLogger::new(self.name.clone(), log_dir))
+    }
+
+    /// Check whether agentd is reachable without refreshing the sandbox idle timer.
+    ///
+    /// Local backend only. The request uses `core.ping` and returns the SDK-measured
+    /// round-trip latency. If the sandbox runtime predates protocol generation 6,
+    /// this fails before any bytes are sent with an unsupported-operation error.
+    pub async fn ping(&self) -> MicrosandboxResult<SandboxPingResult> {
+        self.require_local(Operation::SandboxPing)?;
+        ping_agent(&self.name, self.client()).await
+    }
+
+    /// Explicitly refresh the sandbox idle timer.
+    ///
+    /// Local backend only. The request uses `core.touch`, so callers can keep a
+    /// sandbox alive intentionally without relying on unrelated agent traffic.
+    pub async fn touch(&self) -> MicrosandboxResult<SandboxTouchResult> {
+        self.require_local(Operation::SandboxTouch)?;
+        touch_agent(&self.name, self.client()).await
     }
 
     /// Low-level access to the guest agent client.
@@ -1218,8 +790,9 @@ impl Sandbox {
     /// trait per-method, so this constructor is infallible. On cloud each
     /// op returns `Unsupported` until cloud guest-fs lands; on local each
     /// op routes through the agent protocol (`core.fs.*`).
-    pub fn fs(&self) -> fs::SandboxFs<'_> {
-        fs::SandboxFs::new(self.backend.clone(), &self.name)
+    pub fn fs(&self) -> fs::SandboxFsOps<'_> {
+        let client = self.local().map(|local| Arc::clone(&local.client));
+        fs::SandboxFsOps::new(self.backend.clone(), &self.name, client)
     }
 
     /// Stop the sandbox gracefully and wait until stopped state is observed.
@@ -1280,7 +853,7 @@ impl Sandbox {
     /// **Local backend only.** Cloud sandboxes have no host process to wait
     /// on; use [`stop`](Self::stop) and poll [`status`](Self::status) instead.
     pub async fn stop_and_wait(&self) -> MicrosandboxResult<ExitStatus> {
-        let local = self.require_local("stop_and_wait")?;
+        let local = self.require_local(Operation::SandboxStopAndWait)?;
         let stop_result = self.request_stop().await;
         if local.handle.is_none() {
             stop_result?;
@@ -1342,7 +915,7 @@ impl Sandbox {
 
     /// Wait for the sandbox process to exit. **Local backend only.**
     pub async fn wait(&self) -> MicrosandboxResult<ExitStatus> {
-        let local = self.require_local("wait")?;
+        let local = self.require_local(Operation::SandboxWait)?;
         match &local.handle {
             Some(h) => h.lock().await.wait().await,
             None => Err(crate::MicrosandboxError::Runtime(
@@ -1358,12 +931,20 @@ impl Sandbox {
             return Ok(stop_result_from_exit_status(&self.name, status));
         }
 
-        self.backend
+        match self
+            .backend
             .sandboxes()
             .get(self.backend.clone(), &self.name)
-            .await?
-            .wait_until_stopped()
             .await
+        {
+            Ok(handle) => handle.wait_until_stopped().await,
+            Err(error)
+                if self.is_local_ephemeral() && sandbox_not_found_for_name(&error, &self.name) =>
+            {
+                Ok(ephemeral_cleanup_stop_result(&self.name))
+            }
+            Err(error) => Err(error),
+        }
     }
 
     /// Detach this handle without stopping the sandbox.
@@ -1381,6 +962,19 @@ impl Sandbox {
         // Normal drop runs — client reader task is aborted and
         // ProcessHandle drops without sending SIGTERM.
     }
+
+    fn is_local_ephemeral(&self) -> bool {
+        self.local().is_some() && self.config.spec.lifecycle.ephemeral
+    }
+
+    fn resolve_default_command(&self) -> MicrosandboxResult<microsandbox_types::ResolvedCommand> {
+        microsandbox_types::resolve_default_command(
+            self.config.spec.runtime.entrypoint.as_deref(),
+            self.config.spec.runtime.cmd.as_deref(),
+            None,
+        )
+        .map_err(Into::into)
+    }
 }
 
 //--------------------------------------------------------------------------------------------------
@@ -1388,6 +982,64 @@ impl Sandbox {
 //--------------------------------------------------------------------------------------------------
 
 impl Sandbox {
+    /// Execute the sandbox's effective OCI entrypoint and CMD and return a streaming handle.
+    pub async fn exec_default_stream(&self) -> MicrosandboxResult<ExecHandle> {
+        self.exec_default_stream_with(|options| options).await
+    }
+
+    /// Execute the sandbox's effective OCI entrypoint and CMD with full streaming options.
+    ///
+    /// Arguments configured through the options builder are appended after the resolved default
+    /// argv. They are execution arguments, not an OCI CMD override.
+    pub async fn exec_default_stream_with(
+        &self,
+        f: impl FnOnce(ExecOptionsBuilder) -> ExecOptionsBuilder,
+    ) -> MicrosandboxResult<ExecHandle> {
+        let command = self.resolve_default_command()?;
+        let opts = f(ExecOptionsBuilder::default())
+            .prepend_args(command.args)
+            .build()?;
+        self.backend
+            .sandboxes()
+            .exec_stream(
+                self.backend.clone(),
+                &self.name,
+                &self.config,
+                command.program,
+                opts,
+            )
+            .await
+    }
+
+    /// Execute the sandbox's effective OCI entrypoint and CMD and wait for completion.
+    pub async fn exec_default(&self) -> MicrosandboxResult<ExecOutput> {
+        self.exec_default_with(|options| options).await
+    }
+
+    /// Execute the sandbox's effective OCI entrypoint and CMD with full options.
+    ///
+    /// Arguments configured through the options builder are appended after the resolved default
+    /// argv. They are execution arguments, not an OCI CMD override.
+    pub async fn exec_default_with(
+        &self,
+        f: impl FnOnce(ExecOptionsBuilder) -> ExecOptionsBuilder,
+    ) -> MicrosandboxResult<ExecOutput> {
+        let command = self.resolve_default_command()?;
+        let opts = f(ExecOptionsBuilder::default())
+            .prepend_args(command.args)
+            .build()?;
+        self.backend
+            .sandboxes()
+            .exec(
+                self.backend.clone(),
+                &self.name,
+                &self.config,
+                command.program,
+                opts,
+            )
+            .await
+    }
+
     /// Execute a command and return a streaming handle.
     ///
     /// ```ignore
@@ -1585,6 +1237,33 @@ impl Sandbox {
 //--------------------------------------------------------------------------------------------------
 
 impl Sandbox {
+    /// Attach to the sandbox's effective OCI entrypoint and CMD.
+    pub async fn attach_default(&self) -> MicrosandboxResult<i32> {
+        self.attach_default_with(|options| options).await
+    }
+
+    /// Attach to the sandbox's effective OCI entrypoint and CMD with full options.
+    ///
+    /// Arguments configured through the options builder are appended after the resolved default
+    /// argv. They are execution arguments, not an OCI CMD override.
+    pub async fn attach_default_with(
+        &self,
+        f: impl FnOnce(AttachOptionsBuilder) -> AttachOptionsBuilder,
+    ) -> MicrosandboxResult<i32> {
+        let command = self.resolve_default_command()?;
+        let builder = f(AttachOptionsBuilder::default()).prepend_args(command.args);
+        self.backend
+            .sandboxes()
+            .attach(
+                self.backend.clone(),
+                &self.name,
+                &self.config,
+                command.program,
+                builder,
+            )
+            .await
+    }
+
     /// Attach to the sandbox with an interactive terminal session.
     ///
     /// ```ignore
@@ -1662,136 +1341,6 @@ impl Sandbox {
 //--------------------------------------------------------------------------------------------------
 // Functions
 //--------------------------------------------------------------------------------------------------
-
-/// Wait for the agent relay socket to become available and connect.
-///
-/// The sandbox process creates the relay socket asynchronously during startup.
-/// This function retries the connection with brief delays until it succeeds
-/// or a timeout is reached.
-async fn wait_for_relay(
-    sock_path: &std::path::Path,
-    log_dir: &std::path::Path,
-    handle: &mut ProcessHandle,
-    sandbox_name: &str,
-) -> MicrosandboxResult<AgentClient> {
-    tracing::debug!(
-        sock = %sock_path.display(),
-        pid = handle.pid(),
-        "wait_for_relay: waiting for agent socket"
-    );
-    let deadline = tokio::time::Instant::now() + AGENT_RELAY_READY_TIMEOUT;
-    let max_backoff = std::time::Duration::from_millis(10);
-    let mut backoff = std::time::Duration::from_millis(1);
-    let mut attempts = 0u32;
-
-    loop {
-        attempts += 1;
-        match tokio::time::timeout(
-            deadline.saturating_duration_since(tokio::time::Instant::now()),
-            AgentClient::connect(sock_path),
-        )
-        .await
-        {
-            Ok(Ok(client)) => {
-                tracing::debug!(attempts, "wait_for_relay: connected");
-                // The relay is up — clear any stale boot-error.json from
-                // a previous failed attempt so it cannot misattribute a
-                // future crash.
-                let _ = microsandbox_runtime::boot_error::BootError::delete(log_dir);
-                return Ok(client);
-            }
-            Ok(Err(_)) | Err(_) if tokio::time::Instant::now() < deadline => {
-                // Check if the sandbox process is still alive before retrying.
-                // If it crashed, there's no point waiting for the socket.
-                if let Some(status) = handle.try_wait()? {
-                    tracing::debug!(attempts, ?status, "wait_for_relay: sandbox process exited");
-
-                    // Prefer the structured boot-error record if the
-                    // sandbox got far enough to write one.
-                    if let Some(boot_err) = read_boot_error(log_dir) {
-                        return Err(crate::MicrosandboxError::BootStart {
-                            name: sandbox_name.to_string(),
-                            err: boot_err,
-                        });
-                    }
-
-                    // No structured boot-error.json — the sandbox died
-                    // too early or too violently (e.g. a Rust panic exits
-                    // 101 without running our atomic-writer). Synthesize
-                    // an `Other`-stage record so the CLI still renders
-                    // the styled error block with the `msb logs` hint
-                    // instead of dumping a raw log directory path.
-                    let synthetic = microsandbox_runtime::boot_error::BootError {
-                        t: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
-                        stage: microsandbox_runtime::boot_error::BootErrorStage::Other,
-                        errno: None,
-                        message: format!(
-                            "sandbox process exited ({status}) before agent relay became available"
-                        ),
-                    };
-                    return Err(crate::MicrosandboxError::BootStart {
-                        name: sandbox_name.to_string(),
-                        err: synthetic,
-                    });
-                }
-
-                // Keep early retries tight so relay readiness doesn't inherit a
-                // coarse fixed delay on warm starts.
-                tokio::time::sleep(backoff).await;
-                backoff = std::cmp::min(backoff.saturating_mul(2), max_backoff);
-            }
-            Ok(Err(e)) => {
-                tracing::debug!(
-                    attempts,
-                    error = %e,
-                    "wait_for_relay: agent connection failed"
-                );
-                if let Some(boot_err) = read_boot_error(log_dir) {
-                    return Err(crate::MicrosandboxError::BootStart {
-                        name: sandbox_name.to_string(),
-                        err: boot_err,
-                    });
-                }
-                return Err(e.into());
-            }
-            Err(e) => {
-                tracing::debug!(
-                    attempts,
-                    error = %e,
-                    "wait_for_relay: timed out"
-                );
-                // Even when the process is still running, the sandbox
-                // may have written a structured boot-error before
-                // stalling (e.g. agentd reported a recoverable failure
-                // and never produced the handshake bytes). Prefer that
-                // typed record over the raw IO/timeout error so the CLI
-                // can render the styled boot-error block.
-                if let Some(boot_err) = read_boot_error(log_dir) {
-                    return Err(crate::MicrosandboxError::BootStart {
-                        name: sandbox_name.to_string(),
-                        err: boot_err,
-                    });
-                }
-                return Err(crate::MicrosandboxError::Runtime(format!(
-                    "timed out waiting for agent relay: {e}"
-                )));
-            }
-        }
-    }
-}
-
-/// Read `boot-error.json` from `log_dir` if present and parseable.
-///
-/// Returns `None` when the directory is unknown, the file is missing, or
-/// the contents cannot be deserialized — callers fall back to a raw
-/// error in those cases.
-fn read_boot_error(
-    log_dir: &std::path::Path,
-) -> Option<microsandbox_runtime::boot_error::BootError> {
-    microsandbox_runtime::boot_error::BootError::read(log_dir)
-        .ok()
-        .flatten()
-}
 
 /// Build an `ExecRequest` by merging sandbox config with caller-provided overrides.
 #[allow(clippy::too_many_arguments)]
@@ -1927,274 +1476,19 @@ fn stop_result_from_exit_status(name: &str, status: ExitStatus) -> SandboxStopRe
     }
 }
 
-/// Update the sandbox status in the database.
-pub(super) async fn update_sandbox_status(
-    db: &DbWriteConnection,
-    sandbox_id: i32,
-    status: SandboxStatus,
-) -> MicrosandboxResult<()> {
-    db.transaction(|txn| async move {
-        sandbox_entity::Entity::update_many()
-            .col_expr(sandbox_entity::Column::Status, Expr::value(status))
-            .col_expr(
-                sandbox_entity::Column::UpdatedAt,
-                Expr::value(chrono::Utc::now().naive_utc()),
-            )
-            .filter(sandbox_entity::Column::Id.eq(sandbox_id))
-            .exec(&txn)
-            .await?;
-        Ok((txn, ()))
-    })
-    .await
-}
-
-// Stale-sandbox reaping is no longer owned by the SDK/CLI. Host runtime
-// processes (`msb sandbox`) now perform lifecycle maintenance: stale active
-// reconciliation and terminal ephemeral cleanup, on startup under a
-// read-gated DB lease (see `microsandbox_runtime::maintenance`). The lazy
-// read-time reconciliation in `reconcile_sandbox_runtime_state` below still
-// keeps `get`/`list`/`start` honest for the row they touch.
-
-//--------------------------------------------------------------------------------------------------
-// Functions: State Reconciliation
-//--------------------------------------------------------------------------------------------------
-
-pub(super) async fn load_sandbox_record_reconciled(
-    pools: &DbPools,
-    name: &str,
-) -> MicrosandboxResult<sandbox_entity::Model> {
-    let sandbox = load_sandbox_record(pools.read(), name).await?;
-    reconcile_sandbox_runtime_state(pools, sandbox).await
-}
-
-pub(super) async fn reconcile_sandbox_runtime_state(
-    pools: &DbPools,
-    sandbox: sandbox_entity::Model,
-) -> MicrosandboxResult<sandbox_entity::Model> {
-    if !matches!(
-        sandbox.status,
-        SandboxStatus::Running | SandboxStatus::Draining
-    ) {
-        return Ok(sandbox);
-    }
-
-    let run = load_active_run(pools.read(), sandbox.id).await?;
-
-    // No run record yet — the sandbox is still starting up (the child
-    // process has not inserted its PID). Skip reconciliation to avoid
-    // racing with create/start.
-    let Some(run) = run else {
-        return Ok(sandbox);
-    };
-
-    if run.pid.is_some_and(pid_is_alive) {
-        return Ok(sandbox);
-    }
-
-    let (terminal_status, reason) = stale_runtime_terminal_state(sandbox.status);
-    mark_sandbox_runtime_stale(
-        pools.write(),
-        sandbox.id,
-        Some(run.id),
-        terminal_status,
-        reason,
-    )
-    .await?;
-
-    sandbox_entity::Entity::find_by_id(sandbox.id)
-        .one(pools.read())
-        .await?
-        .ok_or_else(|| crate::MicrosandboxError::SandboxNotFound(sandbox.name))
-}
-
-pub(super) async fn load_active_run(
-    db: &DbReadConnection,
-    sandbox_id: i32,
-) -> MicrosandboxResult<Option<run_entity::Model>> {
-    run_entity::Entity::find()
-        .filter(run_entity::Column::SandboxId.eq(sandbox_id))
-        .filter(run_entity::Column::Status.eq(run_entity::RunStatus::Running))
-        .order_by_desc(run_entity::Column::StartedAt)
-        .one(db)
-        .await
-        .map_err(Into::into)
-}
-
-async fn load_active_pids(
-    db: &DbReadConnection,
-    sandbox_ids: &[i32],
-) -> MicrosandboxResult<HashMap<i32, i32>> {
-    if sandbox_ids.is_empty() {
-        return Ok(HashMap::new());
-    }
-
-    let runs = run_entity::Entity::find()
-        .filter(run_entity::Column::SandboxId.is_in(sandbox_ids.iter().copied()))
-        .filter(run_entity::Column::Status.eq(run_entity::RunStatus::Running))
-        .order_by_desc(run_entity::Column::StartedAt)
-        .all(db)
-        .await?;
-
-    let mut pids = HashMap::with_capacity(sandbox_ids.len());
-    for run in runs {
-        if pids.contains_key(&run.sandbox_id) {
-            continue;
-        }
-        if let Some(pid) = pid_from_run(Some(&run)) {
-            pids.insert(run.sandbox_id, pid);
-        }
-    }
-
-    Ok(pids)
-}
-
-fn pid_from_run(run: Option<&run_entity::Model>) -> Option<i32> {
-    run.and_then(|model| model.pid)
-        .filter(|pid| pid_is_alive(*pid))
-}
-
-fn stale_runtime_terminal_state(
-    status: SandboxStatus,
-) -> (SandboxStatus, run_entity::TerminationReason) {
-    match status {
-        // Draining means a stop/drain request was already accepted. If the
-        // owning runtime is now gone, the lifecycle reached its requested
-        // terminal state even when the original observer could not reap it.
-        SandboxStatus::Draining => (
-            SandboxStatus::Stopped,
-            run_entity::TerminationReason::ShutdownRequested,
-        ),
-        _ => (
-            SandboxStatus::Crashed,
-            run_entity::TerminationReason::InternalError,
-        ),
+pub(super) fn ephemeral_cleanup_stop_result(name: &str) -> SandboxStopResult {
+    SandboxStopResult {
+        name: name.to_string(),
+        status: SandboxStatus::Stopped,
+        exit_code: None,
+        signal: None,
+        observed_at: chrono::Utc::now(),
+        source: Some("ephemeral cleanup removed persisted state".to_string()),
     }
 }
 
-async fn mark_sandbox_runtime_stale(
-    db: &DbWriteConnection,
-    sandbox_id: i32,
-    run_id: Option<i32>,
-    terminal_status: SandboxStatus,
-    reason: run_entity::TerminationReason,
-) -> MicrosandboxResult<()> {
-    db.transaction(|txn| async move {
-        let now = chrono::Utc::now().naive_utc();
-
-        if let Some(run_id) = run_id {
-            run_entity::Entity::update_many()
-                .col_expr(
-                    run_entity::Column::Status,
-                    Expr::value(run_entity::RunStatus::Terminated),
-                )
-                .col_expr(run_entity::Column::TerminationReason, Expr::value(reason))
-                .col_expr(run_entity::Column::TerminatedAt, Expr::value(now))
-                .filter(run_entity::Column::Id.eq(run_id))
-                .exec(&txn)
-                .await?;
-        }
-
-        // Only reconcile an active row. This prevents a concurrent start()
-        // from having its newly-terminal or newly-running status overwritten.
-        sandbox_entity::Entity::update_many()
-            .col_expr(sandbox_entity::Column::Status, Expr::value(terminal_status))
-            .col_expr(sandbox_entity::Column::UpdatedAt, Expr::value(now))
-            .filter(sandbox_entity::Column::Id.eq(sandbox_id))
-            .filter(
-                sandbox_entity::Column::Status
-                    .is_in([SandboxStatus::Running, SandboxStatus::Draining]),
-            )
-            .exec(&txn)
-            .await?;
-
-        Ok((txn, ()))
-    })
-    .await
-}
-
-pub(super) fn pid_is_alive(pid: i32) -> bool {
-    microsandbox_utils::process::pid_is_alive(pid)
-}
-
-#[cfg(unix)]
-fn pid_is_dead_or_reaped(pid: i32) -> bool {
-    let mut status = 0;
-    let result = unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) };
-    if result == pid {
-        return true;
-    }
-
-    !pid_is_alive(pid)
-}
-
-#[cfg(windows)]
-fn pid_is_dead_or_reaped(pid: i32) -> bool {
-    !pid_is_alive(pid)
-}
-
-#[cfg(unix)]
-fn terminate_pid_gracefully(pid: i32) -> MicrosandboxResult<()> {
-    nix::sys::signal::kill(
-        nix::unistd::Pid::from_raw(pid),
-        nix::sys::signal::Signal::SIGTERM,
-    )?;
-    Ok(())
-}
-
-#[cfg(windows)]
-fn terminate_pid_gracefully(pid: i32) -> MicrosandboxResult<()> {
-    terminate_pid(pid)
-}
-
-#[cfg(unix)]
-fn kill_pid(pid: i32) -> MicrosandboxResult<()> {
-    nix::sys::signal::kill(
-        nix::unistd::Pid::from_raw(pid),
-        nix::sys::signal::Signal::SIGKILL,
-    )?;
-    Ok(())
-}
-
-#[cfg(windows)]
-fn kill_pid(pid: i32) -> MicrosandboxResult<()> {
-    terminate_pid(pid)
-}
-
-#[cfg(unix)]
-fn drain_pid(pid: i32) -> MicrosandboxResult<()> {
-    nix::sys::signal::kill(
-        nix::unistd::Pid::from_raw(pid),
-        nix::sys::signal::Signal::SIGUSR1,
-    )?;
-    Ok(())
-}
-
-#[cfg(windows)]
-fn terminate_pid(pid: i32) -> MicrosandboxResult<()> {
-    let pid = u32::try_from(pid)
-        .map_err(|_| crate::MicrosandboxError::Runtime(format!("invalid Windows pid: {pid}")))?;
-    let handle = unsafe { OpenProcess(PROCESS_TERMINATE, 0, pid) };
-    if handle.is_null() {
-        return Err(std::io::Error::last_os_error().into());
-    }
-
-    let result = unsafe { TerminateProcess(handle, 1) };
-    let close_result = unsafe { CloseHandle(handle) };
-    if result == 0 {
-        return Err(std::io::Error::last_os_error().into());
-    }
-    if close_result == 0 {
-        return Err(std::io::Error::last_os_error().into());
-    }
-    Ok(())
-}
-
-fn image_pull_policy(policy: PullPolicy) -> microsandbox_image::PullPolicy {
-    match policy {
-        PullPolicy::IfMissing => microsandbox_image::PullPolicy::IfMissing,
-        PullPolicy::Always => microsandbox_image::PullPolicy::Always,
-        PullPolicy::Never => microsandbox_image::PullPolicy::Never,
-    }
+pub(super) fn sandbox_not_found_for_name(error: &crate::MicrosandboxError, name: &str) -> bool {
+    matches!(error, crate::MicrosandboxError::SandboxNotFound(missing) if missing == name)
 }
 
 /// Derive a guest hostname from a sandbox name, fitting within
@@ -2203,95 +1497,6 @@ fn image_pull_policy(policy: PullPolicy) -> microsandbox_image::PullPolicy {
 /// keep distinct long names very unlikely to share a hostname.
 pub(crate) fn hostname_from_sandbox_name(name: &str) -> String {
     derive_hostname(name)
-}
-
-/// Pull an OCI image and return the pull result.
-///
-/// Auth resolution:
-/// 1. Explicit `RegistryAuth` from `SandboxBuilder::registry_auth()` (if provided)
-/// 2. OS keyring / credential store
-/// 3. Global config `registries.auth` matched by registry hostname
-/// 4. Docker credential store/config fallback
-/// 5. Anonymous fallback
-///
-/// When `progress` is `Some`, uses `pull_with_sender()` to emit per-layer
-/// progress events. The caller must consume the corresponding `PullProgressHandle`.
-async fn pull_oci_image(
-    local_backend: &crate::backend::LocalBackend,
-    reference: &str,
-    pull_policy: PullPolicy,
-    registry_overrides: RegistryOverrides,
-    progress: Option<PullProgressSender>,
-) -> MicrosandboxResult<PullResult> {
-    let global = local_backend.config();
-    let cache = GlobalCache::new(&local_backend.cache_dir())?;
-    let platform = microsandbox_image::Platform::host_linux();
-    let image_ref: Reference = reference.parse().map_err(|e| {
-        crate::MicrosandboxError::InvalidConfig(format!("invalid image reference: {e}"))
-    })?;
-    let options = PullOptions {
-        pull_policy: image_pull_policy(pull_policy),
-        ..Default::default()
-    };
-
-    // Warm runs spend most of their time outside the guest, so avoid
-    // constructing the registry client when the image is already complete
-    // in the local cache.
-    if let Some((result, metadata)) = Registry::pull_cached(&cache, &image_ref, &options)? {
-        if let Some(sender) = progress {
-            let reference: std::sync::Arc<str> = reference.to_string().into();
-            sender.send(PullProgress::Resolving {
-                reference: reference.clone(),
-            });
-            sender.send(PullProgress::Resolved {
-                reference: reference.clone(),
-                manifest_digest: metadata.manifest_digest.clone().into(),
-                layer_count: metadata.layers.len(),
-                total_download_bytes: metadata
-                    .layers
-                    .iter()
-                    .filter_map(|layer| layer.size_bytes)
-                    .reduce(|a, b| a + b),
-            });
-            sender.send(PullProgress::Complete {
-                reference,
-                layer_count: metadata.layers.len(),
-            });
-        }
-
-        return Ok(result);
-    }
-
-    let auth = match registry_overrides.auth {
-        Some(auth) => auth,
-        None => global.resolve_registry_auth(image_ref.registry())?,
-    };
-
-    // Merge global config with SDK overrides.
-    let mut ca_certs = global.resolve_ca_certs().await?;
-    ca_certs.extend(registry_overrides.ca_certs);
-
-    let mut insecure_registries = global.insecure_registries();
-    if registry_overrides.insecure {
-        insecure_registries.push(image_ref.registry().to_string());
-    }
-
-    let registry = Registry::builder(platform, cache)
-        .auth(auth)
-        .extra_ca_certs(ca_certs)
-        .add_insecure_registries(insecure_registries)
-        .build()?;
-
-    if let Some(sender) = progress {
-        let task = registry.pull_with_sender(&image_ref, &options, sender);
-        let result = task
-            .await
-            .map_err(|e| crate::MicrosandboxError::Custom(format!("pull task panicked: {e}")))??;
-        Ok(result)
-    } else {
-        let result = registry.pull(&image_ref, &options).await?;
-        Ok(result)
-    }
 }
 
 /// Validate user-defined sandbox labels. Keys must be non-empty and must not
@@ -2325,69 +1530,72 @@ pub(crate) fn validate_env(env: &[EnvVar]) -> MicrosandboxResult<()> {
     Ok(())
 }
 
-fn sandbox_handle_matches_filter(handle: &SandboxHandle, filter: &SandboxFilter) -> bool {
-    let Ok(value) = serde_json::from_str::<serde_json::Value>(handle.config_json()) else {
-        return false;
-    };
-
-    let labels = value
-        .get("labels")
-        .or_else(|| value.get("config").and_then(|config| config.get("labels")))
-        .and_then(serde_json::Value::as_object);
-
-    filter.labels.iter().all(|(key, expected)| {
-        labels
-            .and_then(|labels| labels.get(key))
-            .and_then(serde_json::Value::as_str)
-            .is_some_and(|actual| actual == expected)
-    })
-}
-
-/// Validate rootfs configuration that depends on host filesystem state.
-fn validate_rootfs_source(rootfs: &RootfsSource) -> MicrosandboxResult<()> {
-    match rootfs {
-        RootfsSource::Bind(path) => {
-            if !path.exists() {
-                return Err(crate::MicrosandboxError::InvalidConfig(format!(
-                    "rootfs bind path does not exist: {}",
-                    path.display()
-                )));
-            }
-
-            if !path.is_dir() {
-                return Err(crate::MicrosandboxError::InvalidConfig(format!(
-                    "rootfs bind path is not a directory: {}",
-                    path.display()
-                )));
-            }
-        }
-        RootfsSource::Oci(_) => {}
-        RootfsSource::DiskImage { path, .. } => {
-            if !path.exists() {
-                return Err(crate::MicrosandboxError::InvalidConfig(format!(
-                    "disk image does not exist: {}",
-                    path.display()
-                )));
-            }
-
-            if !path.is_file() {
-                return Err(crate::MicrosandboxError::InvalidConfig(format!(
-                    "disk image is not a regular file: {}",
-                    path.display()
-                )));
-            }
-        }
-    }
-
-    Ok(())
-}
-
 pub(super) fn remove_dir_if_exists(path: &Path) -> MicrosandboxResult<()> {
     match std::fs::remove_dir_all(path) {
         Ok(()) => Ok(()),
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(err) => Err(err.into()),
     }
+}
+
+/// Remove one exact local sandbox identity after proving no runtime owns it.
+pub(super) async fn remove_local_persisted_sandbox(
+    local_backend: &LocalBackend,
+    name: &str,
+    expected_id: i32,
+) -> MicrosandboxResult<()> {
+    let _guard = crate::runtime::acquire_sandbox_lifecycle_guard(
+        &local_backend.config().run_dir(),
+        name,
+        std::time::Duration::from_secs(5),
+    )
+    .await?;
+
+    // Re-read only after acquiring ownership. A stale `Sandbox` object must
+    // never delete a newer sandbox that reused the same deterministic name.
+    let pools = local_backend.db().await?;
+    let current = sandbox_entity::Entity::find()
+        .filter(sandbox_entity::Column::Name.eq(name))
+        .one(pools.read())
+        .await?
+        .ok_or_else(|| crate::MicrosandboxError::SandboxNotFound(name.to_string()))?;
+    if current.id != expected_id {
+        return Err(crate::MicrosandboxError::Runtime(format!(
+            "sandbox {name:?} identity changed from database id {expected_id} to {}; refusing stale removal",
+            current.id
+        )));
+    }
+    if !matches!(
+        current.status,
+        SandboxStatus::Stopped | SandboxStatus::Crashed
+    ) {
+        return Err(crate::MicrosandboxError::SandboxStillRunning(format!(
+            "cannot remove sandbox {name:?}: status is {:?}",
+            current.status
+        )));
+    }
+
+    let latest_run = run_entity::Entity::find()
+        .filter(run_entity::Column::SandboxId.eq(expected_id))
+        .order_by_desc(run_entity::Column::Id)
+        .one(pools.read())
+        .await?;
+    if latest_run
+        .and_then(|run| run.pid)
+        .is_some_and(microsandbox_utils::process::pid_is_alive)
+    {
+        return Err(crate::MicrosandboxError::SandboxStillRunning(format!(
+            "cannot remove sandbox {name:?}: its recorded runtime process is still alive"
+        )));
+    }
+
+    crate::runtime::remove_sandbox_socket_artifacts_for(local_backend, name)?;
+    remove_dir_if_exists(&local_backend.sandboxes_dir().join(name))?;
+    sandbox_entity::Entity::delete_by_id(expected_id)
+        .exec(pools.write())
+        .await?;
+
+    Ok(())
 }
 
 /// Load a sandbox row by name.
@@ -2402,470 +1610,53 @@ pub(super) async fn load_sandbox_record(
         .ok_or_else(|| crate::MicrosandboxError::SandboxNotFound(name.into()))
 }
 
-async fn prepare_create_target(
-    pools: &DbPools,
-    config: &SandboxConfig,
-    sandbox_dir: &Path,
-) -> MicrosandboxResult<()> {
-    let existing = sandbox_entity::Entity::find()
-        .filter(sandbox_entity::Column::Name.eq(&config.spec.name))
-        .one(pools.read())
-        .await?;
-
-    let dir_exists = sandbox_dir.exists();
-
-    if !config.replace_existing {
-        if existing.is_some() || dir_exists {
-            return Err(crate::MicrosandboxError::SandboxAlreadyExists(format!(
-                "sandbox '{}' already exists; remove it, start the stopped sandbox, or recreate with .replace()",
-                config.spec.name
-            )));
-        }
-        return Ok(());
-    }
-
-    if let Some(model) = existing {
-        let model = reconcile_sandbox_runtime_state(pools, model).await?;
-        let active = matches!(
-            model.status,
-            SandboxStatus::Running | SandboxStatus::Draining | SandboxStatus::Paused
-        );
-        if active {
-            stop_sandbox_for_replacement(pools, &model, config.replace_with_timeout).await?;
-        }
-
-        sandbox_entity::Entity::delete_by_id(model.id)
-            .exec(pools.write())
-            .await?;
-    }
-
-    remove_dir_if_exists(sandbox_dir)?;
-    Ok(())
-}
-
-/// Stop the prior sandbox before recreating it.
-///
-/// Sends SIGTERM with the configured grace, then escalates to SIGKILL
-/// and waits a short reap window. Single path for both same-process and
-/// foreign-process owners: SIGKILL bypasses any signal handler so the
-/// process is dead within kernel time, and the reap completes via the
-/// owning process's existing wait machinery (tokio's SIGCHLD driver
-/// when we're the parent, or the foreign parent's own `waitpid`).
-/// Replaces the previous "wait 30s and give up" behavior, which spun
-/// the full timeout when libkrun's SIGTERM handler did a slow
-/// graceful shutdown.
-async fn stop_sandbox_for_replacement(
-    pools: &DbPools,
-    sandbox: &sandbox_entity::Model,
-    grace: std::time::Duration,
-) -> MicrosandboxResult<()> {
-    let run = load_active_run(pools.read(), sandbox.id).await?;
-    let pids: Vec<i32> = run
-        .as_ref()
-        .and_then(|model| model.pid)
-        .filter(|pid| pid_is_alive(*pid))
-        .into_iter()
-        .collect();
-
-    if !pids.is_empty() {
-        // Polite phase: SIGTERM and wait up to `grace` for graceful exit.
-        if !grace.is_zero() {
-            for pid in &pids {
-                let _ = terminate_pid_gracefully(*pid);
-            }
-            wait_for_pids_to_exit(&pids, grace).await;
-        }
-
-        // SIGKILL anything still alive. We don't wait or verify after
-        // SIGKILL: it's uncatchable, so termination is bounded by kernel
-        // time, and the only state that would have us spin is the
-        // zombie window between exit and the parent's `waitpid`. That
-        // window is harmless: prepare_create_target wipes the DB row
-        // and the sandbox dir, the new spawn gets a fresh PID, and the
-        // zombie reaps on its own (tokio's SIGCHLD driver when we own
-        // it, or the foreign parent's wait machinery otherwise).
-        for pid in pids.iter().copied().filter(|p| pid_is_alive(*p)) {
-            let _ = kill_pid(pid);
-        }
-    }
-
-    mark_sandbox_stopped_for_replacement(
-        pools.write(),
-        sandbox.id,
-        run.as_ref().map(|model| model.id),
-    )
-    .await
-}
-
-async fn mark_sandbox_stopped_for_replacement(
-    db: &DbWriteConnection,
-    sandbox_id: i32,
-    run_id: Option<i32>,
-) -> MicrosandboxResult<()> {
-    db.transaction(|txn| async move {
-        let now = chrono::Utc::now().naive_utc();
-
-        if let Some(run_id) = run_id {
-            run_entity::Entity::update_many()
-                .col_expr(
-                    run_entity::Column::Status,
-                    Expr::value(run_entity::RunStatus::Terminated),
-                )
-                .col_expr(
-                    run_entity::Column::TerminationReason,
-                    Expr::value(run_entity::TerminationReason::Signal),
-                )
-                .col_expr(run_entity::Column::TerminatedAt, Expr::value(now))
-                .filter(run_entity::Column::Id.eq(run_id))
-                .exec(&txn)
-                .await?;
-        }
-
-        sandbox_entity::Entity::update_many()
-            .col_expr(
-                sandbox_entity::Column::Status,
-                Expr::value(SandboxStatus::Stopped),
-            )
-            .col_expr(sandbox_entity::Column::UpdatedAt, Expr::value(now))
-            .filter(sandbox_entity::Column::Id.eq(sandbox_id))
-            .exec(&txn)
-            .await?;
-
-        Ok((txn, ()))
-    })
-    .await
-}
-
-async fn wait_for_pids_to_exit(pids: &[i32], timeout: std::time::Duration) {
-    let start = std::time::Instant::now();
-    let poll_interval = std::time::Duration::from_millis(50);
-
-    loop {
-        if pids.iter().all(|pid| !pid_is_alive(*pid)) {
-            return;
-        }
-
-        if start.elapsed() >= timeout {
-            return;
-        }
-
-        tokio::time::sleep(poll_interval).await;
-    }
-}
-
-fn validate_start_state(
-    local_backend: &crate::backend::LocalBackend,
-    config: &SandboxConfig,
-    sandbox_dir: &Path,
-) -> MicrosandboxResult<()> {
-    if !sandbox_dir.exists() {
-        return Err(crate::MicrosandboxError::Custom(format!(
-            "sandbox state missing for '{}': {}",
-            config.spec.name,
-            sandbox_dir.display()
-        )));
-    }
-
-    if let RootfsSource::Oci(_) = &config.spec.image
-        && let Some(ref digest_str) = config.manifest_digest
-    {
-        let cache_dir = local_backend.cache_dir();
-        if let Ok(cache) = GlobalCache::new(&cache_dir)
-            && let Ok(digest) = digest_str.parse::<Digest>()
-        {
-            let vmdk_path = cache.vmdk_path(&digest);
-            if !vmdk_path.exists() {
-                return Err(crate::MicrosandboxError::Custom(format!(
-                    "sandbox '{}' cannot start: VMDK missing: {}",
-                    config.spec.name,
-                    vmdk_path.display()
-                )));
-            }
-        }
-    }
-
-    Ok(())
-}
-
-/// Insert the sandbox record in the database and return its ID.
-async fn insert_sandbox_record(
-    db: &DbWriteConnection,
-    config: &SandboxConfig,
-) -> MicrosandboxResult<i32> {
-    let config_json = serde_json::to_string(config)?;
-
-    db.transaction(|txn| {
-        let config_json = config_json.clone();
-        async move {
-            let now = chrono::Utc::now().naive_utc();
-            let model = sandbox_entity::ActiveModel {
-                name: Set(config.spec.name.clone()),
-                config: Set(config_json),
-                status: Set(SandboxStatus::Running),
-                ephemeral: Set(config.spec.lifecycle.ephemeral),
-                created_at: Set(Some(now)),
-                updated_at: Set(Some(now)),
-                ..Default::default()
-            };
-            let result = sandbox_entity::Entity::insert(model).exec(&txn).await?;
-            Ok((txn, result.last_insert_id))
-        }
-    })
-    .await
-}
-
-async fn delete_sandbox_record(db: &DbWriteConnection, sandbox_id: i32) -> MicrosandboxResult<()> {
-    sandbox_entity::Entity::delete_by_id(sandbox_id)
-        .exec(db)
-        .await?;
-    Ok(())
-}
-
-async fn persist_oci_manifest_pin(
-    db: &DbWriteConnection,
-    sandbox_id: i32,
-    manifest_digest: &str,
-) -> MicrosandboxResult<()> {
-    db.transaction(|txn| async move {
-        replace_oci_manifest_pin(&txn, sandbox_id, manifest_digest).await?;
-        Ok((txn, ()))
-    })
-    .await
-}
-
-/// Pin a sandbox to its resolved OCI manifest.
-async fn replace_oci_manifest_pin<C: ConnectionTrait>(
-    db: &C,
-    sandbox_id: i32,
-    manifest_digest: &str,
-) -> MicrosandboxResult<()> {
-    use crate::db::entity::manifest as manifest_entity;
-
-    let now = chrono::Utc::now().naive_utc();
-
-    let manifest = manifest_entity::Entity::find()
-        .filter(manifest_entity::Column::Digest.eq(manifest_digest))
-        .one(db)
-        .await?;
-
-    let manifest_id = manifest.map(|m| m.id);
-
-    sandbox_rootfs_entity::Entity::delete_many()
-        .filter(sandbox_rootfs_entity::Column::SandboxId.eq(sandbox_id))
-        .exec(db)
-        .await?;
-
-    sandbox_rootfs_entity::Entity::insert(sandbox_rootfs_entity::ActiveModel {
-        sandbox_id: Set(sandbox_id),
-        manifest_id: Set(manifest_id),
-        mode: Set("erofs".to_string()),
-        upper_fstype: Set(Some("ext4".to_string())),
-        created_at: Set(Some(now)),
-        ..Default::default()
-    })
-    .exec(db)
-    .await?;
-
-    Ok(())
-}
-
-/// Create a sparse ext4 image for the writable overlay upper layer.
-async fn create_upper_ext4(
-    path: &std::path::Path,
-    size_mib: u32,
-    tree: Option<tree::FileTree>,
-) -> MicrosandboxResult<()> {
-    let _ = tokio::fs::remove_file(path).await;
-    let ext4_options = ext4::Ext4FormatOptions {
-        size_bytes: u64::from(size_mib) * 1024 * 1024,
-        ..Default::default()
-    };
-    let overlay_tree = build_overlay_upper_tree(tree);
-    let path = path.to_path_buf();
-
-    tokio::task::spawn_blocking(move || {
-        ext4::format_ext4_with_tree(&path, &ext4_options, overlay_tree)
-    })
-    .await
-    .map_err(|e| crate::MicrosandboxError::Custom(format!("ext4 format task failed: {e}")))?
-    .map_err(|e| crate::MicrosandboxError::Custom(format!("failed to create upper.ext4: {e}")))?;
-
-    Ok(())
-}
-
-/// Build the ext4 root directory tree that overlayfs expects.
-fn build_overlay_upper_tree(tree: Option<tree::FileTree>) -> tree::FileTree {
-    use tree::{DirectoryNode, FileTree, InodeMetadata, TreeNode};
-
-    let mut overlay_tree = FileTree::new();
-    let mut upper_dir = DirectoryNode::new(InodeMetadata::default());
-    let work_dir = DirectoryNode::new(InodeMetadata::default());
-
-    if let Some(mut tree) = tree {
-        upper_dir.entries = std::mem::take(&mut tree.root.entries);
-    }
-
-    overlay_tree
-        .root
-        .entries
-        .insert("upper".into(), TreeNode::Directory(upper_dir));
-    overlay_tree
-        .root
-        .entries
-        .insert("work".into(), TreeNode::Directory(work_dir));
-
-    overlay_tree
-}
-
 //--------------------------------------------------------------------------------------------------
 // Tests
 //--------------------------------------------------------------------------------------------------
 
 #[cfg(test)]
 mod tests {
-    use std::{
-        fs,
-        path::PathBuf,
-        sync::Arc,
-        time::{SystemTime, UNIX_EPOCH},
-    };
+    use std::fs;
     #[cfg(unix)]
-    use std::{
-        os::fd::{AsRawFd, FromRawFd, OwnedFd},
-        process::Command,
-    };
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 
-    use microsandbox_db::entity::{run as run_entity, sandbox_rootfs as sandbox_rootfs_entity};
-    use microsandbox_db::pool::DbPools;
-
-    use crate::{
-        backend::{Backend, LocalBackend},
-        sandbox::OciRootfsSource,
-    };
-    use microsandbox_migration::{Migrator, MigratorTrait};
-    #[cfg(unix)]
-    use sea_orm::{ColumnTrait, QueryFilter};
-    use sea_orm::{EntityTrait, Set};
+    use sea_orm::{ActiveModelTrait, Set};
     use tempfile::tempdir;
 
     use super::{
-        MAX_HOSTNAME_BYTES, MAX_SANDBOX_NAME_BYTES, MountOptions, RootfsSource, SandboxConfig,
-        SandboxStatus, VolumeMount, hostname_from_sandbox_name, insert_sandbox_record,
-        persist_oci_manifest_pin, prepare_create_target, reconcile_sandbox_runtime_state,
-        remove_dir_if_exists, validate_hostname, validate_rootfs_source,
+        MAX_HOSTNAME_BYTES, MAX_SANDBOX_NAME_BYTES, SandboxStatus, ephemeral_cleanup_stop_result,
+        hostname_from_sandbox_name, remove_dir_if_exists, remove_local_persisted_sandbox,
+        sandbox_not_found_for_name, validate_hostname,
     };
+    use crate::backend::LocalBackend;
 
-    /// Open both pools at `db_path` for tests, with migrations applied.
-    async fn open_test_pools(db_path: &std::path::Path) -> DbPools {
-        // Connect timeout matches the production default (30s). 1s was too
-        // tight on cold ci runners and surfaced as `PoolTimedOut` flakes
-        // before the test body had a chance to run.
-        let pools = DbPools::open(
-            db_path,
-            1,
-            std::time::Duration::from_secs(30),
-            std::time::Duration::from_secs(5),
-        )
-        .await
-        .unwrap();
-        Migrator::up(pools.write().inner(), None).await.unwrap();
-        pools
+    #[test]
+    fn test_sandbox_not_found_for_name_requires_exact_match() {
+        assert!(sandbox_not_found_for_name(
+            &crate::MicrosandboxError::SandboxNotFound("gone".into()),
+            "gone"
+        ));
+        assert!(!sandbox_not_found_for_name(
+            &crate::MicrosandboxError::SandboxNotFound("other".into()),
+            "gone"
+        ));
+        assert!(!sandbox_not_found_for_name(
+            &crate::MicrosandboxError::Runtime("gone".into()),
+            "gone"
+        ));
     }
 
-    fn test_config(name: impl Into<String>) -> SandboxConfig {
-        SandboxConfig {
-            spec: microsandbox_types::SandboxSpec {
-                name: name.into(),
-                ..Default::default()
-            },
-            ..Default::default()
-        }
-    }
+    #[test]
+    fn test_ephemeral_cleanup_stop_result_marks_stopped() {
+        let result = ephemeral_cleanup_stop_result("msb-gone");
 
-    fn test_config_with_rootfs(name: impl Into<String>, image: RootfsSource) -> SandboxConfig {
-        SandboxConfig {
-            spec: microsandbox_types::SandboxSpec {
-                name: name.into(),
-                image,
-                ..Default::default()
-            },
-            ..Default::default()
-        }
-    }
-
-    fn unique_temp_path(suffix: &str) -> PathBuf {
-        let nanos = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        std::env::temp_dir().join(format!("microsandbox-rootfs-{suffix}-{nanos}"))
-    }
-
-    fn dead_pid() -> i32 {
-        let mut pid = 900_000;
-        while super::pid_is_alive(pid) {
-            pid += 1;
-        }
-        pid
-    }
-
-    #[tokio::test]
-    async fn test_runtime_name_validation_uses_explicit_backend_paths() {
-        let temp = tempfile::Builder::new()
-            .prefix("msb")
-            .tempdir_in("/tmp")
-            .unwrap();
-        let home = temp.path().join("msb-home");
-        let backend = LocalBackend::builder().home(&home).build().await.unwrap();
-
-        super::validate_sandbox_name_for_runtime_with_backend(&backend, "sdk-socket-test").unwrap();
-    }
-
-    #[tokio::test]
-    async fn test_create_local_validates_direct_config_mounts() {
-        let temp = tempfile::Builder::new()
-            .prefix("msb")
-            .tempdir_in("/tmp")
-            .unwrap();
-        let rootfs = temp.path().join("rootfs");
-        std::fs::create_dir_all(&rootfs).unwrap();
-        let backend = Arc::new(
-            LocalBackend::builder()
-                .home(temp.path().join("home"))
-                .build()
-                .await
-                .unwrap(),
-        );
-        let backend_trait: Arc<dyn Backend> = backend;
-        let mut config = test_config_with_rootfs("bad-mounts", RootfsSource::Bind(rootfs));
-        config.spec.mounts = vec![
-            VolumeMount::Tmpfs {
-                guest: "/dup".to_string(),
-                size_mib: None,
-                options: MountOptions::default(),
-            },
-            VolumeMount::Tmpfs {
-                guest: "/dup".to_string(),
-                size_mib: None,
-                options: MountOptions::default(),
-            },
-        ];
-
-        let err = match super::create_local(
-            backend_trait,
-            config,
-            crate::runtime::SpawnMode::Attached,
-            None,
-        )
-        .await
-        {
-            Ok(_) => panic!("expected invalid direct-config mounts to be rejected"),
-            Err(err) => err,
-        };
-
-        assert!(
-            err.to_string().contains("multiple volumes cannot mount"),
-            "got: {err}"
+        assert_eq!(result.name, "msb-gone");
+        assert_eq!(result.status, SandboxStatus::Stopped);
+        assert_eq!(result.exit_code, None);
+        assert_eq!(result.signal, None);
+        assert_eq!(
+            result.source.as_deref(),
+            Some("ephemeral cleanup removed persisted state")
         );
     }
 
@@ -2882,6 +1673,7 @@ mod tests {
         let _ = super::Sandbox::kill_with_timeout;
         let _ = super::Sandbox::request_drain;
         let _ = super::Sandbox::wait_until_stopped;
+        let _ = super::all_sandbox_metrics;
     }
 
     #[test]
@@ -2953,46 +1745,6 @@ mod tests {
             0,
             "dup'd tty fd should remain blocking"
         );
-    }
-
-    #[test]
-    fn test_validate_rootfs_source_missing_bind_path() {
-        let path = unique_temp_path("missing");
-        let err = validate_rootfs_source(&RootfsSource::Bind(path.clone())).unwrap_err();
-        assert_eq!(
-            err.to_string(),
-            format!(
-                "invalid config: rootfs bind path does not exist: {}",
-                path.display()
-            )
-        );
-    }
-
-    #[test]
-    fn test_validate_rootfs_source_bind_path_must_be_directory() {
-        let path = unique_temp_path("file");
-        fs::write(&path, b"not a directory").unwrap();
-
-        let err = validate_rootfs_source(&RootfsSource::Bind(path.clone())).unwrap_err();
-        assert_eq!(
-            err.to_string(),
-            format!(
-                "invalid config: rootfs bind path is not a directory: {}",
-                path.display()
-            )
-        );
-
-        fs::remove_file(path).unwrap();
-    }
-
-    #[test]
-    fn test_validate_rootfs_source_existing_bind_directory() {
-        let path = unique_temp_path("dir");
-        fs::create_dir(&path).unwrap();
-
-        validate_rootfs_source(&RootfsSource::Bind(path.clone())).unwrap();
-
-        fs::remove_dir(path).unwrap();
     }
 
     #[test]
@@ -3072,34 +1824,6 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn test_create_local_rejects_invalid_hostname_before_rootfs_validation() {
-        let temp = tempdir().unwrap();
-        let backend = Arc::new(
-            crate::backend::LocalBackend::builder()
-                .home(temp.path())
-                .build()
-                .await
-                .unwrap(),
-        );
-        let mut config =
-            test_config_with_rootfs("test", RootfsSource::Bind(unique_temp_path("missing")));
-        config.spec.runtime.hostname = Some("y".repeat(MAX_HOSTNAME_BYTES + 1));
-
-        let err =
-            match super::create_local(backend, config, crate::runtime::SpawnMode::Attached, None)
-                .await
-            {
-                Ok(_) => panic!("invalid hostname should fail before sandbox creation"),
-                Err(err) => err,
-            };
-
-        assert_eq!(
-            err.to_string(),
-            "invalid config: hostname is too long: 65 bytes (max 64)"
-        );
-    }
-
     #[test]
     fn test_remove_dir_if_exists_removes_existing_sandbox_tree() {
         let temp = tempdir().unwrap();
@@ -3124,487 +1848,33 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_persist_oci_manifest_pin_upserts_rootfs_record() {
+    async fn persisted_removal_rejects_a_stale_sandbox_identity() {
         let temp = tempdir().unwrap();
-        let db_path = temp.path().join("test.db");
-        let pools = open_test_pools(&db_path).await;
-
-        let mut config = test_config_with_rootfs(
-            "pinned",
-            RootfsSource::Oci(OciRootfsSource {
-                reference: "docker.io/library/alpine".into(),
-                upper_size_mib: None,
-            }),
-        );
-        config.manifest_digest = Some("sha256:aaaa".into());
-        let sandbox_id = insert_sandbox_record(pools.write(), &config).await.unwrap();
-
-        // First pin (no matching manifest in DB, so manifest_id will be None).
-        persist_oci_manifest_pin(
-            pools.write(),
-            sandbox_id,
-            "sha256:1111111111111111111111111111111111111111111111111111111111111111",
-        )
-        .await
-        .unwrap();
-
-        // Second pin replaces the first.
-        persist_oci_manifest_pin(
-            pools.write(),
-            sandbox_id,
-            "sha256:2222222222222222222222222222222222222222222222222222222222222222",
-        )
-        .await
-        .unwrap();
-
-        let pins = sandbox_rootfs_entity::Entity::find()
-            .all(pools.write())
+        let backend = LocalBackend::builder()
+            .home(temp.path().join("home"))
+            .build()
             .await
             .unwrap();
-        assert_eq!(pins.len(), 1);
-        assert_eq!(pins[0].sandbox_id, sandbox_id);
-        assert_eq!(pins[0].mode, "erofs");
-        assert_eq!(pins[0].manifest_id, None);
-    }
-
-    #[tokio::test]
-    async fn test_persist_oci_manifest_pin_replaces_stale_pin_for_different_digest() {
-        let temp = tempdir().unwrap();
-        let db_path = temp.path().join("test.db");
-        let pools = open_test_pools(&db_path).await;
-
-        let mut config = test_config_with_rootfs(
-            "recreated",
-            RootfsSource::Oci(OciRootfsSource {
-                reference: "docker.io/library/alpine".into(),
-                upper_size_mib: None,
-            }),
-        );
-        config.manifest_digest = Some("sha256:aaaa".into());
-        let sandbox_id = insert_sandbox_record(pools.write(), &config).await.unwrap();
-
-        persist_oci_manifest_pin(
-            pools.write(),
-            sandbox_id,
-            "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-        )
+        let pools = backend.db().await.unwrap();
+        let current = super::sandbox_entity::ActiveModel {
+            name: Set("recreated".to_string()),
+            config: Set("{}".to_string()),
+            status: Set(SandboxStatus::Stopped),
+            ephemeral: Set(false),
+            ..Default::default()
+        }
+        .insert(pools.write())
         .await
         .unwrap();
+        let sandbox_dir = backend.sandboxes_dir().join("recreated");
+        std::fs::create_dir_all(&sandbox_dir).unwrap();
+        std::fs::write(sandbox_dir.join("marker"), b"successor").unwrap();
 
-        // Replacing with a different digest should delete the old pin.
-        persist_oci_manifest_pin(
-            pools.write(),
-            sandbox_id,
-            "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
-        )
-        .await
-        .unwrap();
-
-        let pins = sandbox_rootfs_entity::Entity::find()
-            .all(pools.write())
-            .await
-            .unwrap();
-        assert_eq!(pins.len(), 1);
-        assert_eq!(pins[0].sandbox_id, sandbox_id);
-        assert_eq!(pins[0].mode, "erofs");
-        assert_eq!(pins[0].manifest_id, None);
-    }
-
-    #[tokio::test]
-    async fn test_insert_sandbox_record_persists_manifest_digest_in_config_json() {
-        let temp = tempdir().unwrap();
-        let db_path = temp.path().join("test.db");
-        let pools = open_test_pools(&db_path).await;
-
-        let mut config = test_config_with_rootfs(
-            "persisted-digest",
-            RootfsSource::Oci(OciRootfsSource {
-                reference: "docker.io/library/alpine".into(),
-                upper_size_mib: None,
-            }),
-        );
-        config.manifest_digest = Some("sha256:abc123".into());
-
-        let sandbox_id = insert_sandbox_record(pools.write(), &config).await.unwrap();
-        let row = super::sandbox_entity::Entity::find_by_id(sandbox_id)
-            .one(pools.write())
-            .await
-            .unwrap()
-            .unwrap();
-        let decoded: SandboxConfig = serde_json::from_str(&row.config).unwrap();
-
-        assert_eq!(decoded.manifest_digest, config.manifest_digest);
-    }
-
-    #[tokio::test]
-    async fn test_prepare_create_target_rejects_existing_state_without_force() {
-        let temp = tempdir().unwrap();
-        let db_path = temp.path().join("test.db");
-        let pools = open_test_pools(&db_path).await;
-
-        let sandbox_dir = temp.path().join("sandboxes").join("existing");
-        fs::create_dir_all(&sandbox_dir).unwrap();
-
-        let config = test_config("existing");
-
-        let err = prepare_create_target(&pools, &config, &sandbox_dir)
+        let error = remove_local_persisted_sandbox(&backend, "recreated", current.id + 1)
             .await
             .unwrap_err();
-        assert!(err.to_string().contains("already exists"));
-    }
 
-    #[tokio::test]
-    async fn test_prepare_create_target_force_replaces_stopped_sandbox_state() {
-        let temp = tempdir().unwrap();
-        let db_path = temp.path().join("test.db");
-        let pools = open_test_pools(&db_path).await;
-
-        let sandbox_dir = temp.path().join("sandboxes").join("replaceable");
-        fs::create_dir_all(sandbox_dir.join("rw")).unwrap();
-        let config = test_config("replaceable");
-        let sandbox_id = insert_sandbox_record(pools.write(), &config).await.unwrap();
-        super::update_sandbox_status(pools.write(), sandbox_id, super::SandboxStatus::Stopped)
-            .await
-            .unwrap();
-
-        let mut forced = test_config("replaceable");
-        forced.replace_existing = true;
-
-        prepare_create_target(&pools, &forced, &sandbox_dir)
-            .await
-            .unwrap();
-
-        assert!(!sandbox_dir.exists());
-        assert!(
-            super::sandbox_entity::Entity::find_by_id(sandbox_id)
-                .one(pools.write())
-                .await
-                .unwrap()
-                .is_none()
-        );
-    }
-
-    #[tokio::test]
-    async fn test_reconcile_sandbox_runtime_state_marks_dead_processes_crashed() {
-        let temp = tempdir().unwrap();
-        let db_path = temp.path().join("test.db");
-        let pools = open_test_pools(&db_path).await;
-
-        let config = test_config("stale");
-        let sandbox_id = insert_sandbox_record(pools.write(), &config).await.unwrap();
-        let dead_run_pid = dead_pid();
-
-        let run = run_entity::ActiveModel {
-            sandbox_id: Set(sandbox_id),
-            pid: Set(Some(dead_run_pid)),
-            status: Set(run_entity::RunStatus::Running),
-            ..Default::default()
-        };
-        let run_id = run_entity::Entity::insert(run)
-            .exec(pools.write())
-            .await
-            .unwrap()
-            .last_insert_id;
-
-        let sandbox = super::sandbox_entity::Entity::find_by_id(sandbox_id)
-            .one(pools.write())
-            .await
-            .unwrap()
-            .unwrap();
-        let reconciled = reconcile_sandbox_runtime_state(&pools, sandbox)
-            .await
-            .unwrap();
-        assert_eq!(reconciled.status, SandboxStatus::Crashed);
-
-        let run = run_entity::Entity::find_by_id(run_id)
-            .one(pools.write())
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(run.status, run_entity::RunStatus::Terminated);
-        assert_eq!(
-            run.termination_reason,
-            Some(run_entity::TerminationReason::InternalError)
-        );
-        assert!(run.terminated_at.is_some());
-    }
-
-    #[tokio::test]
-    async fn test_reconcile_sandbox_runtime_state_marks_dead_draining_stopped() {
-        let temp = tempdir().unwrap();
-        let db_path = temp.path().join("test.db");
-        let pools = open_test_pools(&db_path).await;
-
-        let config = test_config("draining-stale");
-        let sandbox_id = insert_sandbox_record(pools.write(), &config).await.unwrap();
-        super::update_sandbox_status(pools.write(), sandbox_id, SandboxStatus::Draining)
-            .await
-            .unwrap();
-
-        let run = run_entity::ActiveModel {
-            sandbox_id: Set(sandbox_id),
-            pid: Set(Some(dead_pid())),
-            status: Set(run_entity::RunStatus::Running),
-            ..Default::default()
-        };
-        let run_id = run_entity::Entity::insert(run)
-            .exec(pools.write())
-            .await
-            .unwrap()
-            .last_insert_id;
-
-        let sandbox = super::sandbox_entity::Entity::find_by_id(sandbox_id)
-            .one(pools.write())
-            .await
-            .unwrap()
-            .unwrap();
-        let reconciled = reconcile_sandbox_runtime_state(&pools, sandbox)
-            .await
-            .unwrap();
-        assert_eq!(reconciled.status, SandboxStatus::Stopped);
-
-        let run = run_entity::Entity::find_by_id(run_id)
-            .one(pools.write())
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(run.status, run_entity::RunStatus::Terminated);
-        assert_eq!(
-            run.termination_reason,
-            Some(run_entity::TerminationReason::ShutdownRequested)
-        );
-        assert!(run.terminated_at.is_some());
-    }
-
-    #[tokio::test]
-    async fn test_prepare_create_target_force_replaces_stale_running_sandbox_state() {
-        let temp = tempdir().unwrap();
-        let db_path = temp.path().join("test.db");
-        let pools = open_test_pools(&db_path).await;
-
-        let sandbox_dir = temp.path().join("sandboxes").join("stale-running");
-        fs::create_dir_all(sandbox_dir.join("rw")).unwrap();
-        let config = test_config("stale-running");
-        let sandbox_id = insert_sandbox_record(pools.write(), &config).await.unwrap();
-
-        let run = run_entity::ActiveModel {
-            sandbox_id: Set(sandbox_id),
-            pid: Set(Some(dead_pid())),
-            status: Set(run_entity::RunStatus::Running),
-            ..Default::default()
-        };
-        run_entity::Entity::insert(run)
-            .exec(pools.write())
-            .await
-            .unwrap();
-
-        let mut forced = test_config("stale-running");
-        forced.replace_existing = true;
-
-        prepare_create_target(&pools, &forced, &sandbox_dir)
-            .await
-            .unwrap();
-
-        assert!(!sandbox_dir.exists());
-        assert!(
-            super::sandbox_entity::Entity::find_by_id(sandbox_id)
-                .one(pools.write())
-                .await
-                .unwrap()
-                .is_none()
-        );
-    }
-
-    #[tokio::test]
-    #[cfg(unix)]
-    async fn test_prepare_create_target_force_replaces_running_sandbox() {
-        let temp = tempdir().unwrap();
-        let db_path = temp.path().join("test.db");
-        let pools = open_test_pools(&db_path).await;
-
-        let sandbox_dir = temp.path().join("sandboxes").join("running");
-        fs::create_dir_all(&sandbox_dir).unwrap();
-        let config = test_config("running");
-        let sandbox_id = insert_sandbox_record(pools.write(), &config).await.unwrap();
-
-        let child = Command::new("sleep").arg("30").spawn().unwrap();
-        let live_pid = child.id() as i32;
-        let waiter = std::thread::spawn(move || {
-            let mut child = child;
-            child.wait().unwrap()
-        });
-        let run = run_entity::ActiveModel {
-            sandbox_id: Set(sandbox_id),
-            pid: Set(Some(live_pid)),
-            status: Set(run_entity::RunStatus::Running),
-            ..Default::default()
-        };
-        run_entity::Entity::insert(run)
-            .exec(pools.write())
-            .await
-            .unwrap();
-
-        let mut forced = test_config("running");
-        forced.replace_existing = true;
-
-        prepare_create_target(&pools, &forced, &sandbox_dir)
-            .await
-            .unwrap();
-
-        waiter.join().unwrap();
-
-        assert!(!super::pid_is_alive(live_pid));
-        assert!(!sandbox_dir.exists());
-        assert!(
-            super::sandbox_entity::Entity::find_by_id(sandbox_id)
-                .one(pools.write())
-                .await
-                .unwrap()
-                .is_none()
-        );
-    }
-
-    #[test]
-    fn test_validate_start_state_requires_existing_sandbox_dir() {
-        let temp = tempdir().unwrap();
-        let sandbox_dir = temp.path().join("missing");
-        let config = test_config("missing");
-
-        let backend = crate::backend::LocalBackend::lazy();
-        let err = super::validate_start_state(&backend, &config, &sandbox_dir).unwrap_err();
-        assert!(err.to_string().contains("sandbox state missing"));
-    }
-
-    #[test]
-    fn test_validate_start_state_accepts_oci_with_manifest_digest() {
-        let temp = tempdir().unwrap();
-        let sandbox_dir = temp.path().join("persisted");
-        fs::create_dir_all(&sandbox_dir).unwrap();
-
-        let mut config = test_config_with_rootfs(
-            "persisted",
-            RootfsSource::Oci(OciRootfsSource {
-                reference: "docker.io/library/alpine".into(),
-                upper_size_mib: None,
-            }),
-        );
-        config.manifest_digest = Some("sha256:aaaa".into());
-
-        // validate_start_state checks VMDK existence via GlobalCache,
-        // which depends on the global config. In unit tests without a real
-        // config, it succeeds because the cache init may fail gracefully.
-        // The key thing is it doesn't panic.
-        let backend = crate::backend::LocalBackend::lazy();
-        let _ = super::validate_start_state(&backend, &config, &sandbox_dir);
-    }
-
-    /// Simulates the reaper sweep: queries all Running/Draining sandboxes and
-    /// reconciles each. Verifies that only stale entries are reaped while
-    /// live, stopped, crashed, and starting (no run record) sandboxes are
-    /// left untouched.
-    #[tokio::test]
-    #[cfg(unix)]
-    async fn test_reap_marks_only_dead_running_and_draining_sandboxes() {
-        let temp = tempdir().unwrap();
-        let db_path = temp.path().join("test.db");
-        let pools = open_test_pools(&db_path).await;
-
-        let dead = dead_pid();
-
-        // --- Sandbox A: Running + dead PID → should become Crashed ---
-        let cfg_a = test_config("running-dead");
-        let id_a = insert_sandbox_record(pools.write(), &cfg_a).await.unwrap();
-        run_entity::Entity::insert(run_entity::ActiveModel {
-            sandbox_id: Set(id_a),
-            pid: Set(Some(dead)),
-            status: Set(run_entity::RunStatus::Running),
-            ..Default::default()
-        })
-        .exec(pools.write())
-        .await
-        .unwrap();
-
-        // --- Sandbox B: Running + live PID → should stay Running ---
-        let child = Command::new("sleep").arg("30").spawn().unwrap();
-        let live_pid = child.id() as i32;
-        let waiter = std::thread::spawn(move || {
-            let mut child = child;
-            child.wait().unwrap()
-        });
-
-        let cfg_b = test_config("running-alive");
-        let id_b = insert_sandbox_record(pools.write(), &cfg_b).await.unwrap();
-        run_entity::Entity::insert(run_entity::ActiveModel {
-            sandbox_id: Set(id_b),
-            pid: Set(Some(live_pid)),
-            status: Set(run_entity::RunStatus::Running),
-            ..Default::default()
-        })
-        .exec(pools.write())
-        .await
-        .unwrap();
-
-        // --- Sandbox C: Draining + dead PID → should become Stopped ---
-        let cfg_c = test_config("draining-dead");
-        let id_c = insert_sandbox_record(pools.write(), &cfg_c).await.unwrap();
-        super::update_sandbox_status(pools.write(), id_c, SandboxStatus::Draining)
-            .await
-            .unwrap();
-        run_entity::Entity::insert(run_entity::ActiveModel {
-            sandbox_id: Set(id_c),
-            pid: Set(Some(dead)),
-            status: Set(run_entity::RunStatus::Running),
-            ..Default::default()
-        })
-        .exec(pools.write())
-        .await
-        .unwrap();
-
-        // --- Sandbox D: Stopped → should stay Stopped ---
-        let cfg_d = test_config("stopped");
-        let id_d = insert_sandbox_record(pools.write(), &cfg_d).await.unwrap();
-        super::update_sandbox_status(pools.write(), id_d, SandboxStatus::Stopped)
-            .await
-            .unwrap();
-
-        // --- Sandbox E: Running + no run record (still starting) → should stay Running ---
-        let cfg_e = test_config("starting");
-        let id_e = insert_sandbox_record(pools.write(), &cfg_e).await.unwrap();
-
-        // --- Reap: query all Running/Draining, reconcile each ---
-        let stale = super::sandbox_entity::Entity::find()
-            .filter(
-                super::sandbox_entity::Column::Status
-                    .is_in([SandboxStatus::Running, SandboxStatus::Draining]),
-            )
-            .all(pools.write())
-            .await
-            .unwrap();
-
-        for sandbox in stale {
-            let _ = reconcile_sandbox_runtime_state(&pools, sandbox).await;
-        }
-
-        // --- Assertions ---
-        let load = |id| {
-            let read_db = pools.read();
-            async move {
-                super::sandbox_entity::Entity::find_by_id(id)
-                    .one(read_db)
-                    .await
-                    .unwrap()
-                    .unwrap()
-            }
-        };
-
-        assert_eq!(load(id_a).await.status, SandboxStatus::Crashed);
-        assert_eq!(load(id_b).await.status, SandboxStatus::Running);
-        assert_eq!(load(id_c).await.status, SandboxStatus::Stopped);
-        assert_eq!(load(id_d).await.status, SandboxStatus::Stopped);
-        assert_eq!(load(id_e).await.status, SandboxStatus::Running);
-
-        // Cleanup the live process.
-        unsafe { libc::kill(live_pid, libc::SIGKILL) };
-        waiter.join().unwrap();
+        assert!(error.to_string().contains("identity changed"));
+        assert!(sandbox_dir.join("marker").exists());
     }
 }

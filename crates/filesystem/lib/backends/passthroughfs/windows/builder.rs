@@ -35,6 +35,19 @@ pub struct PassthroughConfig {
     /// Path to the root directory on the host.
     pub root_dir: PathBuf,
 
+    /// Resolve `root_dir` treating no component of the path as trusted.
+    ///
+    /// When `true`, `root_dir` is resolved from the volume root rejecting a
+    /// reparse point (symlink or junction) at *every* component and refusing
+    /// `..`, so neither a planted reparse point nor an injected `..` can move
+    /// the mount off its intended target. Because nothing is trusted, the caller
+    /// must pass an absolute path whose components are all real directories.
+    ///
+    /// `false` preserves the legacy behavior of resolving `root_dir` with
+    /// `canonicalize`, which follows reparse points, with the caller vouching
+    /// for the whole path.
+    pub no_symlink_root: bool,
+
     /// Stat virtualization policy.
     ///
     /// Default: [`StatVirtualization::Strict`].
@@ -62,6 +75,15 @@ pub struct PassthroughConfig {
     /// `None` means unbounded. When set, guest-attributable growth past this
     /// many bytes is rejected with `ENOSPC`.
     pub quota_bytes: Option<u64>,
+
+    /// Guest `(uid, gid)` to present for host files that carry no per-file
+    /// override in the metadata store.
+    ///
+    /// Host-created files have no store entry, so without this they surface as
+    /// `0:0` (root). When set, such files are presented as this owner instead.
+    /// `None` keeps the legacy `0:0` fallback. Only consulted while stat
+    /// virtualization is enabled.
+    pub default_owner: Option<(u32, u32)>,
 }
 
 //--------------------------------------------------------------------------------------------------
@@ -91,13 +113,28 @@ impl PassthroughConfig {
 impl PassthroughFs {
     /// Create a Windows passthrough filesystem rooted at `cfg.root_dir`.
     pub fn new(cfg: PassthroughConfig) -> io::Result<Self> {
-        let root = std::fs::canonicalize(&cfg.root_dir).map_err(host_error)?;
-        let metadata = std::fs::symlink_metadata(&root).map_err(host_error)?;
-        reject_reparse_metadata(&metadata)?;
-        if !metadata.file_type().is_dir() {
-            return Err(linux_error(LINUX_ENOTDIR));
+        // Reject contradictory metadata policy before resolving or probing the
+        // host root. Direct backend callers must receive the same guarantee as
+        // the SDK and runtime boundaries.
+        if cfg.default_owner.is_some() && matches!(cfg.stat_virtualization, StatVirtualization::Off)
+        {
+            return Err(linux_error(LINUX_EINVAL));
         }
-        let stat_store = StatStore::new(&root, cfg.stat_virtualization)?;
+
+        let root = if cfg.no_symlink_root {
+            // Resolve without following any reparse point; nothing in the path
+            // is trusted, so the escaping-symlink-root vector is closed.
+            resolve_root_no_reparse(&cfg.root_dir)?
+        } else {
+            let root = std::fs::canonicalize(&cfg.root_dir).map_err(host_error)?;
+            let metadata = std::fs::symlink_metadata(&root).map_err(host_error)?;
+            reject_reparse_metadata(&metadata)?;
+            if !metadata.file_type().is_dir() {
+                return Err(linux_error(LINUX_ENOTDIR));
+            }
+            root
+        };
+        let stat_store = StatStore::new(&root, cfg.stat_virtualization, cfg.readonly)?;
 
         let init_file = if cfg.inject_init {
             let mut file = tempfile::tempfile().map_err(host_error)?;
@@ -162,7 +199,7 @@ impl PassthroughFs {
         let path = std::fs::canonicalize(path).map_err(host_error)?;
         let metadata = safe_metadata_under_root(&root, &path)?;
         let mode = (mode_from_metadata(&metadata) & S_IFMT) | (permissions & 0o7777);
-        let store = StatStore::new(&root, StatVirtualization::Strict)?
+        let store = StatStore::new(&root, StatVirtualization::Strict, false)?
             .ok_or_else(|| linux_error(LINUX_EIO))?;
         store.write(&path, uid, gid, mode, 0)
     }
@@ -176,6 +213,7 @@ impl Default for PassthroughConfig {
     fn default() -> Self {
         Self {
             root_dir: PathBuf::new(),
+            no_symlink_root: false,
             stat_virtualization: StatVirtualization::Strict,
             host_permissions: HostPermissions::Private,
             readonly: false,
@@ -183,6 +221,7 @@ impl Default for PassthroughConfig {
             attr_timeout: Duration::from_secs(5),
             inject_init: true,
             quota_bytes: None,
+            default_owner: None,
         }
     }
 }

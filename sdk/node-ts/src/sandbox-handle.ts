@@ -1,4 +1,10 @@
 import { withMappedErrors } from "./internal/error-mapping.js";
+import {
+  modificationPlanFromJson,
+  modifyOptionsToNapi,
+  type ModifyOptions,
+  type SandboxModificationPlan,
+} from "./modify.js";
 import { metricsFromNapi } from "./internal/metrics.js";
 import type { NapiSandboxConfig, NapiSandboxHandle } from "./internal/napi.js";
 import {
@@ -10,7 +16,11 @@ import {
   logReadOptionsToNapi,
   logStreamOptionsToNapi,
 } from "./logs.js";
-import { Sandbox } from "./sandbox.js";
+import {
+  Sandbox,
+  type SandboxPingResult,
+  type SandboxTouchResult,
+} from "./sandbox.js";
 import type { SandboxStatus } from "./sandbox-status.js";
 import type { SandboxMetrics } from "./metrics.js";
 import { Snapshot } from "./snapshot.js";
@@ -29,6 +39,8 @@ export class SandboxHandle {
   /** Sandbox name. Names are limited to 128 UTF-8 bytes. */
   readonly name: string;
   readonly status: SandboxStatus;
+  /** Backend retained by this handle. */
+  readonly backendKind: "local" | "cloud";
   readonly configJson: string;
   readonly createdAt: Date | null;
   readonly updatedAt: Date | null;
@@ -38,6 +50,7 @@ export class SandboxHandle {
     this.inner = inner;
     this.name = inner.name;
     this.status = inner.status as SandboxStatus;
+    this.backendKind = inner.backendKind;
     this.configJson = inner.configJson;
     this.createdAt =
       typeof inner.createdAt === "number" ? new Date(inner.createdAt) : null;
@@ -58,6 +71,37 @@ export class SandboxHandle {
   async metrics(): Promise<SandboxMetrics> {
     const raw = await withMappedErrors(() => this.inner.metrics());
     return metricsFromNapi(raw);
+  }
+
+  /**
+   * Check whether agentd is reachable without refreshing idle activity.
+   *
+   * This connects to an already-running sandbox and does not start stopped
+   * sandboxes implicitly.
+   */
+  async ping(): Promise<SandboxPingResult> {
+    return await withMappedErrors(() => this.inner.ping());
+  }
+
+  /**
+   * Explicitly refresh this sandbox's idle activity timer.
+   *
+   * This connects to an already-running sandbox and does not start stopped
+   * sandboxes implicitly.
+   */
+  async touch(): Promise<SandboxTouchResult> {
+    return await withMappedErrors(() => this.inner.touch());
+  }
+
+  /**
+   * Plan or apply a sandbox modification. With `dryRun: true` the plan is
+   * computed without applying anything.
+   */
+  async modify(opts?: ModifyOptions): Promise<SandboxModificationPlan> {
+    const raw = await withMappedErrors(() =>
+      this.inner.modify(modifyOptionsToNapi(opts)),
+    );
+    return modificationPlanFromJson(raw);
   }
 
   /** Resume in attached mode. */
@@ -173,19 +217,13 @@ export class SandboxHandle {
   /**
    * Snapshot this (stopped) sandbox under a bare name. Resolves under
    * `~/.microsandbox/snapshots/<name>/`. For an explicit filesystem
-   * destination, see `snapshotTo`.
+   * destination, move the artifact with `Snapshot.save`/`Snapshot.load`.
    *
    * The sandbox must be stopped (or crashed); running sandboxes are
    * rejected with a `SnapshotSandboxRunning` error.
    */
   async snapshot(name: string): Promise<Snapshot> {
     const raw = await withMappedErrors(() => this.inner.snapshot(name));
-    return new Snapshot(raw);
-  }
-
-  /** Snapshot this (stopped) sandbox to an explicit filesystem path. */
-  async snapshotTo(path: string): Promise<Snapshot> {
-    const raw = await withMappedErrors(() => this.inner.snapshotTo(path));
     return new Snapshot(raw);
   }
 }

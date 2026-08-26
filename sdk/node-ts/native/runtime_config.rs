@@ -13,6 +13,19 @@ static BACKEND_SCOPES: OnceLock<Mutex<HashMap<u32, Arc<dyn microsandbox::Backend
     OnceLock::new();
 
 //--------------------------------------------------------------------------------------------------
+// Types
+//--------------------------------------------------------------------------------------------------
+
+/// Secret-safe backend diagnostics returned to JavaScript.
+#[napi(object, object_from_js = false)]
+pub struct JsBackendInfo {
+    pub kind: String,
+    pub api_url: Option<String>,
+    pub source: String,
+    pub profile: Option<String>,
+}
+
+//--------------------------------------------------------------------------------------------------
 // Functions
 //--------------------------------------------------------------------------------------------------
 
@@ -36,8 +49,8 @@ pub fn set_runtime_libkrunfw_path(path: String) {
 
 /// Set the process-wide default backend.
 ///
-/// `kind="local"` selects the local backend. `kind="cloud"` requires either
-/// `url` + `api_key`, or `profile`.
+/// `kind="local"` selects the local backend. `kind="cloud"` requires either an
+/// API key (with an optional URL override), or a profile.
 #[napi(js_name = "setDefaultBackend")]
 pub fn set_default_backend(
     kind: String,
@@ -84,9 +97,18 @@ pub fn pop_default_backend(token: u32) -> napi::Result<()> {
 /// Return the active default backend kind (`"local"` or `"cloud"`).
 #[napi(js_name = "defaultBackendKind")]
 pub fn default_backend_kind() -> &'static str {
-    match microsandbox::default_backend().kind() {
-        microsandbox::BackendKind::Local => "local",
-        microsandbox::BackendKind::Cloud => "cloud",
+    microsandbox::default_backend().kind().as_str()
+}
+
+/// Return secret-safe information about the active default backend.
+#[napi(js_name = "defaultBackendInfo")]
+pub fn default_backend_info() -> JsBackendInfo {
+    let info = microsandbox::default_backend_info();
+    JsBackendInfo {
+        kind: info.kind.as_str().to_string(),
+        api_url: info.api_url,
+        source: info.source.as_str().to_string(),
+        profile: info.profile,
     }
 }
 
@@ -102,13 +124,13 @@ fn build_backend(
             let cloud = if let Some(profile) = profile {
                 microsandbox::CloudBackend::from_profile(&profile)
             } else {
-                let url = url.ok_or_else(|| {
-                    napi::Error::from_reason("cloud backend requires url + apiKey or profile")
-                })?;
                 let api_key = api_key.ok_or_else(|| {
-                    napi::Error::from_reason("cloud backend requires url + apiKey or profile")
+                    napi::Error::from_reason("cloud backend requires apiKey or profile")
                 })?;
-                microsandbox::CloudBackend::new(url, api_key)
+                match url {
+                    Some(url) => microsandbox::CloudBackend::new(url, api_key),
+                    None => microsandbox::CloudBackend::with_api_key(api_key),
+                }
             }
             .map_err(|e| napi::Error::from_reason(e.to_string()))?;
             Ok(Arc::new(cloud))

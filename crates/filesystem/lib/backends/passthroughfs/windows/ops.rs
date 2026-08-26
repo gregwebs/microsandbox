@@ -276,6 +276,14 @@ impl DynFileSystem for PassthroughFs {
         }
 
         let handle = self.handle(inode, handle)?;
+        // A read-only handle has no buffered writes to persist. On Windows, flush
+        // maps to FlushFileBuffers, which requires the handle to hold GENERIC_WRITE
+        // and returns ERROR_ACCESS_DENIED on a read-only handle. That surfaces as a
+        // spurious EACCES on the guest close() of any read. Skip flush for read-only
+        // handles: there is nothing to sync.
+        if !open_flags_write(handle.flags) {
+            return Ok(());
+        }
         handle.file.lock().unwrap().sync_data().map_err(host_error)
     }
 
@@ -336,7 +344,6 @@ impl DynFileSystem for PassthroughFs {
             f_files: self.inodes.read().unwrap().by_inode.len() as u64,
             f_ffree: 0,
             f_namemax: 255,
-            ..Default::default()
         })
     }
 
@@ -426,6 +433,28 @@ impl DynFileSystem for PassthroughFs {
             .collect())
     }
 
+    fn readdir_for_each(
+        &self,
+        _ctx: Context,
+        inode: u64,
+        handle: u64,
+        _size: u32,
+        offset: u64,
+        add_entry: &mut AddDirEntry<'_>,
+    ) -> io::Result<()> {
+        let dir_handle = self
+            .dir_handles
+            .read()
+            .unwrap()
+            .get(&handle)
+            .filter(|data| data.inode == inode)
+            .cloned()
+            .ok_or_else(|| linux_error(LINUX_EBADF))?;
+        let _ = dir_handle;
+
+        self.dir_entries_for_each(inode, offset, &mut |dir_entry, _entry| add_entry(dir_entry))
+    }
+
     fn readdirplus(
         &self,
         _ctx: Context,
@@ -449,6 +478,28 @@ impl DynFileSystem for PassthroughFs {
             .into_iter()
             .skip(offset as usize)
             .collect())
+    }
+
+    fn readdirplus_for_each(
+        &self,
+        _ctx: Context,
+        inode: u64,
+        handle: u64,
+        _size: u32,
+        offset: u64,
+        add_entry: &mut AddDirEntryPlus<'_>,
+    ) -> io::Result<()> {
+        let dir_handle = self
+            .dir_handles
+            .read()
+            .unwrap()
+            .get(&handle)
+            .filter(|data| data.inode == inode)
+            .cloned()
+            .ok_or_else(|| linux_error(LINUX_EBADF))?;
+        let _ = dir_handle;
+
+        self.dir_entries_for_each(inode, offset, add_entry)
     }
 
     fn fsyncdir(&self, _ctx: Context, inode: u64, _datasync: bool, handle: u64) -> io::Result<()> {

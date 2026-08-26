@@ -60,7 +60,11 @@ func main() {
 	if err != nil {
 		log.Fatalf("Snapshot: %v", err)
 	}
-	fmt.Printf("snapshot created: digest=%s size=%d bytes\n", artifact.Digest(), artifact.SizeBytes())
+	size := "unknown"
+	if sizeBytes := artifact.SizeBytes(); sizeBytes != nil {
+		size = fmt.Sprintf("%d", *sizeBytes)
+	}
+	fmt.Printf("snapshot created: digest=%s size=%s bytes\n", artifact.Digest(), size)
 
 	report, err := artifact.Verify(ctx)
 	if err != nil {
@@ -78,7 +82,7 @@ func main() {
 	}
 	fmt.Printf("snapshot index entry: name=%s digest=%s\n", name, handle.Digest())
 
-	fork, err := microsandbox.CreateSandbox(ctx, forkName, microsandbox.WithSnapshot(snapshotName))
+	fork, err := microsandbox.CreateSandbox(ctx, forkName, microsandbox.WithFromSnapshot(snapshotName))
 	if err != nil {
 		log.Fatalf("CreateSandbox fork: %v", err)
 	}

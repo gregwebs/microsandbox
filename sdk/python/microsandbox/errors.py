@@ -17,6 +17,11 @@ class InvalidConfigError(MicrosandboxError):
     code = "invalid-config"
 
 
+class NoDefaultCommandError(MicrosandboxError):
+    """Sandbox configuration does not provide an executable default command."""
+    code = "no-default-command"
+
+
 class CloudHttpError(MicrosandboxError):
     """Cloud control-plane request failed."""
     code = "cloud-http"
@@ -120,3 +125,8 @@ class UnsupportedOperationError(MicrosandboxError):
 class UnsupportedError(MicrosandboxError):
     """The selected backend does not support a requested feature yet."""
     code = "unsupported"
+
+
+class SnapshotMigrationError(MicrosandboxError):
+    """A snapshot could not complete its adjacent-release migration."""
+    code = "snapshot-migration"

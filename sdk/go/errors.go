@@ -92,6 +92,9 @@ const (
 	// ErrSnapshotIntegrity indicates snapshot verification failed.
 	ErrSnapshotIntegrity
 
+	// ErrSnapshotMigration indicates an adjacent-release snapshot migration is blocked.
+	ErrSnapshotMigration
+
 	// ErrPatchFailed indicates a rootfs patch could not be applied before
 	// the VM booted.
 	ErrPatchFailed
@@ -148,6 +151,9 @@ const (
 
 	// ErrInternal is every other error from the runtime.
 	ErrInternal
+
+	// ErrNoDefaultCommand indicates that neither the effective entrypoint nor CMD is executable.
+	ErrNoDefaultCommand
 )
 
 func (k ErrorKind) String() string {
@@ -188,6 +194,8 @@ func (k ErrorKind) String() string {
 		return "SnapshotImageMissing"
 	case ErrSnapshotIntegrity:
 		return "SnapshotIntegrity"
+	case ErrSnapshotMigration:
+		return "SnapshotMigration"
 	case ErrPatchFailed:
 		return "PatchFailed"
 	case ErrNetworkPolicy:
@@ -218,6 +226,8 @@ func (k ErrorKind) String() string {
 		return "UnsupportedOperation"
 	case ErrInternal:
 		return "Internal"
+	case ErrNoDefaultCommand:
+		return "NoDefaultCommand"
 	default:
 		return "Unknown"
 	}
@@ -297,6 +307,8 @@ func kindFromFFI(kind string) ErrorKind {
 		return ErrVolumeAlreadyExists
 	case ffi.KindExecTimeout:
 		return ErrExecTimeout
+	case ffi.KindNoDefaultCommand:
+		return ErrNoDefaultCommand
 	case ffi.KindFilesystem:
 		return ErrFilesystem
 	case ffi.KindImageNotFound:
@@ -313,6 +325,8 @@ func kindFromFFI(kind string) ErrorKind {
 		return ErrSnapshotImageMissing
 	case ffi.KindSnapshotIntegrity:
 		return ErrSnapshotIntegrity
+	case ffi.KindSnapshotMigration:
+		return ErrSnapshotMigration
 	case ffi.KindPatchFailed:
 		return ErrPatchFailed
 	case ffi.KindIO:

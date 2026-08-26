@@ -4,7 +4,8 @@ PackageVersion: "{{VERSION}}"
 PackageLocale: en-US
 Publisher: Super Rad Company
 PublisherUrl: https://superrad.company/
-PackageName: microsandbox
+PublisherSupportUrl: https://github.com/superradcompany/microsandbox/issues
+PackageName: Microsandbox
 PackageUrl: https://microsandbox.dev/
 License: Apache-2.0
 LicenseUrl: https://github.com/superradcompany/microsandbox/blob/main/LICENSE
@@ -12,6 +13,11 @@ Copyright: Copyright 2026 Super Rad Company
 ShortDescription: Fast local microVM runtime for running untrusted workloads with hardware isolation.
 Description: Microsandbox runs untrusted workloads inside fast, local microVMs for AI agents, user code, plugins, CI jobs, development environments, scrapers, and automation.
 Moniker: microsandbox
+ReleaseNotesUrl: https://github.com/superradcompany/microsandbox/releases/tag/{{TAG}}
+Documentations:
+- DocumentLabel: Documentation
+  DocumentUrl: https://docs.microsandbox.dev
+InstallationNotes: Microsandbox requires Windows Hypervisor Platform to run local microVMs.
 Tags:
 - ai
 - cli

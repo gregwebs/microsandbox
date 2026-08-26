@@ -33,8 +33,12 @@ pub struct ExecArgs {
     pub user: Option<String>,
 
     /// Allocate a pseudo-terminal (enables colors, line editing).
-    #[arg(short = 't', long)]
+    #[arg(short = 't', long, conflicts_with = "no_tty")]
     pub tty: bool,
+
+    /// Disable pseudo-terminal allocation and run non-interactively.
+    #[arg(long = "no-tty", conflicts_with = "tty")]
+    pub no_tty: bool,
 
     /// Kill the command after this duration (e.g. 30s, 5m, 1h).
     #[arg(long)]
@@ -73,30 +77,86 @@ pub async fn run(args: ExecArgs) -> anyhow::Result<()> {
     // driver. A terminal stdin would be read in cooked mode (local echo, line
     // buffering, Ctrl-C delivered to msb) — the opposite of the byte-faithful
     // stream this mode promises. Interactive users want the PTY path (`--tty`).
-    if args.stream && std::io::stdin().is_terminal() {
+    let stdin_is_terminal = std::io::stdin().is_terminal();
+    if args.stream && stdin_is_terminal {
         anyhow::bail!(
             "`--stream` requires piped (non-terminal) stdin; use `--tty` for an interactive terminal session"
         );
     }
 
-    let sandbox = super::resolve_and_start(&args.name, args.quiet).await?;
-
-    // Build exec options.
     let env_pairs: Vec<(String, String)> = args
         .env
         .iter()
         .map(|s| ui::parse_env(s).map_err(anyhow::Error::msg))
         .collect::<anyhow::Result<Vec<_>>>()?;
 
+    let interactive = super::common::use_interactive_tty(stdin_is_terminal, args.no_tty);
+
+    let rlimits = args
+        .rlimit
+        .iter()
+        .map(|s| super::common::parse_rlimit(s))
+        .collect::<anyhow::Result<Vec<_>>>()?;
+
+    let timeout = args
+        .timeout
+        .as_deref()
+        .map(super::common::parse_duration_secs)
+        .transpose()?
+        .map(Duration::from_secs);
+
+    let sandbox = super::resolve_and_start(&args.name, args.quiet).await?;
+
+    let result = run_started(
+        &sandbox,
+        args,
+        env_pairs,
+        timeout,
+        rlimits,
+        stdin_is_terminal,
+        interactive,
+    )
+    .await;
+
+    // `maybe_stop` is a no-op for a sandbox that was already running, but it
+    // synchronously restores a sandbox that `exec` temporarily started.
+    super::maybe_stop(&sandbox).await;
+
+    let exit_code = result?;
+    if exit_code != 0 {
+        std::process::exit(exit_code);
+    }
+
+    Ok(())
+}
+
+//--------------------------------------------------------------------------------------------------
+// Functions: Helpers
+//--------------------------------------------------------------------------------------------------
+
+/// Run validated inputs while the caller retains responsibility for cleanup.
+#[allow(clippy::too_many_arguments)]
+async fn run_started(
+    sandbox: &Sandbox,
+    args: ExecArgs,
+    env_pairs: Vec<(String, String)>,
+    timeout: Option<Duration>,
+    rlimits: Vec<(RlimitResource, u64, u64)>,
+    stdin_is_terminal: bool,
+    interactive: bool,
+) -> anyhow::Result<i32> {
     let workdir = args.workdir;
-    let interactive = std::io::stdin().is_terminal();
 
     // Read piped stdin upfront so it can be forwarded into the sandbox.
     // Skipped in `--stream` mode, where stdin is forwarded incrementally.
-    let piped_stdin = if !interactive && !args.stream {
+    let piped_stdin = if should_read_buffered_stdin(stdin_is_terminal, interactive, args.stream) {
         let mut buf = Vec::new();
         tokio::io::stdin().read_to_end(&mut buf).await.ok();
         Some(buf)
+    } else if !interactive && !args.stream {
+        // `--no-tty` with terminal stdin means "non-interactive", so give the
+        // guest EOF instead of blocking on the host terminal.
+        Some(Vec::new())
     } else {
         None
     };
@@ -107,28 +167,12 @@ pub async fn run(args: ExecArgs) -> anyhow::Result<()> {
     let (cmd, cmd_args) =
         match super::common::resolve_exec_command(sandbox.config(), args.command, interactive)? {
             (Some(cmd), cmd_args) => (cmd, cmd_args),
-            (None, _) => {
-                super::maybe_stop(&sandbox).await;
-                std::process::exit(0);
-            }
+            (None, _) => return Ok(0),
         };
-
-    // Parse rlimits.
-    let rlimits: Vec<_> = args
-        .rlimit
-        .iter()
-        .map(|s| super::common::parse_rlimit(s))
-        .collect::<anyhow::Result<Vec<_>>>()?;
-
-    // Parse timeout.
-    let timeout = match &args.timeout {
-        Some(t) => Some(Duration::from_secs(super::common::parse_duration_secs(t)?)),
-        None => None,
-    };
 
     if args.stream {
         return run_stream(
-            &sandbox, cmd, cmd_args, &env_pairs, &workdir, &args.user, timeout, &rlimits,
+            sandbox, cmd, cmd_args, &env_pairs, &workdir, &args.user, timeout, &rlimits,
         )
         .await;
     }
@@ -153,12 +197,7 @@ pub async fn run(args: ExecArgs) -> anyhow::Result<()> {
                 a
             })
             .await?;
-
-        super::maybe_stop(&sandbox).await;
-
-        if exit_code != 0 {
-            std::process::exit(exit_code);
-        }
+        Ok(exit_code)
     } else {
         // Non-interactive: exec and capture output.
         let output: ExecOutput = sandbox
@@ -181,20 +220,9 @@ pub async fn run(args: ExecArgs) -> anyhow::Result<()> {
 
         std::io::stdout().write_all(output.stdout_bytes())?;
         std::io::stderr().write_all(output.stderr_bytes())?;
-
-        super::maybe_stop(&sandbox).await;
-
-        if !output.status().success {
-            std::process::exit(output.status().code);
-        }
+        Ok(output.status().code)
     }
-
-    Ok(())
 }
-
-//--------------------------------------------------------------------------------------------------
-// Functions: Helpers
-//--------------------------------------------------------------------------------------------------
 
 /// Apply the options shared by every `exec` mode (env, cwd, user, timeout,
 /// rlimits) onto an [`ExecOptionsBuilder`]. Mode-specific bits (stdin handling,
@@ -225,12 +253,15 @@ fn apply_common_exec_opts(
     e
 }
 
+/// Return whether buffered exec should consume host stdin before starting.
+fn should_read_buffered_stdin(stdin_is_terminal: bool, interactive: bool, stream: bool) -> bool {
+    !stdin_is_terminal && !interactive && !stream
+}
+
 /// Drive a non-PTY bidirectional streaming exec session (`--stream`).
 ///
 /// Forwards host stdin into the guest incrementally and flushes guest
 /// stdout/stderr per chunk, so a host driver can run the guest turn by turn.
-/// Always stops the sandbox (when we own its lifecycle) before returning, so a
-/// broken host pipe or a timeout can't leak it.
 #[allow(clippy::too_many_arguments)]
 async fn run_stream(
     sandbox: &Sandbox,
@@ -241,8 +272,8 @@ async fn run_stream(
     user: &Option<String>,
     timeout: Option<Duration>,
     rlimits: &[(RlimitResource, u64, u64)],
-) -> anyhow::Result<()> {
-    let mut handle = match sandbox
+) -> anyhow::Result<i32> {
+    let mut handle = sandbox
         .exec_stream_with(cmd, |e| {
             apply_common_exec_opts(
                 e.args(cmd_args).stdin_pipe(),
@@ -253,14 +284,7 @@ async fn run_stream(
                 rlimits,
             )
         })
-        .await
-    {
-        Ok(handle) => handle,
-        Err(e) => {
-            super::maybe_stop(sandbox).await;
-            return Err(e.into());
-        }
-    };
+        .await?;
 
     // Forward host stdin → guest incrementally in the background so it runs
     // concurrently with draining output. EOF or any read/write error closes the
@@ -283,17 +307,7 @@ async fn run_stream(
         });
     }
 
-    let result = drive_stream(&mut handle, timeout).await;
-
-    // Stop before propagating so neither a host-pipe error nor a timeout can
-    // leave the sandbox running.
-    super::maybe_stop(sandbox).await;
-
-    match result {
-        Ok(0) => Ok(()),
-        Ok(code) => std::process::exit(code),
-        Err(e) => Err(e),
-    }
+    drive_stream(&mut handle, timeout).await
 }
 
 /// Pump events from a streaming exec session to the host's stdout/stderr until
@@ -363,4 +377,54 @@ async fn write_chunk<W: tokio::io::AsyncWrite + Unpin>(
     w.write_all(data).await?;
     w.flush().await?;
     Ok(())
+}
+
+//--------------------------------------------------------------------------------------------------
+// Tests
+//--------------------------------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use clap::Parser;
+    use clap::error::ErrorKind;
+
+    use super::*;
+
+    #[derive(Debug, Parser)]
+    struct TestCli {
+        #[command(flatten)]
+        args: ExecArgs,
+    }
+
+    fn parse_exec_args(args: &[&str]) -> ExecArgs {
+        TestCli::parse_from(std::iter::once("msb").chain(args.iter().copied())).args
+    }
+
+    #[test]
+    fn no_tty_parses_before_command_delimiter() {
+        let args = parse_exec_args(&["box", "--no-tty", "--", "python3", "-c", "print('ok')"]);
+
+        assert!(args.no_tty);
+        assert_eq!(args.name, "box");
+        assert_eq!(
+            args.command,
+            vec![
+                "python3".to_string(),
+                "-c".to_string(),
+                "print('ok')".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn no_tty_conflicts_with_tty() {
+        let err = TestCli::try_parse_from(["msb", "--tty", "--no-tty", "box"]).unwrap_err();
+
+        assert_eq!(err.kind(), ErrorKind::ArgumentConflict);
+    }
+
+    #[test]
+    fn no_tty_with_terminal_stdin_does_not_buffer_stdin() {
+        assert!(!should_read_buffered_stdin(true, false, false));
+    }
 }

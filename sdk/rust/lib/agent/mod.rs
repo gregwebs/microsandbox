@@ -9,7 +9,10 @@ mod bridge;
 use std::ops::Deref;
 use std::path::Path;
 use std::time::Duration;
-use tokio::time::Instant;
+use tokio::{
+    io::{AsyncRead, AsyncWrite},
+    time::Instant,
+};
 
 //--------------------------------------------------------------------------------------------------
 // Types
@@ -82,6 +85,23 @@ impl AgentClient {
             .map(Self)
     }
 
+    /// Connect over an arbitrary byte-stream transport with an explicit
+    /// handshake timeout.
+    ///
+    /// The stream must be a transparent pipe to a sandbox's agent relay,
+    /// such as the cloud's agent WebSocket route adapted to bytes.
+    pub async fn connect_stream_with_timeout<S>(
+        stream: S,
+        timeout: Duration,
+    ) -> AgentClientResult<Self>
+    where
+        S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    {
+        microsandbox_agent_client::AgentClient::connect_stream_with_timeout(stream, timeout)
+            .await
+            .map(Self)
+    }
+
     /// Connect to an arbitrary agent relay socket path with an explicit
     /// handshake timeout.
     pub async fn connect_with_timeout(
@@ -121,12 +141,12 @@ impl AgentClient {
     /// Resolve a sandbox name to its agent relay socket path **without
     /// connecting**.
     ///
-    /// Returns the same path [`connect_sandbox`] would dial — the hashed path
-    /// under the runtime directory when it fits the platform's Unix-socket
-    /// length limit, and the legacy name-derived path otherwise. Useful for
-    /// talking to `agentd` over a raw byte transport (e.g. a transparent relay
-    /// that splices bytes to/from the socket) instead of this frame client. The
-    /// sandbox need not be running.
+    /// Returns the same path [`connect_sandbox`] would dial: the canonical
+    /// per-sandbox runtime path, an existing legacy flat path when talking to
+    /// an older runtime, or the retained in-sandbox fallback for deep homes.
+    /// Useful for talking to `agentd` over a raw byte transport (e.g. a
+    /// transparent relay that splices bytes to/from the socket) instead of
+    /// this frame client. The sandbox need not be running.
     pub fn socket_path(name: &str) -> crate::MicrosandboxResult<std::path::PathBuf> {
         crate::runtime::agent_socket_path(name)
     }

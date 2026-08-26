@@ -3,6 +3,8 @@ package microsandbox
 import (
 	"context"
 	"encoding/json"
+	"fmt"
+	"os"
 	"time"
 
 	"github.com/superradcompany/microsandbox/sdk/go/internal/ffi"
@@ -21,6 +23,9 @@ type Sandbox struct {
 	inner *ffi.Sandbox
 }
 
+// BackendKind returns the backend retained by this sandbox.
+func (s *Sandbox) BackendKind() BackendKind { return BackendKind(s.inner.BackendKind()) }
+
 // CreateSandbox creates and boots a new sandbox. The returned Sandbox owns the
 // VM process — call Close (or Stop + Close) when done.
 //
@@ -34,6 +39,10 @@ func CreateSandbox(ctx context.Context, name string, opts ...SandboxOption) (*Sa
 		opt(&o)
 	}
 
+	if err := resolveRegistryCACertPaths(&o); err != nil {
+		return nil, err
+	}
+
 	ffiOpts := buildFFICreateOptions(o)
 
 	inner, err := ffi.CreateSandbox(ctx, name, ffiOpts)
@@ -43,39 +52,72 @@ func CreateSandbox(ctx context.Context, name string, opts ...SandboxOption) (*Sa
 	return &Sandbox{inner: inner}, nil
 }
 
+// resolveRegistryCACertPaths reads every PEM file named by
+// RegistryCACertPaths and appends its contents to RegistryCACerts. The option
+// functions only record paths, since they cannot report a read failure.
+func resolveRegistryCACertPaths(o *SandboxConfig) error {
+	for _, path := range o.RegistryCACertPaths {
+		pem, err := os.ReadFile(path)
+		if err != nil {
+			return fmt.Errorf("microsandbox: reading registry CA certs %q: %w", path, err)
+		}
+		o.RegistryCACerts = append(o.RegistryCACerts, pem)
+	}
+	return nil
+}
+
 // buildFFICreateOptions translates SandboxConfig into the FFI wire shape.
 // Extracted so tests can assert the JSON envelope without booting the runtime.
 func buildFFICreateOptions(o SandboxConfig) ffi.CreateOptions {
 	ffiOpts := ffi.CreateOptions{
-		Image:           o.Image,
-		ImageFstype:     o.ImageFstype,
-		ImageBind:       o.ImageBind,
-		Snapshot:        o.Snapshot,
-		MemoryMiB:       o.MemoryMiB,
-		CPUs:            o.CPUs,
-		Workdir:         o.Workdir,
-		Shell:           o.Shell,
-		SecurityProfile: string(o.SecurityProfile),
-		Hostname:        o.Hostname,
-		User:            o.User,
-		Replace:         o.Replace,
-		Env:             o.Env,
-		Labels:          o.Labels,
-		Detached:        o.Detached,
-		Ephemeral:       o.Ephemeral,
-		Entrypoint:      o.Entrypoint,
-		LogLevel:        string(o.LogLevel),
-		QuietLogs:       o.QuietLogs,
-		Scripts:         o.Scripts,
-		PullPolicy:      string(o.PullPolicy),
-		MaxDurationSecs: durationSecsCeil(o.MaxDuration),
-		IdleTimeoutSecs: durationSecsCeil(o.IdleTimeout),
-		Ports:           o.Ports,
-		PortsUDP:        o.PortsUDP,
-		PortBindings:    buildFFIPortBindings(o.PortBindings),
+		Image:             o.Image,
+		ImageFstype:       o.ImageFstype,
+		ImageBind:         o.ImageBind,
+		Snapshot:          o.Snapshot,
+		MemoryMiB:         o.MemoryMiB,
+		CPUs:              o.CPUs,
+		MaxMemoryMiB:      o.MaxMemoryMiB,
+		MaxCPUs:           o.MaxCPUs,
+		CPUPlacement:      string(o.CPUPlacement),
+		PlacementProfile:  o.PlacementProfile,
+		THP:               string(o.THP),
+		Workdir:           o.Workdir,
+		Shell:             o.Shell,
+		SecurityProfile:   string(o.SecurityProfile),
+		DeploymentProfile: string(o.DeploymentProfile),
+		Hostname:          o.Hostname,
+		User:              o.User,
+		Replace:           o.Replace,
+		Env:               o.Env,
+		Labels:            o.Labels,
+		Detached:          o.Detached,
+		Ephemeral:         o.Ephemeral,
+		LogLevel:          string(o.LogLevel),
+		QuietLogs:         o.QuietLogs,
+		Scripts:           o.Scripts,
+		PullPolicy:        string(o.PullPolicy),
+		MaxDurationSecs:   durationSecsCeil(o.MaxDuration),
+		IdleTimeoutSecs:   durationSecsCeil(o.IdleTimeout),
+		Ports:             o.Ports,
+		PortsUDP:          o.PortsUDP,
+		PortBindings:      buildFFIPortBindings(o.PortBindings),
+		Vsock:             buildFFIVsockRoutes(o.Vsock),
+		RegistryInsecure:  o.RegistryInsecure,
 	}
-	if o.ociUpperSizeSet || o.OCIUpperSizeMiB != 0 {
-		ffiOpts.OCIUpperSizeMiB = &o.OCIUpperSizeMiB
+	if o.Entrypoint != nil {
+		entrypoint := append([]string{}, o.Entrypoint...)
+		ffiOpts.Entrypoint = &entrypoint
+	}
+	if o.Cmd != nil {
+		cmd := append([]string{}, o.Cmd...)
+		ffiOpts.Cmd = &cmd
+	}
+	if o.RootDisk != nil {
+		ffiOpts.RootDisk = buildFFIRootDisk(*o.RootDisk)
+	} else if o.ociUpperSizeSet || o.OCIUpperSizeMiB != 0 {
+		// Deprecated flat field, honored as a managed root disk.
+		size := o.OCIUpperSizeMiB
+		ffiOpts.RootDisk = &ffi.RootDiskSpec{Kind: "managed", SizeMiB: &size}
 	}
 	if o.ReplaceWithTimeout != nil {
 		var ms uint64
@@ -100,11 +142,17 @@ func buildFFICreateOptions(o SandboxConfig) ffi.CreateOptions {
 			Password: o.RegistryAuth.Password,
 		}
 	}
+	if len(o.RegistryCACerts) > 0 {
+		ffiOpts.RegistryCACerts = make([]string, 0, len(o.RegistryCACerts))
+		for _, pem := range o.RegistryCACerts {
+			ffiOpts.RegistryCACerts = append(ffiOpts.RegistryCACerts, string(pem))
+		}
+	}
 
 	if len(o.Volumes) > 0 {
 		ffiOpts.Volumes = make(map[string]ffi.MountSpec, len(o.Volumes))
 		for guestPath, m := range o.Volumes {
-			ffiOpts.Volumes[guestPath] = ffi.MountSpec{
+			spec := ffi.MountSpec{
 				Bind:               m.Bind,
 				Named:              m.Named,
 				NamedMode:          m.NamedMode,
@@ -122,6 +170,11 @@ func buildFFICreateOptions(o SandboxConfig) ffi.CreateOptions {
 				StatVirtualization: string(m.StatVirtualization),
 				HostPermissions:    string(m.HostPermissions),
 			}
+			if m.Owner != nil {
+				uid, gid := m.Owner.UID, m.Owner.GID
+				spec.OverrideUid, spec.OverrideGid = &uid, &gid
+			}
+			ffiOpts.Volumes[guestPath] = spec
 		}
 	}
 
@@ -156,6 +209,32 @@ func buildFFICreateOptions(o SandboxConfig) ffi.CreateOptions {
 	}
 
 	return ffiOpts
+}
+
+// buildFFIRootDisk translates a RootDiskConfig into the FFI wire shape.
+func buildFFIRootDisk(rd RootDiskConfig) *ffi.RootDiskSpec {
+	spec := &ffi.RootDiskSpec{}
+	switch rd.Kind() {
+	case RootDiskKindTmpfs:
+		spec.Kind = "tmpfs"
+	case RootDiskKindDiskImage:
+		spec.Kind = "disk-image"
+		spec.Path = rd.Path
+		spec.Format = rd.Format
+		spec.Fstype = rd.Fstype
+	case RootDiskKindFlat:
+		spec.Kind = "flat"
+		spec.Fstype = rd.Fstype
+		spec.Clone = string(rd.Clone)
+	default:
+		// Managed, including zero-valued configs built without the factory.
+		spec.Kind = "managed"
+	}
+	if rd.sizeSet || rd.SizeMiB != 0 {
+		size := rd.SizeMiB
+		spec.SizeMiB = &size
+	}
+	return spec
 }
 
 // durationSecsCeil rounds a Duration up to whole seconds. Sub-second values
@@ -204,10 +283,29 @@ func sandboxStopResultFromFFI(result *ffi.SandboxStopResult) *SandboxStopResult 
 	}
 }
 
+func sandboxPingResultFromFFI(result *ffi.SandboxPingResult) *SandboxPingResult {
+	if result == nil {
+		return nil
+	}
+	return &SandboxPingResult{
+		Name:    result.Name,
+		Latency: time.Duration(result.LatencyMs * float64(time.Millisecond)),
+	}
+}
+
+func sandboxTouchResultFromFFI(result *ffi.SandboxTouchResult) *SandboxTouchResult {
+	if result == nil {
+		return nil
+	}
+	return &SandboxTouchResult{
+		Name:        result.Name,
+		ActivitySeq: result.ActivitySeq,
+	}
+}
+
 // buildFFINetwork converts a public NetworkConfig into its ffi counterpart.
 func buildFFINetwork(n *NetworkConfig) *ffi.NetworkOptions {
 	out := &ffi.NetworkOptions{
-		Policy:              string(n.Policy),
 		DNSRebindProtection: n.DNSRebindProtection,
 		DenyDomains:         n.DenyDomains,
 		DenyDomainSuffixes:  n.DenyDomainSuffixes,
@@ -216,6 +314,7 @@ func buildFFINetwork(n *NetworkConfig) *ffi.NetworkOptions {
 		IPv4Pool:            n.IPv4Pool,
 		IPv6Pool:            n.IPv6Pool,
 		MaxConnections:      n.MaxConnections,
+		RateLimiter:         buildFFINetworkRateLimiter(n.RateLimiter),
 		OnSecretViolation:   string(n.OnSecretViolation),
 		TrustHostCAs:        n.TrustHostCAs,
 	}
@@ -251,18 +350,72 @@ func buildFFINetwork(n *NetworkConfig) *ffi.NetworkOptions {
 	}
 
 	if n.TLS != nil {
+		scopedUpstreamCACerts := make([]ffi.ScopedUpstreamCACert, 0, len(n.TLS.ScopedUpstreamCACerts))
+		for _, scoped := range n.TLS.ScopedUpstreamCACerts {
+			scopedUpstreamCACerts = append(scopedUpstreamCACerts, ffi.ScopedUpstreamCACert{
+				Pattern: scoped.Pattern,
+				Path:    scoped.Path,
+			})
+		}
+		scopedVerifyUpstream := make([]ffi.ScopedVerifyUpstream, 0, len(n.TLS.ScopedVerifyUpstream))
+		for _, scoped := range n.TLS.ScopedVerifyUpstream {
+			scopedVerifyUpstream = append(scopedVerifyUpstream, ffi.ScopedVerifyUpstream{
+				Pattern: scoped.Pattern,
+				Verify:  scoped.Verify,
+			})
+		}
 		out.TLS = &ffi.TLSOptions{
-			Bypass:           n.TLS.Bypass,
-			VerifyUpstream:   n.TLS.VerifyUpstream,
-			InterceptedPorts: n.TLS.InterceptedPorts,
-			BlockQUIC:        n.TLS.BlockQUIC,
-			CACert:           n.TLS.CACert,
-			CAKey:            n.TLS.CAKey,
-			UpstreamCACerts:  append([]string(nil), n.TLS.UpstreamCACerts...),
+			Bypass:                n.TLS.Bypass,
+			VerifyUpstream:        n.TLS.VerifyUpstream,
+			InterceptedPorts:      n.TLS.InterceptedPorts,
+			BlockQUIC:             n.TLS.BlockQUIC,
+			CACert:                n.TLS.CACert,
+			CAKey:                 n.TLS.CAKey,
+			UpstreamCACerts:       append([]string(nil), n.TLS.UpstreamCACerts...),
+			ScopedUpstreamCACerts: scopedUpstreamCACerts,
+			ScopedVerifyUpstream:  scopedVerifyUpstream,
 		}
 	}
 
 	return out
+}
+
+func buildFFINetworkRateLimiter(l *NetworkRateLimiterConfig) *ffi.NetworkRateLimiterOptions {
+	if l == nil {
+		return nil
+	}
+	return &ffi.NetworkRateLimiterOptions{
+		Egress:  buildFFIRateLimiter(l.Egress),
+		Ingress: buildFFIRateLimiter(l.Ingress),
+	}
+}
+
+func buildFFIRateLimiter(l *RateLimiterConfig) *ffi.RateLimiterOptions {
+	if l == nil {
+		return nil
+	}
+	return &ffi.RateLimiterOptions{
+		Bandwidth: buildFFITokenBucket(l.Bandwidth),
+		Ops:       buildFFITokenBucket(l.Ops),
+	}
+}
+
+func buildFFITokenBucket(b *TokenBucketConfig) *ffi.TokenBucketOptions {
+	if b == nil {
+		return nil
+	}
+	// Keep invalid durations invalid on the wire so the Rust builder returns
+	// a configuration error. Casting a negative Milliseconds result directly
+	// to uint64 would otherwise turn it into an enormous valid interval.
+	var refillTimeMs uint64
+	if b.RefillTime >= time.Millisecond && b.RefillTime%time.Millisecond == 0 {
+		refillTimeMs = uint64(b.RefillTime / time.Millisecond)
+	}
+	return &ffi.TokenBucketOptions{
+		Size:         b.Size,
+		RefillTimeMs: refillTimeMs,
+		OneTimeBurst: b.OneTimeBurst,
+	}
 }
 
 func buildFFIPortBindings(bindings []PortBinding) []ffi.PortBindingOptions {
@@ -273,6 +426,18 @@ func buildFFIPortBindings(bindings []PortBinding) []ffi.PortBindingOptions {
 			HostPort:  b.HostPort,
 			GuestPort: b.GuestPort,
 			Protocol:  string(b.Protocol),
+		})
+	}
+	return out
+}
+
+func buildFFIVsockRoutes(routes []VsockRoute) []ffi.VsockRouteOptions {
+	out := make([]ffi.VsockRouteOptions, 0, len(routes))
+	for _, route := range routes {
+		out = append(out, ffi.VsockRouteOptions{
+			HostSocket: route.HostSocket,
+			Port:       route.Port,
+			SocketType: string(route.SocketType),
 		})
 	}
 	return out
@@ -340,12 +505,20 @@ func AllSandboxMetrics(ctx context.Context) (map[string]*Metrics, error) {
 	return out, nil
 }
 
-// SandboxFilter narrows the results of ListSandboxes. The zero value matches
-// every sandbox. Build one fluently, e.g.
-// NewSandboxFilter().WithLabels(map[string]string{"user.id": "alice"}).
-type SandboxFilter struct {
+// SandboxPage is one page returned by ListSandboxes or ListSandboxesWith.
+type SandboxPage struct {
+	Sandboxes  []*SandboxHandle
+	NextCursor *string
+}
+
+type sandboxListOptions struct {
+	cursor *string
+	limit  *uint32
 	labels map[string]string
 }
+
+// SandboxListOption configures one paginated sandbox list request.
+type SandboxListOption func(*sandboxListOptions)
 
 type lifecycleOptions struct {
 	timeout time.Duration
@@ -367,6 +540,18 @@ type SandboxStopResult struct {
 	Source     *string
 }
 
+// SandboxPingResult describes a successful agent reachability check.
+type SandboxPingResult struct {
+	Name    string
+	Latency time.Duration
+}
+
+// SandboxTouchResult describes a successful explicit idle-activity refresh.
+type SandboxTouchResult struct {
+	Name        string
+	ActivitySeq uint64
+}
+
 // WithStopTimeout sets how long Stop waits for graceful shutdown before force-killing.
 func WithStopTimeout(timeout time.Duration) StopOption {
 	return func(o *lifecycleOptions) { o.timeout = timeout }
@@ -377,45 +562,56 @@ func WithKillTimeout(timeout time.Duration) KillOption {
 	return func(o *lifecycleOptions) { o.timeout = timeout }
 }
 
-// NewSandboxFilter returns an empty filter that matches every sandbox.
-func NewSandboxFilter() SandboxFilter { return SandboxFilter{} }
+// WithListCursor continues after a cursor returned by a previous page.
+func WithListCursor(cursor string) SandboxListOption {
+	return func(options *sandboxListOptions) { options.cursor = &cursor }
+}
 
-// WithLabels requires matched sandboxes to carry all of these labels
-// (AND-matched). Repeated calls merge; later keys overwrite earlier ones.
-func (f SandboxFilter) WithLabels(labels map[string]string) SandboxFilter {
-	if f.labels == nil {
-		f.labels = make(map[string]string, len(labels))
+// WithListLimit sets the maximum number of sandboxes returned in one page.
+func WithListLimit(limit uint32) SandboxListOption {
+	return func(options *sandboxListOptions) { options.limit = &limit }
+}
+
+// WithListLabels requires every returned sandbox to carry all labels.
+func WithListLabels(labels map[string]string) SandboxListOption {
+	return func(options *sandboxListOptions) {
+		if options.labels == nil {
+			options.labels = make(map[string]string, len(labels))
+		}
+		for key, value := range labels {
+			options.labels[key] = value
+		}
 	}
-	for k, v := range labels {
-		f.labels[k] = v
+}
+
+// ListSandboxes returns the first page of known sandboxes.
+func ListSandboxes(ctx context.Context) (*SandboxPage, error) {
+	return listSandboxes(ctx)
+}
+
+// ListSandboxesWith returns a configured page of known sandboxes.
+func ListSandboxesWith(ctx context.Context, configure ...SandboxListOption) (*SandboxPage, error) {
+	return listSandboxes(ctx, configure...)
+}
+
+func listSandboxes(ctx context.Context, configure ...SandboxListOption) (*SandboxPage, error) {
+	options := sandboxListOptions{}
+	for _, apply := range configure {
+		apply(&options)
 	}
-	return f
-}
-
-// ListSandboxes returns metadata for every known sandbox (running or stopped),
-// ordered by creation time (newest first). Use ListSandboxesWith to narrow the
-// results by labels.
-func ListSandboxes(ctx context.Context) ([]*SandboxHandle, error) {
-	return listSandboxes(ctx, nil)
-}
-
-// ListSandboxesWith returns sandbox metadata narrowed by a SandboxFilter, e.g.
-// NewSandboxFilter().WithLabels(map[string]string{"user.id": "alice"}). Label
-// selectors are AND-matched.
-func ListSandboxesWith(ctx context.Context, filter SandboxFilter) ([]*SandboxHandle, error) {
-	return listSandboxes(ctx, filter.labels)
-}
-
-func listSandboxes(ctx context.Context, labels map[string]string) ([]*SandboxHandle, error) {
-	infos, err := ffi.ListSandboxes(ctx, labels)
+	page, err := ffi.ListSandboxes(ctx, ffi.SandboxListOptions{
+		Cursor: options.cursor,
+		Limit:  options.limit,
+		Labels: options.labels,
+	})
 	if err != nil {
 		return nil, wrapFFI(err)
 	}
-	out := make([]*SandboxHandle, len(infos))
-	for i, info := range infos {
+	out := make([]*SandboxHandle, len(page.Sandboxes))
+	for i, info := range page.Sandboxes {
 		out[i] = newSandboxHandle(info)
 	}
-	return out, nil
+	return &SandboxPage{Sandboxes: out, NextCursor: page.NextCursor}, nil
 }
 
 // RemoveSandbox removes a stopped sandbox's persisted state by name.
@@ -437,15 +633,21 @@ type SandboxHandle struct {
 	configJSON    string
 	createdAtUnix *int64
 	updatedAtUnix *int64
+	backendKind   BackendKind
 }
 
 func newSandboxHandle(info *ffi.SandboxHandleInfo) *SandboxHandle {
+	backendKind := BackendKind(info.BackendKind)
+	if backendKind == "" {
+		backendKind = BackendUnknown
+	}
 	return &SandboxHandle{
 		name:          info.Name,
 		status:        SandboxStatus(info.Status),
 		configJSON:    info.ConfigJSON,
 		createdAtUnix: info.CreatedAtUnix,
 		updatedAtUnix: info.UpdatedAtUnix,
+		backendKind:   backendKind,
 	}
 }
 
@@ -454,6 +656,9 @@ func (h *SandboxHandle) Name() string { return h.name }
 
 // Status returns the sandbox's last-known lifecycle status.
 func (h *SandboxHandle) Status() SandboxStatus { return h.status }
+
+// BackendKind returns the backend retained by this handle.
+func (h *SandboxHandle) BackendKind() BackendKind { return h.backendKind }
 
 // ConfigJSON returns the raw JSON configuration stored for this sandbox.
 func (h *SandboxHandle) ConfigJSON() string { return h.configJSON }
@@ -511,6 +716,28 @@ func (h *SandboxHandle) Metrics(ctx context.Context) (*Metrics, error) {
 		UpperHostAllocatedBytes: m.UpperHostAllocatedBytes,
 		Uptime:                  m.Uptime,
 	}, nil
+}
+
+// Ping checks whether agentd is reachable without refreshing idle activity.
+// It connects to an already-running sandbox and does not start stopped
+// sandboxes implicitly.
+func (h *SandboxHandle) Ping(ctx context.Context) (*SandboxPingResult, error) {
+	result, err := ffi.PingSandboxByName(ctx, h.name)
+	if err != nil {
+		return nil, wrapFFI(err)
+	}
+	return sandboxPingResultFromFFI(result), nil
+}
+
+// Touch explicitly refreshes this sandbox's idle activity timer. It connects
+// to an already-running sandbox and does not start stopped sandboxes
+// implicitly.
+func (h *SandboxHandle) Touch(ctx context.Context) (*SandboxTouchResult, error) {
+	result, err := ffi.TouchSandboxByName(ctx, h.name)
+	if err != nil {
+		return nil, wrapFFI(err)
+	}
+	return sandboxTouchResultFromFFI(result), nil
 }
 
 // Connect reattaches to the running sandbox and returns a live handle.
@@ -572,15 +799,6 @@ func (h *SandboxHandle) Remove(ctx context.Context) error {
 // snapshots directory.
 func (h *SandboxHandle) Snapshot(ctx context.Context, name string) (*SnapshotArtifact, error) {
 	info, err := ffi.SandboxHandleSnapshot(ctx, h.name, name)
-	if err != nil {
-		return nil, wrapFFI(err)
-	}
-	return snapshotFromInfo(info), nil
-}
-
-// SnapshotTo captures this stopped sandbox to an explicit artifact directory.
-func (h *SandboxHandle) SnapshotTo(ctx context.Context, path string) (*SnapshotArtifact, error) {
-	info, err := ffi.SandboxHandleSnapshotTo(ctx, h.name, path)
 	if err != nil {
 		return nil, wrapFFI(err)
 	}
@@ -666,7 +884,40 @@ func (s *Sandbox) OwnsLifecycleOrFalse() bool {
 // The caller's terminal must be a real TTY; this is primarily useful for
 // CLI tools, not library code.
 func (s *Sandbox) Attach(ctx context.Context, cmd string, args ...string) (int, error) {
-	code, err := s.inner.Attach(ctx, cmd, args)
+	code, err := s.inner.Attach(ctx, cmd, ffi.AttachOptions{Args: args})
+	return code, wrapFFI(err)
+}
+
+// AttachDefault starts an interactive PTY session for the effective OCI entrypoint and CMD.
+func (s *Sandbox) AttachDefault(ctx context.Context, opts ...AttachOption) (int, error) {
+	o := AttachConfig{}
+	for _, opt := range opts {
+		opt(&o)
+	}
+	code, err := s.inner.AttachDefault(ctx, ffi.AttachOptions{
+		Cwd:        o.Cwd,
+		User:       o.User,
+		Env:        o.Env,
+		DetachKeys: o.DetachKeys,
+	})
+	return code, wrapFFI(err)
+}
+
+// AttachWith starts an interactive PTY session running cmd with args, applying
+// the given options. Otherwise identical to Attach.
+func (s *Sandbox) AttachWith(ctx context.Context, cmd string, args []string, opts ...AttachOption) (int, error) {
+	o := AttachConfig{}
+	for _, opt := range opts {
+		opt(&o)
+	}
+
+	code, err := s.inner.Attach(ctx, cmd, ffi.AttachOptions{
+		Args:       args,
+		Cwd:        o.Cwd,
+		User:       o.User,
+		Env:        o.Env,
+		DetachKeys: o.DetachKeys,
+	})
 	return code, wrapFFI(err)
 }
 
@@ -704,6 +955,24 @@ func (s *Sandbox) Metrics(ctx context.Context) (*Metrics, error) {
 		UpperHostAllocatedBytes: m.UpperHostAllocatedBytes,
 		Uptime:                  m.Uptime,
 	}, nil
+}
+
+// Ping checks whether agentd is reachable without refreshing idle activity.
+func (s *Sandbox) Ping(ctx context.Context) (*SandboxPingResult, error) {
+	result, err := s.inner.Ping(ctx)
+	if err != nil {
+		return nil, wrapFFI(err)
+	}
+	return sandboxPingResultFromFFI(result), nil
+}
+
+// Touch explicitly refreshes this sandbox's idle activity timer.
+func (s *Sandbox) Touch(ctx context.Context) (*SandboxTouchResult, error) {
+	result, err := s.inner.Touch(ctx)
+	if err != nil {
+		return nil, wrapFFI(err)
+	}
+	return sandboxTouchResultFromFFI(result), nil
 }
 
 // MetricsStreamHandle is a live metrics subscription. Obtain via

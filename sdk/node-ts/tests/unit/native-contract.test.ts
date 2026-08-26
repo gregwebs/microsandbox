@@ -14,8 +14,55 @@ describe("native Sandbox lifecycle contract", () => {
       "killWithTimeout",
       "requestDrain",
       "waitUntilStopped",
+      "ping",
+      "touch",
+      "modify",
+      "execDefault",
+      "execDefaultWithBuilder",
+      "execDefaultStream",
+      "execDefaultStreamWithBuilder",
+      "attachDefault",
+      "attachDefaultWithBuilder",
     ]) {
       expect(typeof proto[method], method).toBe("function");
+    }
+  });
+
+  it("exports the durable CMD builder setter", () => {
+    const proto = napi.SandboxBuilder.prototype as Record<string, unknown>;
+    expect(typeof proto.cmd).toBe("function");
+  });
+
+  it("exports the handle health methods used by the TS wrapper", () => {
+    const proto = napi.SandboxHandle.prototype as Record<string, unknown>;
+
+    for (const method of ["ping", "touch", "modify"]) {
+      expect(typeof proto[method], method).toBe("function");
+    }
+  });
+});
+
+describe("native ExecHandle contract", () => {
+  it("exports the TTY resize method used by the TS wrapper", () => {
+    const proto = napi.ExecHandle.prototype as Record<string, unknown>;
+    expect(typeof proto.resize).toBe("function");
+  });
+});
+
+describe("native image cache contract", () => {
+  it("exports the image functions used by the TS wrapper", () => {
+    const fns = napi as unknown as Record<string, unknown>;
+
+    for (const fn of [
+      "imageGet",
+      "imageList",
+      "imageInspect",
+      "imageRemove",
+      "imagePrune",
+      "imageLoad",
+      "imageSave",
+    ]) {
+      expect(typeof fns[fn], fn).toBe("function");
     }
   });
 });

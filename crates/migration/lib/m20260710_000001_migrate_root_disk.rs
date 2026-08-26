@@ -1,0 +1,292 @@
+//! Migration: Root disk kinds for the OCI writable layer.
+//!
+//! microsandbox 0.6 replaces `image.Oci.upper_size_mib` in persisted sandbox
+//! config JSON with the structured `root_disk` spec (`{kind, ...}`), and adds
+//! `sandbox_rootfs.root_disk_kind` / `root_disk_path` so spawn can dispatch on
+//! the kind without parsing config.
+
+use sea_orm_migration::{
+    prelude::*,
+    sea_orm::{ConnectionTrait, DatabaseBackend, Statement},
+};
+
+//--------------------------------------------------------------------------------------------------
+// Types
+//--------------------------------------------------------------------------------------------------
+
+pub struct Migration;
+
+//--------------------------------------------------------------------------------------------------
+// Types: Identifiers
+//--------------------------------------------------------------------------------------------------
+
+#[derive(Iden)]
+enum SandboxRootfs {
+    Table,
+    RootDiskKind,
+    RootDiskPath,
+}
+
+//--------------------------------------------------------------------------------------------------
+// Trait Implementations
+//--------------------------------------------------------------------------------------------------
+
+impl MigrationName for Migration {
+    fn name(&self) -> &str {
+        "m20260710_000001_migrate_root_disk"
+    }
+}
+
+#[async_trait::async_trait]
+impl MigrationTrait for Migration {
+    async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+        manager
+            .alter_table(
+                Table::alter()
+                    .table(SandboxRootfs::Table)
+                    .add_column(
+                        ColumnDef::new(SandboxRootfs::RootDiskKind)
+                            .text()
+                            .not_null()
+                            .default("managed"),
+                    )
+                    .to_owned(),
+            )
+            .await?;
+
+        manager
+            .alter_table(
+                Table::alter()
+                    .table(SandboxRootfs::Table)
+                    .add_column(ColumnDef::new(SandboxRootfs::RootDiskPath).text())
+                    .to_owned(),
+            )
+            .await?;
+
+        let conn = manager.get_connection();
+        for column in ["config", "active_config"] {
+            let rows = conn
+                .query_all_raw(Statement::from_string(
+                    DatabaseBackend::Sqlite,
+                    format!("SELECT id, {column} FROM sandbox WHERE {column} IS NOT NULL"),
+                ))
+                .await?;
+
+            for row in rows {
+                let id = row.try_get_by_index::<i32>(0)?;
+                let config = row.try_get_by_index::<String>(1)?;
+                let Some(updated) = migrate_config(&config)? else {
+                    continue;
+                };
+
+                conn.execute_raw(Statement::from_sql_and_values(
+                    DatabaseBackend::Sqlite,
+                    format!("UPDATE sandbox SET {column} = ? WHERE id = ?"),
+                    [updated.into(), id.into()],
+                ))
+                .await?;
+            }
+        }
+
+        Ok(())
+    }
+
+    async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+        let conn = manager.get_connection();
+        for column in ["config", "active_config"] {
+            let rows = conn
+                .query_all_raw(Statement::from_string(
+                    DatabaseBackend::Sqlite,
+                    format!("SELECT id, {column} FROM sandbox WHERE {column} IS NOT NULL"),
+                ))
+                .await?;
+
+            for row in rows {
+                let id = row.try_get_by_index::<i32>(0)?;
+                let config = row.try_get_by_index::<String>(1)?;
+                let Some(updated) = downgrade_config(&config)? else {
+                    continue;
+                };
+                conn.execute_raw(Statement::from_sql_and_values(
+                    DatabaseBackend::Sqlite,
+                    format!("UPDATE sandbox SET {column} = ? WHERE id = ?"),
+                    [updated.into(), id.into()],
+                ))
+                .await?;
+            }
+        }
+
+        manager
+            .alter_table(
+                Table::alter()
+                    .table(SandboxRootfs::Table)
+                    .drop_column(SandboxRootfs::RootDiskPath)
+                    .to_owned(),
+            )
+            .await?;
+        manager
+            .alter_table(
+                Table::alter()
+                    .table(SandboxRootfs::Table)
+                    .drop_column(SandboxRootfs::RootDiskKind)
+                    .to_owned(),
+            )
+            .await?;
+
+        Ok(())
+    }
+}
+
+//--------------------------------------------------------------------------------------------------
+// Functions
+//--------------------------------------------------------------------------------------------------
+
+fn migrate_config(config: &str) -> Result<Option<String>, DbErr> {
+    let mut value = serde_json::from_str::<serde_json::Value>(config)
+        .map_err(|err| DbErr::Custom(format!("parse sandbox config JSON: {err}")))?;
+
+    let Some(oci) = value
+        .get_mut("image")
+        .and_then(|image| image.get_mut("Oci"))
+        .and_then(|oci| oci.as_object_mut())
+    else {
+        return Ok(None);
+    };
+
+    if oci.contains_key("root_disk") {
+        return Ok(None);
+    }
+
+    let Some(size) = oci.remove("upper_size_mib") else {
+        return Ok(None);
+    };
+
+    // `serde_json::Value::is_null` spelled out: with the sea-query prelude in
+    // scope, `size.is_null()` resolves to `ExprTrait::is_null` (by-value self
+    // beats serde_json's by-ref inherent method) and builds SQL instead.
+    if !serde_json::Value::is_null(&size) {
+        oci.insert(
+            "root_disk".to_owned(),
+            serde_json::json!({ "kind": "managed", "size_mib": size }),
+        );
+    }
+
+    serde_json::to_string(&value)
+        .map(Some)
+        .map_err(|err| DbErr::Custom(format!("serialize sandbox config JSON: {err}")))
+}
+
+/// Project a managed root disk back to the v0.6.6 `upper_size_mib` field.
+/// New root-disk kinds are refused because the old runtime would otherwise
+/// interpret them as a managed ext4 upper and could start against the wrong
+/// storage.
+fn downgrade_config(config: &str) -> Result<Option<String>, DbErr> {
+    let mut value = serde_json::from_str::<serde_json::Value>(config)
+        .map_err(|err| DbErr::Custom(format!("parse sandbox config JSON: {err}")))?;
+    let Some(oci) = value
+        .get_mut("image")
+        .and_then(|image| image.get_mut("Oci"))
+        .and_then(serde_json::Value::as_object_mut)
+    else {
+        return Ok(None);
+    };
+    let Some(root_disk) = oci.remove("root_disk") else {
+        return Ok(None);
+    };
+    // UFCS to dodge sea-query's `ExprTrait::is_null` (see `migrate_config`).
+    if serde_json::Value::is_null(&root_disk) {
+        return serde_json::to_string(&value)
+            .map(Some)
+            .map_err(|err| DbErr::Custom(format!("serialize sandbox config JSON: {err}")));
+    }
+    let kind = root_disk
+        .get("kind")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| {
+            DbErr::Custom("root_disk_downgrade_unrepresentable: root_disk.kind is missing".into())
+        })?;
+    if kind != "managed" {
+        return Err(DbErr::Custom(format!(
+            "root_disk_downgrade_unrepresentable: root disk kind {kind:?} is not supported by v0.6.6"
+        )));
+    }
+    let size = root_disk
+        .get("size_mib")
+        .cloned()
+        .unwrap_or(serde_json::Value::Null);
+    if !serde_json::Value::is_null(&size) && !size.is_u64() {
+        return Err(DbErr::Custom(
+            "root_disk_downgrade_unrepresentable: managed size_mib is not an unsigned integer"
+                .into(),
+        ));
+    }
+    oci.insert("upper_size_mib".into(), size);
+
+    serde_json::to_string(&value)
+        .map(Some)
+        .map_err(|err| DbErr::Custom(format!("serialize sandbox config JSON: {err}")))
+}
+
+//--------------------------------------------------------------------------------------------------
+// Tests
+//--------------------------------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn migrate_config_rewrites_upper_size_to_root_disk() {
+        let config =
+            r#"{"name":"old","image":{"Oci":{"reference":"ubuntu","upper_size_mib":8192}}}"#;
+        let updated = migrate_config(config).unwrap().unwrap();
+        let value: serde_json::Value = serde_json::from_str(&updated).unwrap();
+
+        assert_eq!(value["image"]["Oci"]["reference"], "ubuntu");
+        assert_eq!(value["image"]["Oci"]["root_disk"]["kind"], "managed");
+        assert_eq!(value["image"]["Oci"]["root_disk"]["size_mib"], 8192);
+        assert!(value["image"]["Oci"].get("upper_size_mib").is_none());
+    }
+
+    #[test]
+    fn migrate_config_drops_null_upper_size_without_root_disk() {
+        let config =
+            r#"{"name":"old","image":{"Oci":{"reference":"ubuntu","upper_size_mib":null}}}"#;
+        let updated = migrate_config(config).unwrap().unwrap();
+        let value: serde_json::Value = serde_json::from_str(&updated).unwrap();
+
+        assert!(value["image"]["Oci"].get("upper_size_mib").is_none());
+        assert!(value["image"]["Oci"].get("root_disk").is_none());
+    }
+
+    #[test]
+    fn migrate_config_ignores_migrated_and_non_oci_sources() {
+        let migrated = r#"{"name":"new","image":{"Oci":{"reference":"ubuntu","root_disk":{"kind":"managed","size_mib":8192}}}}"#;
+        assert!(migrate_config(migrated).unwrap().is_none());
+
+        let bind = r#"{"name":"bind","image":{"Bind":"/tmp/rootfs"}}"#;
+        assert!(migrate_config(bind).unwrap().is_none());
+    }
+
+    #[test]
+    fn downgrade_config_projects_managed_root_disk_to_upper_size() {
+        let config = r#"{"name":"new","image":{"Oci":{"reference":"ubuntu","root_disk":{"kind":"managed","size_mib":8192}}}}"#;
+        let updated = downgrade_config(config).unwrap().unwrap();
+        let value: serde_json::Value = serde_json::from_str(&updated).unwrap();
+
+        assert_eq!(value["image"]["Oci"]["upper_size_mib"], 8192);
+        assert!(value["image"]["Oci"].get("root_disk").is_none());
+    }
+
+    #[test]
+    fn downgrade_config_refuses_newer_root_disk_kinds() {
+        let config = r#"{"name":"new","image":{"Oci":{"reference":"ubuntu","root_disk":{"kind":"tmpfs","size_mib":1024}}}}"#;
+        let error = downgrade_config(config).unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("root_disk_downgrade_unrepresentable")
+        );
+    }
+}

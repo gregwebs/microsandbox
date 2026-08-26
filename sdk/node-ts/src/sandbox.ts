@@ -1,5 +1,11 @@
 import { withMappedErrors } from "./internal/error-mapping.js";
 import {
+  modificationPlanFromJson,
+  modifyOptionsToNapi,
+  type ModifyOptions,
+  type SandboxModificationPlan,
+} from "./modify.js";
+import {
   napi,
   type NapiAttachOptionsBuilder,
   type NapiExecOptionsBuilder,
@@ -9,6 +15,8 @@ import {
   type NapiSandbox,
   type NapiSandboxBuilderSetters,
   type NapiSandboxConfig,
+  type NapiSandboxListOptions,
+  type NapiSandboxPage,
 } from "./internal/napi.js";
 import { ExecHandle, ExecOutput } from "./exec.js";
 import { SandboxFsOps } from "./fs.js";
@@ -48,9 +56,65 @@ import { SandboxSshOps } from "./ssh.js";
 // `Promise<NapiSandbox>`.
 export type SandboxConfig = NapiSandboxConfig;
 
+export type CpuPlacement = "inherit" | "auto" | "spread" | "compact";
+
 export interface SandboxBuilder extends NapiSandboxBuilderSetters {
   create(): Promise<Sandbox>;
   createWithPullProgress(): Promise<PullProgressCreate>;
+}
+
+export interface SandboxPingResult {
+  readonly name: string;
+  readonly latencyMs: number;
+}
+
+export interface SandboxTouchResult {
+  readonly name: string;
+  readonly activitySeq: number;
+}
+
+/** One page returned by `Sandbox.list()` or `Sandbox.listWith()`. */
+export interface SandboxPage {
+  sandboxes: SandboxHandle[];
+  nextCursor?: string;
+}
+
+/** Fluent options for one paginated sandbox list request. */
+export class SandboxListBuilder {
+  private readonly options: NapiSandboxListOptions = {};
+
+  limit(limit: number): this {
+    this.options.limit = limit;
+    return this;
+  }
+
+  cursor(cursor: string): this {
+    this.options.cursor = cursor;
+    return this;
+  }
+
+  label(key: string, value: string): this {
+    this.options.labels ??= {};
+    this.options.labels[key] = value;
+    return this;
+  }
+
+  labels(labels: Record<string, string>): this {
+    this.options.labels = { ...this.options.labels, ...labels };
+    return this;
+  }
+
+  /** @internal */
+  toNapi(): NapiSandboxListOptions {
+    return this.options;
+  }
+}
+
+function sandboxPageFromNapi(page: NapiSandboxPage): SandboxPage {
+  return {
+    sandboxes: page.sandboxes.map((handle) => new SandboxHandle(handle)),
+    nextCursor: page.nextCursor,
+  };
 }
 
 /**
@@ -102,12 +166,15 @@ export class Sandbox implements AsyncDisposable {
   /** Sandbox name. Names are limited to 128 UTF-8 bytes. */
   readonly name: string;
   readonly ownsLifecycle: boolean;
+  /** Backend retained by this sandbox. */
+  readonly backendKind: "local" | "cloud";
 
   /** @internal use `Sandbox.builder(name).create()` */
   constructor(inner: NapiSandbox, name: string, ownsLifecycle = true) {
     this.inner = inner;
     this.name = name;
     this.ownsLifecycle = ownsLifecycle;
+    this.backendKind = inner.backendKind;
   }
 
   // -- statics ------------------------------------------------------------
@@ -172,21 +239,21 @@ export class Sandbox implements AsyncDisposable {
     return new SandboxHandle(h);
   }
 
-  /** List all known sandboxes. */
-  static async list(): Promise<SandboxHandle[]> {
-    const handles = await withMappedErrors(() => napi.Sandbox.list());
-    return handles.map((handle) => new SandboxHandle(handle));
+  /** List the first page of known sandboxes. */
+  static async list(): Promise<SandboxPage> {
+    const page = await withMappedErrors(() => napi.Sandbox.list());
+    return sandboxPageFromNapi(page);
   }
 
-  /**
-   * List sandboxes filtered to those carrying all of the given labels
-   * (AND-matched).
-   */
-  static async listWith(filter: {
-    labels?: Record<string, string>;
-  }): Promise<SandboxHandle[]> {
-    const handles = await withMappedErrors(() => napi.Sandbox.listWith(filter));
-    return handles.map((handle) => new SandboxHandle(handle));
+  /** List a configured page of sandboxes. */
+  static async listWith(
+    configure: (list: SandboxListBuilder) => SandboxListBuilder,
+  ): Promise<SandboxPage> {
+    const options = configure(new SandboxListBuilder()).toNapi();
+    const page = await withMappedErrors(() =>
+      napi.Sandbox.listWith(options),
+    );
+    return sandboxPageFromNapi(page);
   }
 
   /**
@@ -198,6 +265,36 @@ export class Sandbox implements AsyncDisposable {
   }
 
   // -- exec ---------------------------------------------------------------
+
+  async execDefault(): Promise<ExecOutput> {
+    const raw = await withMappedErrors(() => this.inner.execDefault());
+    return new ExecOutput(raw);
+  }
+
+  async execDefaultWith(
+    configure: (b: NapiExecOptionsBuilder) => NapiExecOptionsBuilder,
+  ): Promise<ExecOutput> {
+    const builder = configure(new napi.ExecOptionsBuilder());
+    const raw = await withMappedErrors(() =>
+      this.inner.execDefaultWithBuilder(builder),
+    );
+    return new ExecOutput(raw);
+  }
+
+  async execDefaultStream(): Promise<ExecHandle> {
+    const raw = await withMappedErrors(() => this.inner.execDefaultStream());
+    return new ExecHandle(raw);
+  }
+
+  async execDefaultStreamWith(
+    configure: (b: NapiExecOptionsBuilder) => NapiExecOptionsBuilder,
+  ): Promise<ExecHandle> {
+    const builder = configure(new napi.ExecOptionsBuilder());
+    const raw = await withMappedErrors(() =>
+      this.inner.execDefaultStreamWithBuilder(builder),
+    );
+    return new ExecHandle(raw);
+  }
 
   async exec(cmd: string, args?: Iterable<string>): Promise<ExecOutput> {
     const argv = args ? Array.from(args) : undefined;
@@ -246,6 +343,19 @@ export class Sandbox implements AsyncDisposable {
   }
 
   // -- attach -------------------------------------------------------------
+
+  async attachDefault(): Promise<number> {
+    return await withMappedErrors(() => this.inner.attachDefault());
+  }
+
+  async attachDefaultWith(
+    configure: (b: NapiAttachOptionsBuilder) => NapiAttachOptionsBuilder,
+  ): Promise<number> {
+    const builder = configure(new napi.AttachOptionsBuilder());
+    return await withMappedErrors(() =>
+      this.inner.attachDefaultWithBuilder(builder),
+    );
+  }
 
   async attach(cmd: string, args?: Iterable<string>): Promise<number> {
     const argv = args ? Array.from(args) : undefined;
@@ -327,6 +437,31 @@ export class Sandbox implements AsyncDisposable {
   async metrics(): Promise<SandboxMetrics> {
     const raw = await withMappedErrors(() => this.inner.metrics());
     return metricsFromNapi(raw);
+  }
+
+  /**
+   * Check whether agentd is reachable without refreshing idle activity.
+   */
+  async ping(): Promise<SandboxPingResult> {
+    return await withMappedErrors(() => this.inner.ping());
+  }
+
+  /**
+   * Explicitly refresh this sandbox's idle activity timer.
+   */
+  async touch(): Promise<SandboxTouchResult> {
+    return await withMappedErrors(() => this.inner.touch());
+  }
+
+  /**
+   * Plan or apply a sandbox modification. With `dryRun: true` the plan is
+   * computed without applying anything.
+   */
+  async modify(opts?: ModifyOptions): Promise<SandboxModificationPlan> {
+    const raw = await withMappedErrors(() =>
+      this.inner.modify(modifyOptionsToNapi(opts)),
+    );
+    return modificationPlanFromJson(raw);
   }
 
   /** Stream metrics snapshots at the given interval (in milliseconds). */

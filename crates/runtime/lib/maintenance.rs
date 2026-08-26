@@ -30,7 +30,7 @@ use sea_orm::{
     ColumnTrait, Condition, DbErr, EntityTrait, QueryFilter, QueryOrder, QuerySelect, Set,
 };
 
-use crate::RuntimeResult;
+use crate::{RuntimeError, RuntimeResult};
 
 //--------------------------------------------------------------------------------------------------
 // Constants
@@ -43,6 +43,14 @@ const LEASE_DURATION_SECS: i64 = 10;
 /// Minimum interval between successful sweeps. Read-gates the lease so most
 /// startups skip the maintenance write entirely.
 const MIN_SWEEP_INTERVAL_SECS: i64 = 30;
+
+/// Default duration for the install-exclusive lease.
+///
+/// This is deliberately much longer than lifecycle maintenance because it can
+/// cover a bundle download, DB backup, rollback, cache removal, and binary
+/// install on slow disks or networks. The CLI clears the row on success/failure;
+/// expiry is the crash self-heal path.
+pub const INSTALL_EXCLUSIVE_LEASE_SECS: i64 = 30 * 60;
 
 /// Wall-clock budget for a single maintenance sweep. The sweep stops early
 /// (leaving the rest for the next window) once this elapses.
@@ -66,6 +74,9 @@ pub enum CleanupOutcome {
 
     /// Directory removal failed; the row remains so cleanup can retry later.
     DirRemoveFailed,
+
+    /// Runtime socket cleanup failed; the row remains so cleanup can retry.
+    ArtifactRemoveFailed,
 
     /// The sandbox row was already gone (cleaned by another runtime).
     AlreadyGone,
@@ -107,6 +118,24 @@ pub struct MaintenanceReport {
     pub timed_out: bool,
 }
 
+/// A currently active sandbox that blocks schema rollback.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ActiveSandbox {
+    /// Sandbox name.
+    pub name: String,
+    /// Live or last-known run PID, when available.
+    pub pid: Option<i32>,
+}
+
+/// Install-exclusive lease acquired by an install-mutating command.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct InstallExclusiveLease {
+    /// PID that acquired the lease.
+    pub holder_pid: i32,
+    /// When the lease self-expires if the holder crashes.
+    pub lease_expires_at: chrono::NaiveDateTime,
+}
+
 //--------------------------------------------------------------------------------------------------
 // Trait Implementations
 //--------------------------------------------------------------------------------------------------
@@ -130,7 +159,7 @@ impl Default for MaintenanceLimits {
 /// Best-effort: this must never abort the sandbox boot path, so all errors are
 /// logged and swallowed. When the lease is not won, returns immediately after a
 /// single indexed read.
-pub async fn run_startup_maintenance(db: &DbWriteConnection, sandboxes_dir: &Path) {
+pub async fn run_startup_maintenance(db: &DbWriteConnection, sandboxes_dir: &Path, run_dir: &Path) {
     match try_acquire_lease(db).await {
         Ok(true) => {}
         Ok(false) => {
@@ -143,7 +172,14 @@ pub async fn run_startup_maintenance(db: &DbWriteConnection, sandboxes_dir: &Pat
         }
     }
 
-    match run_sandbox_lifecycle_maintenance(db, sandboxes_dir, MaintenanceLimits::default()).await {
+    match run_sandbox_lifecycle_maintenance(
+        db,
+        sandboxes_dir,
+        run_dir,
+        MaintenanceLimits::default(),
+    )
+    .await
+    {
         Ok(report) => {
             tracing::debug!(
                 reconciled = report.reconciled,
@@ -171,6 +207,7 @@ pub async fn run_startup_maintenance(db: &DbWriteConnection, sandboxes_dir: &Pat
 pub async fn run_sandbox_lifecycle_maintenance(
     db: &DbWriteConnection,
     sandboxes_dir: &Path,
+    run_dir: &Path,
     limits: MaintenanceLimits,
 ) -> RuntimeResult<MaintenanceReport> {
     let mut report = MaintenanceReport::default();
@@ -193,7 +230,7 @@ pub async fn run_sandbox_lifecycle_maintenance(
             report.timed_out = true;
             break;
         }
-        match reconcile_stale_active(db, &sandbox).await {
+        match reconcile_stale_active(db, sandboxes_dir, run_dir, &sandbox).await {
             Ok(true) => report.reconciled += 1,
             Ok(false) => {}
             Err(err) => {
@@ -222,7 +259,7 @@ pub async fn run_sandbox_lifecycle_maintenance(
                 report.timed_out = true;
                 break;
             }
-            match cleanup_terminal_ephemeral_sandbox(db, sandboxes_dir, sandbox.id).await {
+            match cleanup_terminal_ephemeral_sandbox(db, sandboxes_dir, run_dir, sandbox.id).await {
                 Ok(CleanupOutcome::Removed) => report.removed += 1,
                 Ok(_) => {}
                 Err(err) => {
@@ -236,6 +273,45 @@ pub async fn run_sandbox_lifecycle_maintenance(
     Ok(report)
 }
 
+/// Return active sandboxes that must stop before schema rollback.
+///
+/// Downgrade only needs this when rollback removes columns/tables. The query is
+/// intentionally status-based rather than "PID is live" based: a non-terminal
+/// row with no PID is still state owned by a runtime transition and should not
+/// be mutated out from under it.
+pub async fn active_sandboxes_for_schema_rollback(
+    db: &DbWriteConnection,
+) -> RuntimeResult<Vec<ActiveSandbox>> {
+    let sandboxes = sandbox_entity::Entity::find()
+        .filter(sandbox_entity::Column::Status.is_in([
+            sandbox_entity::SandboxStatus::Created,
+            sandbox_entity::SandboxStatus::Starting,
+            sandbox_entity::SandboxStatus::Running,
+            sandbox_entity::SandboxStatus::Draining,
+            sandbox_entity::SandboxStatus::Paused,
+        ]))
+        .order_by_asc(sandbox_entity::Column::Name)
+        .all(db)
+        .await?;
+
+    let mut active = Vec::with_capacity(sandboxes.len());
+    for sandbox in sandboxes {
+        let run = run_entity::Entity::find()
+            .filter(run_entity::Column::SandboxId.eq(sandbox.id))
+            .filter(run_entity::Column::Status.eq(run_entity::RunStatus::Running))
+            .order_by_desc(run_entity::Column::StartedAt)
+            .one(db)
+            .await?;
+
+        active.push(ActiveSandbox {
+            name: sandbox.name,
+            pid: run.and_then(|run| run.pid),
+        });
+    }
+
+    Ok(active)
+}
+
 /// Remove a single terminal ephemeral sandbox's persisted state.
 ///
 /// Idempotent and race-safe: the row is claimed with a conditional delete, so
@@ -246,7 +322,29 @@ pub async fn run_sandbox_lifecycle_maintenance(
 pub async fn cleanup_terminal_ephemeral_sandbox(
     db: &DbWriteConnection,
     sandboxes_dir: &Path,
+    run_dir: &Path,
     sandbox_id: i32,
+) -> RuntimeResult<CleanupOutcome> {
+    cleanup_terminal_ephemeral_sandbox_inner(db, sandboxes_dir, run_dir, sandbox_id, false).await
+}
+
+/// Remove a terminal ephemeral sandbox while its runtime still owns the
+/// lifecycle guard during the synchronous exit observer.
+pub(crate) async fn cleanup_terminal_ephemeral_sandbox_owned(
+    db: &DbWriteConnection,
+    sandboxes_dir: &Path,
+    run_dir: &Path,
+    sandbox_id: i32,
+) -> RuntimeResult<CleanupOutcome> {
+    cleanup_terminal_ephemeral_sandbox_inner(db, sandboxes_dir, run_dir, sandbox_id, true).await
+}
+
+async fn cleanup_terminal_ephemeral_sandbox_inner(
+    db: &DbWriteConnection,
+    sandboxes_dir: &Path,
+    run_dir: &Path,
+    sandbox_id: i32,
+    owner_holds_guard: bool,
 ) -> RuntimeResult<CleanupOutcome> {
     let Some(sandbox) = sandbox_entity::Entity::find_by_id(sandbox_id)
         .one(db)
@@ -263,8 +361,41 @@ pub async fn cleanup_terminal_ephemeral_sandbox(
         return Ok(CleanupOutcome::SkippedActive);
     }
 
+    let _guard = if owner_holds_guard {
+        None
+    } else {
+        let Some(guard) = crate::ipc::try_acquire_lifecycle_guard(run_dir, &sandbox.name)? else {
+            return Ok(CleanupOutcome::SkippedLivePid);
+        };
+        Some(guard)
+    };
+
+    // Status can change while waiting for another lifecycle operation. Re-read
+    // under ownership before removing any name-derived filesystem state.
+    let Some(sandbox) = sandbox_entity::Entity::find_by_id(sandbox_id)
+        .one(db)
+        .await?
+    else {
+        return Ok(CleanupOutcome::AlreadyGone);
+    };
+    if !sandbox.ephemeral {
+        return Ok(CleanupOutcome::SkippedPersistent);
+    }
+    if !is_terminal(sandbox.status) {
+        return Ok(CleanupOutcome::SkippedActive);
+    }
+
     if has_live_active_run(db, sandbox.id).await? {
         return Ok(CleanupOutcome::SkippedLivePid);
+    }
+
+    if let Err(err) = remove_runtime_socket_artifacts(run_dir, sandboxes_dir, &sandbox.name) {
+        tracing::warn!(
+            sandbox = %sandbox.name,
+            error = %err,
+            "ephemeral cleanup failed to remove runtime socket artifacts; keeping row for retry"
+        );
+        return Ok(CleanupOutcome::ArtifactRemoveFailed);
     }
 
     // Remove the on-disk state before deleting the DB row. If this fails, the
@@ -389,16 +520,217 @@ async fn record_completion(db: &DbWriteConnection) -> RuntimeResult<()> {
     Ok(())
 }
 
+/// Acquire the install-exclusive lease if it is currently free or expired.
+pub async fn acquire_install_exclusive_lease(
+    db: &DbWriteConnection,
+) -> RuntimeResult<InstallExclusiveLease> {
+    let now = chrono::Utc::now().naive_utc();
+    let holder_pid = std::process::id() as i32;
+
+    seed_install_exclusive_lease(db, now).await?;
+
+    let lease_deadline = now + chrono::Duration::seconds(INSTALL_EXCLUSIVE_LEASE_SECS);
+    let result = lease_entity::Entity::update_many()
+        .col_expr(lease_entity::Column::HolderPid, Expr::value(holder_pid))
+        .col_expr(
+            lease_entity::Column::LeaseExpiresAt,
+            Expr::value(lease_deadline),
+        )
+        .col_expr(
+            lease_entity::Column::LastCompletedAt,
+            Expr::value(None::<chrono::NaiveDateTime>),
+        )
+        .filter(lease_entity::Column::Name.eq(lease_entity::INSTALL_EXCLUSIVE))
+        .filter(lease_entity::Column::LeaseExpiresAt.lte(now))
+        .exec(db)
+        .await?;
+
+    if result.rows_affected == 1 {
+        return Ok(InstallExclusiveLease {
+            holder_pid,
+            lease_expires_at: lease_deadline,
+        });
+    }
+
+    let Some(lease) = lease_entity::Entity::find_by_id(lease_entity::INSTALL_EXCLUSIVE)
+        .one(db)
+        .await?
+    else {
+        return Err(RuntimeError::Custom(
+            "install-exclusive lease disappeared while acquiring it".into(),
+        ));
+    };
+
+    Err(RuntimeError::Custom(format!(
+        "another microsandbox install operation is in progress until {}",
+        lease.lease_expires_at
+    )))
+}
+
+/// Renew an install-exclusive lease if this process still owns the exact row.
+pub async fn renew_install_exclusive_lease(
+    db: &DbWriteConnection,
+    lease: &mut InstallExclusiveLease,
+) -> RuntimeResult<()> {
+    let now = chrono::Utc::now().naive_utc();
+    let lease_deadline = now + chrono::Duration::seconds(INSTALL_EXCLUSIVE_LEASE_SECS);
+    let previous_deadline = lease.lease_expires_at;
+    let result = lease_entity::Entity::update_many()
+        .col_expr(
+            lease_entity::Column::LeaseExpiresAt,
+            Expr::value(lease_deadline),
+        )
+        .col_expr(
+            lease_entity::Column::LastCompletedAt,
+            Expr::value(None::<chrono::NaiveDateTime>),
+        )
+        .filter(lease_entity::Column::Name.eq(lease_entity::INSTALL_EXCLUSIVE))
+        .filter(lease_entity::Column::HolderPid.eq(lease.holder_pid))
+        .filter(lease_entity::Column::LeaseExpiresAt.eq(previous_deadline))
+        .exec(db)
+        .await?;
+
+    if result.rows_affected != 1 {
+        return Err(RuntimeError::Custom(
+            "install-exclusive lease is no longer held by this process".into(),
+        ));
+    }
+
+    lease.lease_expires_at = lease_deadline;
+    Ok(())
+}
+
+/// Clear the install-exclusive lease after an install-mutating command exits.
+pub async fn clear_install_exclusive_lease(
+    db: &DbWriteConnection,
+    lease: &InstallExclusiveLease,
+) -> RuntimeResult<()> {
+    let now = chrono::Utc::now().naive_utc();
+    let result = lease_entity::Entity::update_many()
+        .col_expr(lease_entity::Column::HolderPid, Expr::value(None::<i32>))
+        .col_expr(lease_entity::Column::LeaseExpiresAt, Expr::value(now))
+        .col_expr(lease_entity::Column::LastCompletedAt, Expr::value(now))
+        .filter(lease_entity::Column::Name.eq(lease_entity::INSTALL_EXCLUSIVE))
+        .filter(lease_entity::Column::HolderPid.eq(lease.holder_pid))
+        .filter(lease_entity::Column::LeaseExpiresAt.eq(lease.lease_expires_at))
+        .exec(db)
+        .await?;
+
+    if result.rows_affected != 1 {
+        return Err(RuntimeError::Custom(
+            "install-exclusive lease is no longer held by this process".into(),
+        ));
+    }
+
+    Ok(())
+}
+
+/// Clear an install-exclusive lease, accepting an already released or expired
+/// row as success so a crash-restarted installer can repeat its cleanup.
+pub async fn clear_install_exclusive_lease_idempotent(
+    db: &DbWriteConnection,
+    lease: &InstallExclusiveLease,
+) -> RuntimeResult<()> {
+    match clear_install_exclusive_lease(db, lease).await {
+        Ok(()) => Ok(()),
+        Err(clear_error) => {
+            let current = lease_entity::Entity::find_by_id(lease_entity::INSTALL_EXCLUSIVE)
+                .one(db)
+                .await?;
+            let now = chrono::Utc::now().naive_utc();
+            if current
+                .as_ref()
+                .is_none_or(|row| row.holder_pid.is_none() || row.lease_expires_at <= now)
+            {
+                return Ok(());
+            }
+            Err(clear_error)
+        }
+    }
+}
+
+/// Refuse startup/migration when an install-mutating command is active.
+///
+/// A missing table means the database has not reached the maintenance-lease
+/// migration yet. In that case startup continues so normal migrations can
+/// create it. Once the table exists, the install-exclusive row becomes a hard
+/// refusal while unexpired.
+pub async fn refuse_if_install_exclusive_held(db: &DbWriteConnection) -> RuntimeResult<()> {
+    let now = chrono::Utc::now().naive_utc();
+    let lease = match lease_entity::Entity::find_by_id(lease_entity::INSTALL_EXCLUSIVE)
+        .one(db)
+        .await
+    {
+        Ok(lease) => lease,
+        Err(err) if is_missing_maintenance_lease_table(&err) => return Ok(()),
+        Err(err) => return Err(err.into()),
+    };
+
+    if let Some(lease) = lease
+        && lease.lease_expires_at > now
+    {
+        return Err(RuntimeError::Custom(format!(
+            "microsandbox install operation in progress until {}; retry after it completes",
+            lease.lease_expires_at
+        )));
+    }
+
+    Ok(())
+}
+
 //--------------------------------------------------------------------------------------------------
 // Functions: Helpers
 //--------------------------------------------------------------------------------------------------
+
+async fn seed_install_exclusive_lease(
+    db: &DbWriteConnection,
+    now: chrono::NaiveDateTime,
+) -> RuntimeResult<()> {
+    let seed = lease_entity::ActiveModel {
+        name: Set(lease_entity::INSTALL_EXCLUSIVE.to_string()),
+        holder_pid: Set(None),
+        lease_expires_at: Set(now),
+        last_completed_at: Set(None),
+    };
+    let insert = lease_entity::Entity::insert(seed)
+        .on_conflict(
+            OnConflict::column(lease_entity::Column::Name)
+                .do_nothing()
+                .to_owned(),
+        )
+        .exec(db)
+        .await;
+    match insert {
+        Ok(_) => Ok(()),
+        Err(DbErr::RecordNotInserted) => Ok(()),
+        Err(err) => Err(err.into()),
+    }
+}
 
 /// Reconcile one active sandbox whose owning runtime may have died. Returns
 /// `true` when the sandbox was marked terminal.
 async fn reconcile_stale_active(
     db: &DbWriteConnection,
+    sandboxes_dir: &Path,
+    run_dir: &Path,
     sandbox: &sandbox_entity::Model,
 ) -> RuntimeResult<bool> {
+    let Some(_guard) = crate::ipc::try_acquire_lifecycle_guard(run_dir, &sandbox.name)? else {
+        return Ok(false);
+    };
+    let Some(sandbox) = sandbox_entity::Entity::find_by_id(sandbox.id)
+        .one(db)
+        .await?
+    else {
+        return Ok(false);
+    };
+    if !matches!(
+        sandbox.status,
+        sandbox_entity::SandboxStatus::Running | sandbox_entity::SandboxStatus::Draining
+    ) {
+        return Ok(false);
+    }
+
     let run = run_entity::Entity::find()
         .filter(run_entity::Column::SandboxId.eq(sandbox.id))
         .filter(run_entity::Column::Status.eq(run_entity::RunStatus::Running))
@@ -406,9 +738,29 @@ async fn reconcile_stale_active(
         .one(db)
         .await?;
 
-    // No active run yet: the sandbox is still starting (its runtime has not
-    // inserted a run row). Skip to avoid racing create/start.
+    // No active run yet while Running means the sandbox is still starting
+    // (its runtime has not inserted a run row). Draining with no active run
+    // means the stop request already reached a terminal run state, so repair
+    // the sandbox status instead of leaving future stop callers polling.
     let Some(run) = run else {
+        if sandbox.status == sandbox_entity::SandboxStatus::Draining {
+            remove_runtime_socket_artifacts(run_dir, sandboxes_dir, &sandbox.name)?;
+            let now = chrono::Utc::now().naive_utc();
+            let (terminal_status, _) = stale_runtime_terminal_state(sandbox.status);
+            let result = sandbox_entity::Entity::update_many()
+                .col_expr(sandbox_entity::Column::Status, Expr::value(terminal_status))
+                .col_expr(
+                    sandbox_entity::Column::ActiveConfig,
+                    Expr::value(Option::<String>::None),
+                )
+                .col_expr(sandbox_entity::Column::UpdatedAt, Expr::value(now))
+                .filter(sandbox_entity::Column::Id.eq(sandbox.id))
+                .filter(sandbox_entity::Column::Status.eq(sandbox_entity::SandboxStatus::Draining))
+                .exec(db)
+                .await?;
+            return Ok(result.rows_affected > 0);
+        }
+
         return Ok(false);
     };
 
@@ -421,6 +773,11 @@ async fn reconcile_stale_active(
     if run.pid.is_some_and(pid_is_alive) {
         return Ok(false);
     }
+
+    // Runtime artifacts are part of reaping this specific dead process. Do
+    // this before the terminal transition so a failure leaves the row in the
+    // active maintenance query and therefore retryable.
+    remove_runtime_socket_artifacts(run_dir, sandboxes_dir, &sandbox.name)?;
 
     let now = chrono::Utc::now().naive_utc();
     let (terminal_status, reason) = stale_runtime_terminal_state(sandbox.status);
@@ -442,6 +799,10 @@ async fn reconcile_stale_active(
     // is not clobbered.
     let result = sandbox_entity::Entity::update_many()
         .col_expr(sandbox_entity::Column::Status, Expr::value(terminal_status))
+        .col_expr(
+            sandbox_entity::Column::ActiveConfig,
+            Expr::value(Option::<String>::None),
+        )
         .col_expr(sandbox_entity::Column::UpdatedAt, Expr::value(now))
         .filter(sandbox_entity::Column::Id.eq(sandbox.id))
         .filter(sandbox_entity::Column::Status.is_in([
@@ -470,6 +831,26 @@ fn stale_runtime_terminal_state(
             run_entity::TerminationReason::InternalError,
         ),
     }
+}
+
+fn remove_runtime_socket_artifacts(
+    run_dir: &Path,
+    sandboxes_dir: &Path,
+    name: &str,
+) -> std::io::Result<()> {
+    #[cfg(not(unix))]
+    let _ = sandboxes_dir;
+
+    let canonical_result = crate::ipc::remove_sandbox_socket_artifacts(run_dir, name);
+
+    #[cfg(unix)]
+    let fallback_result = crate::ipc::remove_socket_pair(
+        &sandboxes_dir.join(name).join("runtime").join("agent.sock"),
+    );
+    #[cfg(not(unix))]
+    let fallback_result = Ok(());
+
+    canonical_result.and(fallback_result)
 }
 
 /// Whether the sandbox has any run that is still Running with a live PID.
@@ -505,6 +886,11 @@ fn remove_dir_if_exists(path: &Path) -> std::io::Result<()> {
     }
 }
 
+fn is_missing_maintenance_lease_table(err: &DbErr) -> bool {
+    let message = err.to_string();
+    message.contains("no such table") && message.contains("maintenance_lease")
+}
+
 //--------------------------------------------------------------------------------------------------
 // Tests
 //--------------------------------------------------------------------------------------------------
@@ -523,6 +909,12 @@ mod tests {
     const DEAD_PID: i32 = 2_000_000_000;
 
     async fn test_db() -> (TempDir, DbWriteConnection) {
+        #[cfg(unix)]
+        let dir = tempfile::Builder::new()
+            .prefix("msb-maint")
+            .tempdir_in("/tmp")
+            .unwrap();
+        #[cfg(not(unix))]
         let dir = tempfile::tempdir().unwrap();
         let db = DbWriteConnection::open(
             &dir.path().join("test.db"),
@@ -583,20 +975,99 @@ mod tests {
             .map(|model| model.status)
     }
 
+    #[cfg(unix)]
+    fn seed_socket_artifacts(
+        sandboxes_dir: &Path,
+        run_dir: &Path,
+        name: &str,
+    ) -> crate::ipc::SandboxSocketPaths {
+        let paths = crate::ipc::sandbox_socket_paths(run_dir, name);
+        std::fs::create_dir_all(&paths.canonical_dir).unwrap();
+        let _agent = std::os::unix::net::UnixListener::bind(&paths.agent).unwrap();
+        let _control = std::os::unix::net::UnixListener::bind(&paths.control).unwrap();
+        crate::ipc::publish_legacy_agent_link(run_dir, name, &paths.agent).unwrap();
+        crate::ipc::publish_legacy_control_link(run_dir, name, &paths.control).unwrap();
+
+        let fallback = sandboxes_dir.join(name).join("runtime").join("agent.sock");
+        std::fs::create_dir_all(fallback.parent().unwrap()).unwrap();
+        let _fallback_agent = std::os::unix::net::UnixListener::bind(&fallback).unwrap();
+        let fallback_control = crate::ipc::control_socket_path_for(&fallback);
+        let _fallback_control = std::os::unix::net::UnixListener::bind(fallback_control).unwrap();
+
+        paths
+    }
+
+    #[cfg(unix)]
+    fn assert_socket_artifacts_absent(
+        sandboxes_dir: &Path,
+        paths: &crate::ipc::SandboxSocketPaths,
+        name: &str,
+    ) {
+        let fallback_agent = sandboxes_dir.join(name).join("runtime").join("agent.sock");
+        let fallback_control = crate::ipc::control_socket_path_for(&fallback_agent);
+        for path in [
+            &paths.agent,
+            &paths.control,
+            &paths.legacy_agent,
+            &paths.legacy_control,
+            &fallback_agent,
+            &fallback_control,
+        ] {
+            assert!(
+                std::fs::symlink_metadata(path).is_err(),
+                "socket artifact remains at {}",
+                path.display()
+            );
+        }
+        assert!(!paths.canonical_dir.exists());
+    }
+
     #[tokio::test]
     async fn cleanup_removes_terminal_ephemeral_row_and_dir() {
         let (dir, db) = test_db().await;
         let id = insert_sandbox(&db, "eph", sandbox_entity::SandboxStatus::Stopped, true).await;
         let sandbox_dir = dir.path().join("eph");
         std::fs::create_dir_all(&sandbox_dir).unwrap();
+        let run_dir = dir.path().join("run");
+        #[cfg(unix)]
+        let socket_paths = seed_socket_artifacts(dir.path(), &run_dir, "eph");
 
-        let outcome = cleanup_terminal_ephemeral_sandbox(&db, dir.path(), id)
+        let outcome = cleanup_terminal_ephemeral_sandbox(&db, dir.path(), &run_dir, id)
             .await
             .unwrap();
 
         assert_eq!(outcome, CleanupOutcome::Removed);
         assert!(status_of(&db, id).await.is_none(), "row should be deleted");
         assert!(!sandbox_dir.exists(), "directory should be removed");
+        #[cfg(unix)]
+        assert_socket_artifacts_absent(dir.path(), &socket_paths, "eph");
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn cleanup_does_not_cross_a_live_lifecycle_owner() {
+        let (dir, db) = test_db().await;
+        let id = insert_sandbox(
+            &db,
+            "successor",
+            sandbox_entity::SandboxStatus::Stopped,
+            true,
+        )
+        .await;
+        let run_dir = dir.path().join("run");
+        let paths = seed_socket_artifacts(dir.path(), &run_dir, "successor");
+        let _owner = crate::ipc::acquire_lifecycle_guard(&run_dir, "successor").unwrap();
+
+        let outcome = cleanup_terminal_ephemeral_sandbox(&db, dir.path(), &run_dir, id)
+            .await
+            .unwrap();
+
+        assert_eq!(outcome, CleanupOutcome::SkippedLivePid);
+        assert!(status_of(&db, id).await.is_some());
+        assert!(paths.agent.exists());
+        assert!(paths.control.exists());
+        assert!(std::fs::symlink_metadata(paths.legacy_agent).is_ok());
+        assert!(std::fs::symlink_metadata(paths.legacy_control).is_ok());
     }
 
     #[tokio::test]
@@ -604,9 +1075,10 @@ mod tests {
         let (dir, db) = test_db().await;
         let id = insert_sandbox(&db, "keep", sandbox_entity::SandboxStatus::Stopped, false).await;
 
-        let outcome = cleanup_terminal_ephemeral_sandbox(&db, dir.path(), id)
-            .await
-            .unwrap();
+        let outcome =
+            cleanup_terminal_ephemeral_sandbox(&db, dir.path(), &dir.path().join("run"), id)
+                .await
+                .unwrap();
 
         assert_eq!(outcome, CleanupOutcome::SkippedPersistent);
         assert!(status_of(&db, id).await.is_some(), "row should remain");
@@ -617,9 +1089,10 @@ mod tests {
         let (dir, db) = test_db().await;
         let id = insert_sandbox(&db, "run", sandbox_entity::SandboxStatus::Running, true).await;
 
-        let outcome = cleanup_terminal_ephemeral_sandbox(&db, dir.path(), id)
-            .await
-            .unwrap();
+        let outcome =
+            cleanup_terminal_ephemeral_sandbox(&db, dir.path(), &dir.path().join("run"), id)
+                .await
+                .unwrap();
 
         assert_eq!(outcome, CleanupOutcome::SkippedActive);
         assert!(status_of(&db, id).await.is_some());
@@ -638,9 +1111,10 @@ mod tests {
         )
         .await;
 
-        let outcome = cleanup_terminal_ephemeral_sandbox(&db, dir.path(), id)
-            .await
-            .unwrap();
+        let outcome =
+            cleanup_terminal_ephemeral_sandbox(&db, dir.path(), &dir.path().join("run"), id)
+                .await
+                .unwrap();
 
         assert_eq!(outcome, CleanupOutcome::SkippedLivePid);
         assert!(status_of(&db, id).await.is_some());
@@ -652,13 +1126,13 @@ mod tests {
         let id = insert_sandbox(&db, "eph", sandbox_entity::SandboxStatus::Stopped, true).await;
 
         assert_eq!(
-            cleanup_terminal_ephemeral_sandbox(&db, dir.path(), id)
+            cleanup_terminal_ephemeral_sandbox(&db, dir.path(), &dir.path().join("run"), id)
                 .await
                 .unwrap(),
             CleanupOutcome::Removed
         );
         assert_eq!(
-            cleanup_terminal_ephemeral_sandbox(&db, dir.path(), id)
+            cleanup_terminal_ephemeral_sandbox(&db, dir.path(), &dir.path().join("run"), id)
                 .await
                 .unwrap(),
             CleanupOutcome::AlreadyGone
@@ -706,12 +1180,100 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn install_exclusive_lease_blocks_startup_until_cleared() {
+        let (_dir, db) = test_db().await;
+
+        let lease = acquire_install_exclusive_lease(&db).await.unwrap();
+        assert_eq!(lease.holder_pid, std::process::id() as i32);
+
+        let err = refuse_if_install_exclusive_held(&db).await.unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("microsandbox install operation in progress")
+        );
+
+        clear_install_exclusive_lease(&db, &lease).await.unwrap();
+        clear_install_exclusive_lease_idempotent(&db, &lease)
+            .await
+            .unwrap();
+        refuse_if_install_exclusive_held(&db).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn install_exclusive_lease_renew_and_clear_require_current_holder() {
+        let (_dir, db) = test_db().await;
+
+        let mut lease = acquire_install_exclusive_lease(&db).await.unwrap();
+        let original_deadline = lease.lease_expires_at;
+
+        renew_install_exclusive_lease(&db, &mut lease)
+            .await
+            .unwrap();
+        assert!(lease.lease_expires_at >= original_deadline);
+
+        let stale_lease = InstallExclusiveLease {
+            holder_pid: lease.holder_pid + 1,
+            lease_expires_at: lease.lease_expires_at,
+        };
+
+        let err = clear_install_exclusive_lease(&db, &stale_lease)
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("install-exclusive lease is no longer held")
+        );
+        assert!(refuse_if_install_exclusive_held(&db).await.is_err());
+        assert!(
+            clear_install_exclusive_lease_idempotent(&db, &stale_lease)
+                .await
+                .is_err()
+        );
+
+        clear_install_exclusive_lease(&db, &lease).await.unwrap();
+        clear_install_exclusive_lease_idempotent(&db, &lease)
+            .await
+            .unwrap();
+        refuse_if_install_exclusive_held(&db).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn active_sandboxes_include_non_terminal_rows_with_pid() {
+        let (_dir, db) = test_db().await;
+        let running =
+            insert_sandbox(&db, "run", sandbox_entity::SandboxStatus::Running, false).await;
+        insert_run(&db, running, Some(DEAD_PID), run_entity::RunStatus::Running).await;
+        let stopped =
+            insert_sandbox(&db, "stop", sandbox_entity::SandboxStatus::Stopped, false).await;
+        insert_run(
+            &db,
+            stopped,
+            Some(DEAD_PID),
+            run_entity::RunStatus::Terminated,
+        )
+        .await;
+
+        let active = active_sandboxes_for_schema_rollback(&db).await.unwrap();
+
+        assert_eq!(
+            active,
+            vec![ActiveSandbox {
+                name: "run".to_string(),
+                pid: Some(DEAD_PID),
+            }]
+        );
+    }
+
+    #[tokio::test]
     async fn sweep_reconciles_dead_active_and_cleans_terminal_ephemeral() {
         let (dir, db) = test_db().await;
+        let run_dir = dir.path().join("run");
 
         // Persistent Running sandbox with a dead PID should become Crashed.
         let dead = insert_sandbox(&db, "dead", sandbox_entity::SandboxStatus::Running, false).await;
         insert_run(&db, dead, Some(DEAD_PID), run_entity::RunStatus::Running).await;
+        #[cfg(unix)]
+        let dead_sockets = seed_socket_artifacts(dir.path(), &run_dir, "dead");
 
         // Persistent Draining sandbox with a dead PID completed a requested stop.
         let draining = insert_sandbox(
@@ -728,17 +1290,35 @@ mod tests {
             run_entity::RunStatus::Running,
         )
         .await;
+        #[cfg(unix)]
+        let draining_sockets = seed_socket_artifacts(dir.path(), &run_dir, "draining");
+
+        // Draining without an active run should also settle as Stopped.
+        let draining_no_run = insert_sandbox(
+            &db,
+            "draining-no-run",
+            sandbox_entity::SandboxStatus::Draining,
+            false,
+        )
+        .await;
+        #[cfg(unix)]
+        let draining_no_run_sockets =
+            seed_socket_artifacts(dir.path(), &run_dir, "draining-no-run");
 
         // Ephemeral Stopped sandbox should be removed in phase 2.
         let eph = insert_sandbox(&db, "eph", sandbox_entity::SandboxStatus::Stopped, true).await;
         std::fs::create_dir_all(dir.path().join("eph")).unwrap();
 
-        let report =
-            run_sandbox_lifecycle_maintenance(&db, dir.path(), MaintenanceLimits::default())
-                .await
-                .unwrap();
+        let report = run_sandbox_lifecycle_maintenance(
+            &db,
+            dir.path(),
+            &run_dir,
+            MaintenanceLimits::default(),
+        )
+        .await
+        .unwrap();
 
-        assert_eq!(report.reconciled, 2);
+        assert_eq!(report.reconciled, 3);
         assert_eq!(report.removed, 1);
         assert_eq!(report.errors, 0);
         assert_eq!(
@@ -749,7 +1329,17 @@ mod tests {
             status_of(&db, draining).await,
             Some(sandbox_entity::SandboxStatus::Stopped)
         );
+        assert_eq!(
+            status_of(&db, draining_no_run).await,
+            Some(sandbox_entity::SandboxStatus::Stopped)
+        );
         assert!(status_of(&db, eph).await.is_none());
         assert!(!dir.path().join("eph").exists());
+        #[cfg(unix)]
+        {
+            assert_socket_artifacts_absent(dir.path(), &dead_sockets, "dead");
+            assert_socket_artifacts_absent(dir.path(), &draining_sockets, "draining");
+            assert_socket_artifacts_absent(dir.path(), &draining_no_run_sockets, "draining-no-run");
+        }
     }
 }

@@ -48,6 +48,28 @@ func (e *ExecOutput) ExitCode() int { return e.exitCode }
 // Success reports whether the command exited with code 0.
 func (e *ExecOutput) Success() bool { return e.exitCode == 0 }
 
+// ExecDefault runs the sandbox's effective OCI entrypoint and CMD.
+// A missing executable default is returned as ErrNoDefaultCommand.
+func (s *Sandbox) ExecDefault(ctx context.Context, opts ...ExecOption) (*ExecOutput, error) {
+	o := ExecConfig{}
+	for _, opt := range opts {
+		opt(&o)
+	}
+	ffiOpts := ffi.ExecOptions{Cwd: o.Cwd, TTY: o.TTY, User: o.User, Env: o.Env}
+	if o.Timeout > 0 {
+		ffiOpts.TimeoutSecs = timeoutSecsCeil(o.Timeout)
+	}
+	res, err := s.inner.ExecDefault(ctx, ffiOpts)
+	if err != nil {
+		return nil, wrapFFI(err)
+	}
+	return &ExecOutput{
+		stdout:   []byte(res.Stdout),
+		stderr:   []byte(res.Stderr),
+		exitCode: res.ExitCode,
+	}, nil
+}
+
 // Exec runs a command in the sandbox and returns its collected output.
 // The returned error is non-nil only on transport/runtime failures; a
 // non-zero exit code is reported via ExecOutput.ExitCode, not as an error.
@@ -58,7 +80,7 @@ func (s *Sandbox) Exec(ctx context.Context, cmd string, args []string, opts ...E
 		opt(&o)
 	}
 
-	ffiOpts := ffi.ExecOptions{Args: args, Cwd: o.Cwd, User: o.User, Env: o.Env}
+	ffiOpts := ffi.ExecOptions{Args: args, Cwd: o.Cwd, TTY: o.TTY, User: o.User, Env: o.Env}
 	if o.Timeout > 0 {
 		ffiOpts.TimeoutSecs = timeoutSecsCeil(o.Timeout)
 	}
@@ -137,7 +159,8 @@ type ExecSink = ffi.ExecSink
 // ExecHandle is a live streaming exec session. Obtain via Sandbox.ExecStream.
 // Call Close when done to release Rust-side resources.
 //
-// ExecHandle is NOT safe for concurrent use from multiple goroutines.
+// Signal, Kill, and Resize may be called concurrently with Recv. Other method
+// combinations, including concurrent Recv calls, are not supported.
 type ExecHandle struct {
 	inner *ffi.ExecStreamHandle
 }
@@ -217,6 +240,11 @@ func (h *ExecHandle) Signal(ctx context.Context, signal int) error {
 	return wrapFFI(h.inner.Signal(ctx, signal))
 }
 
+// Resize changes the pseudo-terminal size for this exec session.
+func (h *ExecHandle) Resize(ctx context.Context, rows, cols uint16) error {
+	return wrapFFI(h.inner.Resize(ctx, rows, cols))
+}
+
 // Close releases the Rust-side exec handle. Does not kill the running process;
 // call Signal(ctx, 9) first if you need to terminate it. Safe to call after
 // ExecEventDone has been received.
@@ -237,7 +265,7 @@ func (s *Sandbox) ExecStream(ctx context.Context, cmd string, args []string, opt
 	for _, opt := range opts {
 		opt(&o)
 	}
-	ffiOpts := ffi.ExecOptions{Args: args, Cwd: o.Cwd, StdinPipe: o.StdinPipe, User: o.User, Env: o.Env}
+	ffiOpts := ffi.ExecOptions{Args: args, Cwd: o.Cwd, StdinPipe: o.StdinPipe, TTY: o.TTY, User: o.User, Env: o.Env}
 	if o.Timeout > 0 {
 		ffiOpts.TimeoutSecs = timeoutSecsCeil(o.Timeout)
 	}
@@ -246,6 +274,23 @@ func (s *Sandbox) ExecStream(ctx context.Context, cmd string, args []string, opt
 		return nil, wrapFFI(err)
 	}
 	return &ExecHandle{inner: h}, nil
+}
+
+// ExecDefaultStream starts a streaming exec of the effective OCI entrypoint and CMD.
+func (s *Sandbox) ExecDefaultStream(ctx context.Context, opts ...ExecOption) (*ExecHandle, error) {
+	o := ExecConfig{}
+	for _, opt := range opts {
+		opt(&o)
+	}
+	ffiOpts := ffi.ExecOptions{Cwd: o.Cwd, StdinPipe: o.StdinPipe, TTY: o.TTY, User: o.User, Env: o.Env}
+	if o.Timeout > 0 {
+		ffiOpts.TimeoutSecs = timeoutSecsCeil(o.Timeout)
+	}
+	handle, err := s.inner.ExecDefaultStream(ctx, ffiOpts)
+	if err != nil {
+		return nil, wrapFFI(err)
+	}
+	return &ExecHandle{inner: handle}, nil
 }
 
 // ShellStream runs `/bin/sh -c command` with streaming output.

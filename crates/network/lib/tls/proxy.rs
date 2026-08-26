@@ -17,12 +17,11 @@ use tokio::sync::mpsc;
 
 use super::sni;
 use super::state::TlsState;
-use crate::conn::ProxyConnectState;
+use crate::netstack::shared::SharedState;
 use crate::policy::{EgressEvaluation, HostnameSource, NetworkPolicy, Protocol};
-use crate::proxy::connect_upstream;
 use crate::secrets::config::ViolationAction;
 use crate::secrets::handler::SecretsHandler;
-use crate::shared::SharedState;
+use crate::tcp::{connection::ProxyConnectState, upstream::UpstreamTcpTarget};
 
 //--------------------------------------------------------------------------------------------------
 // Constants
@@ -38,45 +37,48 @@ const RELAY_BUF_SIZE: usize = 16384;
 // Types
 //--------------------------------------------------------------------------------------------------
 
-pub(crate) struct TlsProxyContext {
-    pub(crate) guest_dst: SocketAddr,
-    pub(crate) connect_dst: SocketAddr,
-    pub(crate) shared: Arc<SharedState>,
-    pub(crate) tls_state: Arc<TlsState>,
-    pub(crate) network_policy: Arc<NetworkPolicy>,
-    pub(crate) proxy_connect: Arc<ProxyConnectState>,
-    /// Pre-connected upstream; when `Some`, skips dialing `connect_dst`.
-    pub(crate) upstream_stream: Option<TcpStream>,
-    /// Hostname from a CONNECT authority that must match the ClientHello SNI.
-    pub(crate) expected_sni: Option<String>,
-    /// `true` when the connection arrived via HTTP CONNECT; skips the DNS-cache pin check.
-    pub(crate) via_connect: bool,
-}
-
-//--------------------------------------------------------------------------------------------------
-// Functions
-//--------------------------------------------------------------------------------------------------
-
-/// Spawn a TLS proxy task for a connection to an intercepted port.
-///
-/// See [`crate::proxy::spawn_tcp_proxy`] for the `proxy_connect`
-/// contract.
-#[allow(clippy::too_many_arguments)]
-pub fn spawn_tls_proxy(
-    handle: &tokio::runtime::Handle,
+/// Per-connection TLS proxy task and the state it owns.
+pub(crate) struct TlsProxy {
     guest_dst: SocketAddr,
-    connect_dst: SocketAddr,
+    connect_target: UpstreamTcpTarget,
     from_smoltcp: mpsc::Receiver<Bytes>,
     to_smoltcp: mpsc::Sender<Bytes>,
     shared: Arc<SharedState>,
     tls_state: Arc<TlsState>,
     network_policy: Arc<NetworkPolicy>,
     proxy_connect: Arc<ProxyConnectState>,
-) {
-    handle.spawn(async move {
-        let context = TlsProxyContext {
+    /// Pre-connected upstream; when `Some`, skips dialing `connect_target`.
+    upstream_stream: Option<TcpStream>,
+    /// Hostname from a CONNECT authority that must match the ClientHello SNI.
+    expected_sni: Option<String>,
+    /// `true` when the connection arrived via HTTP CONNECT; skips the DNS-cache pin check.
+    via_connect: bool,
+    /// ClientHello bytes already consumed from the guest stream.
+    initial_buf: Vec<u8>,
+}
+
+//--------------------------------------------------------------------------------------------------
+// Methods
+//--------------------------------------------------------------------------------------------------
+
+impl TlsProxy {
+    /// Build a proxy for a newly established guest TLS connection.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn new(
+        guest_dst: SocketAddr,
+        connect_target: UpstreamTcpTarget,
+        from_smoltcp: mpsc::Receiver<Bytes>,
+        to_smoltcp: mpsc::Sender<Bytes>,
+        shared: Arc<SharedState>,
+        tls_state: Arc<TlsState>,
+        network_policy: Arc<NetworkPolicy>,
+        proxy_connect: Arc<ProxyConnectState>,
+    ) -> Self {
+        Self {
             guest_dst,
-            connect_dst,
+            connect_target,
+            from_smoltcp,
+            to_smoltcp,
             shared,
             tls_state,
             network_policy,
@@ -84,112 +86,149 @@ pub fn spawn_tls_proxy(
             upstream_stream: None,
             expected_sni: None,
             via_connect: false,
-        };
-
-        if let Err(e) = tls_proxy_task(context, from_smoltcp, to_smoltcp, Vec::new()).await {
-            tracing::debug!(dst = %connect_dst, guest_dst = %guest_dst, error = %e, "TLS proxy task ended");
+            initial_buf: Vec::new(),
         }
-    });
-}
-
-/// Core TLS proxy task.
-pub(crate) async fn tls_proxy_task(
-    context: TlsProxyContext,
-    mut from_smoltcp: mpsc::Receiver<Bytes>,
-    to_smoltcp: mpsc::Sender<Bytes>,
-    tls_initial_buf: Vec<u8>,
-) -> io::Result<()> {
-    let TlsProxyContext {
-        guest_dst,
-        connect_dst,
-        shared,
-        tls_state,
-        network_policy,
-        proxy_connect,
-        upstream_stream,
-        expected_sni,
-        via_connect,
-    } = context;
-
-    // Buffer initial data to extract SNI from ClientHello. Timeout prevents a
-    // slow/malicious guest from holding a proxy slot indefinitely.
-    let sni_name = tokio::time::timeout(
-        std::time::Duration::from_secs(10),
-        extract_sni_from_channel(&mut from_smoltcp, tls_initial_buf),
-    )
-    .await
-    .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "SNI extraction timed out"))?;
-    let (sni_name, initial_buf) = sni_name?;
-
-    // Canonicalize so byte equality against rule destinations works.
-    let sni_name = sni_name.trim_end_matches('.').to_ascii_lowercase();
-
-    if let Some(expected) = expected_sni.as_deref()
-        && !sni_name.eq_ignore_ascii_case(expected.trim_end_matches('.'))
-    {
-        tracing::debug!(
-            sni = %sni_name,
-            expected = %expected,
-            dst = %connect_dst,
-            "TLS SNI did not match CONNECT authority",
-        );
-        proxy_connect.mark_policy_denied();
-        shared.proxy_wake.wake();
-        return Ok(());
     }
 
-    // Apply Domain / DomainSuffix rules against the SNI.
-    let eval = network_policy.evaluate_egress_with_source(
-        guest_dst,
-        Protocol::Tcp,
-        &shared,
-        HostnameSource::Sni(&sni_name),
-    );
-    if !matches!(eval, EgressEvaluation::Allow) {
-        tracing::debug!(
-            sni = %sni_name,
-            dst = %guest_dst,
-            "TLS egress denied by domain policy",
-        );
-        proxy_connect.mark_policy_denied();
-        shared.proxy_wake.wake();
-        return Ok(());
+    /// Reuse an already connected upstream stream.
+    pub(crate) fn with_upstream(mut self, upstream_stream: TcpStream) -> Self {
+        self.upstream_stream = Some(upstream_stream);
+        self
     }
 
-    if tls_state.should_bypass(&sni_name) {
-        tracing::debug!(sni = %sni_name, dst = %connect_dst, guest_dst = %guest_dst, "TLS bypass");
-        bypass_relay(
-            connect_dst,
-            initial_buf,
-            from_smoltcp,
-            to_smoltcp,
-            shared,
-            proxy_connect,
-            upstream_stream,
-        )
-        .await
-    } else {
-        tracing::debug!(sni = %sni_name, dst = %connect_dst, guest_dst = %guest_dst, "TLS intercept");
-        intercept_relay(
+    /// Require the ClientHello SNI to match an HTTP CONNECT authority.
+    pub(crate) fn with_expected_sni(mut self, expected_sni: Option<String>) -> Self {
+        self.via_connect = expected_sni.is_some();
+        self.expected_sni = expected_sni;
+        self
+    }
+
+    /// Seed the proxy with ClientHello bytes already read from the guest.
+    pub(crate) fn with_initial_buf(mut self, initial_buf: Vec<u8>) -> Self {
+        self.initial_buf = initial_buf;
+        self
+    }
+
+    /// Run the TLS proxy task to completion.
+    ///
+    /// See [`crate::tcp::proxy::spawn_tcp_proxy`] for the `proxy_connect`
+    /// contract.
+    pub(crate) async fn run(self) {
+        let guest_dst = self.guest_dst;
+        let connect_dst = self.connect_target.primary();
+
+        if let Err(error) = self.try_run().await {
+            tracing::debug!(
+                dst = %connect_dst,
+                %guest_dst,
+                %error,
+                "TLS proxy task ended",
+            );
+        }
+    }
+
+    /// Drive the TLS proxy to completion, returning operational failures.
+    pub(crate) async fn try_run(self) -> io::Result<()> {
+        let Self {
             guest_dst,
-            connect_dst,
-            &sni_name,
-            via_connect,
-            initial_buf,
-            from_smoltcp,
+            connect_target,
+            mut from_smoltcp,
             to_smoltcp,
             shared,
             tls_state,
+            network_policy,
             proxy_connect,
             upstream_stream,
+            expected_sni,
+            via_connect,
+            initial_buf,
+        } = self;
+        let connect_dst = connect_target.primary();
+
+        // Buffer initial data to extract SNI from ClientHello. Timeout prevents a
+        // slow/malicious guest from holding a proxy slot indefinitely.
+        let sni_name = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            extract_sni_from_channel(&mut from_smoltcp, initial_buf),
         )
         .await
+        .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "SNI extraction timed out"))?;
+        let (sni_name, initial_buf) = sni_name?;
+
+        // Canonicalize so byte equality against rule destinations works.
+        let sni_name = sni_name.trim_end_matches('.').to_ascii_lowercase();
+
+        if let Some(expected) = expected_sni.as_deref()
+            && !sni_name.eq_ignore_ascii_case(expected.trim_end_matches('.'))
+        {
+            tracing::debug!(
+                sni = %sni_name,
+                expected = %expected,
+                dst = %connect_dst,
+                "TLS SNI did not match CONNECT authority",
+            );
+            proxy_connect.mark_policy_denied();
+            shared.proxy_wake.wake();
+            return Ok(());
+        }
+
+        // Apply Domain / DomainSuffix rules against the SNI.
+        let eval = network_policy.evaluate_egress_with_source(
+            guest_dst,
+            Protocol::Tcp,
+            &shared,
+            HostnameSource::Sni(&sni_name),
+        );
+        if !matches!(eval, EgressEvaluation::Allow) {
+            tracing::debug!(
+                sni = %sni_name,
+                dst = %guest_dst,
+                "TLS egress denied by domain policy",
+            );
+            proxy_connect.mark_policy_denied();
+            shared.proxy_wake.wake();
+            return Ok(());
+        }
+
+        if tls_state.should_bypass(&sni_name) {
+            tracing::debug!(sni = %sni_name, dst = %connect_dst, guest_dst = %guest_dst, "TLS bypass");
+            bypass_relay(
+                connect_target,
+                initial_buf,
+                from_smoltcp,
+                to_smoltcp,
+                shared,
+                proxy_connect,
+                upstream_stream,
+            )
+            .await
+        } else {
+            tracing::debug!(sni = %sni_name, dst = %connect_dst, guest_dst = %guest_dst, "TLS intercept");
+            intercept_relay(
+                guest_dst,
+                connect_target,
+                &sni_name,
+                via_connect,
+                initial_buf,
+                from_smoltcp,
+                to_smoltcp,
+                shared,
+                tls_state,
+                proxy_connect,
+                upstream_stream,
+            )
+            .await
+        }
     }
 }
 
+//--------------------------------------------------------------------------------------------------
+// Functions
+//--------------------------------------------------------------------------------------------------
+
 /// Bypass mode: plain TCP splice, no TLS termination.
 async fn bypass_relay(
-    dst: SocketAddr,
+    connect_target: UpstreamTcpTarget,
     initial_buf: Vec<u8>,
     mut from_smoltcp: mpsc::Receiver<Bytes>,
     to_smoltcp: mpsc::Sender<Bytes>,
@@ -199,19 +238,27 @@ async fn bypass_relay(
 ) -> io::Result<()> {
     let mut server = match upstream_stream {
         Some(s) => s,
-        None => connect_upstream(dst, &proxy_connect, &shared).await?,
+        None => connect_target.connect(&proxy_connect, &shared).await?,
     };
     server.write_all(&initial_buf).await?;
 
     let (mut server_rx, mut server_tx) = server.into_split();
     let mut buf = vec![0u8; RELAY_BUF_SIZE];
 
+    let mut guest_eof = false;
     loop {
         tokio::select! {
-            data = from_smoltcp.recv() => {
+            data = from_smoltcp.recv(), if !guest_eof => {
                 match data {
                     Some(bytes) => server_tx.write_all(&bytes).await?,
-                    None => break,
+                    // Guest half-closed (FIN): stop sending upstream but
+                    // keep relaying server → guest until the server closes.
+                    None => {
+                        guest_eof = true;
+                        if server_tx.shutdown().await.is_err() {
+                            break;
+                        }
+                    }
                 }
             }
             result = server_rx.read(&mut buf) => {
@@ -236,7 +283,7 @@ async fn bypass_relay(
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn intercept_relay(
     guest_dst: SocketAddr,
-    connect_dst: SocketAddr,
+    connect_target: UpstreamTcpTarget,
     sni_name: &str,
     via_connect: bool,
     initial_buf: Vec<u8>,
@@ -247,10 +294,12 @@ pub(crate) async fn intercept_relay(
     proxy_connect: Arc<ProxyConnectState>,
     upstream_stream: Option<TcpStream>,
 ) -> io::Result<()> {
+    // Per-connection snapshot: live secret updates apply to later connections.
+    let secrets = tls_state.secrets.load();
     let mut secrets_handler = if via_connect {
-        SecretsHandler::new_tls_intercepted_via_connect(&tls_state.secrets, sni_name)
+        SecretsHandler::new_tls_intercepted_via_connect(&secrets, sni_name)
     } else {
-        SecretsHandler::new_tls_intercepted(&tls_state.secrets, sni_name, guest_dst.ip(), &shared)
+        SecretsHandler::new_tls_intercepted(&secrets, sni_name, guest_dst.ip(), &shared)
     }
     .with_guest_dst(guest_dst);
 
@@ -304,12 +353,12 @@ pub(crate) async fn intercept_relay(
     // Connect to real server with TLS.
     let server_stream = match upstream_stream {
         Some(s) => s,
-        None => connect_upstream(connect_dst, &proxy_connect, &shared).await?,
+        None => connect_target.connect(&proxy_connect, &shared).await?,
     };
     let server_name = ServerName::try_from(sni_name.to_string())
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
     let mut server_tls = tls_state
-        .connector
+        .upstream_connector_for(sni_name)
         .connect(server_name, server_stream)
         .await
         .map_err(io::Error::other)?;
@@ -331,13 +380,25 @@ pub(crate) async fn intercept_relay(
     )
     .await?;
 
+    let mut guest_eof = false;
     loop {
         tokio::select! {
             // Guest → server: receive encrypted, decrypt, forward plaintext.
-            data = from_smoltcp.recv() => {
+            data = from_smoltcp.recv(), if !guest_eof => {
                 let data = match data {
                     Some(d) => d,
-                    None => break,
+                    // Guest half-closed (TCP FIN): propagate as a TLS
+                    // close_notify + FIN upstream, but keep relaying
+                    // server → guest until the server closes. (A TLS 1.3
+                    // server may keep sending; a TLS 1.2 server responds
+                    // with its own close_notify, ending the relay.)
+                    None => {
+                        guest_eof = true;
+                        if server_tls.shutdown().await.is_err() {
+                            break;
+                        }
+                        continue;
+                    }
                 };
                 // Feed all data to rustls.
                 let mut remaining = &data[..];

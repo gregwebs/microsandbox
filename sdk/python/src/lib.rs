@@ -27,6 +27,19 @@ struct PyBackendScope {
     previous: Option<Arc<dyn microsandbox::Backend>>,
 }
 
+/// Secret-safe information about an SDK backend.
+#[pyclass(name = "BackendInfo", frozen)]
+struct PyBackendInfo {
+    #[pyo3(get)]
+    kind: String,
+    #[pyo3(get)]
+    api_url: Option<String>,
+    #[pyo3(get)]
+    source: String,
+    #[pyo3(get)]
+    profile: Option<String>,
+}
+
 //--------------------------------------------------------------------------------------------------
 // Functions
 //--------------------------------------------------------------------------------------------------
@@ -42,17 +55,20 @@ fn _microsandbox(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(set_default_backend, m)?)?;
     m.add_function(wrap_pyfunction!(backend_scope, m)?)?;
     m.add_function(wrap_pyfunction!(default_backend_kind, m)?)?;
+    m.add_function(wrap_pyfunction!(default_backend_info, m)?)?;
     m.add_function(wrap_pyfunction!(resolved_msb_path, m)?)?;
     m.add_function(wrap_pyfunction!(metrics::all_sandbox_metrics, m)?)?;
     m.add_class::<sandbox::PySandbox>()?;
     m.add_class::<sandbox::PySandboxStopResult>()?;
+    m.add_class::<sandbox::PySandboxPingResult>()?;
+    m.add_class::<sandbox::PySandboxTouchResult>()?;
+    m.add_class::<sandbox::PySandboxPage>()?;
     m.add_class::<sandbox_handle::PySandboxHandle>()?;
     m.add_class::<exec::PyExecOutput>()?;
     m.add_class::<exec::PyExecHandle>()?;
     m.add_class::<exec::PyExecSink>()?;
     m.add_class::<agent::PyAgentClient>()?;
     m.add_class::<fs::PySandboxFsOps>()?;
-    m.add("SandboxFsOps", m.getattr("SandboxFs")?)?;
     m.add_class::<fs::PyFsReadStream>()?;
     m.add_class::<fs::PyFsWriteSink>()?;
     m.add_class::<image::PyImage>()?;
@@ -71,6 +87,7 @@ fn _microsandbox(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<logs::PyLogEntry>()?;
     m.add_class::<logs::PyLogStream>()?;
     m.add_class::<sandbox::PyPullSession>()?;
+    m.add_class::<sandbox::PyPullEvent>()?;
     m.add_class::<ssh::PySandboxSshOps>()?;
     m.add_class::<ssh::PySshOutput>()?;
     m.add_class::<ssh::PySshClient>()?;
@@ -80,6 +97,7 @@ fn _microsandbox(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<fs::PyFsEntry>()?;
     m.add_class::<fs::PyFsMetadata>()?;
     m.add_class::<PyBackendScope>()?;
+    m.add_class::<PyBackendInfo>()?;
     Ok(())
 }
 
@@ -107,16 +125,18 @@ fn set_runtime_libkrunfw_path(path: String) {
 
 /// Set the process-wide default backend.
 ///
-/// `kind="local"` selects the local libkrun backend. `kind="cloud"` requires
-/// either `url` + `api_key`, or `profile`.
+/// `BackendKind.LOCAL` selects the local libkrun backend. `BackendKind.CLOUD`
+/// requires either `api_key` (with an optional `url` override), or `profile`.
 #[pyfunction]
 #[pyo3(signature = (kind, *, url=None, api_key=None, profile=None))]
 fn set_default_backend(
-    kind: String,
+    py: Python<'_>,
+    kind: Py<PyAny>,
     url: Option<String>,
     api_key: Option<String>,
     profile: Option<String>,
 ) -> PyResult<()> {
+    let kind = crate::helpers::extract_str_enum(kind.bind(py), "BackendKind")?;
     microsandbox::set_default_backend(build_backend(kind, url, api_key, profile)?);
     Ok(())
 }
@@ -126,7 +146,7 @@ fn set_default_backend(
 /// Use as a regular context manager, including inside async functions:
 ///
 /// ```python
-/// with backend_scope("cloud", profile="dev"):
+/// with backend_scope(BackendKind.CLOUD, profile="dev"):
 ///     sandbox = await Sandbox.create("x", image="alpine:3.19")
 /// ```
 ///
@@ -135,23 +155,38 @@ fn set_default_backend(
 #[pyfunction]
 #[pyo3(signature = (kind, *, url=None, api_key=None, profile=None))]
 fn backend_scope(
-    kind: String,
+    py: Python<'_>,
+    kind: Py<PyAny>,
     url: Option<String>,
     api_key: Option<String>,
     profile: Option<String>,
 ) -> PyResult<PyBackendScope> {
+    let kind = crate::helpers::extract_str_enum(kind.bind(py), "BackendKind")?;
     let previous = microsandbox::swap_default_backend(build_backend(kind, url, api_key, profile)?);
     Ok(PyBackendScope {
         previous: Some(previous),
     })
 }
 
-/// Return the active default backend kind (`"local"` or `"cloud"`).
+/// Return the active default backend kind.
 #[pyfunction]
-fn default_backend_kind() -> &'static str {
-    match microsandbox::default_backend().kind() {
+fn default_backend_kind(py: Python<'_>) -> PyResult<PyObject> {
+    let kind = match microsandbox::default_backend().kind() {
         microsandbox::BackendKind::Local => "local",
         microsandbox::BackendKind::Cloud => "cloud",
+    };
+    crate::helpers::str_enum_member(py, "BackendKind", kind)
+}
+
+/// Return secret-safe information about the active default backend.
+#[pyfunction]
+fn default_backend_info() -> PyBackendInfo {
+    let info = microsandbox::default_backend_info();
+    PyBackendInfo {
+        kind: info.kind.as_str().to_string(),
+        api_url: info.api_url,
+        source: info.source.as_str().to_string(),
+        profile: info.profile,
     }
 }
 
@@ -161,13 +196,12 @@ fn default_backend_kind() -> &'static str {
 #[pyfunction]
 fn resolved_msb_path() -> PyResult<String> {
     let backend = microsandbox::backend::default_backend();
-    let local = backend.as_local().ok_or_else(|| {
-        error::to_py_err(microsandbox::MicrosandboxError::Unsupported {
-            feature: "resolved_msb_path requires a local backend".into(),
-            available_when: "with a local backend".into(),
-        })
-    })?;
-    microsandbox::config::resolve_msb_path(local.config())
+    let local = backend
+        .as_local()
+        .ok_or_else(|| error::local_only("resolved_msb_path"))?;
+    local
+        .config()
+        .resolve_msb_path()
         .map(|path| path.to_string_lossy().into_owned())
         .map_err(error::to_py_err)
 }
@@ -184,17 +218,15 @@ fn build_backend(
             let cloud = if let Some(profile) = profile {
                 microsandbox::CloudBackend::from_profile(&profile)
             } else {
-                let url = url.ok_or_else(|| {
-                    pyo3::exceptions::PyValueError::new_err(
-                        "cloud backend requires url + api_key or profile",
-                    )
-                })?;
                 let api_key = api_key.ok_or_else(|| {
                     pyo3::exceptions::PyValueError::new_err(
-                        "cloud backend requires url + api_key or profile",
+                        "cloud backend requires api_key or profile",
                     )
                 })?;
-                microsandbox::CloudBackend::new(url, api_key)
+                match url {
+                    Some(url) => microsandbox::CloudBackend::new(url, api_key),
+                    None => microsandbox::CloudBackend::with_api_key(api_key),
+                }
             }
             .map_err(error::to_py_err)?;
             Ok(Arc::new(cloud))

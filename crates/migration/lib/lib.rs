@@ -13,6 +13,18 @@ mod m20260531_000002_index_sandbox_labels_key_value;
 mod m20260606_000001_named_volume_kinds;
 mod m20260621_000001_add_sandbox_ephemeral;
 mod m20260621_000002_create_maintenance_lease;
+mod m20260703_000001_add_sandbox_active_config;
+mod m20260708_000001_migrate_bind_rootfs_source;
+mod m20260710_000001_migrate_root_disk;
+mod m20260714_000001_add_snapshot_scope;
+mod m20260719_000001_create_cpu_allocations;
+mod m20260723_000001_snapshot_artifact_transition;
+mod m20260803_000001_create_writeback_allocations;
+mod m20260808_000001_create_memory_allocation_nodes;
+mod m20260810_000001_rebuild_sandbox_labels;
+mod m20260813_000001_share_cpu_allocations;
+mod m20260824_000001_mount_owner_config;
+pub mod schema_metadata;
 
 use sea_orm_migration::prelude::*;
 
@@ -50,6 +62,17 @@ impl MigratorTrait for Migrator {
             Box::new(m20260606_000001_named_volume_kinds::Migration),
             Box::new(m20260621_000001_add_sandbox_ephemeral::Migration),
             Box::new(m20260621_000002_create_maintenance_lease::Migration),
+            Box::new(m20260703_000001_add_sandbox_active_config::Migration),
+            Box::new(m20260708_000001_migrate_bind_rootfs_source::Migration),
+            Box::new(m20260710_000001_migrate_root_disk::Migration),
+            Box::new(m20260714_000001_add_snapshot_scope::Migration),
+            Box::new(m20260723_000001_snapshot_artifact_transition::Migration),
+            Box::new(m20260719_000001_create_cpu_allocations::Migration),
+            Box::new(m20260803_000001_create_writeback_allocations::Migration),
+            Box::new(m20260808_000001_create_memory_allocation_nodes::Migration),
+            Box::new(m20260810_000001_rebuild_sandbox_labels::Migration),
+            Box::new(m20260813_000001_share_cpu_allocations::Migration),
+            Box::new(m20260824_000001_mount_owner_config::Migration),
         ]
     }
 }

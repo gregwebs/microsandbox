@@ -201,7 +201,9 @@ impl AgentListener {
     fn cleanup(&self, endpoint: &Path) {
         #[cfg(unix)]
         {
-            let _ = std::fs::remove_file(endpoint);
+            // The control endpoint is derived from the relay endpoint and is
+            // owned by the same runtime lifetime.
+            let _ = crate::ipc::remove_socket_pair(endpoint);
         }
 
         #[cfg(windows)]
@@ -269,6 +271,18 @@ impl AgentRelay {
             return Ok(());
         };
 
+        // A mount may have pinned an explicit guest owner (`uid=`/`gid=`), which
+        // is installed host-side before the guest reports its default user. Keep
+        // that value; only fall back to the resolved default user when no
+        // explicit owner was set.
+        if handle.get().is_some() {
+            tracing::info!(
+                mounts = self.bind_identity_map_mount_count,
+                "agent relay: bind identity map already set by an explicit mount owner"
+            );
+            return Ok(());
+        }
+
         let host_owner_uid = unsafe { libc::getuid() as u32 };
         let map = BindIdentityMap::new(
             host_owner_uid,
@@ -276,9 +290,8 @@ impl AgentRelay {
             resolved.default_user.gid,
         );
 
-        handle
-            .set(map)
-            .map_err(|_| RuntimeError::Custom("bind identity map already installed".into()))?;
+        // Ignore a lost race: a concurrent explicit install winning here is fine.
+        let _ = handle.set(map);
 
         tracing::info!(
             host_owner_uid,

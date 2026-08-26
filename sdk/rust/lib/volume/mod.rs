@@ -2,8 +2,10 @@
 //!
 //! Volumes are persistent named storage. Locally they are host-side
 //! directories under `~/.microsandbox/volumes/<name>/` with metadata tracked
-//! in SQLite. Cloud-side they ultimately live in the org's S3 namespace via
-//! msb-cloud (Phase 6; today every cloud op returns `Unsupported`).
+//! in SQLite. Cloud-side they are org-scoped managed volumes: create / get /
+//! list / remove and direct filesystem operations route through msb-cloud.
+//! Cloud also provides an always-present default volume; local lookup of that
+//! default is deliberately unsupported to avoid exposing host storage.
 //!
 //! Per the SDK local-cloud parity plan (D6.4) [`Volume`] and [`VolumeHandle`]
 //! stay single types regardless of backend. Each holds an
@@ -26,12 +28,13 @@ use sea_orm::ConnectionTrait;
 use sea_orm::{ColumnTrait, EntityTrait, QueryFilter, QueryOrder, Set};
 
 use crate::backend::{
-    Backend, BackendKind, LocalBackend, VolumeHandleInner, VolumeHandleLocalState, VolumeInner,
-    VolumeLocalState,
+    Backend, BackendKind, LocalBackend, VolumeCloudState, VolumeHandleCloudState,
+    VolumeHandleInner, VolumeHandleLocalState, VolumeInner, VolumeLocalState,
 };
 use crate::{
     MicrosandboxError, MicrosandboxResult,
     db::entity::{sandbox as sandbox_entity, volume as volume_entity},
+    error::Operation,
     sandbox::{SandboxConfig, SandboxStatus, VolumeMount},
     size::Mebibytes,
 };
@@ -51,6 +54,7 @@ pub struct Volume {
     backend: Arc<dyn Backend>,
     inner: Arc<VolumeInner>,
     name: String,
+    fs_target: String,
 }
 
 /// A lightweight handle to a volume.
@@ -65,6 +69,7 @@ pub struct VolumeHandle {
     backend: Arc<dyn Backend>,
     inner: VolumeHandleInner,
     name: String,
+    fs_target: String,
 }
 
 /// Builder for creating a volume.
@@ -104,6 +109,15 @@ impl Volume {
         backend.volumes().get(backend.clone(), name).await
     }
 
+    /// Get the cloud account's always-present default volume.
+    ///
+    /// The local backend deliberately returns [`MicrosandboxError::Unsupported`]
+    /// so a missing cloud credential can never turn this into host filesystem access.
+    pub async fn get_default() -> MicrosandboxResult<VolumeHandle> {
+        let backend = crate::backend::default_backend();
+        backend.volumes().get_default(backend.clone()).await
+    }
+
     /// List all volumes from the active backend.
     pub async fn list() -> MicrosandboxResult<Vec<VolumeHandle>> {
         let backend = crate::backend::default_backend();
@@ -131,6 +145,21 @@ impl Volume {
         Self {
             backend,
             inner: Arc::new(VolumeInner::Local(local)),
+            fs_target: name.clone(),
+            name,
+        }
+    }
+
+    /// Build an outer `Volume` from cloud-variant inner state.
+    pub(crate) fn from_cloud(
+        backend: Arc<dyn Backend>,
+        cloud: VolumeCloudState,
+        name: String,
+    ) -> Self {
+        Self {
+            backend,
+            fs_target: format!("cloud-id:{}", cloud.id),
+            inner: Arc::new(VolumeInner::Cloud(cloud)),
             name,
         }
     }
@@ -160,25 +189,21 @@ impl Volume {
     }
 
     /// Cloud-only volume state. Returns `Some` for cloud-backed volumes.
-    pub fn cloud(&self) -> Option<&crate::backend::VolumeCloudState> {
+    pub fn cloud(&self) -> Option<&VolumeCloudState> {
         match &*self.inner {
             VolumeInner::Cloud(s) => Some(s),
             VolumeInner::Local(_) => None,
         }
     }
 
-    /// Host-side directory where this volume's data is stored (local backend
-    /// only).
+    /// Host-side directory where this volume's data is stored.
     ///
     /// Errors with [`MicrosandboxError::Unsupported`] for cloud volumes —
-    /// cloud bytes live in the org's S3 namespace, not on the caller's host.
+    /// cloud bytes are not exposed on the caller's host.
     pub fn path(&self) -> MicrosandboxResult<&Path> {
         match &*self.inner {
             VolumeInner::Local(s) => Ok(&s.path),
-            VolumeInner::Cloud(_) => Err(MicrosandboxError::Unsupported {
-                feature: "Volume::path on cloud".into(),
-                available_when: "never — cloud volumes don't live on the host".into(),
-            }),
+            VolumeInner::Cloud(_) => Err(MicrosandboxError::local_only(Operation::VolumePath)),
         }
     }
 
@@ -186,7 +211,7 @@ impl Volume {
     pub fn kind(&self) -> VolumeKind {
         match &*self.inner {
             VolumeInner::Local(s) => s.kind,
-            VolumeInner::Cloud(s) => s.kind,
+            VolumeInner::Cloud(_) => VolumeKind::Directory,
         }
     }
 
@@ -202,7 +227,7 @@ impl Volume {
     pub fn disk_format(&self) -> Option<&str> {
         match &*self.inner {
             VolumeInner::Local(s) => s.disk_format.as_deref(),
-            VolumeInner::Cloud(s) => s.disk_format.as_deref(),
+            VolumeInner::Cloud(_) => None,
         }
     }
 
@@ -210,7 +235,7 @@ impl Volume {
     pub fn disk_fstype(&self) -> Option<&str> {
         match &*self.inner {
             VolumeInner::Local(s) => s.disk_fstype.as_deref(),
-            VolumeInner::Cloud(s) => s.disk_fstype.as_deref(),
+            VolumeInner::Cloud(_) => None,
         }
     }
 
@@ -226,10 +251,10 @@ impl Volume {
     /// Operate on the volume's filesystem (read, write, list files) without
     /// needing a running sandbox.
     ///
-    /// Routes through the backend trait — local ops hit `tokio::fs`, cloud
-    /// ops will route through msb-cloud HTTP once Phase 6 lands.
+    /// Routes through the backend trait — local ops hit `tokio::fs`, while
+    /// Cloud ops use the authenticated msb-cloud API.
     pub fn fs(&self) -> VolumeFs<'_> {
-        VolumeFs::new(self.backend.clone(), &self.name)
+        VolumeFs::new(self.backend.clone(), &self.fs_target)
     }
 }
 
@@ -276,6 +301,24 @@ impl VolumeHandle {
                 labels,
                 created_at: model.created_at.map(|dt| dt.and_utc()),
             }),
+            fs_target: name.clone(),
+            name,
+        }
+    }
+
+    /// Build a handle from the cloud's volume snapshot.
+    ///
+    /// The org's shared default volume has no name and carries an empty one
+    /// here; it is addressed by kind, not name.
+    pub(crate) fn from_cloud(
+        backend: Arc<dyn Backend>,
+        cloud: VolumeHandleCloudState,
+        name: String,
+    ) -> Self {
+        Self {
+            backend,
+            fs_target: format!("cloud-id:{}", cloud.id),
+            inner: VolumeHandleInner::Cloud(cloud),
             name,
         }
     }
@@ -299,18 +342,31 @@ impl VolumeHandle {
     }
 
     /// Cloud-only handle state. Returns `Some` for cloud-backed handles.
-    pub fn cloud(&self) -> Option<&crate::backend::VolumeHandleCloudState> {
+    pub fn cloud(&self) -> Option<&VolumeHandleCloudState> {
         match &self.inner {
             VolumeHandleInner::Cloud(s) => Some(s),
             VolumeHandleInner::Local(_) => None,
         }
     }
 
+    /// Whether this is the cloud account's always-present default volume.
+    pub fn is_default(&self) -> bool {
+        matches!(
+            &self.inner,
+            VolumeHandleInner::Cloud(state)
+                if state.kind == crate::backend::CloudVolumeKind::Host
+        )
+    }
+
     /// Maximum storage in MiB, or `None` if unlimited.
     pub fn quota_mib(&self) -> Option<u32> {
         match &self.inner {
             VolumeHandleInner::Local(s) => s.quota_mib,
-            VolumeHandleInner::Cloud(s) => s.quota_mib,
+            // Cloud volumes are elastic volumes; their per-volume limit
+            // surfaces here (in MiB). Absent = no per-volume limit.
+            VolumeHandleInner::Cloud(s) => s
+                .capacity_bytes
+                .map(|bytes| u32::try_from(bytes.div_ceil(1024 * 1024)).unwrap_or(u32::MAX)),
         }
     }
 
@@ -318,7 +374,12 @@ impl VolumeHandle {
     pub fn kind(&self) -> VolumeKind {
         match &self.inner {
             VolumeHandleInner::Local(s) => s.kind,
-            VolumeHandleInner::Cloud(s) => s.kind,
+            // CloudVolumeKind distinguishes the org's shared host volume from
+            // a user-created managed volume; it does not describe the storage
+            // representation. Both are directory volumes from the SDK's point
+            // of view. The cloud-specific lifecycle kind remains available
+            // through `cloud().kind`.
+            VolumeHandleInner::Cloud(_) => VolumeKind::Directory,
         }
     }
 
@@ -327,7 +388,8 @@ impl VolumeHandle {
     pub fn used_bytes(&self) -> u64 {
         match &self.inner {
             VolumeHandleInner::Local(s) => s.used_bytes,
-            VolumeHandleInner::Cloud(s) => s.used_bytes,
+            // Zero until the cloud reports per-volume usage.
+            VolumeHandleInner::Cloud(s) => s.used_bytes.unwrap_or(0),
         }
     }
 
@@ -335,6 +397,8 @@ impl VolumeHandle {
     pub fn capacity_bytes(&self) -> Option<u64> {
         match &self.inner {
             VolumeHandleInner::Local(s) => s.capacity_bytes,
+            // The cloud's per-volume storage limit, byte-exact. `quota_mib`
+            // reports the same limit in MiB. Absent = no per-volume limit.
             VolumeHandleInner::Cloud(s) => s.capacity_bytes,
         }
     }
@@ -343,7 +407,7 @@ impl VolumeHandle {
     pub fn disk_format(&self) -> Option<&str> {
         match &self.inner {
             VolumeHandleInner::Local(s) => s.disk_format.as_deref(),
-            VolumeHandleInner::Cloud(s) => s.disk_format.as_deref(),
+            VolumeHandleInner::Cloud(_) => None,
         }
     }
 
@@ -351,7 +415,7 @@ impl VolumeHandle {
     pub fn disk_fstype(&self) -> Option<&str> {
         match &self.inner {
             VolumeHandleInner::Local(s) => s.disk_fstype.as_deref(),
-            VolumeHandleInner::Cloud(s) => s.disk_fstype.as_deref(),
+            VolumeHandleInner::Cloud(_) => None,
         }
     }
 
@@ -377,14 +441,14 @@ impl VolumeHandle {
     pub fn created_at(&self) -> Option<chrono::DateTime<chrono::Utc>> {
         match &self.inner {
             VolumeHandleInner::Local(s) => s.created_at,
-            VolumeHandleInner::Cloud(s) => s.created_at,
+            VolumeHandleInner::Cloud(s) => Some(s.created_at),
         }
     }
 
     /// Operate on the volume's filesystem (read, write, list files) without
     /// needing a running sandbox. Routes through the bound backend.
     pub fn fs(&self) -> VolumeFs<'_> {
-        VolumeFs::new(self.backend.clone(), &self.name)
+        VolumeFs::new(self.backend.clone(), &self.fs_target)
     }
 
     /// Remove this volume.
@@ -393,6 +457,14 @@ impl VolumeHandle {
     /// directory is easier to detect and clean up than an orphaned DB record.
     /// Cloud handles route through the backend's remove endpoint.
     pub async fn remove(&self) -> MicrosandboxResult<()> {
+        if self.is_default() {
+            return Err(MicrosandboxError::unsupported(
+                Operation::VolumeRemove,
+                crate::error::UnsupportedReason::NotAvailable(
+                    "the default volume cannot be removed".into(),
+                ),
+            ));
+        }
         self.backend
             .volumes()
             .remove(self.backend.clone(), &self.name)
@@ -506,10 +578,7 @@ pub(crate) async fn create_local(
 
     let local_backend = backend
         .as_local()
-        .ok_or_else(|| MicrosandboxError::Unsupported {
-            feature: "Volume::create_local".into(),
-            available_when: "with a LocalBackend".into(),
-        })?;
+        .ok_or_else(|| MicrosandboxError::local_only(Operation::VolumeCreate))?;
     let pools = local_backend.db().await?;
     let _name_lock = lock_volume_name(local_backend, &config.name)?;
 
@@ -577,10 +646,7 @@ pub(crate) async fn get_local(
 ) -> MicrosandboxResult<VolumeHandle> {
     let local_backend = backend
         .as_local()
-        .ok_or_else(|| MicrosandboxError::Unsupported {
-            feature: "Volume::get_local".into(),
-            available_when: "with a LocalBackend".into(),
-        })?;
+        .ok_or_else(|| MicrosandboxError::local_only(Operation::VolumeGet))?;
     let db = local_backend.db().await?.read();
 
     let model = volume_entity::Entity::find()
@@ -597,10 +663,7 @@ pub(crate) async fn get_local(
 pub(crate) async fn list_local(backend: Arc<dyn Backend>) -> MicrosandboxResult<Vec<VolumeHandle>> {
     let local_backend = backend
         .as_local()
-        .ok_or_else(|| MicrosandboxError::Unsupported {
-            feature: "Volume::list_local".into(),
-            available_when: "with a LocalBackend".into(),
-        })?;
+        .ok_or_else(|| MicrosandboxError::local_only(Operation::VolumeList))?;
     let db = local_backend.db().await?.read();
 
     let models = volume_entity::Entity::find()
@@ -618,10 +681,7 @@ pub(crate) async fn list_local(backend: Arc<dyn Backend>) -> MicrosandboxResult<
 pub(crate) async fn remove_local(backend: Arc<dyn Backend>, name: &str) -> MicrosandboxResult<()> {
     let local_backend = backend
         .as_local()
-        .ok_or_else(|| MicrosandboxError::Unsupported {
-            feature: "Volume::remove_local".into(),
-            available_when: "with a LocalBackend".into(),
-        })?;
+        .ok_or_else(|| MicrosandboxError::local_only(Operation::VolumeRemove))?;
     let pools = local_backend.db().await?;
 
     let model = volume_entity::Entity::find()
@@ -872,10 +932,66 @@ mod tests {
 
     use sea_orm::{ActiveModelTrait, Set};
 
-    use crate::backend::{Backend, LocalBackend};
+    use crate::backend::{
+        Backend, CloudBackend, CloudVolumeKind, CloudVolumeStatus, LocalBackend,
+        VolumeHandleCloudState,
+    };
     use crate::sandbox::{HostPermissions, MountOptions, SandboxStatus, StatVirtualization};
 
     use super::*;
+
+    #[test]
+    fn cloud_managed_volume_reports_directory_storage_kind() {
+        let backend: Arc<dyn Backend> =
+            Arc::new(CloudBackend::new("https://msb.example.com", "msb_test_abc").unwrap());
+        let now = chrono::Utc::now();
+        let handle = VolumeHandle::from_cloud(
+            backend,
+            VolumeHandleCloudState {
+                id: "volume-id".into(),
+                used_bytes: Some(0),
+                capacity_bytes: None,
+                labels: Vec::new(),
+                kind: CloudVolumeKind::Managed,
+                status: CloudVolumeStatus::Active,
+                created_at: now,
+                updated_at: now,
+            },
+            "data".into(),
+        );
+
+        assert_eq!(handle.kind(), VolumeKind::Directory);
+        assert_eq!(handle.cloud().unwrap().kind, CloudVolumeKind::Managed);
+        assert_eq!(handle.fs_target, "cloud-id:volume-id");
+    }
+
+    #[tokio::test]
+    async fn cloud_default_volume_is_identified_and_cannot_be_removed() {
+        let backend: Arc<dyn Backend> =
+            Arc::new(CloudBackend::new("https://msb.example.com", "msb_test_abc").unwrap());
+        let now = chrono::Utc::now();
+        let handle = VolumeHandle::from_cloud(
+            backend,
+            VolumeHandleCloudState {
+                id: "default-volume-id".into(),
+                used_bytes: Some(0),
+                capacity_bytes: None,
+                labels: Vec::new(),
+                kind: CloudVolumeKind::Host,
+                status: CloudVolumeStatus::Active,
+                created_at: now,
+                updated_at: now,
+            },
+            String::new(),
+        );
+
+        assert!(handle.is_default());
+        assert_eq!(handle.fs_target, "cloud-id:default-volume-id");
+        assert!(matches!(
+            handle.remove().await,
+            Err(MicrosandboxError::Unsupported { .. })
+        ));
+    }
 
     #[tokio::test]
     async fn test_remove_local_rejects_active_named_volume_reference() {
@@ -911,6 +1027,7 @@ mod tests {
                     options: MountOptions::default(),
                     stat_virtualization: StatVirtualization::Strict,
                     host_permissions: HostPermissions::Private,
+                    follow_root_symlinks: false,
                 }],
                 ..Default::default()
             },

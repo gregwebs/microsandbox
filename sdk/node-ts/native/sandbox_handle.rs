@@ -42,6 +42,12 @@ impl JsSandboxHandle {
         format!("{:?}", self.inner.status_snapshot()).to_lowercase()
     }
 
+    /// Backend retained by this handle (`"local"` or `"cloud"`).
+    #[napi(getter)]
+    pub fn backend_kind(&self) -> &'static str {
+        self.inner.backend_kind().as_str()
+    }
+
     /// Raw config JSON string from the database.
     #[napi(getter)]
     pub fn config_json(&self) -> String {
@@ -72,6 +78,34 @@ impl JsSandboxHandle {
     pub async fn metrics(&self) -> Result<SandboxMetrics> {
         let m = self.inner.metrics().await.map_err(to_napi_error)?;
         Ok(crate::sandbox::metrics_to_js(&m))
+    }
+
+    /// Check whether agentd is reachable without refreshing idle activity.
+    ///
+    /// Connects to an already-running sandbox; stopped sandboxes are not
+    /// started implicitly.
+    #[napi]
+    pub async fn ping(&self) -> Result<SandboxPingResult> {
+        let result = self.inner.ping().await.map_err(to_napi_error)?;
+        Ok(crate::sandbox::sandbox_ping_result_to_js(result))
+    }
+
+    /// Explicitly refresh this sandbox's idle activity timer.
+    ///
+    /// Connects to an already-running sandbox; stopped sandboxes are not
+    /// started implicitly.
+    #[napi]
+    pub async fn touch(&self) -> Result<SandboxTouchResult> {
+        let result = self.inner.touch().await.map_err(to_napi_error)?;
+        Ok(crate::sandbox::sandbox_touch_result_to_js(result))
+    }
+
+    /// Plan or apply a sandbox modification. Returns the plan as a JSON
+    /// string; the TS wrapper parses it into a `SandboxModificationPlan`.
+    #[napi]
+    pub async fn modify(&self, options: Option<SandboxModifyOptions>) -> Result<String> {
+        let builder = crate::sandbox::configure_modify(self.inner.modify(), options.as_ref())?;
+        crate::sandbox::run_modify(builder, crate::sandbox::modify_dry_run(options.as_ref())).await
     }
 
     /// Start the sandbox (attached mode) — returns a live Sandbox handle.
@@ -220,23 +254,11 @@ impl JsSandboxHandle {
 
     /// Snapshot this (stopped) sandbox under a bare name.
     ///
-    /// Resolves under `~/.microsandbox/snapshots/<name>/`. Use
-    /// [`snapshotTo`](Self::snapshot_to) for an explicit filesystem
-    /// destination.
+    /// Resolves under `~/.microsandbox/snapshots/<name>/`. Move
+    /// artifacts with `Snapshot.save`/`Snapshot.load`.
     #[napi]
     pub async fn snapshot(&self, name: String) -> Result<crate::snapshot::JsSnapshot> {
         let snap = self.inner.snapshot(&name).await.map_err(to_napi_error)?;
-        Ok(crate::snapshot::JsSnapshot::from_rust(snap))
-    }
-
-    /// Snapshot this (stopped) sandbox to an explicit filesystem path.
-    #[napi(js_name = "snapshotTo")]
-    pub async fn snapshot_to(&self, path: String) -> Result<crate::snapshot::JsSnapshot> {
-        let snap = self
-            .inner
-            .snapshot_to(std::path::PathBuf::from(path))
-            .await
-            .map_err(to_napi_error)?;
         Ok(crate::snapshot::JsSnapshot::from_rust(snap))
     }
 }

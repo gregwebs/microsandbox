@@ -26,9 +26,8 @@ use super::common::config::NormalizedDnsConfig;
 use super::forwarder::{DnsForwarder, DnsForwarderHandle};
 use super::proxies::udp::UdpProxy;
 use crate::config::DnsConfig;
+use crate::netstack::{poll::GatewayIps, shared::SharedState};
 use crate::policy::NetworkPolicy;
-use crate::shared::SharedState;
-use crate::stack::GatewayIps;
 
 //--------------------------------------------------------------------------------------------------
 // Constants
@@ -97,6 +96,7 @@ impl DnsInterceptor {
         tokio_handle: &tokio::runtime::Handle,
         gateway_ips: Arc<HashSet<IpAddr>>,
         network_policy: Arc<NetworkPolicy>,
+        platform_policy: Option<Arc<NetworkPolicy>>,
         gateway: GatewayIps,
         gateway_mac: [u8; 6],
         guest_mac: [u8; 6],
@@ -125,29 +125,25 @@ impl DnsInterceptor {
 
         let normalized = Arc::new(NormalizedDnsConfig::from_config(dns_config));
 
-        // Two spawns from the same construction site:
-        //   1. DnsForwarder::spawn — connects to the configured
-        //      upstream and publishes the shared handle.
-        //   2. UdpProxy::spawn — drains UDP queries from this
-        //      interceptor's channel and routes them through the
-        //      forwarder, mirroring how `tcp.rs` handles per-connection
-        //      TCP/53 traffic.
+        // Start the forwarder initializer, then schedule the UDP proxy
+        // that waits for its shared handle and drains intercepted queries.
         let forwarder_handle = DnsForwarder::spawn(
             tokio_handle,
             normalized,
             gateway_ips,
             network_policy,
+            platform_policy,
             shared.clone(),
             gateway,
         );
-        UdpProxy::spawn(
-            tokio_handle,
+        let proxy = UdpProxy::new(
             query_rx,
             forwarder_handle.clone(),
             shared,
             gateway_mac,
             guest_mac,
         );
+        tokio_handle.spawn(proxy.run());
 
         (
             Self {
@@ -197,7 +193,7 @@ mod tests {
     use smoltcp::time::Instant;
     use smoltcp::wire::{HardwareAddress, IpCidr, Ipv4Address, Ipv6Address};
 
-    use crate::device::SmoltcpDevice;
+    use crate::netstack::device::SmoltcpDevice;
 
     /// IPv6 capture smoke test (#3): a UDP socket bound to
     /// `addr: None, port: 53` must accept packets destined to *any*

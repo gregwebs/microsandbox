@@ -1,0 +1,381 @@
+---
+title: Images
+description: Rust SDK - Image cache API reference
+---
+
+<Tooltip tip="The image-cache API manages the local cache and is local-only. On microsandbox cloud, specify an OCI image when creating the sandbox and it is pulled for you."><span className="msb-badge-local">Local-only <Icon icon="circle-info" size={11} /></span></Tooltip>
+
+Inspect and manage the local OCI image cache.
+
+## Image
+
+These methods resolve the active backend with `microsandbox::backend::default_backend()`.
+
+#### <span className="msb-recv">Image::</span><span className="msb-hn">get()</span>
+
+```rust
+async fn get(reference: &str) -> MicrosandboxResult<ImageHandle>
+```
+
+<Accordion title="Example">
+
+```rust
+let image = Image::get("python:3.12").await?;
+println!("{:?}", image.manifest_digest());
+```
+
+</Accordion>
+
+Fetch one cached image by reference. Returns `ImageNotFound` when the reference is not present in the local cache.
+
+#### <span className="msb-recv">Image::</span><span className="msb-hn">list()</span>
+
+```rust
+async fn list() -> MicrosandboxResult<Vec<ImageHandle>>
+```
+
+<Accordion title="Example">
+
+```rust
+for image in Image::list().await? {
+    println!("{}", image.reference());
+}
+```
+
+</Accordion>
+
+Return every cached image, ordered by creation time with newest first.
+
+#### <span className="msb-recv">Image::</span><span className="msb-hn">inspect()</span>
+
+```rust
+async fn inspect(reference: &str) -> MicrosandboxResult<ImageDetail>
+```
+
+<Accordion title="Example">
+
+```rust
+let detail = Image::inspect("python:3.12").await?;
+for layer in &detail.layers {
+    println!("{} {}", layer.position, layer.diff_id);
+}
+```
+
+</Accordion>
+
+Return full detail for a cached image: handle metadata, parsed OCI config fields, and layer metadata.
+
+#### <span className="msb-recv">Image::</span><span className="msb-hn">remove()</span>
+
+```rust
+async fn remove(reference: &str, force: bool) -> MicrosandboxResult<()>
+```
+
+<Accordion title="Example">
+
+```rust
+Image::remove("old:tag", false).await?;
+```
+
+</Accordion>
+
+Delete a cached image. When `force` is `false`, an image still referenced by one or more sandboxes returns `ImageInUse`.
+
+#### <span className="msb-recv">Image::</span><span className="msb-hn">prune()</span>
+
+```rust
+async fn prune() -> MicrosandboxResult<ImagePruneReport>
+```
+
+<Accordion title="Example">
+
+```rust
+let report = Image::prune().await?;
+println!("{:?}", report.bytes_reclaimed);
+```
+
+</Accordion>
+
+---
+
+#### <span className="msb-recv">Image::</span><span className="msb-hn">load()</span>
+<div className="msb-tags"><span className="msb-tag is-static">static</span><span className="msb-tag is-async">async</span></div>
+
+```rust
+async fn load(input: &Path, tags: Vec<String>) -> MicrosandboxResult<Vec<ImageHandle>>
+```
+
+Import images from a local archive into the cache. Accepts `docker save` tarballs and OCI Image Layout archives, so locally built images can be used without going through a registry. `tags` applies extra references to the first image in the archive. Returns a handle for every image reference imported.
+
+<Accordion title="Example">
+
+```rust
+// docker save my-image:latest -o my-image.tar
+let images = Image::load(Path::new("my-image.tar"), vec!["app:local".into()]).await?;
+for image in &images {
+    println!("{}", image.reference());
+}
+```
+
+</Accordion>
+
+---
+
+#### <span className="msb-recv">Image::</span><span className="msb-hn">save()</span>
+<div className="msb-tags"><span className="msb-tag is-static">static</span><span className="msb-tag is-async">async</span></div>
+
+```rust
+async fn save(references: &[String], output: &Path, format: ImageArchiveFormat) -> MicrosandboxResult<()>
+```
+
+Export cached images to an archive file. [`ImageArchiveFormat`](#imagearchiveformat) selects the layout: `Docker` (loadable with `docker load`) or `Oci` (OCI Image Layout). Returns `ImageNotFound` when any reference is missing from the local cache.
+
+<Accordion title="Example">
+
+```rust
+use microsandbox::ImageArchiveFormat;
+
+let references = vec!["python:3.12".to_string()];
+Image::save(&references, Path::new("python.tar"), ImageArchiveFormat::Docker).await?;
+```
+
+</Accordion>
+
+<p className="msb-member-group">Explicit local variants</p>
+
+Use these when your program owns a specific `LocalBackend` and should not depend on the process default backend.
+
+```rust
+use microsandbox::{Image, LocalBackend};
+
+let backend = LocalBackend::builder()
+    .home("/tmp/msb-home")
+    .build()
+    .await?;
+
+let image = Image::get_local(&backend, "python:3.12").await?;
+let images = Image::list_local(&backend).await?;
+let detail = Image::inspect_local(&backend, image.reference()).await?;
+Image::remove_local(&backend, detail.handle.reference(), false).await?;
+let report = Image::prune_local(&backend).await?;
+```
+
+#### <span className="msb-recv">Image::</span><span className="msb-hn">get_local()</span>
+
+```rust
+async fn get_local(local: &LocalBackend, reference: &str) -> MicrosandboxResult<ImageHandle>
+```
+
+#### <span className="msb-recv">Image::</span><span className="msb-hn">list_local()</span>
+
+```rust
+async fn list_local(local: &LocalBackend) -> MicrosandboxResult<Vec<ImageHandle>>
+```
+
+#### <span className="msb-recv">Image::</span><span className="msb-hn">inspect_local()</span>
+
+```rust
+async fn inspect_local(local: &LocalBackend, reference: &str) -> MicrosandboxResult<ImageDetail>
+```
+
+#### <span className="msb-recv">Image::</span><span className="msb-hn">remove_local()</span>
+
+```rust
+async fn remove_local(local: &LocalBackend, reference: &str, force: bool) -> MicrosandboxResult<()>
+```
+
+#### <span className="msb-recv">Image::</span><span className="msb-hn">prune_local()</span>
+
+```rust
+async fn prune_local(local: &LocalBackend) -> MicrosandboxResult<ImagePruneReport>
+```
+
+#### <span className="msb-recv">Image::</span><span className="msb-hn">load_local()</span>
+
+```rust
+async fn load_local(local: &LocalBackend, input: &Path, tags: Vec<String>) -> MicrosandboxResult<Vec<ImageHandle>>
+```
+
+#### <span className="msb-recv">Image::</span><span className="msb-hn">save_local()</span>
+
+```rust
+async fn save_local(local: &LocalBackend, references: &[String], output: &Path, format: ImageArchiveFormat) -> MicrosandboxResult<()>
+```
+
+## ImageHandle
+
+
+<p className="msb-backref">Returned by <a href="#image-get">get()</a> · <a href="#image-list">list()</a></p>
+
+A lightweight metadata handle for a cached OCI image.
+
+
+#### <span className="msb-recv">h.</span><span className="msb-hn">reference()</span>
+
+```rust
+reference()
+```
+
+Image reference
+
+<p className="msb-label">Returns</p>
+
+`&str`
+
+#### <span className="msb-recv">h.</span><span className="msb-hn">size_bytes()</span>
+
+```rust
+size_bytes()
+```
+
+Total image size in bytes, when known
+
+<p className="msb-label">Returns</p>
+
+`Option<i64>`
+
+#### <span className="msb-recv">h.</span><span className="msb-hn">manifest_digest()</span>
+
+```rust
+manifest_digest()
+```
+
+Content-addressable manifest digest
+
+<p className="msb-label">Returns</p>
+
+`Option<&str>`
+
+#### <span className="msb-recv">h.</span><span className="msb-hn">architecture()</span>
+
+```rust
+architecture()
+```
+
+Resolved architecture
+
+<p className="msb-label">Returns</p>
+
+`Option<&str>`
+
+#### <span className="msb-recv">h.</span><span className="msb-hn">os()</span>
+
+```rust
+os()
+```
+
+Resolved operating system
+
+<p className="msb-label">Returns</p>
+
+`Option<&str>`
+
+#### <span className="msb-recv">h.</span><span className="msb-hn">layer_count()</span>
+
+```rust
+layer_count()
+```
+
+Number of layers
+
+<p className="msb-label">Returns</p>
+
+`usize`
+
+#### <span className="msb-recv">h.</span><span className="msb-hn">last_used_at()</span>
+
+```rust
+last_used_at()
+```
+
+Last referenced time
+
+<p className="msb-label">Returns</p>
+
+`Option<DateTime<Utc>>`
+
+#### <span className="msb-recv">h.</span><span className="msb-hn">created_at()</span>
+
+```rust
+created_at()
+```
+
+First-pulled time
+
+<p className="msb-label">Returns</p>
+
+`Option<DateTime<Utc>>`
+
+## Types
+
+### ImageDetail
+
+<p className="msb-backref">Returned by <a href="#image-inspect">inspect()</a></p>
+
+Full detail for a cached image.
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `handle` | [`ImageHandle`](#imagehandle) | Core cached image metadata |
+| `config` | `Option<`[`ImageConfigDetail`](#imageconfigdetail)`>` | Parsed OCI config block |
+| `layers` | `Vec<`[`ImageLayerDetail`](#imagelayerdetail)`>` | Layers in bottom-to-top order |
+
+### ImageConfigDetail
+
+<p className="msb-backref">Used by <a href="#imagedetail">ImageDetail.config</a></p>
+
+OCI image config fields extracted from the local cache.
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `digest` | `String` | Config blob digest |
+| `env` | `Vec<String>` | Environment variables in `KEY=value` form |
+| `cmd` | `Option<Vec<String>>` | Default command |
+| `entrypoint` | `Option<Vec<String>>` | Image entrypoint |
+| `working_dir` | `Option<String>` | Default working directory |
+| `user` | `Option<String>` | Default user |
+| `labels` | `Option<serde_json::Value>` | OCI labels |
+| `stop_signal` | `Option<String>` | Configured stop signal |
+
+### ImageLayerDetail
+
+<p className="msb-backref">Used by <a href="#imagedetail">ImageDetail.layers</a></p>
+
+Metadata for one image layer.
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `diff_id` | `String` | Uncompressed diff ID |
+| `blob_digest` | `String` | Compressed blob digest |
+| `media_type` | `Option<String>` | OCI media type |
+| `compressed_size_bytes` | `Option<i64>` | Compressed blob size in bytes |
+| `erofs_size_bytes` | `Option<i64>` | EROFS image size in bytes |
+| `position` | `i32` | Layer position, where `0` is the bottom |
+
+### ImagePruneReport
+
+<p className="msb-backref">Returned by <a href="#image-prune">prune()</a></p>
+
+Summary of cached image data removed by [`Image::prune()`](#image-prune).
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `image_refs_removed` | `u32` | Cached image references removed from the local image index |
+| `manifests_removed` | `u32` | OCI manifests removed from the local image index |
+| `layers_removed` | `u32` | Layer records removed from the local image index |
+| `fsmeta_removed` | `u32` | Merged fsmeta EROFS artifacts removed from disk |
+| `vmdk_removed` | `u32` | VMDK descriptor artifacts removed from disk |
+| `bytes_reclaimed` | `Option<u64>` | Best-effort measured bytes reclaimed from deleted artifacts |
+
+### ImageArchiveFormat
+
+<div className="msb-tags"><span className="msb-tag is-type">enum</span></div>
+
+<p className="msb-backref">Used by <a href="#image-save">save()</a></p>
+
+Archive layout to write when exporting images with [`Image::save()`](#image-save).
+
+| Variant | Description |
+|---------|-------------|
+| `Docker` | Docker `docker save` compatible archive (default) |
+| `Oci` | OCI Image Layout archive |

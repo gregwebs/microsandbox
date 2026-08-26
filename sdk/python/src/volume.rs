@@ -1,9 +1,11 @@
 use std::collections::HashMap;
 
+use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyModule};
 
 use crate::error::to_py_err;
+use crate::helpers::{extract_str_enum, str_enum_member};
 
 //--------------------------------------------------------------------------------------------------
 // Types
@@ -13,7 +15,8 @@ use crate::error::to_py_err;
 #[pyclass(name = "Volume")]
 pub struct PyVolume {
     name: String,
-    path: String,
+    /// Local volumes expose a host path; cloud volumes deliberately do not.
+    path: Option<String>,
 }
 
 /// A lightweight handle to a volume from the database.
@@ -34,14 +37,18 @@ impl PyVolume {
     fn create<'py>(
         py: Python<'py>,
         name: String,
-        kind: Option<String>,
+        kind: Option<Py<PyAny>>,
         size_mib: Option<u32>,
         quota_mib: Option<u32>,
         labels: Option<HashMap<String, String>>,
     ) -> PyResult<Bound<'py, PyAny>> {
+        let kind = kind
+            .as_ref()
+            .map(|value| extract_str_enum(value.bind(py), "VolumeKind"))
+            .transpose()?
+            .unwrap_or_else(|| "dir".to_string());
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
             let mut builder = microsandbox::Volume::builder(&name);
-            let kind = kind.unwrap_or_else(|| "dir".to_string());
             match kind.as_str() {
                 "dir" => {
                     builder = builder.directory();
@@ -75,10 +82,13 @@ impl PyVolume {
                 }
             }
             let vol = builder.create().await.map_err(to_py_err)?;
-            let path = vol
-                .path()
-                .map(|p| p.display().to_string())
-                .map_err(to_py_err)?;
+            // A cloud create is still a successful volume create even though
+            // its bytes have no path on the SDK caller's machine.
+            let path = match vol.path() {
+                Ok(path) => Some(path.display().to_string()),
+                Err(microsandbox::MicrosandboxError::Unsupported { .. }) => None,
+                Err(error) => return Err(to_py_err(error)),
+            };
             Ok(PyVolume {
                 name: vol.name().to_string(),
                 path,
@@ -91,6 +101,17 @@ impl PyVolume {
     fn get<'py>(py: Python<'py>, name: String) -> PyResult<Bound<'py, PyAny>> {
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
             let handle = microsandbox::Volume::get(&name).await.map_err(to_py_err)?;
+            Ok(PyVolumeHandle { inner: handle })
+        })
+    }
+
+    /// Get the cloud account's always-present default volume.
+    #[staticmethod]
+    fn get_default<'py>(py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let handle = microsandbox::Volume::get_default()
+                .await
+                .map_err(to_py_err)?;
             Ok(PyVolumeHandle { inner: handle })
         })
     }
@@ -127,8 +148,10 @@ impl PyVolume {
 
     /// Host path of the volume.
     #[getter]
-    fn path(&self) -> &str {
-        &self.path
+    fn path(&self) -> PyResult<&str> {
+        self.path
+            .as_deref()
+            .ok_or_else(|| crate::error::local_only("volume.path"))
     }
 
     //----------------------------------------------------------------------------------------------
@@ -137,7 +160,8 @@ impl PyVolume {
 
     /// Create a bind mount config.
     #[staticmethod]
-    #[pyo3(signature = (path, *, readonly = false, noexec = false, nosuid = false, nodev = false))]
+    #[allow(clippy::too_many_arguments)]
+    #[pyo3(signature = (path, *, readonly = false, noexec = false, nosuid = false, nodev = false, stat_virtualization = None, host_permissions = None, uid = None, gid = None))]
     fn bind(
         py: Python<'_>,
         path: String,
@@ -145,6 +169,10 @@ impl PyVolume {
         noexec: bool,
         nosuid: bool,
         nodev: bool,
+        stat_virtualization: Option<Py<PyAny>>,
+        host_permissions: Option<Py<PyAny>>,
+        uid: Option<Py<PyAny>>,
+        gid: Option<Py<PyAny>>,
     ) -> PyResult<PyObject> {
         let kwargs = PyDict::new(py);
         kwargs.set_item("kind", mount_kind(py, "BIND")?)?;
@@ -153,32 +181,39 @@ impl PyVolume {
         kwargs.set_item("noexec", noexec)?;
         kwargs.set_item("nosuid", nosuid)?;
         kwargs.set_item("nodev", nodev)?;
+        set_mount_metadata_options(py, &kwargs, stat_virtualization, host_permissions, uid, gid)?;
         Ok(mount_config_class(py)?.call((), Some(&kwargs))?.unbind())
     }
 
     /// Create a named volume mount config.
     #[staticmethod]
     #[allow(clippy::too_many_arguments)]
-    #[pyo3(signature = (name, *, mode = None, kind = None, size_mib = None, quota_mib = None, readonly = false, noexec = false, nosuid = false, nodev = false))]
+    #[pyo3(signature = (name, *, mode = None, kind = None, size_mib = None, quota_mib = None, readonly = false, noexec = false, nosuid = false, nodev = false, stat_virtualization = None, host_permissions = None, uid = None, gid = None))]
     fn named(
         py: Python<'_>,
         name: String,
-        mode: Option<String>,
-        kind: Option<String>,
+        mode: Option<Py<PyAny>>,
+        kind: Option<Py<PyAny>>,
         size_mib: Option<u32>,
         quota_mib: Option<u32>,
         readonly: bool,
         noexec: bool,
         nosuid: bool,
         nodev: bool,
+        stat_virtualization: Option<Py<PyAny>>,
+        host_permissions: Option<Py<PyAny>>,
+        uid: Option<Py<PyAny>>,
+        gid: Option<Py<PyAny>>,
     ) -> PyResult<PyObject> {
         let kwargs = PyDict::new(py);
         kwargs.set_item("kind", mount_kind(py, "NAMED")?)?;
         kwargs.set_item("named", name)?;
         if let Some(mode) = mode {
+            extract_str_enum(mode.bind(py), "NamedVolumeMode")?;
             kwargs.set_item("named_mode", mode)?;
         }
         if let Some(kind) = kind {
+            extract_str_enum(kind.bind(py), "VolumeKind")?;
             kwargs.set_item("named_kind", kind)?;
         }
         if let Some(size_mib) = size_mib {
@@ -191,6 +226,7 @@ impl PyVolume {
         kwargs.set_item("noexec", noexec)?;
         kwargs.set_item("nosuid", nosuid)?;
         kwargs.set_item("nodev", nodev)?;
+        set_mount_metadata_options(py, &kwargs, stat_virtualization, host_permissions, uid, gid)?;
         Ok(mount_config_class(py)?.call((), Some(&kwargs))?.unbind())
     }
 
@@ -219,8 +255,8 @@ impl PyVolume {
 
     /// Create a disk-image volume mount config.
     ///
-    /// `format` is the disk image format (`"qcow2"` / `"raw"` / `"vmdk"`).
-    /// When omitted it is inferred from the file extension. `fstype`
+    /// `format` is a `DiskImageFormat` member. When omitted it is inferred
+    /// from the file extension. `fstype`
     /// (e.g. `"ext4"`) is the inner filesystem agentd will mount; if
     /// omitted, agentd probes `/proc/filesystems` to find a type that
     /// mounts cleanly.
@@ -228,7 +264,7 @@ impl PyVolume {
     #[pyo3(signature = (path, *, format = None, fstype = None, readonly = false, noexec = false, nosuid = false, nodev = false))]
     fn disk(
         path: String,
-        format: Option<String>,
+        format: Option<Py<PyAny>>,
         fstype: Option<String>,
         readonly: bool,
         noexec: bool,
@@ -240,6 +276,7 @@ impl PyVolume {
             kwargs.set_item("kind", mount_kind(py, "DISK")?)?;
             kwargs.set_item("disk", path)?;
             if let Some(format) = format {
+                extract_str_enum(format.bind(py), "DiskImageFormat")?;
                 kwargs.set_item("format", format)?;
             }
             if let Some(fstype) = fstype {
@@ -266,13 +303,18 @@ impl PyVolumeHandle {
     }
 
     #[getter]
+    fn is_default(&self) -> bool {
+        self.inner.is_default()
+    }
+
+    #[getter]
     fn quota_mib(&self) -> Option<u32> {
         self.inner.quota_mib()
     }
 
     #[getter]
-    fn kind(&self) -> &str {
-        self.inner.kind().as_str()
+    fn kind(&self, py: Python<'_>) -> PyResult<PyObject> {
+        str_enum_member(py, "VolumeKind", self.inner.kind().as_str())
     }
 
     #[getter]
@@ -286,8 +328,11 @@ impl PyVolumeHandle {
     }
 
     #[getter]
-    fn disk_format(&self) -> Option<&str> {
-        self.inner.disk_format()
+    fn disk_format(&self, py: Python<'_>) -> PyResult<Option<PyObject>> {
+        self.inner
+            .disk_format()
+            .map(|format| str_enum_member(py, "DiskImageFormat", format))
+            .transpose()
     }
 
     #[getter]
@@ -405,6 +450,43 @@ impl PyVolumeFs {
         })
     }
 
+    fn remove_dir<'py>(&self, py: Python<'py>, path: String) -> PyResult<Bound<'py, PyAny>> {
+        let handle = self.inner.clone();
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            handle.fs().remove_dir(&path).await.map_err(to_py_err)?;
+            Ok(())
+        })
+    }
+
+    fn copy<'py>(&self, py: Python<'py>, from_: String, to: String) -> PyResult<Bound<'py, PyAny>> {
+        let handle = self.inner.clone();
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            handle.fs().copy(&from_, &to).await.map_err(to_py_err)?;
+            Ok(())
+        })
+    }
+
+    fn rename<'py>(
+        &self,
+        py: Python<'py>,
+        from_: String,
+        to: String,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let handle = self.inner.clone();
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            handle.fs().rename(&from_, &to).await.map_err(to_py_err)?;
+            Ok(())
+        })
+    }
+
+    fn stat<'py>(&self, py: Python<'py>, path: String) -> PyResult<Bound<'py, PyAny>> {
+        let handle = self.inner.clone();
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let metadata = handle.fs().stat(&path).await.map_err(to_py_err)?;
+            Ok(crate::fs::convert_fs_metadata(&metadata))
+        })
+    }
+
     fn exists<'py>(&self, py: Python<'py>, path: String) -> PyResult<Bound<'py, PyAny>> {
         let handle = self.inner.clone();
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
@@ -427,4 +509,34 @@ fn mount_config_class<'py>(py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
 fn mount_kind<'py>(py: Python<'py>, variant: &str) -> PyResult<Bound<'py, PyAny>> {
     let types = PyModule::import(py, "microsandbox.types")?;
     types.getattr("MountKind")?.getattr(variant)
+}
+
+fn set_mount_metadata_options(
+    py: Python<'_>,
+    kwargs: &Bound<'_, PyDict>,
+    stat_virtualization: Option<Py<PyAny>>,
+    host_permissions: Option<Py<PyAny>>,
+    uid: Option<Py<PyAny>>,
+    gid: Option<Py<PyAny>>,
+) -> PyResult<()> {
+    if let Some(policy) = stat_virtualization {
+        extract_str_enum(policy.bind(py), "StatVirtualization")?;
+        kwargs.set_item("stat_virtualization", policy)?;
+    }
+    if let Some(policy) = host_permissions {
+        extract_str_enum(policy.bind(py), "HostPermissions")?;
+        kwargs.set_item("host_permissions", policy)?;
+    }
+    if uid.is_some() != gid.is_some() {
+        return Err(PyValueError::new_err(
+            "uid and gid must be specified together",
+        ));
+    }
+    if let (Some(uid), Some(gid)) = (uid, gid) {
+        // Keep the public names concise while preserving the author's internal
+        // wire fields used by the shared MountOptions type.
+        kwargs.set_item("override_uid", uid)?;
+        kwargs.set_item("override_gid", gid)?;
+    }
+    Ok(())
 }

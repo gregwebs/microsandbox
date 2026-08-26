@@ -18,8 +18,9 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::agentd::AGENTD_BYTES;
 use crate::{
-    Context, DirEntry, DynFileSystem, Entry, Extensions, FsOptions, GetxattrReply, ListxattrReply,
-    OpenOptions, SetattrValid, ZeroCopyReader, ZeroCopyWriter, stat64, statvfs64,
+    AddDirEntry, AddDirEntryPlus, Context, DirEntry, DynFileSystem, Entry, Extensions, FsOptions,
+    GetxattrReply, ListxattrReply, OpenOptions, SetattrValid, ZeroCopyReader, ZeroCopyWriter,
+    stat64, statvfs64,
 };
 
 mod builder;
@@ -48,6 +49,7 @@ const FALLBACK_METADATA_DIR_NAME: &str = ".msb_override_stat";
 const METADATA_ROOT_NAME: &str = "__root";
 const METADATA_STAT_NAME: &str = "stat.bin";
 const ADS_STREAM_NAME: &str = "msb.override_stat";
+const ADS_PROBE_STREAM_NAME: &str = "msb._probe";
 
 const DT_UNKNOWN: u32 = 0;
 const DT_FIFO: u32 = 1;
@@ -238,6 +240,69 @@ fn ensure_lexically_under_root(root: &Path, path: &Path) -> io::Result<()> {
     } else {
         Err(linux_error(LINUX_EACCES))
     }
+}
+
+/// Resolve the mount root trusting no component of the provided path.
+///
+/// Walks `root_dir` from the volume root, rejecting a reparse point (symlink or
+/// junction) at every component and refusing `..`, so neither a planted reparse
+/// point nor an injected `..` can move the mount off its intended target. The
+/// only implicitly trusted object is the volume root (e.g. `C:\`), which cannot
+/// be a reparse point. Each component is checked with a non-following
+/// `symlink_metadata` only after its ancestors are verified clean, so path
+/// resolution never crosses a reparse point. Unlike `canonicalize`, this never
+/// follows a reparse point out of the intended subtree.
+fn resolve_root_no_reparse(root_dir: &Path) -> io::Result<PathBuf> {
+    // Reject `..` from the RAW path string, not from `Path::components()`.
+    //
+    // For verbatim (`\\?\`) paths, `components()` collapses `a\..` lexically
+    // before we ever see a `ParentDir` or `Normal("..")`, so a `..` would slip
+    // through and the filesystem would resolve it out of the subtree. Splitting
+    // the raw string on separators catches a `..` segment in any path form.
+    // (`..` is pure ASCII, so a lossy conversion can neither hide nor fabricate
+    // one.)
+    if root_dir
+        .as_os_str()
+        .to_string_lossy()
+        .split(['\\', '/'])
+        .any(|segment| segment == "..")
+    {
+        return Err(linux_error(LINUX_EINVAL));
+    }
+
+    // Split into the trusted base and the segments below it. For an absolute
+    // path the base is the volume root (prefix + root); for a relative path it
+    // is the working directory. Neither is attacker-controllable.
+    let mut cursor = PathBuf::new();
+    let mut names = Vec::new();
+    for component in root_dir.components() {
+        match component {
+            Component::Prefix(_) | Component::RootDir => cursor.push(component.as_os_str()),
+            Component::Normal(part) => names.push(part.to_os_string()),
+            Component::CurDir => {}
+            Component::ParentDir => return Err(linux_error(LINUX_EINVAL)),
+        }
+    }
+    if cursor.as_os_str().is_empty() {
+        cursor.push(".");
+    }
+
+    // Descend one component at a time; each ancestor is verified non-reparse
+    // before the next lookup, so resolution never follows a reparse point.
+    for name in &names {
+        if name.to_str().is_some_and(is_reserved_name) {
+            return Err(linux_error(LINUX_EPERM));
+        }
+        cursor.push(name);
+        let metadata = std::fs::symlink_metadata(&cursor).map_err(host_error)?;
+        reject_reparse_metadata(&metadata)?;
+    }
+
+    let metadata = std::fs::symlink_metadata(&cursor).map_err(host_error)?;
+    if !metadata.file_type().is_dir() {
+        return Err(linux_error(LINUX_ENOTDIR));
+    }
+    Ok(cursor)
 }
 
 fn safe_metadata_under_root(root: &Path, path: &Path) -> io::Result<std::fs::Metadata> {
@@ -510,9 +575,21 @@ fn write_override_sidecar_file(path: &Path, override_stat: OverrideStat) -> io::
 }
 
 fn ads_override_path(path: &Path) -> PathBuf {
+    ads_stream_path(path, ADS_STREAM_NAME)
+}
+
+fn ads_probe_path(path: &Path) -> PathBuf {
+    ads_stream_path(path, ADS_PROBE_STREAM_NAME)
+}
+
+/// Build an alternate-data-stream path without changing the base path.
+///
+/// Capability probes must use their own stream name: writing to the real
+/// override stream would destroy persisted metadata for the mount root.
+fn ads_stream_path(path: &Path, stream_name: &str) -> PathBuf {
     let mut encoded: Vec<u16> = path.as_os_str().encode_wide().collect();
     encoded.push(b':' as u16);
-    encoded.extend(ADS_STREAM_NAME.encode_utf16());
+    encoded.extend(stream_name.encode_utf16());
     PathBuf::from(OsString::from_wide(&encoded))
 }
 
@@ -576,12 +653,17 @@ fn mode_from_metadata(metadata: &std::fs::Metadata) -> u32 {
         0
     };
 
+    // NTFS has no Unix execute bit, so synthesize a default mode for files
+    // that have no virtual override yet. Default to executable (matching
+    // libkrun's own Windows fs passthrough and WSL DrvFs's no-metadata
+    // behavior) so binaries on a bind mount or bind rootfs can run: without
+    // this, every host file is exposed as 0o666 and the guest cannot exec
+    // anything before it has a chance to chmod it. Precise per-file modes
+    // still come from the virtual stat store once the guest sets them.
     let perms = if metadata.file_attributes() & FILE_ATTRIBUTE_READONLY != 0 {
         0o555
-    } else if metadata.file_type().is_dir() {
-        0o777
     } else {
-        0o666
+        0o777
     };
     type_bits | perms
 }

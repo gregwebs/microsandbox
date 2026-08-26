@@ -122,6 +122,8 @@ export declare class ExecHandle {
   signal(signal: number): Promise<void>
   /** Kill the running process (SIGKILL). */
   kill(): Promise<void>
+  /** Resize the pseudo-terminal for this exec session. */
+  resize(rows: number, cols: number): Promise<void>
 }
 export type JsExecHandle = ExecHandle
 
@@ -187,7 +189,7 @@ export declare class ExecOutput {
 export declare class ExecSink {
   /** Write data to the process stdin. */
   write(data: Buffer): Promise<void>
-  /** Close stdin (sends EOF to the process). */
+  /** Close the sink. Sends EOF in non-TTY pipe mode; PTY mode stays open. */
   close(): Promise<void>
 }
 export type JsExecSink = ExecSink
@@ -228,7 +230,7 @@ export type JsFsWriteSink = FsWriteSink
  * Fluent builder for an explicit rootfs image source.
  *
  * Used inside `Sandbox.builder(...).imageWith((i) => i.disk(...).fstype(...))`
- * or `Sandbox.builder(...).imageWith((i) => i.oci(...).upperSize(...))`.
+ * or `Sandbox.builder(...).imageWith((i) => i.oci(...).rootDisk(...))`.
  * Standalone use is rare; `.image("python:3.12")` and `.image("./ubuntu.qcow2")`
  * resolve the common cases automatically.
  */
@@ -236,7 +238,24 @@ export declare class ImageBuilder {
   constructor()
   /** Use an OCI image reference as the root filesystem. */
   oci(reference: string): this
-  /** Set the writable overlay upper size for an OCI rootfs, in MiB. */
+  /**
+   * Configure the writable rootfs layer (root disk) for an OCI rootfs.
+   *
+   * Pass a number of MiB for a managed root disk, or a callback for the
+   * tmpfs and disk-image kinds:
+   *
+   * ```ts
+   * .imageWith((i) => i.oci("python:3.12").rootDisk(8192))
+   * .imageWith((i) => i.oci("python:3.12").rootDisk((d) => d.tmpfs().size(512)))
+   * .imageWith((i) => i.oci("python:3.12").rootDisk((d) => d.disk("./scratch.img")))
+   * ```
+   */
+  rootDisk(sizeMibOrConfigure: number | ((d: RootDiskBuilder) => RootDiskBuilder)): this
+  /**
+   * Set the writable overlay upper size for an OCI rootfs, in MiB.
+   *
+   * @deprecated Use `rootDisk` instead.
+   */
   upperSize(sizeMib: number): this
   /**
    * Use a host disk image file as the root filesystem. The format is
@@ -421,6 +440,11 @@ export declare class MountBuilder {
    */
   hostPermissions(policy: string): this
   /**
+   * Present host files that carry no per-file stat override as this guest
+   * owner. Valid only for bind and directory-backed named volume mounts.
+   */
+  owner(uid: number, gid: number): this
+  /**
    * Materialize the mount spec. Returns a flat `VolumeMount` with a
    * `kind` discriminator and per-variant fields.
    */
@@ -442,8 +466,8 @@ export declare class NetworkBuilder {
   /** Publish a UDP port on a specific host bind address. */
   portUdpBind(bind: string, hostPort: number, guestPort: number): this
   /**
-   * Set a policy. Construct via the JS-side `NetworkPolicy.publicOnly()`
-   * / `.allowAll()` / `.none()` / `.nonLocal()` factories or build a
+   * Set a policy. Construct via the JS-side `NetworkPolicy.fromProfiles()`
+   * / `.allowAll()` / `.none()` factories or build a
    * custom one and pass it through `JSON.stringify`-friendly JSON. Here
    * we accept the canonical serialized form (a JSON string) to avoid
    * re-modeling the rule schema across the FFI; Phase 7 reconciles.
@@ -488,6 +512,18 @@ export declare class NetworkBuilder {
   ipv6Pool(pool: string): this
   /** Trust the host's root CAs inside the guest. Default: false. */
   trustHostCAs(enabled: boolean): this
+  /**
+   * Configure local egress and ingress rate limits. Applies on the next
+   * sandbox start.
+   *
+   * ```js
+   * .rateLimiter((r) => r
+   *   .egress((r) => r
+   *     .bandwidth(1_048_576, 1_000)
+   *     .ops(1_000, 1_000)))
+   * ```
+   */
+  rateLimiter(configure: (arg: JsNetworkRateLimiterBuilder) => JsNetworkRateLimiterBuilder): this
   /**
    * Snapshot the accumulated configuration as a JSON string. The TS
    * layer parses + key-remaps to camelCase before returning to the
@@ -539,6 +575,16 @@ export declare class NetworkPolicyBuilder {
   build(): NetworkPolicy
 }
 export type JsNetworkPolicyBuilder = NetworkPolicyBuilder
+
+/** Fluent builder grouping egress and ingress rate limits. */
+export declare class NetworkRateLimiterBuilder {
+  constructor()
+  /** Configure guest-to-runtime traffic limits. */
+  egress(configure: (arg: RateLimiterBuilder) => RateLimiterBuilder): this
+  /** Configure runtime-to-guest traffic limits. */
+  ingress(configure: (arg: RateLimiterBuilder) => RateLimiterBuilder): this
+}
+export type JsNetworkRateLimiterBuilder = NetworkRateLimiterBuilder
 
 /** Fluent builder for an ordered list of pre-boot rootfs patches. */
 export declare class PatchBuilder {
@@ -611,6 +657,29 @@ export declare class PullProgressStream {
 }
 export type JsPullProgressStream = PullProgressStream
 
+/**
+ * Fluent builder for one direction's network rate limiter. Chainable
+ * setters accumulate bucket values for `NetworkRateLimiterBuilder`.
+ */
+export declare class RateLimiterBuilder {
+  constructor()
+  /** Cap bandwidth at `sizeBytes` bytes per `refillTimeMs` milliseconds. */
+  bandwidth(sizeBytes: number, refillTimeMs: number): this
+  /**
+   * Grant a one-time startup burst of `sizeBytes` bytes on top of the
+   * bandwidth bucket. Requires `bandwidth()`.
+   */
+  bandwidthBurst(sizeBytes: number): this
+  /** Cap packet rate at `count` frames per `refillTimeMs` milliseconds. */
+  ops(count: number, refillTimeMs: number): this
+  /**
+   * Grant a one-time startup burst of `count` frames on top of the ops
+   * bucket. Requires `ops()`.
+   */
+  opsBurst(count: number): this
+}
+export type JsRateLimiterBuilder = RateLimiterBuilder
+
 /** Fluent builder for OCI registry connection settings. */
 export declare class RegistryConfigBuilder {
   constructor()
@@ -634,6 +703,53 @@ export declare class RegistryConfigBuilder {
   build(): RegistryConfig
 }
 export type JsRegistryConfigBuilder = RegistryConfigBuilder
+
+/**
+ * Fluent builder for the root disk of an OCI image.
+ *
+ * Used inside `ImageBuilder.rootDisk((d) => ...)`:
+ *
+ * ```ts
+ * .imageWith((i) => i.oci("python:3.12").rootDisk(8192))                       // managed, sized
+ * .imageWith((i) => i.oci("python:3.12").rootDisk((d) => d.tmpfs().size(512))) // RAM-backed
+ * .imageWith((i) => i.oci("python:3.12").rootDisk((d) => d.disk("./scratch.img").fstype("ext4")))
+ * .imageWith((i) => i.oci("python:3.12").rootDisk((d) => d.flat().size(8192)))
+ * ```
+ */
+export declare class RootDiskBuilder {
+  constructor()
+  /**
+   * Size in MiB. Valid for the managed (default), tmpfs, and flat kinds; a
+   * user-supplied disk image is sized by the image file itself.
+   */
+  size(mib: number): this
+  /**
+   * Use a RAM-backed tmpfs upper. Ephemeral: the rootfs is pristine on
+   * every boot, and the size counts against guest memory.
+   */
+  tmpfs(): this
+  /** Use a complete flat ext4 OCI rootfs without guest OverlayFS. */
+  flat(): this
+  /**
+   * Use a user-supplied disk image as the upper, attached writable. The
+   * format is derived from the file extension (`.img`/`.raw` → raw,
+   * `.qcow2` → qcow2) unless set explicitly with `.format()`.
+   */
+  disk(path: string): this
+  /**
+   * Set the disk image format explicitly (`"raw" | "qcow2"`). Only valid
+   * after `.disk()`; vmdk is not supported as a root disk.
+   */
+  format(format: string): this
+  /**
+   * Inner filesystem type (currently `"ext4"` for flat roots). Valid
+   * after `.disk()` or `.flat()`.
+   */
+  fstype(fstype: string): this
+  /** Select `"auto"`, `"copy"`, or `"reflink"` private-disk provisioning. */
+  cloneStrategy(strategy: string): this
+}
+export type JsRootDiskBuilder = RootDiskBuilder
 
 /**
  * Per-rule-batch builder. Lives only inside the closure passed to
@@ -778,16 +894,18 @@ export declare class Sandbox {
    * Sandbox names are limited to 128 UTF-8 bytes.
    */
   static get(name: string): Promise<JsSandboxHandle>
-  /** List all sandboxes. */
-  static list(): Promise<Array<JsSandboxHandle>>
-  /** List sandboxes matching a filter. */
-  static listWith(filter: SandboxListFilter): Promise<Array<JsSandboxHandle>>
+  /** List the first page of sandboxes. */
+  static list(): Promise<JsSandboxPage>
+  /** List a configured page of sandboxes. */
+  static listWith(options: SandboxListOptions): Promise<JsSandboxPage>
   /**
    * Remove a stopped sandbox from the database.
    *
    * Sandbox names are limited to 128 UTF-8 bytes.
    */
   static remove(name: string): Promise<void>
+  /** Backend retained by this sandbox (`"local"` or `"cloud"`). */
+  get backendKind(): string
   /** Sandbox name. Names are limited to 128 UTF-8 bytes. */
   get name(): Promise<string>
   /** Whether this handle owns the sandbox lifecycle (attached mode). */
@@ -798,6 +916,14 @@ export declare class Sandbox {
    * The TS layer parses + camelCase-remaps this into a plain object.
    */
   configJson(): Promise<string>
+  /** Execute the sandbox's effective OCI entrypoint and CMD. */
+  execDefault(): Promise<ExecOutput>
+  /** Execute the sandbox's effective OCI entrypoint and CMD using a populated options builder. */
+  execDefaultWithBuilder(builder: ExecOptionsBuilder): Promise<ExecOutput>
+  /** Execute the sandbox's effective OCI entrypoint and CMD with streaming I/O. */
+  execDefaultStream(): Promise<ExecHandle>
+  /** Stream the sandbox's effective OCI entrypoint and CMD using a populated options builder. */
+  execDefaultStreamWithBuilder(builder: ExecOptionsBuilder): Promise<ExecHandle>
   /** Execute a command and wait for completion. */
   exec(cmd: string, args?: Array<string> | undefined | null): Promise<ExecOutput>
   /**
@@ -826,8 +952,21 @@ export declare class Sandbox {
   sshServer(options?: SshServerOptions | undefined | null): Promise<JsSshServer>
   /** Get point-in-time resource metrics. */
   metrics(): Promise<SandboxMetrics>
+  /** Check whether agentd is reachable without refreshing idle activity. */
+  ping(): Promise<SandboxPingResult>
+  /** Explicitly refresh this sandbox's idle activity timer. */
+  touch(): Promise<SandboxTouchResult>
+  /**
+   * Plan or apply a sandbox modification. Returns the plan as a JSON
+   * string; the TS wrapper parses it into a `SandboxModificationPlan`.
+   */
+  modify(options?: SandboxModifyOptions | undefined | null): Promise<string>
   /** Stream metrics snapshots at the requested interval (in milliseconds). */
   metricsStream(intervalMs: number): Promise<MetricsStream>
+  /** Attach to the sandbox's effective OCI entrypoint and CMD. */
+  attachDefault(): Promise<number>
+  /** Attach to the sandbox's effective OCI entrypoint and CMD using a populated options builder. */
+  attachDefaultWithBuilder(builder: AttachOptionsBuilder): Promise<number>
   /**
    * Attach to an interactive PTY session inside the sandbox.
    *
@@ -906,6 +1045,22 @@ export declare class SandboxBuilder {
   /** Configure a disk-image rootfs explicitly via a callback. */
   imageWith(configure: (arg: ImageBuilder) => ImageBuilder): this
   /**
+   * Configure the writable rootfs layer (root disk) for the OCI image.
+   *
+   * Sugar over `imageWith((i) => i.oci(...).rootDisk(...))` — the root
+   * disk lives on the OCI rootfs source, so an OCI image must be set
+   * first. Pass a number of MiB for a managed root disk, or a callback
+   * for the tmpfs, flat, and disk-image kinds:
+   *
+   * ```ts
+   * .image("python").rootDisk(8192)
+   * .image("python").rootDisk((d) => d.tmpfs().size(512))
+   * .image("python").rootDisk((d) => d.flat().size(8192).cloneStrategy("auto"))
+   * .image("python").rootDisk((d) => d.disk("./scratch.img"))
+   * ```
+   */
+  rootDisk(sizeMibOrConfigure: number | ((d: RootDiskBuilder) => RootDiskBuilder)): this
+  /**
    * Boot a fresh sandbox from a snapshot artifact (path or name).
    * Mutually exclusive with `image()` / `imageWith()` — the
    * snapshot already pins the image reference and digest.
@@ -913,8 +1068,18 @@ export declare class SandboxBuilder {
   fromSnapshot(pathOrName: string): this
   /** Number of virtual CPUs. */
   cpus(count: number): this
+  /** Boot-time maximum possible virtual CPUs. */
+  maxCpus(count: number): this
+  /** Host CPU placement policy. */
+  cpuPlacement(policy: string): this
+  /** Host-defined placement profile name. */
+  placementProfile(profile: string): this
   /** Guest memory in MiB. */
   memory(mib: number): this
+  /** Boot-time maximum hotpluggable guest memory in MiB. */
+  maxMemory(mib: number): this
+  /** Guest transparent huge-page policy selected at boot. */
+  thp(policy: 'always' | 'madvise' | 'never'): this
   /** Override log verbosity: `"trace" | "debug" | "info" | "warn" | "error"`. */
   logLevel(level: string): this
   /** Suppress sandbox logs. */
@@ -939,6 +1104,11 @@ export declare class SandboxBuilder {
   shell(shell: string): this
   /** In-guest security profile (`"default"` or `"restricted"`). */
   security(profile: string): this
+  /**
+   * Host-runtime deployment profile (`"single-tenant"` or `"multi-tenant"`).
+   * Managed backends may enforce their own profile.
+   */
+  deploymentProfile(profile: string): this
   /** Configure registry connection settings via a callback. */
   registry(configure: (arg: RegistryConfigBuilder) => RegistryConfigBuilder): this
   /**
@@ -963,6 +1133,8 @@ export declare class SandboxBuilder {
   replaceWithTimeout(timeoutMs: number): this
   /** Override the image entrypoint. */
   entrypoint(cmd: Array<string>): this
+  /** Override the image CMD used by default-workload execution. */
+  cmd(cmd: Array<string>): this
   /**
    * Hand off PID 1 to a guest init binary after agentd's setup.
    *
@@ -1006,6 +1178,10 @@ export declare class SandboxBuilder {
   portUdp(hostPort: number, guestPort: number): this
   /** Publish a UDP port from host -> guest on a specific host bind address. */
   portUdpBind(bind: string, hostPort: number, guestPort: number): this
+  /** Expose a host Unix stream socket or local Windows named pipe on a guest-to-host vsock port. */
+  vsock(hostPath: string, port: number): this
+  /** Expose a host Unix datagram socket on a guest-to-host vsock port. */
+  vsockDgram(hostPath: string, port: number): this
   /** Add a secret via a callback. */
   secret(configure: (arg: JsSecretBuilder) => JsSecretBuilder): this
   /**
@@ -1118,6 +1294,8 @@ export declare class SandboxHandle {
   get name(): string
   /** Status at time of query: "running", "stopped", "crashed", or "draining". */
   get status(): string
+  /** Backend retained by this handle (`"local"` or `"cloud"`). */
+  get backendKind(): string
   /** Raw config JSON string from the database. */
   get configJson(): string
   /** Return a fresh handle for the same sandbox. */
@@ -1128,6 +1306,25 @@ export declare class SandboxHandle {
   get updatedAt(): number | null
   /** Get point-in-time metrics from the database. */
   metrics(): Promise<SandboxMetrics>
+  /**
+   * Check whether agentd is reachable without refreshing idle activity.
+   *
+   * Connects to an already-running sandbox; stopped sandboxes are not
+   * started implicitly.
+   */
+  ping(): Promise<SandboxPingResult>
+  /**
+   * Explicitly refresh this sandbox's idle activity timer.
+   *
+   * Connects to an already-running sandbox; stopped sandboxes are not
+   * started implicitly.
+   */
+  touch(): Promise<SandboxTouchResult>
+  /**
+   * Plan or apply a sandbox modification. Returns the plan as a JSON
+   * string; the TS wrapper parses it into a `SandboxModificationPlan`.
+   */
+  modify(options?: SandboxModifyOptions | undefined | null): Promise<string>
   /** Start the sandbox (attached mode) — returns a live Sandbox handle. */
   start(): Promise<Sandbox>
   /** Start the sandbox (detached mode). */
@@ -1187,13 +1384,10 @@ export declare class SandboxHandle {
   /**
    * Snapshot this (stopped) sandbox under a bare name.
    *
-   * Resolves under `~/.microsandbox/snapshots/<name>/`. Use
-   * [`snapshotTo`](Self::snapshot_to) for an explicit filesystem
-   * destination.
+   * Resolves under `~/.microsandbox/snapshots/<name>/`. Move
+   * artifacts with `Snapshot.save`/`Snapshot.load`.
    */
   snapshot(name: string): Promise<JsSnapshot>
-  /** Snapshot this (stopped) sandbox to an explicit filesystem path. */
-  snapshotTo(path: string): Promise<JsSnapshot>
 }
 export type JsSandboxHandle = SandboxHandle
 
@@ -1201,7 +1395,7 @@ export type JsSandboxHandle = SandboxHandle
 export declare class SecretBuilder {
   constructor()
   /** Environment variable to expose the placeholder under (required). */
-  env(var: string): this
+  env(envVar: string): this
   /** Secret value (required). */
   value(value: string): this
   /** Custom placeholder. Auto-generated as `$MSB_<env>` when unset. */
@@ -1278,7 +1472,7 @@ export declare class Snapshot {
   static get(nameOrDigest: string): Promise<SnapshotHandle>
   static list(): Promise<Array<SnapshotInfo>>
   /**
-   * Walk `dir` and parse each subdirectory's `manifest.json`. Does
+   * Walk `dir` and parse each subdirectory's `snapshot.json`. Does
    * not touch the local index — useful for inspecting external
    * snapshot collections (e.g. a mounted volume of artifacts that
    * were never imported).
@@ -1286,16 +1480,30 @@ export declare class Snapshot {
   static listDir(dir: string): Promise<Array<Snapshot>>
   static remove(pathOrName: string, opts?: SnapshotRemoveOptions | undefined | null): Promise<void>
   static reindex(dir?: string | undefined | null): Promise<number>
-  static export(nameOrPath: string, out: string, opts?: ExportOpts | undefined | null): Promise<void>
-  static import(archive: string, dest?: string | undefined | null): Promise<SnapshotHandle>
+  /**
+   * Bundle a snapshot into a `.tar.zst` archive. The recorded
+   * manifest is archived as-is, so create the snapshot with
+   * `recordIntegrity()` if receivers must verify content.
+   */
+  static save(nameOrPath: string, out: string, opts?: SaveOpts | undefined | null): Promise<void>
+  static load(archive: string, dest?: string | undefined | null): Promise<SnapshotHandle>
   get path(): string
   get digest(): string
-  get sizeBytes(): bigint
+  get sizeBytes(): bigint | null
   get imageRef(): string
   get imageManifestDigest(): string
-  get format(): string
-  get fstype(): string
+  get stateKind(): string
+  get format(): string | null
+  get fstype(): string | null
+  get upperFile(): string | null
+  get upperIntegrityAlgorithm(): string | null
+  get upperIntegrityDigest(): string | null
+  get upperIntegrityLogicalSize(): bigint | null
+  get upperIntegrityLeafSize(): number | null
+  get checkpointId(): string | null
+  get checkpointManifestDigest(): string | null
   get parent(): string | null
+  get scope(): 'disk' | 'resumable'
   get createdAt(): string
   get labels(): Record<string, string>
   get sourceSandbox(): string | null
@@ -1303,19 +1511,27 @@ export declare class Snapshot {
 }
 export type JsSnapshot = Snapshot
 
-/** Fluent builder for a snapshot. Returned by `Snapshot.builder(name)`. */
+/**
+ * Fluent builder for a snapshot. Returned by `Snapshot.builder(name)`.
+ * The source sandbox is set with `fromSandbox()` and is required.
+ */
 export declare class SnapshotBuilder {
-  constructor(sourceSandbox: string)
-  /** Set a bare name (resolved under the default snapshots dir). */
-  name(name: string): this
-  /** Set an explicit destination path. */
-  path(path: string): this
+  constructor(name: string)
+  /**
+   * Create the artifact under this parent directory instead of the
+   * default snapshots store. The artifact lands at `destDir/<name>`.
+   */
+  destDir(destDir: string): this
+  /** Set the source sandbox to snapshot. Required. */
+  fromSandbox(sourceSandbox: string): this
   /** Attach a key-value label. May be called multiple times. */
   label(key: string, value: string): this
   /** Overwrite an existing artifact at the destination. */
   force(): this
   /** Compute and record content integrity at create time. */
   recordIntegrity(): this
+  /** Request a future resumable snapshot. */
+  resumable(): this
   /** Snapshot the accumulated configuration. */
   build(): SnapshotConfig
   /**
@@ -1336,9 +1552,17 @@ export declare class SnapshotHandle {
   get digest(): string
   get name(): string | null
   get parentDigest(): string | null
+  get scope(): 'disk' | 'resumable'
   get imageRef(): string
-  get format(): string
+  get stateKind(): string
+  get format(): string | null
+  get fstype(): string | null
+  get checkpointManifestDigest(): string | null
   get sizeBytes(): bigint | null
+  get locality(): string
+  get availability(): string
+  get migrationState(): string
+  get migrationErrorCode(): string | null
   get createdAt(): number
   get path(): string
   open(): Promise<Snapshot>
@@ -1375,12 +1599,16 @@ export declare class TlsBuilder {
   bypass(pattern: string): this
   /** Verify upstream server certificates (default: true). */
   verifyUpstream(verify: boolean): this
+  /** Verify upstream server certificates for matching hosts. */
+  verifyUpstreamFor(pattern: string, verify: boolean): this
   /** Set the ports to intercept (default: 443). */
   interceptedPorts(ports: Array<number>): this
   /** Block QUIC on intercepted ports (default: true). */
   blockQuic(block: boolean): this
   /** Add an upstream CA certificate PEM path. May be called repeatedly. */
   upstreamCaCert(path: string): this
+  /** Add an upstream CA certificate PEM path for matching hosts. */
+  upstreamCaCertFor(pattern: string, path: string): this
   /** Set a custom interception CA certificate PEM path. */
   interceptCaCert(path: string): this
   /** Set a custom interception CA private key PEM path. */
@@ -1410,11 +1638,12 @@ export type JsViolationActionBuilder = ViolationActionBuilder
 
 export declare class Volume {
   static get(name: string): Promise<VolumeHandle>
+  static getDefault(): Promise<VolumeHandle>
   static list(): Promise<Array<VolumeInfo>>
   static remove(name: string): Promise<void>
   get name(): string
   get path(): string
-  /** Host-side filesystem operations on this volume's directory. */
+  /** Direct filesystem operations through this volume's bound backend. */
   fs(): VolumeFs
 }
 export type JsVolume = Volume
@@ -1483,6 +1712,7 @@ export type JsVolumeFsWriteSink = VolumeFsWriteSink
 
 export declare class VolumeHandle {
   get name(): string
+  get isDefault(): boolean
   get quotaMib(): number | null
   get kind(): string
   get usedBytes(): number
@@ -1492,7 +1722,7 @@ export declare class VolumeHandle {
   get labels(): Record<string, string>
   get createdAt(): number | null
   remove(): Promise<void>
-  /** Host-side filesystem operations on this volume's directory. */
+  /** Direct filesystem operations through this volume's bound backend. */
   fs(): VolumeFs
 }
 export type JsVolumeHandle = VolumeHandle
@@ -1515,6 +1745,9 @@ export interface AttachOptions {
   detachKeys?: string
   rlimits: Array<JsRlimit>
 }
+
+/** Return secret-safe information about the active default backend. */
+export declare function defaultBackendInfo(): JsBackendInfo
 
 /** Return the active default backend kind (`"local"` or `"cloud"`). */
 export declare function defaultBackendKind(): string
@@ -1559,16 +1792,6 @@ export interface ExecOptions {
 export interface ExitStatus {
   code: number
   success: boolean
-}
-
-/** Options for `Snapshot.export()`. */
-export interface ExportOpts {
-  /** Walk the parent chain and include each ancestor (no-op today). */
-  withParents?: boolean
-  /** Bundle the OCI image cache for offline transport. */
-  withImage?: boolean
-  /** Skip zstd compression and write a plain `.tar`. */
-  plainTar?: boolean
 }
 
 /** Filesystem entry metadata returned by `fs.list()`. */
@@ -1618,12 +1841,6 @@ export interface ImageDetailJs {
   layers: Array<ImageLayerDetail>
 }
 
-/** Garbage-collect everything reclaimable. Returns the number reclaimed. */
-export declare function imageGc(): Promise<number>
-
-/** Garbage-collect orphaned layers. Returns the number reclaimed. */
-export declare function imageGcLayers(): Promise<number>
-
 /** Look up a cached image by reference. */
 export declare function imageGet(reference: string): Promise<ImageHandle>
 
@@ -1656,16 +1873,56 @@ export interface ImageLayerDetail {
 export declare function imageList(): Promise<Array<ImageInfo>>
 
 /**
+ * Load images from a local archive (`docker save` tarball or OCI Image
+ * Layout) into the image cache. `tag` applies an extra reference to the
+ * first image in the archive.
+ */
+export declare function imageLoad(inputPath: string, tag?: string | undefined | null): Promise<Array<ImageInfo>>
+
+/** Remove cached image data that is not used by any sandbox or indexed snapshot. */
+export declare function imagePrune(): Promise<ImagePruneReportJs>
+
+/** Summary of artifacts removed by `imagePrune`. */
+export interface ImagePruneReportJs {
+  imageRefsRemoved: number
+  manifestsRemoved: number
+  layersRemoved: number
+  fsmetaRemoved: number
+  vmdkRemoved: number
+  bytesReclaimed?: number
+}
+
+/**
  * Remove a cached image. Pass `force = true` to delete even when a
  * sandbox references it.
  */
 export declare function imageRemove(reference: string, force?: boolean | undefined | null): Promise<void>
+
+/**
+ * Save cached images to an archive file. `format` selects the layout:
+ * `"docker"` (default, loadable with `docker load`) or `"oci"`.
+ */
+export declare function imageSave(references: Array<string>, outputPath: string, format?: string | undefined | null): Promise<void>
 
 /** Download and install msb + libkrunfw to ~/.microsandbox/. */
 export declare function install(): Promise<void>
 
 /** Check if msb and libkrunfw are installed and available. */
 export declare function isInstalled(): boolean
+
+/** Secret-safe backend diagnostics returned to JavaScript. */
+export interface JsBackendInfo {
+  kind: string
+  apiUrl?: string
+  source: string
+  profile?: string
+}
+
+/** One page returned by `Sandbox.list` / `Sandbox.listWith`. */
+export interface JsSandboxPage {
+  sandboxes: Array<JsSandboxHandle>
+  nextCursor?: string
+}
 
 /** One captured log entry from `exec.log`. */
 export interface LogEntry {
@@ -1900,11 +2157,10 @@ export interface Rlimit {
   hard: number
 }
 
-/**
- * Filter for `Sandbox.list`. Matched sandboxes must carry all of `labels`
- * (AND-matched). Omit or leave empty to match every sandbox.
- */
-export interface SandboxListFilter {
+/** Options for one paginated sandbox list request. */
+export interface SandboxListOptions {
+  cursor?: string
+  limit?: number
   labels?: Record<string, string>
 }
 
@@ -1929,6 +2185,36 @@ export interface SandboxMetrics {
   timestampMs: number
 }
 
+/**
+ * Options accepted by `Sandbox.modify()` / `SandboxHandle.modify()`.
+ *
+ * `memoryMib` / `maxMemoryMib` / `rootDiskSizeMib` are in MiB. `policy` is `"no_restart"`
+ * (default), `"next_start"`, or `"restart"`. With `dryRun: true` the plan
+ * is computed without applying anything.
+ */
+export interface SandboxModifyOptions {
+  cpus?: number
+  maxCpus?: number
+  memoryMib?: number
+  maxMemoryMib?: number
+  rootDiskSizeMib?: number
+  env?: Record<string, string>
+  envRemove?: Array<string>
+  labels?: Record<string, string>
+  labelsRemove?: Array<string>
+  workdir?: string
+  secrets?: Record<string, SecretModifySpec>
+  secretsRemove?: Array<string>
+  policy?: string
+  dryRun?: boolean
+}
+
+/** Result returned by `Sandbox.ping()` / `SandboxHandle.ping()`. */
+export interface SandboxPingResult {
+  name: string
+  latencyMs: number
+}
+
 /** Result of observing a sandbox in a terminal state. */
 export interface SandboxStopResult {
   name: string
@@ -1937,6 +2223,34 @@ export interface SandboxStopResult {
   signal?: number
   observedAt: number
   source?: string
+}
+
+/** Result returned by `Sandbox.touch()` / `SandboxHandle.touch()`. */
+export interface SandboxTouchResult {
+  name: string
+  activitySeq: number
+}
+
+/** Options for `Snapshot.save()`. */
+export interface SaveOpts {
+  /** Walk the parent chain and include each ancestor in the archive. */
+  withParents?: boolean
+  /** Bundle the OCI image cache for offline transport. */
+  withImage?: boolean
+  /** Skip zstd compression and write a plain `.tar`. */
+  plainTar?: boolean
+}
+
+/** Host-scoped upstream CA certificate path. */
+export interface ScopedUpstreamCaCert {
+  pattern: string
+  path: string
+}
+
+/** Host-scoped upstream certificate verification override. */
+export interface ScopedVerifyUpstream {
+  pattern: string
+  verify: boolean
 }
 
 /** A secret entry produced by `SecretBuilder.build()`. */
@@ -1968,10 +2282,24 @@ export interface SecretInjection {
 }
 
 /**
+ * Desired state for one secret in `SandboxModifyOptions.secrets`, keyed by
+ * secret name. `env` / `value` / `store` are mutually exclusive ways to
+ * provide the secret material; setting more than one is rejected at the
+ * boundary. Only `value` may carry raw secret material.
+ */
+export interface SecretModifySpec {
+  env?: string
+  value?: string
+  store?: string
+  placeholder?: string
+  allowedHosts?: Array<string>
+}
+
+/**
  * Set the process-wide default backend.
  *
- * `kind="local"` selects the local backend. `kind="cloud"` requires either
- * `url` + `api_key`, or `profile`.
+ * `kind="local"` selects the local backend. `kind="cloud"` requires either an
+ * API key (with an optional URL override), or a profile.
  */
 export declare function setDefaultBackend(kind: string, url?: string | undefined | null, apiKey?: string | undefined | null, profile?: string | undefined | null): void
 
@@ -1993,12 +2321,13 @@ export declare function setRuntimeMsbPath(path: string): void
 
 /** Built snapshot configuration produced by `SnapshotBuilder.build()`. */
 export interface SnapshotConfig {
-  sourceSandbox: string
-  destinationKind: string
-  destinationValue?: string
+  name: string
+  sourceSandbox?: string
+  destDir?: string
   labels: Array<JsSnapshotLabel>
   force: boolean
   recordIntegrity: boolean
+  resumable: boolean
 }
 
 /** Snapshot index info from the local DB cache. */
@@ -2007,9 +2336,18 @@ export interface SnapshotInfo {
   name?: string
   parentDigest?: string
   imageRef: string
+  /** `"disk"` today; `"resumable"` once memory/device-state restore lands. */
+  scope: string
   /** `"raw"` or `"qcow2"`. */
-  format: string
+  stateKind: string
+  format?: string
+  fstype?: string
+  checkpointManifestDigest?: string
   sizeBytes?: number
+  locality: string
+  availability: string
+  migrationState: string
+  migrationErrorCode?: string
   createdAt: number
   path: string
 }
@@ -2027,10 +2365,8 @@ export interface SnapshotRemoveOptions {
 /**
  * Result of `Snapshot.verify()`.
  *
- * `upperKind` is `"notRecorded"` when no integrity hash was stored,
- * or `"verified"` when the recorded hash matched the recomputed one.
- * `upperAlgorithm` and `upperDigest` are populated only when
- * `upperKind === "verified"`.
+ * `upperKind` is `"notRecorded"` when integrity is absent or `"verified"`
+ * when the recorded value matched. The other fields carry that binding.
  */
 export interface SnapshotVerifyReport {
   digest: string
@@ -2051,6 +2387,7 @@ export interface SshClientOptions {
   user?: string
   term?: string
   sftp?: boolean
+  inactivityTimeoutSecs?: number
 }
 
 /** Options accepted by `SshClient.exec()`. */
@@ -2071,6 +2408,7 @@ export interface SshServerOptions {
   authorizedKeysPath?: string
   user?: string
   sftp?: boolean
+  inactivityTimeoutSecs?: number
 }
 
 /** Stdin mode for an exec. */
@@ -2100,6 +2438,8 @@ export interface TlsConfig {
   interceptedPorts: Array<number>
   blockQuic: boolean
   upstreamCaCertPaths: Array<string>
+  scopedUpstreamCaCerts: Array<JsScopedUpstreamCaCert>
+  scopedVerifyUpstream: Array<JsScopedVerifyUpstream>
   interceptCaCertPath?: string
   interceptCaKeyPath?: string
 }
@@ -2116,6 +2456,7 @@ export interface VolumeConfig {
 /** Volume handle info from the database. */
 export interface VolumeInfo {
   name: string
+  isDefault: boolean
   kind: string
   quotaMib?: number
   usedBytes: number
@@ -2150,4 +2491,14 @@ export interface VolumeMount {
   statVirtualization?: string
   /** `"private" | "mirror"` for bind/named mounts; `None` for tmpfs/disk. */
   hostPermissions?: string
+  /**
+   * Guest owner uid for host-created files under bind/named mounts; `None`
+   * when unset or for tmpfs/disk. Set together with `override_gid`.
+   */
+  overrideUid?: number
+  /**
+   * Guest owner gid for host-created files under bind/named mounts; `None`
+   * when unset or for tmpfs/disk. Set together with `override_uid`.
+   */
+  overrideGid?: number
 }

@@ -4,9 +4,11 @@ description: Monitor sandbox resource usage
 icon: "chart-line"
 ---
 
+<Tooltip tip="SDK and CLI resource metrics are not yet available on microsandbox cloud; instrument the workload with an external monitoring system."><span className="msb-badge-local">Local-only <Icon icon="circle-info" size={11} /></span></Tooltip>
+
 Query resource usage for a running sandbox: CPU, memory, and more. Get a single point-in-time snapshot, or open a streaming subscription that delivers updates at a fixed interval.
 
-OCI sandboxes also expose optional upper filesystem fields for capacity dashboards: guest-visible `upper_used_bytes` / `upper_free_bytes` when the protected bundled-kernel reporter is available and fresh, plus host-observed `upper_host_allocated_bytes` when the writable upper image can be inspected from the host. SDKs surface those as nullable fields (`Option`, `null`, `None`, or `nil`) because custom kernels and non-OCI roots may not provide them.
+OCI sandboxes also expose optional upper filesystem fields for capacity dashboards. Guest-visible `upper_used_bytes` and `upper_free_bytes` are available when the protected bundled-kernel reporter is fresh. Host-observed `upper_host_allocated_bytes` is available when microsandbox can inspect the writable upper image from the host. SDKs surface those as nullable fields (`Option`, `null`, `None`, or `nil`) because custom kernels and non-OCI roots may not provide them.
 
 <Note>
 Need continuous shipping to Grafana, Datadog, Prometheus, or any other OTel-compatible backend? See [`msb-metrics`](/observability/msb-metrics), a sidecar binary that reads the same data and ships it over OTLP.
@@ -111,3 +113,25 @@ all, err := m.AllSandboxMetrics(ctx)
 ```
 
 </CodeGroup>
+
+Fleet snapshots only include sandboxes whose runtime process is actually alive. A runtime that crashed without cleanup used to keep reporting its last sample as if the sandbox were running; readers now detect the dead owner and retire the entry on first read.
+
+## Metrics reports (Rust)
+
+The Rust SDK additionally exposes *reports*: metrics joined with catalog context for presentation. A report resolves the CPU and memory allocations from the sandbox's **active config**, so live resizes are reflected. It also carries a state field: `Running`, `Stalled` (runtime alive but no sample within three sampling intervals), or `Exited` (the preserved terminal sample of a stopped sandbox). This is what `msb metrics` renders.
+
+```rust Rust
+use microsandbox::{all_sandbox_metrics_reports_local, sandbox_metrics_report_local};
+
+// All sandboxes; pass true to include exited ones.
+let reports = all_sandbox_metrics_reports_local(&local, false).await?;
+for r in &reports {
+    println!("{} [{:?}] {:.2} cores of {:?}", r.name, r.state, r.metrics.cpu_percent / 100.0, r.cpus);
+}
+
+// One sandbox by name, in any state (unlike `Sandbox::metrics`, which
+// errors when the sandbox is not running).
+let report = sandbox_metrics_report_local(&local, "my-app").await?;
+```
+
+Report APIs for TypeScript, Python, and Go will follow.

@@ -410,6 +410,46 @@ fn seeded_virtual_permissions_are_visible_after_backend_start() {
 }
 
 #[test]
+fn host_files_without_override_are_executable() {
+    let temp = TempDir::new();
+    std::fs::write(temp.path.join("program"), b"\x7fELFbinary").unwrap();
+
+    let fs = fs_for(&temp.path);
+    let entry = fs.lookup(context(), ROOT_INODE, c"program").unwrap();
+    let (st, _) = fs.getattr(context(), entry.inode, None).unwrap();
+
+    // NTFS has no Unix exec bit, but a freshly bound host file must still be
+    // runnable (e.g. binaries in a bind rootfs) before the guest chmods it.
+    assert_eq!(st.st_mode & S_IFMT, S_IFREG);
+    assert_eq!(st.st_mode & 0o7777, 0o777);
+    assert_ne!(
+        st.st_mode & 0o111,
+        0,
+        "host file should be executable by default"
+    );
+
+    // Root must pass an X_OK access check against the synthesized mode.
+    check_access(context(), &st, LINUX_ACCESS_X_OK).unwrap();
+}
+
+#[test]
+fn readonly_host_files_without_override_are_read_execute_only() {
+    let temp = TempDir::new();
+    let file = temp.path.join("locked");
+    std::fs::write(&file, b"data").unwrap();
+    let mut perms = std::fs::metadata(&file).unwrap().permissions();
+    perms.set_readonly(true);
+    std::fs::set_permissions(&file, perms).unwrap();
+
+    let fs = fs_for(&temp.path);
+    let entry = fs.lookup(context(), ROOT_INODE, c"locked").unwrap();
+    let (st, _) = fs.getattr(context(), entry.inode, None).unwrap();
+
+    assert_eq!(st.st_mode & S_IFMT, S_IFREG);
+    assert_eq!(st.st_mode & 0o7777, 0o555);
+}
+
+#[test]
 fn strict_uses_ads_and_does_not_create_sidecar() {
     let temp = TempDir::new();
     let fs = fs_for(&temp.path);
@@ -436,6 +476,84 @@ fn strict_uses_ads_and_does_not_create_sidecar() {
 
     assert!(!temp.path.join(FALLBACK_METADATA_DIR_NAME).exists());
     assert_override(&data.path, 111, 222, S_IFREG | 0o644, 0);
+}
+
+#[test]
+fn readonly_probes_do_not_create_metadata() {
+    let temp = TempDir::new();
+    let override_path = ads_override_path(&temp.path);
+    let probe_path = ads_probe_path(&temp.path);
+
+    for policy in [StatVirtualization::Strict, StatVirtualization::Relaxed] {
+        let fs = PassthroughFs::new(PassthroughConfig {
+            root_dir: temp.path.clone(),
+            inject_init: false,
+            readonly: true,
+            stat_virtualization: policy,
+            ..Default::default()
+        })
+        .unwrap();
+
+        assert_ads_store(&fs);
+    }
+
+    for path in [override_path, probe_path] {
+        assert_eq!(
+            std::fs::metadata(path).unwrap_err().kind(),
+            io::ErrorKind::NotFound
+        );
+    }
+    assert!(!temp.path.join(FALLBACK_METADATA_DIR_NAME).exists());
+}
+
+#[test]
+fn readonly_relaxed_probe_preserves_mount_root_override() {
+    let temp = TempDir::new();
+    write_override_stream(
+        &ads_override_path(&temp.path),
+        OverrideStat::new(1234, 2345, S_IFDIR | 0o1755, 0),
+    )
+    .unwrap();
+
+    let fs = PassthroughFs::new(PassthroughConfig {
+        root_dir: temp.path.clone(),
+        inject_init: false,
+        readonly: true,
+        stat_virtualization: StatVirtualization::Relaxed,
+        ..Default::default()
+    })
+    .unwrap();
+
+    assert_ads_store(&fs);
+    assert_override(&temp.path, 1234, 2345, S_IFDIR | 0o1755, 0);
+    assert_eq!(
+        std::fs::metadata(ads_probe_path(&temp.path))
+            .unwrap_err()
+            .kind(),
+        io::ErrorKind::NotFound
+    );
+    assert!(!temp.path.join(FALLBACK_METADATA_DIR_NAME).exists());
+}
+
+#[test]
+fn writable_probe_preserves_mount_root_override() {
+    let temp = TempDir::new();
+    write_override_stream(
+        &ads_override_path(&temp.path),
+        OverrideStat::new(1234, 2345, S_IFDIR | 0o1755, 0),
+    )
+    .unwrap();
+
+    let fs = fs_for(&temp.path);
+    assert_ads_store(&fs);
+
+    assert_override(&temp.path, 1234, 2345, S_IFDIR | 0o1755, 0);
+    assert_eq!(
+        std::fs::metadata(ads_probe_path(&temp.path))
+            .unwrap_err()
+            .kind(),
+        io::ErrorKind::NotFound
+    );
 }
 
 #[test]
@@ -893,4 +1011,240 @@ fn write_killpriv_clears_virtual_suid_sgid() {
 
     let (st, _) = fs.getattr(context(), entry.inode, None).unwrap();
     assert_eq!(st.st_mode & (S_ISUID | S_ISGID), 0);
+}
+
+//--------------------------------------------------------------------------------------------------
+// Tests: mount-root containment (no_symlink_root)
+//--------------------------------------------------------------------------------------------------
+
+/// Build a two-tenant layout under a canonical (reparse-free) base:
+/// `<base>/vol/tenant-a` and `<base>/vol/tenant-b`, with a secret in tenant-b.
+fn two_tenant_layout(temp: &TempDir) -> (PathBuf, PathBuf, PathBuf) {
+    // Canonicalize so no redirected system folder trips the no-reparse walk;
+    // the control plane owns this step.
+    let base = std::fs::canonicalize(&temp.path).unwrap();
+    let tenant_a = base.join("vol").join("tenant-a");
+    let tenant_b = base.join("vol").join("tenant-b");
+    std::fs::create_dir_all(&tenant_a).unwrap();
+    std::fs::create_dir_all(&tenant_b).unwrap();
+    std::fs::write(tenant_b.join("secret.txt"), b"tenant-b private data").unwrap();
+    (base, tenant_a, tenant_b)
+}
+
+fn build_no_symlink(root_dir: PathBuf) -> io::Result<PassthroughFs> {
+    let fs = PassthroughFs::new(PassthroughConfig {
+        root_dir,
+        no_symlink_root: true,
+        stat_virtualization: StatVirtualization::Off,
+        inject_init: false,
+        ..Default::default()
+    })?;
+    fs.init(FsOptions::empty())?;
+    Ok(fs)
+}
+
+/// Legacy behavior: `canonicalize` follows a junction/symlink root out to the
+/// sibling tenant, exposing its files. Documents the escape the flag closes.
+#[test]
+fn legacy_symlink_root_is_followed() {
+    let temp = TempDir::new();
+    let (_base, tenant_a, tenant_b) = two_tenant_layout(&temp);
+
+    let evil = tenant_a.join("evil");
+    if std::os::windows::fs::symlink_dir(&tenant_b, &evil).is_err() {
+        eprintln!("skip: cannot create directory symlink (privilege/Developer Mode)");
+        return;
+    }
+
+    let fs = PassthroughFs::new(PassthroughConfig {
+        root_dir: evil,
+        no_symlink_root: false,
+        stat_virtualization: StatVirtualization::Off,
+        inject_init: false,
+        ..Default::default()
+    })
+    .expect("legacy path follows the symlink silently");
+    fs.init(FsOptions::empty()).unwrap();
+
+    assert!(
+        fs.lookup(context(), ROOT_INODE, c"secret.txt").is_ok(),
+        "guest reached tenant-b's secret.txt through the mount (escape)"
+    );
+}
+
+/// A junction/symlink as the mount root is refused — never followed.
+#[test]
+fn no_symlink_root_rejects_symlink_root() {
+    let temp = TempDir::new();
+    let (_base, tenant_a, tenant_b) = two_tenant_layout(&temp);
+
+    let evil = tenant_a.join("evil");
+    if std::os::windows::fs::symlink_dir(&tenant_b, &evil).is_err() {
+        eprintln!("skip: cannot create directory symlink (privilege/Developer Mode)");
+        return;
+    }
+
+    let result = build_no_symlink(evil);
+    assert!(result.is_err(), "symlink root must be refused");
+    assert_eq!(
+        result.err().and_then(|e| e.raw_os_error()),
+        Some(LINUX_ELOOP)
+    );
+}
+
+/// A reparse point in a NON-tenant prefix is refused too — nothing is trusted.
+#[test]
+fn no_symlink_root_rejects_symlinked_prefix() {
+    let temp = TempDir::new();
+    let (base, _tenant_a, _tenant_b) = two_tenant_layout(&temp);
+
+    let real = base.join("real-mnt");
+    std::fs::create_dir_all(real.join("work")).unwrap();
+    let linked_prefix = base.join("linked-mnt");
+    if std::os::windows::fs::symlink_dir(&real, &linked_prefix).is_err() {
+        eprintln!("skip: cannot create directory symlink (privilege/Developer Mode)");
+        return;
+    }
+
+    let result = build_no_symlink(linked_prefix.join("work"));
+    assert!(
+        result.is_err(),
+        "a symlinked prefix component must be refused"
+    );
+    assert_eq!(
+        result.err().and_then(|e| e.raw_os_error()),
+        Some(LINUX_ELOOP)
+    );
+
+    // The same real path with no reparse component mounts fine.
+    build_no_symlink(real.join("work")).expect("real path should mount");
+}
+
+/// A `..` segment is refused even though it crosses no reparse point.
+#[test]
+fn no_symlink_root_rejects_dotdot() {
+    let temp = TempDir::new();
+    let (_base, tenant_a, _tenant_b) = two_tenant_layout(&temp);
+
+    // Build the `..` path from a RAW STRING. `PathBuf::join("..")` collapses the
+    // `..` at construction on Windows (especially verbatim `\\?\` paths), so it
+    // would never reach the resolver; a string preserves the literal segment,
+    // which is exactly what a caller that concatenates an untrusted subpath
+    // would produce.
+    let escaping = PathBuf::from(format!("{}\\..\\tenant-b", tenant_a.display()));
+    let result = build_no_symlink(escaping);
+    assert_eq!(
+        result.err().and_then(|e| e.raw_os_error()),
+        Some(LINUX_EINVAL)
+    );
+}
+
+// Relative paths resolve from the working directory (still no reparse point
+// followed), so relative bind mounts keep working under the protective default.
+// Covered end-to-end at the app level rather than here to avoid a unit test
+// mutating the shared process working directory.
+
+/// A legitimate real subdirectory mounts and the guest sees its own files.
+#[test]
+fn no_symlink_root_allows_real_subdir() {
+    let temp = TempDir::new();
+    let (_base, tenant_a, _tenant_b) = two_tenant_layout(&temp);
+    let work = tenant_a.join("work");
+    std::fs::create_dir_all(&work).unwrap();
+    std::fs::write(work.join("hello.txt"), b"tenant-a data").unwrap();
+
+    let fs = build_no_symlink(work).expect("real subdir should mount");
+    fs.lookup(context(), ROOT_INODE, c"hello.txt")
+        .expect("guest should see its own file");
+}
+
+/// A deep chain of real directories is allowed — the resolver rejects reparse
+/// points, not depth.
+#[test]
+fn no_symlink_root_allows_deep_real_path() {
+    let temp = TempDir::new();
+    let (_base, tenant_a, _tenant_b) = two_tenant_layout(&temp);
+    let deep = tenant_a.join("a").join("b").join("c");
+    std::fs::create_dir_all(&deep).unwrap();
+
+    build_no_symlink(deep).expect("deep real path should mount");
+}
+
+#[test]
+fn no_override_falls_back_to_configured_default_owner() {
+    let temp = TempDir::new();
+    std::fs::write(temp.path.join("hostfile.txt"), b"host-created").unwrap();
+
+    // A host-created file has no override stored; with default_owner set it is
+    // presented as that owner instead of the raw 0:0.
+    let fs = PassthroughFs::new(PassthroughConfig {
+        root_dir: temp.path.clone(),
+        inject_init: false,
+        default_owner: Some((1000, 1000)),
+        ..Default::default()
+    })
+    .unwrap();
+    fs.init(FsOptions::empty()).unwrap();
+
+    let entry = fs.lookup(context(), ROOT_INODE, c"hostfile.txt").unwrap();
+    assert_eq!(entry.attr.st_uid, 1000);
+    assert_eq!(entry.attr.st_gid, 1000);
+
+    // Without default_owner the same host file falls back to 0:0.
+    let plain = fs_for(&temp.path);
+    let entry = plain
+        .lookup(context(), ROOT_INODE, c"hostfile.txt")
+        .unwrap();
+    assert_eq!(entry.attr.st_uid, 0);
+    assert_eq!(entry.attr.st_gid, 0);
+}
+
+#[test]
+fn default_owner_rejected_when_stat_virtualization_is_off() {
+    let cfg = PassthroughConfig {
+        root_dir: PathBuf::from(r"Z:\this-path-must-not-be-resolved"),
+        stat_virtualization: StatVirtualization::Off,
+        default_owner: Some((1000, 1000)),
+        ..Default::default()
+    };
+
+    // EINVAL proves validation happens before root resolution, which would
+    // otherwise return a host path-not-found error for this sentinel path.
+    let err = match PassthroughFs::new(cfg) {
+        Ok(_) => panic!("default owner with stat virtualization off must fail"),
+        Err(err) => err,
+    };
+    assert_eq!(err.raw_os_error(), Some(LINUX_EINVAL));
+}
+
+#[test]
+fn setattr_preserves_default_owner_for_host_created_file() {
+    let temp = TempDir::new();
+    std::fs::write(temp.path.join("hostfile.txt"), b"host-created").unwrap();
+
+    let fs = PassthroughFs::new(PassthroughConfig {
+        root_dir: temp.path.clone(),
+        inject_init: false,
+        default_owner: Some((1000, 1000)),
+        ..Default::default()
+    })
+    .unwrap();
+    fs.init(FsOptions::empty()).unwrap();
+
+    let entry = fs.lookup(context(), ROOT_INODE, c"hostfile.txt").unwrap();
+
+    // The guest changes only the mode (chmod, no chown). The mutation baseline
+    // must seed the configured default owner rather than 0:0, so the file does
+    // not silently become root-owned after the metadata write.
+    let attr = stat64 {
+        st_mode: S_IFREG | 0o640,
+        ..Default::default()
+    };
+    fs.setattr(context(), entry.inode, attr, None, SetattrValid::MODE)
+        .unwrap();
+
+    let (st, _) = fs.getattr(context(), entry.inode, None).unwrap();
+    assert_eq!(st.st_uid, 1000);
+    assert_eq!(st.st_gid, 1000);
+    assert_eq!(st.st_mode & 0o7777, 0o640);
 }

@@ -20,6 +20,8 @@ use crate::{
     tar::Compression,
 };
 
+use super::tar_ext::TarBuilderExt;
+
 //--------------------------------------------------------------------------------------------------
 // Constants
 //--------------------------------------------------------------------------------------------------
@@ -34,6 +36,8 @@ const OCI_REF_NAME_ANNOTATION: &str = "org.opencontainers.image.ref.name";
 const ARCHIVE_METADATA_MAX_BYTES: u64 = 16 * 1024 * 1024;
 const ARCHIVE_LAYER_MAX_BYTES: u64 = 10 * 1024 * 1024 * 1024;
 const ARCHIVE_MAX_ENTRY_COUNT: u64 = 1_000_000;
+const OCI_INDEX_MAX_DEPTH: usize = 32;
+const OCI_INDEX_MAX_COUNT: usize = 1_024;
 static TEMP_FILE_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 //--------------------------------------------------------------------------------------------------
@@ -45,6 +49,8 @@ static TEMP_FILE_COUNTER: AtomicU64 = AtomicU64::new(0);
 pub struct ImageLoadOptions {
     /// Extra tags to apply to the first image in the archive.
     pub tags: Vec<String>,
+    /// Optional sink for materialization progress events. `None` stays silent.
+    pub progress: Option<crate::progress::PullProgressSender>,
 }
 
 /// Archive format to use when saving images.
@@ -120,6 +126,17 @@ struct PreparedArchiveLoad {
 }
 
 #[derive(Debug)]
+struct OciManifestCandidate {
+    descriptor: oci_spec::image::Descriptor,
+    reference: Option<String>,
+    /// Position of this descriptor within the index tree, one entry per level:
+    /// the index into `index.json` followed by the index into each nested image
+    /// index traversed to reach it. Sorting candidates by `tree_path` restores the
+    /// original depth-first order regardless of the level they were resolved at.
+    tree_path: Vec<usize>,
+}
+
+#[derive(Debug)]
 struct StagedLayerGuard {
     paths: HashMap<String, PathBuf>,
     cleanup_on_drop: bool,
@@ -189,6 +206,41 @@ impl<W> DigestingWriter<W> {
     }
 }
 
+impl ImageSaveRequest {
+    /// Build a save request for `reference` from its cached metadata.
+    ///
+    /// Extracts `architecture`/`os` from the raw config JSON and carries the
+    /// runtime config fields and ordered layer diff IDs over verbatim.
+    pub fn from_cached(reference: impl Into<String>, metadata: CachedImageMetadata) -> Self {
+        let (architecture, os) = raw_config_platform(&metadata.raw_config_json);
+
+        let layers = metadata
+            .layers
+            .iter()
+            .map(|layer| ImageSaveLayer {
+                diff_id: layer.diff_id.clone(),
+            })
+            .collect();
+
+        let config = metadata.config;
+        Self {
+            reference: reference.into(),
+            config: ImageSaveConfig {
+                architecture,
+                os,
+                env: config.env,
+                entrypoint: config.entrypoint,
+                cmd: config.cmd,
+                working_dir: config.working_dir,
+                user: config.user,
+                labels: config.labels.into_iter().collect(),
+            },
+            raw_config_json: metadata.raw_config_json,
+            layers,
+        }
+    }
+}
+
 impl StagedLayerGuard {
     fn new() -> Self {
         Self {
@@ -246,6 +298,24 @@ impl Drop for StagedLayerGuard {
 // Functions
 //--------------------------------------------------------------------------------------------------
 
+/// Extract `architecture` and `os` from a raw OCI config JSON document.
+fn raw_config_platform(raw_config_json: &str) -> (Option<String>, Option<String>) {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(raw_config_json) else {
+        return (None, None);
+    };
+
+    let architecture = value
+        .get("architecture")
+        .and_then(serde_json::Value::as_str)
+        .map(ToOwned::to_owned);
+    let os = value
+        .get("os")
+        .and_then(serde_json::Value::as_str)
+        .map(ToOwned::to_owned);
+
+    (architecture, os)
+}
+
 /// Load a Docker image archive into the microsandbox image cache.
 pub async fn load_archive(
     cache_dir: &Path,
@@ -254,6 +324,7 @@ pub async fn load_archive(
 ) -> ImageResult<Vec<LoadedImage>> {
     let cache_dir_for_blocking = cache_dir.to_path_buf();
     let input = input.to_path_buf();
+    let progress = options.progress.clone();
     let prepared = tokio::task::spawn_blocking(move || {
         load_archive_blocking(&cache_dir_for_blocking, &input, options)
     })
@@ -284,6 +355,7 @@ pub async fn load_archive(
                     &image.metadata,
                     false,
                     Arc::clone(&staged_layers),
+                    progress.clone(),
                 )
                 .await?;
 
@@ -542,6 +614,8 @@ fn load_archive_blocking(
     input: &Path,
     options: ImageLoadOptions,
 ) -> ImageResult<PreparedArchiveLoad> {
+    // A `docker save` archive carries a `manifest.json` (and often an `oci-layout` compat shim). Prefer the Docker path when `manifest.json` is present: it derives the image
+    // name from `RepoTags` and handles the layer layout that `docker save` actually writes. The OCI path is for archives that ship only an OCI layout.
     if let Some(manifest_json) = read_archive_entry(input, "manifest.json")? {
         let manifest: Vec<DockerManifestEntry> = serde_json::from_slice(&manifest_json)
             .map_err(|e| ImageError::ManifestParse(format!("docker manifest.json: {e}")))?;
@@ -578,6 +652,101 @@ fn load_docker_archive_blocking(
         .iter()
         .flat_map(|image| image.layers.iter().cloned())
         .collect::<HashSet<_>>();
+
+    // Early cache gate: when this exact image is already materialized, skip staging (and re-hashing) every layer blob. `docker save` names images via RepoTags, so we look up
+    // the cached metadata by reference, confirm the archive's content still matches it (diff_ids -- guards against a rebuilt tag reusing the name), and verify the EROFS/VMDK
+    // artifacts survive. On a hit the cached metadata is reused verbatim, which also keys fsmeta/VMDK by the manifest digest recorded at materialization time -- so a `pull`
+    // followed by a `load` of the same image still hits. Only the small config blob is read (seekably, via `read_archive_entries`); layer bytes are never touched.
+    'early_gate: {
+        let config_blobs = read_archive_entries(input, &required_configs)?;
+        let mut early_images = Vec::new();
+        for (image_index, image) in manifest.iter().enumerate() {
+            let Some(config_bytes) = config_blobs.get(&image.config) else {
+                break 'early_gate;
+            };
+            let (_, diff_ids) = ImageConfig::parse(config_bytes)?;
+            if diff_ids.len() != image.layers.len() {
+                break 'early_gate;
+            }
+            let config_digest = format!("sha256:{}", sha256_hex(config_bytes));
+
+            let mut refs = image
+                .repo_tags
+                .clone()
+                .unwrap_or_default()
+                .into_iter()
+                .filter(|tag| tag != "<none>:<none>")
+                .collect::<Vec<_>>();
+            if image_index == 0 {
+                refs.extend(options.tags.iter().cloned());
+            }
+            refs.sort();
+            refs.dedup();
+            if refs.is_empty() {
+                break 'early_gate;
+            }
+
+            // Cached metadata under any of this image's refs whose recorded content (diff_ids) still equals the archive's.
+            let mut cached = None;
+            for reference in &refs {
+                let Ok(parsed) = reference.parse::<Reference>() else {
+                    break 'early_gate;
+                };
+                if let Some(metadata) = cache.read_image_metadata(&parsed)? {
+                    let cached_diff_ids = metadata
+                        .layers
+                        .iter()
+                        .map(|layer| layer.diff_id.clone())
+                        .collect::<Vec<_>>();
+                    if metadata.config_digest == config_digest && cached_diff_ids == diff_ids {
+                        cached = Some(metadata);
+                        break;
+                    }
+                }
+            }
+            let Some(metadata) = cached else {
+                break 'early_gate;
+            };
+
+            let Ok(manifest_digest) = metadata.manifest_digest.parse::<crate::Digest>() else {
+                break 'early_gate;
+            };
+            if !crate::cache::is_valid_erofs_artifact(&cache.fsmeta_erofs_path(&manifest_digest))
+                || !cache.vmdk_path(&manifest_digest).exists()
+            {
+                break 'early_gate;
+            }
+            let mut layers_present = true;
+            for diff_id_str in &diff_ids {
+                let Ok(diff_id) = diff_id_str.parse::<crate::Digest>() else {
+                    layers_present = false;
+                    break;
+                };
+                if !crate::cache::is_valid_erofs_artifact(&cache.layer_erofs_path(&diff_id)) {
+                    layers_present = false;
+                    break;
+                }
+            }
+            if !layers_present {
+                break 'early_gate;
+            }
+
+            for reference in refs {
+                early_images.push(PreparedLoadedImage {
+                    reference,
+                    metadata: metadata.clone(),
+                });
+            }
+        }
+        if !archive_contains_entries(input, &required_layers)? {
+            break 'early_gate;
+        }
+        return Ok(PreparedArchiveLoad {
+            images: early_images,
+            staged_layers: HashMap::new(),
+        });
+    }
+
     let file = File::open(input).map_err(|e| ImageError::Cache {
         path: input.to_path_buf(),
         source: e,
@@ -722,23 +891,24 @@ fn load_oci_archive_blocking(
         .ok_or_else(|| ImageError::ManifestParse("OCI layout missing index.json".into()))?;
     let index: oci_spec::image::ImageIndex = serde_json::from_slice(&index_json)
         .map_err(|e| ImageError::ManifestParse(format!("OCI index.json: {e}")))?;
-    let manifest_descriptors = selectable_oci_manifests(index.manifests())?;
-    if manifest_descriptors.is_empty() {
+    let manifest_candidates = resolve_oci_manifest_candidates(input, index.manifests())?;
+    if manifest_candidates.is_empty() {
         return Err(ImageError::ManifestParse(
             "OCI layout contains no image manifests for the host platform".into(),
         ));
     }
 
-    let manifest_paths = manifest_descriptors
+    let manifest_paths = manifest_candidates
         .iter()
-        .map(|descriptor| blob_path_from_digest(descriptor.digest().as_ref()))
+        .map(|candidate| blob_path_from_digest(candidate.descriptor.digest().as_ref()))
         .collect::<ImageResult<HashSet<_>>>()?;
     let manifest_blobs = read_archive_entries(input, &manifest_paths)?;
-    let mut manifests = Vec::with_capacity(manifest_descriptors.len());
+    let mut manifests = Vec::with_capacity(manifest_candidates.len());
     let mut required_configs = HashSet::new();
     let mut required_layers = HashSet::new();
 
-    for descriptor in &manifest_descriptors {
+    for candidate in manifest_candidates {
+        let descriptor = &candidate.descriptor;
         let manifest_path = blob_path_from_digest(descriptor.digest().as_ref())?;
         let manifest_bytes = manifest_blobs.get(&manifest_path).ok_or_else(|| {
             ImageError::ManifestParse(format!("OCI layout missing manifest blob {manifest_path}"))
@@ -751,9 +921,97 @@ fn load_oci_archive_blocking(
         for layer in manifest.layers() {
             required_layers.insert(blob_path_from_digest(layer.digest().as_ref())?);
         }
-        manifests.push((descriptor.clone(), manifest, manifest_bytes.clone()));
+        manifests.push((candidate, manifest, manifest_bytes.clone()));
     }
 
+    // Fast path: skip re-importing an image that is already fully materialized.
+    //
+    // A `CachedImageMetadata` is fully determined by the small manifest and config blobs — `manifest_digest` is `sha256(manifest_bytes)`; each layer's digest, media type, and
+    // size come from the manifest descriptors; the diff_ids come from the config. So the whole record can be built without opening a single layer blob. When the fsmeta, VMDK,
+    // and every layer EROFS are already cached, return here and never stage (and re-SHA-256) the layer blobs — the work that otherwise dominates a warm-cache load. Any miss
+    // breaks out to the full staging path below.
+    //
+    // Only the small config/manifest blobs are read, seekably (`read_archive_entries` uses `entries_with_seek`), so a hit skips both the ~16 s of layer hashing and the
+    // streaming of layer bytes -- it is truly sub-second.
+    'early_gate: {
+        let config_blobs = read_archive_entries(input, &required_configs)?;
+        let mut early_images = Vec::new();
+        for (image_index, (candidate, manifest, manifest_bytes)) in manifests.iter().enumerate() {
+            let config_path = blob_path_from_digest(manifest.config().digest().as_ref())?;
+            let Some(config_bytes) = config_blobs.get(&config_path) else {
+                break 'early_gate;
+            };
+            verify_descriptor_blob(manifest.config(), config_bytes)?;
+            let (config, diff_ids) = ImageConfig::parse(config_bytes)?;
+            if diff_ids.len() != manifest.layers().len() {
+                break 'early_gate;
+            }
+            let manifest_digest_str = format!("sha256:{}", sha256_hex(manifest_bytes));
+            let Ok(manifest_digest) = manifest_digest_str.parse::<crate::Digest>() else {
+                break 'early_gate;
+            };
+            if !crate::cache::is_valid_erofs_artifact(&cache.fsmeta_erofs_path(&manifest_digest))
+                || !cache.vmdk_path(&manifest_digest).exists()
+            {
+                break 'early_gate;
+            }
+
+            let mut layer_metadata = Vec::with_capacity(manifest.layers().len());
+            for (position, layer_descriptor) in manifest.layers().iter().enumerate() {
+                let diff_id_str = diff_ids[position].clone();
+                let Ok(diff_id) = diff_id_str.parse::<crate::Digest>() else {
+                    break 'early_gate;
+                };
+                if !crate::cache::is_valid_erofs_artifact(&cache.layer_erofs_path(&diff_id)) {
+                    break 'early_gate;
+                }
+                layer_metadata.push(CachedLayerMetadata {
+                    digest: layer_descriptor.digest().to_string(),
+                    media_type: Some(layer_descriptor.media_type().to_string()),
+                    size_bytes: Some(layer_descriptor.size()),
+                    diff_id: diff_id_str,
+                });
+            }
+
+            let metadata = CachedImageMetadata {
+                manifest_digest: manifest_digest_str,
+                config_digest: manifest.config().digest().to_string(),
+                raw_manifest_json: json_bytes_to_string(manifest_bytes, "OCI manifest")?,
+                raw_config_json: json_bytes_to_string(config_bytes, "OCI config")?,
+                config,
+                layers: layer_metadata,
+            };
+
+            let mut refs = candidate.reference.clone().into_iter().collect::<Vec<_>>();
+            if image_index == 0 {
+                refs.extend(options.tags.iter().cloned());
+            }
+            refs.sort();
+            refs.dedup();
+            if refs.is_empty() {
+                break 'early_gate;
+            }
+            for reference in refs {
+                if reference.parse::<Reference>().is_err() {
+                    break 'early_gate;
+                }
+                early_images.push(PreparedLoadedImage {
+                    reference,
+                    metadata: metadata.clone(),
+                });
+            }
+        }
+        if !archive_contains_entries(input, &required_layers)? {
+            break 'early_gate;
+        }
+        return Ok(PreparedArchiveLoad {
+            images: early_images,
+            staged_layers: HashMap::new(),
+        });
+    }
+
+    // Full path: some layer (or fsmeta/VMDK) is missing — stage every layer blob so
+    // the materialize step can build what isn't cached.
     let file = File::open(input).map_err(|e| ImageError::Cache {
         path: input.to_path_buf(),
         source: e,
@@ -787,7 +1045,7 @@ fn load_oci_archive_blocking(
     }
 
     let mut loaded = Vec::new();
-    for (image_index, (descriptor, manifest, manifest_bytes)) in manifests.into_iter().enumerate() {
+    for (image_index, (candidate, manifest, manifest_bytes)) in manifests.into_iter().enumerate() {
         let config_path = blob_path_from_digest(manifest.config().digest().as_ref())?;
         let config_bytes = configs.get(&config_path).ok_or_else(|| {
             ImageError::ConfigParse(format!("OCI layout missing config blob {config_path}"))
@@ -827,13 +1085,7 @@ fn load_oci_archive_blocking(
             layers: layer_metadata,
         };
 
-        let mut refs = descriptor
-            .annotations()
-            .as_ref()
-            .and_then(|annotations| annotations.get(OCI_REF_NAME_ANNOTATION))
-            .cloned()
-            .into_iter()
-            .collect::<Vec<_>>();
+        let mut refs = candidate.reference.into_iter().collect::<Vec<_>>();
 
         if image_index == 0 {
             refs.extend(options.tags.iter().cloned());
@@ -873,7 +1125,9 @@ fn read_archive_entry(input: &Path, wanted_path: &str) -> ImageResult<Option<Vec
     let mut archive = tar::Archive::new(file);
     let mut entry_count = 0u64;
 
-    for entry in archive.entries().map_err(ImageError::Io)? {
+    // `entries_with_seek` skips over each entry's data via the header size field instead of reading through it. In an OCI `docker save` tar the metadata sits at the tail
+    // (after the blobs), so this reaches it in O(headers) rather than a full read of every layer blob.
+    for entry in archive.entries_with_seek().map_err(ImageError::Io)? {
         let mut entry = entry.map_err(ImageError::Io)?;
         entry_count += 1;
         enforce_archive_entry_count(entry_count)?;
@@ -901,7 +1155,8 @@ fn read_archive_entries(
     let mut entries = HashMap::new();
     let mut entry_count = 0u64;
 
-    for entry in archive.entries().map_err(ImageError::Io)? {
+    // Seek past unwanted entry data (see `read_archive_entry`).
+    for entry in archive.entries_with_seek().map_err(ImageError::Io)? {
         let mut entry = entry.map_err(ImageError::Io)?;
         entry_count += 1;
         enforce_archive_entry_count(entry_count)?;
@@ -920,18 +1175,136 @@ fn read_archive_entries(
     Ok(entries)
 }
 
-fn selectable_oci_manifests(
-    descriptors: &[oci_spec::image::Descriptor],
-) -> ImageResult<Vec<oci_spec::image::Descriptor>> {
-    let host = Platform::host_linux();
-    let selected = descriptors
-        .iter()
-        .filter(|descriptor| is_oci_image_manifest_descriptor(descriptor))
-        .filter(|descriptor| descriptor_matches_platform(descriptor, &host))
-        .cloned()
-        .collect();
+fn archive_contains_entries(input: &Path, wanted_paths: &HashSet<String>) -> ImageResult<bool> {
+    if wanted_paths.is_empty() {
+        return Ok(true);
+    }
 
-    Ok(selected)
+    let file = File::open(input).map_err(|e| ImageError::Cache {
+        path: input.to_path_buf(),
+        source: e,
+    })?;
+    let mut archive = tar::Archive::new(file);
+    let mut entries = HashSet::new();
+    let mut entry_count = 0u64;
+
+    // The warm gate trusts cached layer EROFS contents, but the archive still needs
+    // to contain the layer members it advertises. Header-only scanning preserves the
+    // warm path's main win: layer bytes are seeked over, not read or re-hashed.
+    for entry in archive.entries_with_seek().map_err(ImageError::Io)? {
+        let entry = entry.map_err(ImageError::Io)?;
+        entry_count += 1;
+        enforce_archive_entry_count(entry_count)?;
+        let path = normalized_archive_path(&entry)?;
+        if wanted_paths.contains(&path) {
+            entries.insert(path);
+            if entries.len() == wanted_paths.len() {
+                return Ok(true);
+            }
+        }
+    }
+
+    Ok(false)
+}
+
+fn resolve_oci_manifest_candidates(
+    input: &Path,
+    descriptors: &[oci_spec::image::Descriptor],
+) -> ImageResult<Vec<OciManifestCandidate>> {
+    let host = Platform::host_linux();
+    let mut pending = descriptors
+        .iter()
+        .cloned()
+        .enumerate()
+        .map(|(index, descriptor)| OciManifestCandidate {
+            reference: descriptor
+                .annotations()
+                .as_ref()
+                .and_then(|annotations| annotations.get(OCI_REF_NAME_ANNOTATION))
+                .cloned(),
+            descriptor,
+            tree_path: vec![index],
+        })
+        .collect::<Vec<_>>();
+
+    // Every candidate in a given pass sits at the same nesting depth, so a single
+    // counter tracks the level being expanded (top-level descriptors are depth 0).
+    let mut depth = 0usize;
+    let mut index_count = 0usize;
+    let mut resolved = Vec::new();
+
+    while !pending.is_empty() {
+        // Classify every pending candidate once for this level: drop
+        // platform-incompatible and unknown media types, keep image manifests as
+        // resolved, and collect image indexes to expand into the next level.
+        let mut indexes = Vec::new();
+        for candidate in pending {
+            if !descriptor_matches_platform(&candidate.descriptor, &host) {
+                continue;
+            }
+
+            if is_oci_image_manifest_descriptor(&candidate.descriptor) {
+                resolved.push(candidate);
+            } else if is_oci_image_index_descriptor(&candidate.descriptor) {
+                indexes.push(candidate);
+            }
+        }
+
+        if indexes.is_empty() {
+            break;
+        }
+
+        // Enforce both nesting and total-index limits before reading any blobs.
+        if depth >= OCI_INDEX_MAX_DEPTH {
+            return Err(ImageError::ManifestParse(format!(
+                "OCI image index nesting exceeds {OCI_INDEX_MAX_DEPTH} levels"
+            )));
+        }
+
+        index_count = index_count.saturating_add(indexes.len());
+        if index_count > OCI_INDEX_MAX_COUNT {
+            return Err(ImageError::ManifestParse(format!(
+                "OCI layout contains more than {OCI_INDEX_MAX_COUNT} nested image indexes"
+            )));
+        }
+
+        // Batch-read every image index blob for this level in a single archive pass.
+        let index_paths = indexes
+            .iter()
+            .map(|candidate| blob_path_from_digest(candidate.descriptor.digest().as_ref()))
+            .collect::<ImageResult<HashSet<_>>>()?;
+        let index_blobs = read_archive_entries(input, &index_paths)?;
+        let mut next = Vec::new();
+
+        for candidate in indexes {
+            let index_path = blob_path_from_digest(candidate.descriptor.digest().as_ref())?;
+            let index_bytes = index_blobs.get(&index_path).ok_or_else(|| {
+                ImageError::ManifestParse(format!(
+                    "OCI layout missing image index blob {index_path}"
+                ))
+            })?;
+            verify_descriptor_blob(&candidate.descriptor, index_bytes)?;
+            let index: oci_spec::image::ImageIndex = serde_json::from_slice(index_bytes)
+                .map_err(|e| ImageError::ManifestParse(format!("OCI image index: {e}")))?;
+
+            for (child_index, descriptor) in index.manifests().iter().cloned().enumerate() {
+                let mut tree_path = candidate.tree_path.clone();
+                tree_path.push(child_index);
+                next.push(OciManifestCandidate {
+                    descriptor,
+                    reference: candidate.reference.clone(),
+                    tree_path,
+                });
+            }
+        }
+
+        pending = next;
+        depth += 1;
+    }
+
+    resolved.sort_by(|left, right| left.tree_path.cmp(&right.tree_path));
+
+    Ok(resolved)
 }
 
 fn is_oci_image_manifest_descriptor(descriptor: &oci_spec::image::Descriptor) -> bool {
@@ -940,6 +1313,14 @@ fn is_oci_image_manifest_descriptor(descriptor: &oci_spec::image::Descriptor) ->
         oci_spec::image::MediaType::ImageManifest
     ) || descriptor.media_type().to_string()
         == "application/vnd.docker.distribution.manifest.v2+json"
+}
+
+fn is_oci_image_index_descriptor(descriptor: &oci_spec::image::Descriptor) -> bool {
+    matches!(
+        descriptor.media_type(),
+        oci_spec::image::MediaType::ImageIndex
+    ) || descriptor.media_type().to_string()
+        == "application/vnd.docker.distribution.manifest.list.v2+json"
 }
 
 fn descriptor_matches_platform(descriptor: &oci_spec::image::Descriptor, host: &Platform) -> bool {
@@ -1206,10 +1587,8 @@ fn append_erofs_entry<W: Write>(
             if let Some(first_path) = hardlinks.get(&entry.nid) {
                 header.set_entry_type(tar::EntryType::Link);
                 header.set_size(0);
-                header.set_link_name(first_path).map_err(ImageError::Io)?;
-                header.set_cksum();
                 builder
-                    .append_data(&mut header, &entry.path, io::empty())
+                    .append_link(&mut header, &entry.path, first_path)
                     .map_err(ImageError::Io)?;
                 return Ok(());
             }
@@ -1235,13 +1614,7 @@ fn append_erofs_entry<W: Write>(
             header.set_entry_type(tar::EntryType::Symlink);
             header.set_size(0);
             let target = reader.read_link_by_nid(entry.nid).map_err(ImageError::Io)?;
-            header
-                .set_link_name_literal(target)
-                .map_err(ImageError::Io)?;
-            header.set_cksum();
-            builder
-                .append_data(&mut header, &entry.path, io::empty())
-                .map_err(ImageError::Io)?;
+            builder.append_link_literal(&mut header, &entry.path, &target)?;
         }
         ErofsEntryKind::CharDevice | ErofsEntryKind::BlockDevice => {
             header.set_entry_type(if entry.kind == ErofsEntryKind::CharDevice {
@@ -1691,6 +2064,87 @@ mod tests {
     }
 
     #[test]
+    fn oci_layout_archive_loads_nested_indexes() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let temp = tempdir().unwrap();
+        let input = temp.path().join("nested-oci-layout.tar");
+        write_test_nested_oci_archive(&input, Some("nested:latest"), simple_layer_tar(), 2);
+
+        let loaded = runtime
+            .block_on(load_archive(
+                &temp.path().join("cache"),
+                &input,
+                ImageLoadOptions::default(),
+            ))
+            .unwrap();
+
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].reference, "nested:latest");
+        assert_eq!(
+            loaded[0].metadata.config.cmd,
+            Some(vec!["cat".into(), "/hello.txt".into()])
+        );
+    }
+
+    #[test]
+    fn oci_layout_nested_index_without_reference_uses_explicit_tag() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let temp = tempdir().unwrap();
+        let input = temp.path().join("untagged-nested-oci-layout.tar");
+        write_test_nested_oci_archive(&input, None, simple_layer_tar(), 1);
+
+        let loaded = runtime
+            .block_on(load_archive(
+                &temp.path().join("cache"),
+                &input,
+                ImageLoadOptions {
+                    tags: vec!["explicit:latest".into()],
+                    ..ImageLoadOptions::default()
+                },
+            ))
+            .unwrap();
+
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].reference, "explicit:latest");
+    }
+
+    #[test]
+    fn oci_layout_nested_index_skips_incompatible_and_unknown_siblings() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let temp = tempdir().unwrap();
+        let input = temp.path().join("mixed-nested-oci-layout.tar");
+        // The nested index level holds three siblings: a host-compatible image
+        // index that resolves to a valid manifest, an incompatible-platform image
+        // index, and an unknown media type. The latter two point at blobs left out
+        // of the archive, so a successful load proves neither branch was traversed.
+        write_test_mixed_nested_oci_archive(&input, "mixed-nested:latest", simple_layer_tar());
+
+        let loaded = runtime
+            .block_on(load_archive(
+                &temp.path().join("cache"),
+                &input,
+                ImageLoadOptions::default(),
+            ))
+            .unwrap();
+
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].reference, "mixed-nested:latest");
+        assert_eq!(
+            loaded[0].metadata.config.cmd,
+            Some(vec!["cat".into(), "/hello.txt".into()])
+        );
+    }
+
+    #[test]
     fn docker_archive_save_preserves_layer_semantics() {
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -1774,6 +2228,86 @@ mod tests {
     }
 
     #[test]
+    fn docker_archive_save_preserves_long_link_targets() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let temp = tempdir().unwrap();
+        let input = temp.path().join("long-links.tar");
+        let long_target = format!("deep/{}config.txt", "component/".repeat(12));
+        let long_symlink_path = format!("links/{}link", "component/".repeat(12));
+        let relative_symlink_target = "../../etc/passwd";
+        let short_symlink_target = r"..\..\etc\passwd";
+        let long_symlink_target = format!(r"..\{}..\etc\passwd", "component\\".repeat(12));
+        let mut layer_bytes = Vec::new();
+        {
+            let mut layer = tar::Builder::new(&mut layer_bytes);
+            append_test_file(&mut layer, &long_target, b"shared config\n", 0o644, 0, 0, 1);
+            append_test_hardlink(&mut layer, "zz-hardlink", &long_target);
+            append_test_symlink(&mut layer, "zz-relative-symlink", relative_symlink_target);
+            append_test_symlink(&mut layer, "zz-short-symlink", short_symlink_target);
+            append_test_symlink(&mut layer, &long_symlink_path, &long_symlink_target);
+            layer.finish().unwrap();
+        }
+        write_test_docker_archive_from_layer(&input, "long-links:latest", layer_bytes);
+
+        let first_cache = temp.path().join("cache-1");
+        let loaded = runtime
+            .block_on(load_archive(
+                &first_cache,
+                &input,
+                ImageLoadOptions::default(),
+            ))
+            .unwrap();
+
+        let saved = temp.path().join("saved-long-links.tar");
+        let request = save_request_from_loaded(&loaded[0]);
+        let cache = GlobalCache::new(&first_cache).unwrap();
+        save_docker_archive(&cache, &saved, &[request]).unwrap();
+
+        let entries = saved_layer_entries(&saved);
+        assert_eq!(
+            entries.get("zz-hardlink").unwrap().link_name.as_deref(),
+            Some(long_target.as_str())
+        );
+        assert_eq!(
+            entries
+                .get("zz-short-symlink")
+                .unwrap()
+                .link_name
+                .as_deref(),
+            Some(short_symlink_target)
+        );
+        assert_eq!(
+            entries
+                .get("zz-relative-symlink")
+                .unwrap()
+                .link_name
+                .as_deref(),
+            Some(relative_symlink_target)
+        );
+        assert_eq!(
+            entries
+                .get(&long_symlink_path)
+                .unwrap()
+                .link_name
+                .as_deref(),
+            Some(long_symlink_target.as_str())
+        );
+
+        let second_cache = temp.path().join("cache-2");
+        let reloaded = runtime
+            .block_on(load_archive(
+                &second_cache,
+                &saved,
+                ImageLoadOptions::default(),
+            ))
+            .unwrap();
+        assert_eq!(reloaded[0].reference, "long-links:latest");
+    }
+
+    #[test]
     fn docker_archive_save_preserves_raw_config_fields() {
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -1838,6 +2372,225 @@ mod tests {
         assert_eq!(saved_config["history"][0]["comment"], "keep me");
     }
 
+    #[test]
+    fn oci_load_hits_early_cache_gate_when_materialized() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let temp = tempdir().unwrap();
+        let input = temp.path().join("gate.tar");
+        write_test_oci_archive_from_layer(&input, "gate:latest", simple_layer_tar());
+        let cache = temp.path().join("cache");
+
+        // First load materializes the image (layer EROFS + fsmeta + VMDK).
+        let loaded = runtime
+            .block_on(load_archive(&cache, &input, ImageLoadOptions::default()))
+            .unwrap();
+        assert_eq!(loaded.len(), 1);
+
+        // A second load must take the early cache gate: the metadata is rebuilt from the manifest + config blobs alone, and no layer blob is staged.
+        let prepared =
+            load_oci_archive_blocking(&cache, &input, ImageLoadOptions::default()).unwrap();
+        assert!(
+            prepared.staged_layers.is_empty(),
+            "early cache gate should skip staging layer blobs on a warm cache"
+        );
+        assert_eq!(prepared.images.len(), 1);
+        assert_eq!(prepared.images[0].reference, "gate:latest");
+        assert_eq!(
+            prepared.images[0].metadata.manifest_digest,
+            loaded[0].metadata.manifest_digest,
+        );
+    }
+
+    #[test]
+    fn docker_load_hits_early_cache_gate_when_materialized() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let temp = tempdir().unwrap();
+        let input = temp.path().join("gate.tar");
+        write_test_docker_archive(&input, "gate-docker:latest");
+        let cache = temp.path().join("cache");
+
+        // First load materializes the image and records its metadata by reference.
+        let loaded = runtime
+            .block_on(load_archive(&cache, &input, ImageLoadOptions::default()))
+            .unwrap();
+        assert_eq!(loaded.len(), 1);
+
+        // A second load must take the early cache gate: the cached metadata is found by reference (RepoTags) and no layer blob is staged.
+        let prepared = load_archive_blocking(&cache, &input, ImageLoadOptions::default()).unwrap();
+        assert!(
+            prepared.staged_layers.is_empty(),
+            "early cache gate should skip staging layer blobs on a warm cache"
+        );
+        assert_eq!(prepared.images.len(), 1);
+        assert_eq!(prepared.images[0].reference, "gate-docker:latest");
+        assert_eq!(
+            prepared.images[0].metadata.manifest_digest,
+            loaded[0].metadata.manifest_digest,
+        );
+    }
+
+    #[test]
+    fn docker_load_misses_gate_after_content_change() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let temp = tempdir().unwrap();
+        let cache = temp.path().join("cache");
+
+        // Materialize `app:latest` from one layer, recording metadata under that ref.
+        let first = temp.path().join("first.tar");
+        write_test_docker_archive_from_layer(&first, "app:latest", simple_layer_tar());
+        runtime
+            .block_on(load_archive(&cache, &first, ImageLoadOptions::default()))
+            .unwrap();
+
+        // Rebuild `app:latest` with different content (a new layer) and reload. The diff_ids no longer match the cached metadata, so the gate must fall through to
+        // staging rather than reuse the stale image.
+        let second = temp.path().join("second.tar");
+        write_test_docker_archive_from_layer(&second, "app:latest", complex_layer_tar());
+        let prepared = load_archive_blocking(&cache, &second, ImageLoadOptions::default()).unwrap();
+        assert!(
+            !prepared.staged_layers.is_empty(),
+            "a rebuilt tag with new content must not hit the gate"
+        );
+    }
+
+    #[test]
+    fn docker_load_misses_gate_after_config_change() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let temp = tempdir().unwrap();
+        let cache = temp.path().join("cache");
+        let layer_bytes = simple_layer_tar();
+        let diff_id = format!("sha256:{}", sha256_hex(&layer_bytes));
+
+        // Materialize the first image under `app:latest`.
+        let first = temp.path().join("first.tar");
+        write_test_docker_archive_from_layer(&first, "app:latest", layer_bytes.clone());
+        runtime
+            .block_on(load_archive(&cache, &first, ImageLoadOptions::default()))
+            .unwrap();
+
+        // Rebuild the same filesystem layer with a different image config. Diff IDs
+        // alone would hit the old gate, but the config digest must force a miss.
+        let second = temp.path().join("second.tar");
+        let config_bytes = test_config_bytes_with_cmd(&diff_id, &["sh", "-c", "echo changed"]);
+        write_test_docker_archive_entries(
+            &second,
+            "app:latest",
+            format!("{}.json", sha256_hex(&config_bytes)),
+            "layer/layer.tar".into(),
+            config_bytes,
+            layer_bytes,
+        );
+
+        let prepared = load_archive_blocking(&cache, &second, ImageLoadOptions::default()).unwrap();
+        assert!(
+            !prepared.staged_layers.is_empty(),
+            "a config-only rebuild must not reuse stale cached metadata"
+        );
+        let expected_cmd = vec!["sh".into(), "-c".into(), "echo changed".into()];
+        assert_eq!(
+            prepared.images[0].metadata.config.cmd.as_ref(),
+            Some(&expected_cmd)
+        );
+    }
+
+    #[test]
+    fn docker_load_rejects_warm_archive_missing_layer_entry() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let temp = tempdir().unwrap();
+        let cache = temp.path().join("cache");
+        let layer_bytes = simple_layer_tar();
+
+        let valid = temp.path().join("valid.tar");
+        write_test_docker_archive_from_layer(&valid, "app:latest", layer_bytes.clone());
+        runtime
+            .block_on(load_archive(&cache, &valid, ImageLoadOptions::default()))
+            .unwrap();
+
+        let missing_layer = temp.path().join("missing-layer.tar");
+        write_test_docker_archive_without_layer(&missing_layer, "app:latest", layer_bytes);
+        let err =
+            load_archive_blocking(&cache, &missing_layer, ImageLoadOptions::default()).unwrap_err();
+        match err {
+            ImageError::ManifestParse(message) => {
+                assert!(message.contains("docker archive missing layer layer/layer.tar"));
+            }
+            other => panic!("expected missing layer error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn oci_load_rejects_warm_archive_missing_layer_entry() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let temp = tempdir().unwrap();
+        let cache = temp.path().join("cache");
+        let layer_bytes = simple_layer_tar();
+
+        let valid = temp.path().join("valid.tar");
+        write_test_oci_archive_from_layer(&valid, "app:latest", layer_bytes.clone());
+        runtime
+            .block_on(load_archive(&cache, &valid, ImageLoadOptions::default()))
+            .unwrap();
+
+        let missing_layer = temp.path().join("missing-layer.tar");
+        write_test_oci_archive_without_layer(&missing_layer, "app:latest", layer_bytes);
+        let err = load_oci_archive_blocking(&cache, &missing_layer, ImageLoadOptions::default())
+            .unwrap_err();
+        match err {
+            ImageError::ManifestParse(message) => {
+                assert!(message.contains("OCI layout missing layer blob"));
+            }
+            other => panic!("expected missing layer error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn oci_load_rejects_warm_archive_with_mismatched_config_blob() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let temp = tempdir().unwrap();
+        let cache = temp.path().join("cache");
+        let layer_bytes = simple_layer_tar();
+        let diff_id = format!("sha256:{}", sha256_hex(&layer_bytes));
+
+        let valid = temp.path().join("valid.tar");
+        write_test_oci_archive_from_layer(&valid, "app:latest", layer_bytes.clone());
+        runtime
+            .block_on(load_archive(&cache, &valid, ImageLoadOptions::default()))
+            .unwrap();
+
+        let bad_config = test_config_bytes_with_cmd(&diff_id, &["sh", "-c", "echo changed"]);
+        let corrupt = temp.path().join("corrupt-config.tar");
+        write_test_oci_archive_with_config_blob(&corrupt, "app:latest", layer_bytes, bad_config);
+        let err =
+            load_oci_archive_blocking(&cache, &corrupt, ImageLoadOptions::default()).unwrap_err();
+        match err {
+            ImageError::ManifestParse(message) => {
+                assert!(message.contains("OCI blob sha256:"));
+            }
+            other => panic!("expected config descriptor error, got {other:?}"),
+        }
+    }
+
     fn write_test_docker_archive(path: &Path, reference: &str) {
         write_test_docker_archive_from_layer(path, reference, simple_layer_tar());
     }
@@ -1855,6 +2608,25 @@ mod tests {
             config_bytes,
             layer_bytes,
         );
+    }
+
+    fn write_test_docker_archive_without_layer(path: &Path, reference: &str, layer_bytes: Vec<u8>) {
+        let diff_id = format!("sha256:{}", sha256_hex(&layer_bytes));
+        let config_bytes = test_config_bytes(&diff_id);
+        let config_name = format!("{}.json", sha256_hex(&config_bytes));
+        let layer_name = "layer/layer.tar".to_string();
+        let manifest_bytes = serde_json::to_vec(&vec![DockerManifestOut {
+            config: config_name.clone(),
+            repo_tags: vec![reference.into()],
+            layers: vec![layer_name],
+        }])
+        .unwrap();
+
+        let file = File::create(path).unwrap();
+        let mut archive = tar::Builder::new(file);
+        append_bytes(&mut archive, &config_name, &config_bytes).unwrap();
+        append_bytes(&mut archive, "manifest.json", &manifest_bytes).unwrap();
+        archive.finish().unwrap();
     }
 
     fn write_test_docker_blob_archive_from_layer(
@@ -1875,6 +2647,223 @@ mod tests {
             config_bytes,
             layer_bytes,
         );
+    }
+
+    fn write_test_nested_oci_archive(
+        path: &Path,
+        reference: Option<&str>,
+        layer_bytes: Vec<u8>,
+        index_depth: usize,
+    ) {
+        assert!(index_depth > 0);
+
+        let diff_id = format!("sha256:{}", sha256_hex(&layer_bytes));
+        let config_bytes = test_config_bytes(&diff_id);
+        let config_hex = sha256_hex(&config_bytes);
+        let layer_hex = sha256_hex(&layer_bytes);
+        let manifest_bytes = serde_json::to_vec(&serde_json::json!({
+            "schemaVersion": 2,
+            "mediaType": OCI_MANIFEST_MEDIA_TYPE,
+            "config": {
+                "mediaType": OCI_CONFIG_MEDIA_TYPE,
+                "digest": format!("sha256:{config_hex}"),
+                "size": config_bytes.len(),
+            },
+            "layers": [{
+                "mediaType": OCI_LAYER_MEDIA_TYPE,
+                "digest": format!("sha256:{layer_hex}"),
+                "size": layer_bytes.len(),
+            }],
+        }))
+        .unwrap();
+        let manifest_hex = sha256_hex(&manifest_bytes);
+        let host = Platform::host_linux();
+        let mut target_descriptor = serde_json::json!({
+            "mediaType": OCI_MANIFEST_MEDIA_TYPE,
+            "digest": format!("sha256:{manifest_hex}"),
+            "size": manifest_bytes.len(),
+            "platform": {
+                "architecture": host.arch.to_string(),
+                "os": host.os.to_string(),
+            },
+        });
+        let mut metadata_blobs = vec![(manifest_hex, manifest_bytes)];
+
+        for _ in 0..index_depth {
+            let index_bytes = serde_json::to_vec(&serde_json::json!({
+                "schemaVersion": 2,
+                "mediaType": OCI_INDEX_MEDIA_TYPE,
+                "manifests": [target_descriptor],
+            }))
+            .unwrap();
+            let index_hex = sha256_hex(&index_bytes);
+            target_descriptor = serde_json::json!({
+                "mediaType": OCI_INDEX_MEDIA_TYPE,
+                "digest": format!("sha256:{index_hex}"),
+                "size": index_bytes.len(),
+            });
+            metadata_blobs.push((index_hex, index_bytes));
+        }
+
+        if let Some(reference) = reference {
+            target_descriptor["annotations"] = serde_json::json!({
+                (OCI_REF_NAME_ANNOTATION): reference,
+            });
+        }
+        let root_index_bytes = serde_json::to_vec(&serde_json::json!({
+            "schemaVersion": 2,
+            "mediaType": OCI_INDEX_MEDIA_TYPE,
+            "manifests": [target_descriptor],
+        }))
+        .unwrap();
+
+        let file = File::create(path).unwrap();
+        let mut archive = tar::Builder::new(file);
+        append_bytes(
+            &mut archive,
+            "oci-layout",
+            br#"{"imageLayoutVersion":"1.0.0"}"#,
+        )
+        .unwrap();
+        append_bytes(&mut archive, "index.json", &root_index_bytes).unwrap();
+        append_bytes(
+            &mut archive,
+            &format!("blobs/sha256/{config_hex}"),
+            &config_bytes,
+        )
+        .unwrap();
+        for (hex, bytes) in metadata_blobs {
+            append_bytes(&mut archive, &format!("blobs/sha256/{hex}"), &bytes).unwrap();
+        }
+        append_bytes(
+            &mut archive,
+            &format!("blobs/sha256/{layer_hex}"),
+            &layer_bytes,
+        )
+        .unwrap();
+        archive.finish().unwrap();
+    }
+
+    /// Builds an OCI layout whose nested index level mixes a resolvable
+    /// host-compatible image index with two branches that must never be read:
+    /// an incompatible-platform image index and an unknown media type. Both of
+    /// those descriptors reference blobs that are intentionally omitted from the
+    /// archive, so the load only succeeds if their branches are skipped.
+    fn write_test_mixed_nested_oci_archive(path: &Path, reference: &str, layer_bytes: Vec<u8>) {
+        let host = Platform::host_linux();
+        let diff_id = format!("sha256:{}", sha256_hex(&layer_bytes));
+        let config_bytes = test_config_bytes(&diff_id);
+        let config_hex = sha256_hex(&config_bytes);
+        let layer_hex = sha256_hex(&layer_bytes);
+
+        let manifest_bytes = serde_json::to_vec(&serde_json::json!({
+            "schemaVersion": 2,
+            "mediaType": OCI_MANIFEST_MEDIA_TYPE,
+            "config": {
+                "mediaType": OCI_CONFIG_MEDIA_TYPE,
+                "digest": format!("sha256:{config_hex}"),
+                "size": config_bytes.len(),
+            },
+            "layers": [{
+                "mediaType": OCI_LAYER_MEDIA_TYPE,
+                "digest": format!("sha256:{layer_hex}"),
+                "size": layer_bytes.len(),
+            }],
+        }))
+        .unwrap();
+        let manifest_hex = sha256_hex(&manifest_bytes);
+
+        // Host-compatible branch: an image index that resolves to the manifest.
+        let inner_index_bytes = serde_json::to_vec(&serde_json::json!({
+            "schemaVersion": 2,
+            "mediaType": OCI_INDEX_MEDIA_TYPE,
+            "manifests": [{
+                "mediaType": OCI_MANIFEST_MEDIA_TYPE,
+                "digest": format!("sha256:{manifest_hex}"),
+                "size": manifest_bytes.len(),
+                "platform": {
+                    "architecture": host.arch.to_string(),
+                    "os": host.os.to_string(),
+                },
+            }],
+        }))
+        .unwrap();
+        let inner_index_hex = sha256_hex(&inner_index_bytes);
+
+        // Digests for descriptors whose blobs are deliberately absent from the
+        // archive: reaching either branch would fail the load.
+        let absent_incompatible_hex = sha256_hex(b"absent-incompatible-platform-index");
+        let absent_unknown_hex = sha256_hex(b"absent-unknown-media-type");
+
+        // Nested index level holding the three siblings under test.
+        let mixed_index_bytes = serde_json::to_vec(&serde_json::json!({
+            "schemaVersion": 2,
+            "mediaType": OCI_INDEX_MEDIA_TYPE,
+            "manifests": [
+                {
+                    "mediaType": OCI_INDEX_MEDIA_TYPE,
+                    "digest": format!("sha256:{inner_index_hex}"),
+                    "size": inner_index_bytes.len(),
+                },
+                {
+                    "mediaType": OCI_INDEX_MEDIA_TYPE,
+                    "digest": format!("sha256:{absent_incompatible_hex}"),
+                    "size": 0,
+                    "platform": {
+                        "architecture": "sparc64",
+                        "os": "solaris",
+                    },
+                },
+                {
+                    "mediaType": "application/vnd.example.unknown.v1+json",
+                    "digest": format!("sha256:{absent_unknown_hex}"),
+                    "size": 0,
+                },
+            ],
+        }))
+        .unwrap();
+        let mixed_index_hex = sha256_hex(&mixed_index_bytes);
+
+        // Root index nests the mixed level one level below index.json and carries
+        // the reference annotation so it propagates to the resolved manifest.
+        let root_index_bytes = serde_json::to_vec(&serde_json::json!({
+            "schemaVersion": 2,
+            "mediaType": OCI_INDEX_MEDIA_TYPE,
+            "manifests": [{
+                "mediaType": OCI_INDEX_MEDIA_TYPE,
+                "digest": format!("sha256:{mixed_index_hex}"),
+                "size": mixed_index_bytes.len(),
+                "annotations": {
+                    (OCI_REF_NAME_ANNOTATION): reference,
+                },
+            }],
+        }))
+        .unwrap();
+
+        let file = File::create(path).unwrap();
+        let mut archive = tar::Builder::new(file);
+        append_bytes(
+            &mut archive,
+            "oci-layout",
+            br#"{"imageLayoutVersion":"1.0.0"}"#,
+        )
+        .unwrap();
+        append_bytes(&mut archive, "index.json", &root_index_bytes).unwrap();
+        for (hex, bytes) in [
+            (config_hex, config_bytes),
+            (manifest_hex, manifest_bytes),
+            (inner_index_hex, inner_index_bytes),
+            (mixed_index_hex, mixed_index_bytes),
+        ] {
+            append_bytes(&mut archive, &format!("blobs/sha256/{hex}"), &bytes).unwrap();
+        }
+        append_bytes(
+            &mut archive,
+            &format!("blobs/sha256/{layer_hex}"),
+            &layer_bytes,
+        )
+        .unwrap();
+        archive.finish().unwrap();
     }
 
     fn write_test_oci_archive_from_layer(path: &Path, reference: &str, layer_bytes: Vec<u8>) {
@@ -1947,6 +2936,111 @@ mod tests {
         archive.finish().unwrap();
     }
 
+    fn write_test_oci_archive_without_layer(path: &Path, reference: &str, layer_bytes: Vec<u8>) {
+        let diff_id = format!("sha256:{}", sha256_hex(&layer_bytes));
+        let config_bytes = test_config_bytes(&diff_id);
+        let config_hex = sha256_hex(&config_bytes);
+        let layer_hex = sha256_hex(&layer_bytes);
+        let manifest_bytes = serde_json::to_vec(&serde_json::json!({
+            "schemaVersion": 2,
+            "mediaType": OCI_MANIFEST_MEDIA_TYPE,
+            "config": {
+                "mediaType": OCI_CONFIG_MEDIA_TYPE,
+                "digest": format!("sha256:{config_hex}"),
+                "size": config_bytes.len(),
+            },
+            "layers": [{
+                "mediaType": OCI_LAYER_MEDIA_TYPE,
+                "digest": format!("sha256:{layer_hex}"),
+                "size": layer_bytes.len(),
+            }],
+        }))
+        .unwrap();
+        let manifest_hex = sha256_hex(&manifest_bytes);
+        let index_bytes = test_oci_index_bytes(reference, &manifest_hex, manifest_bytes.len());
+
+        let file = File::create(path).unwrap();
+        let mut archive = tar::Builder::new(file);
+        append_bytes(
+            &mut archive,
+            "oci-layout",
+            br#"{"imageLayoutVersion":"1.0.0"}"#,
+        )
+        .unwrap();
+        append_bytes(&mut archive, "index.json", &index_bytes).unwrap();
+        append_bytes(
+            &mut archive,
+            &format!("blobs/sha256/{config_hex}"),
+            &config_bytes,
+        )
+        .unwrap();
+        append_bytes(
+            &mut archive,
+            &format!("blobs/sha256/{manifest_hex}"),
+            &manifest_bytes,
+        )
+        .unwrap();
+        archive.finish().unwrap();
+    }
+
+    fn write_test_oci_archive_with_config_blob(
+        path: &Path,
+        reference: &str,
+        layer_bytes: Vec<u8>,
+        stored_config_bytes: Vec<u8>,
+    ) {
+        let diff_id = format!("sha256:{}", sha256_hex(&layer_bytes));
+        let manifest_config_bytes = test_config_bytes(&diff_id);
+        let config_hex = sha256_hex(&manifest_config_bytes);
+        let layer_hex = sha256_hex(&layer_bytes);
+        let manifest_bytes = serde_json::to_vec(&serde_json::json!({
+            "schemaVersion": 2,
+            "mediaType": OCI_MANIFEST_MEDIA_TYPE,
+            "config": {
+                "mediaType": OCI_CONFIG_MEDIA_TYPE,
+                "digest": format!("sha256:{config_hex}"),
+                "size": manifest_config_bytes.len(),
+            },
+            "layers": [{
+                "mediaType": OCI_LAYER_MEDIA_TYPE,
+                "digest": format!("sha256:{layer_hex}"),
+                "size": layer_bytes.len(),
+            }],
+        }))
+        .unwrap();
+        let manifest_hex = sha256_hex(&manifest_bytes);
+        let index_bytes = test_oci_index_bytes(reference, &manifest_hex, manifest_bytes.len());
+
+        let file = File::create(path).unwrap();
+        let mut archive = tar::Builder::new(file);
+        append_bytes(
+            &mut archive,
+            "oci-layout",
+            br#"{"imageLayoutVersion":"1.0.0"}"#,
+        )
+        .unwrap();
+        append_bytes(&mut archive, "index.json", &index_bytes).unwrap();
+        append_bytes(
+            &mut archive,
+            &format!("blobs/sha256/{config_hex}"),
+            &stored_config_bytes,
+        )
+        .unwrap();
+        append_bytes(
+            &mut archive,
+            &format!("blobs/sha256/{manifest_hex}"),
+            &manifest_bytes,
+        )
+        .unwrap();
+        append_bytes(
+            &mut archive,
+            &format!("blobs/sha256/{layer_hex}"),
+            &layer_bytes,
+        )
+        .unwrap();
+        archive.finish().unwrap();
+    }
+
     fn simple_layer_tar() -> Vec<u8> {
         let mut layer_bytes = Vec::new();
         {
@@ -1970,17 +3064,42 @@ mod tests {
     }
 
     fn test_config_bytes(diff_id: &str) -> Vec<u8> {
+        test_config_bytes_with_cmd(diff_id, &["cat", "/hello.txt"])
+    }
+
+    fn test_config_bytes_with_cmd(diff_id: &str, cmd: &[&str]) -> Vec<u8> {
         serde_json::to_vec(&serde_json::json!({
             "architecture": "arm64",
             "os": "linux",
             "config": {
                 "Env": ["PATH=/usr/bin"],
-                "Cmd": ["cat", "/hello.txt"],
+                "Cmd": cmd,
             },
             "rootfs": {
                 "type": "layers",
                 "diff_ids": [diff_id],
             },
+        }))
+        .unwrap()
+    }
+
+    fn test_oci_index_bytes(reference: &str, manifest_hex: &str, manifest_len: usize) -> Vec<u8> {
+        let host = Platform::host_linux();
+        serde_json::to_vec(&serde_json::json!({
+            "schemaVersion": 2,
+            "mediaType": OCI_INDEX_MEDIA_TYPE,
+            "manifests": [{
+                "mediaType": OCI_MANIFEST_MEDIA_TYPE,
+                "digest": format!("sha256:{manifest_hex}"),
+                "size": manifest_len,
+                "platform": {
+                    "architecture": host.arch.to_string(),
+                    "os": host.os.to_string(),
+                },
+                "annotations": {
+                    (OCI_REF_NAME_ANNOTATION): reference,
+                },
+            }],
         }))
         .unwrap()
     }
@@ -2089,20 +3208,18 @@ mod tests {
     fn append_test_hardlink(layer: &mut tar::Builder<&mut Vec<u8>>, path: &str, target: &str) {
         let mut header = tar::Header::new_gnu();
         header.set_entry_type(tar::EntryType::Link);
-        header.set_link_name(target).unwrap();
         header.set_size(0);
-        header.set_cksum();
-        layer.append_data(&mut header, path, io::empty()).unwrap();
+        layer.append_link(&mut header, path, target).unwrap();
     }
 
     fn append_test_symlink(layer: &mut tar::Builder<&mut Vec<u8>>, path: &str, target: &str) {
         let mut header = tar::Header::new_gnu();
         header.set_entry_type(tar::EntryType::Symlink);
-        header.set_link_name(target).unwrap();
         header.set_mode(0o777);
         header.set_size(0);
-        header.set_cksum();
-        layer.append_data(&mut header, path, io::empty()).unwrap();
+        layer
+            .append_link_literal(&mut header, Path::new(path), target.as_bytes())
+            .unwrap();
     }
 
     #[derive(Debug)]

@@ -1,10 +1,11 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 
-use microsandbox::snapshot::ExportOpts as RustExportOpts;
+use microsandbox::snapshot::SaveOpts as RustSaveOpts;
 use microsandbox::{
     Snapshot as RustSnapshot, SnapshotFormat as RustSnapshotFormat,
-    SnapshotHandle as RustSnapshotHandle, UpperVerifyStatus as RustUpperVerifyStatus,
+    SnapshotHandle as RustSnapshotHandle, SnapshotScope as RustSnapshotScope,
+    UpperIntegrity as RustUpperIntegrity, UpperVerifyStatus as RustUpperVerifyStatus,
 };
 use napi::bindgen_prelude::*;
 use napi_derive::napi;
@@ -27,11 +28,11 @@ pub struct JsSnapshotHandle {
     inner: RustSnapshotHandle,
 }
 
-/// Options for `Snapshot.export()`.
+/// Options for `Snapshot.save()`.
 #[derive(Default)]
-#[napi(object, js_name = "ExportOpts")]
-pub struct JsExportOpts {
-    /// Walk the parent chain and include each ancestor (no-op today).
+#[napi(object, js_name = "SaveOpts")]
+pub struct JsSaveOpts {
+    /// Walk the parent chain and include each ancestor in the archive.
     pub with_parents: Option<bool>,
     /// Bundle the OCI image cache for offline transport.
     pub with_image: Option<bool>,
@@ -41,10 +42,8 @@ pub struct JsExportOpts {
 
 /// Result of `Snapshot.verify()`.
 ///
-/// `upperKind` is `"notRecorded"` when no integrity hash was stored,
-/// or `"verified"` when the recorded hash matched the recomputed one.
-/// `upperAlgorithm` and `upperDigest` are populated only when
-/// `upperKind === "verified"`.
+/// `upperKind` is `"notRecorded"` when integrity is absent or `"verified"`
+/// when the recorded value matched. The other fields carry that binding.
 #[napi(object, js_name = "SnapshotVerifyReport")]
 pub struct JsSnapshotVerifyReport {
     pub digest: String,
@@ -68,9 +67,18 @@ pub struct JsSnapshotInfo {
     pub name: Option<String>,
     pub parent_digest: Option<String>,
     pub image_ref: String,
+    /// `"disk"` today; `"resumable"` once memory/device-state restore lands.
+    pub scope: String,
     /// `"raw"` or `"qcow2"`.
-    pub format: String,
+    pub state_kind: String,
+    pub format: Option<String>,
+    pub fstype: Option<String>,
+    pub checkpoint_manifest_digest: Option<String>,
     pub size_bytes: Option<f64>,
+    pub locality: String,
+    pub availability: String,
+    pub migration_state: String,
+    pub migration_error_code: Option<String>,
     pub created_at: f64,
     pub path: String,
 }
@@ -107,7 +115,7 @@ impl JsSnapshot {
         Ok(handles.iter().map(snapshot_handle_to_info).collect())
     }
 
-    /// Walk `dir` and parse each subdirectory's `manifest.json`. Does
+    /// Walk `dir` and parse each subdirectory's `snapshot.json`. Does
     /// not touch the local index — useful for inspecting external
     /// snapshot collections (e.g. a mounted volume of artifacts that
     /// were never imported).
@@ -143,27 +151,26 @@ impl JsSnapshot {
         Ok(n as u32)
     }
 
+    /// Bundle a snapshot into a `.tar.zst` archive. The recorded
+    /// manifest is archived as-is, so create the snapshot with
+    /// `recordIntegrity()` if receivers must verify content.
     #[napi]
-    pub async fn export(
-        name_or_path: String,
-        out: String,
-        opts: Option<JsExportOpts>,
-    ) -> Result<()> {
+    pub async fn save(name_or_path: String, out: String, opts: Option<JsSaveOpts>) -> Result<()> {
         let opts = opts.unwrap_or_default();
-        let rust_opts = RustExportOpts {
+        let rust_opts = RustSaveOpts {
             with_parents: opts.with_parents.unwrap_or(false),
             with_image: opts.with_image.unwrap_or(false),
             plain_tar: opts.plain_tar.unwrap_or(false),
         };
-        RustSnapshot::export(&name_or_path, &PathBuf::from(out), rust_opts)
+        RustSnapshot::save(&name_or_path, &PathBuf::from(out), rust_opts)
             .await
             .map_err(to_napi_error)
     }
 
-    #[napi(js_name = "import")]
-    pub async fn import_(archive: String, dest: Option<String>) -> Result<JsSnapshotHandle> {
+    #[napi]
+    pub async fn load(archive: String, dest: Option<String>) -> Result<JsSnapshotHandle> {
         let dest = dest.map(PathBuf::from);
-        let h = RustSnapshot::import(&PathBuf::from(archive), dest.as_deref())
+        let h = RustSnapshot::load(&PathBuf::from(archive), dest.as_deref())
             .await
             .map_err(to_napi_error)?;
         Ok(JsSnapshotHandle::from_rust(h))
@@ -184,8 +191,8 @@ impl JsSnapshot {
     }
 
     #[napi(getter)]
-    pub fn size_bytes(&self) -> BigInt {
-        BigInt::from(self.inner.size_bytes())
+    pub fn size_bytes(&self) -> Option<BigInt> {
+        self.inner.size_bytes().map(BigInt::from)
     }
 
     #[napi(getter)]
@@ -199,18 +206,111 @@ impl JsSnapshot {
     }
 
     #[napi(getter)]
-    pub fn format(&self) -> String {
-        format_str(self.inner.manifest().format).into()
+    pub fn state_kind(&self) -> String {
+        self.inner.manifest().state.kind().into()
     }
 
     #[napi(getter)]
-    pub fn fstype(&self) -> String {
-        self.inner.manifest().fstype.clone()
+    pub fn format(&self) -> Option<String> {
+        self.inner
+            .manifest()
+            .state
+            .as_file()
+            .map(|state| format_str(state.format).into())
+    }
+
+    #[napi(getter)]
+    pub fn fstype(&self) -> Option<String> {
+        self.inner
+            .manifest()
+            .state
+            .as_file()
+            .map(|state| state.fstype.clone())
+    }
+
+    #[napi(getter)]
+    pub fn upper_file(&self) -> Option<String> {
+        self.inner
+            .manifest()
+            .state
+            .as_file()
+            .map(|state| state.upper.file.clone())
+    }
+
+    #[napi(getter)]
+    pub fn upper_integrity_algorithm(&self) -> Option<String> {
+        self.inner
+            .manifest()
+            .state
+            .as_file()
+            .and_then(|state| state.upper.integrity.as_ref())
+            .map(|integrity| integrity.algorithm().into())
+    }
+
+    #[napi(getter)]
+    pub fn upper_integrity_digest(&self) -> Option<String> {
+        self.inner
+            .manifest()
+            .state
+            .as_file()
+            .and_then(|state| state.upper.integrity.as_ref())
+            .map(|integrity| integrity.value().into())
+    }
+
+    #[napi(getter)]
+    pub fn upper_integrity_logical_size(&self) -> Option<BigInt> {
+        self.inner
+            .manifest()
+            .state
+            .as_file()
+            .and_then(|state| state.upper.integrity.as_ref())
+            .and_then(|integrity| match integrity {
+                RustUpperIntegrity::FileMerkleBlake3V1 { logical_size, .. } => {
+                    Some(BigInt::from(*logical_size))
+                }
+                _ => None,
+            })
+    }
+
+    #[napi(getter)]
+    pub fn upper_integrity_leaf_size(&self) -> Option<u32> {
+        self.inner
+            .manifest()
+            .state
+            .as_file()
+            .and_then(|state| state.upper.integrity.as_ref())
+            .and_then(|integrity| match integrity {
+                RustUpperIntegrity::FileMerkleBlake3V1 { leaf_size, .. } => Some(*leaf_size),
+                _ => None,
+            })
+    }
+
+    #[napi(getter)]
+    pub fn checkpoint_id(&self) -> Option<String> {
+        self.inner
+            .manifest()
+            .state
+            .as_checkpoint()
+            .map(|state| state.checkpoint_id.clone())
+    }
+
+    #[napi(getter)]
+    pub fn checkpoint_manifest_digest(&self) -> Option<String> {
+        self.inner
+            .manifest()
+            .state
+            .as_checkpoint()
+            .map(|state| state.manifest.clone())
     }
 
     #[napi(getter)]
     pub fn parent(&self) -> Option<String> {
         self.inner.manifest().parent.clone()
+    }
+
+    #[napi(getter, ts_return_type = "'disk' | 'resumable'")]
+    pub fn scope(&self) -> String {
+        format_scope(self.inner.manifest().scope).into()
     }
 
     #[napi(getter)]
@@ -265,19 +365,59 @@ impl JsSnapshotHandle {
         self.inner.parent_digest().map(|s| s.to_string())
     }
 
+    #[napi(getter, ts_return_type = "'disk' | 'resumable'")]
+    pub fn scope(&self) -> String {
+        format_scope(self.inner.scope()).into()
+    }
+
     #[napi(getter)]
     pub fn image_ref(&self) -> String {
         self.inner.image_ref().to_string()
     }
 
     #[napi(getter)]
-    pub fn format(&self) -> String {
-        format_str(self.inner.format()).into()
+    pub fn state_kind(&self) -> String {
+        self.inner.state_kind().into()
+    }
+
+    #[napi(getter)]
+    pub fn format(&self) -> Option<String> {
+        self.inner.format().map(|format| format_str(format).into())
+    }
+
+    #[napi(getter)]
+    pub fn fstype(&self) -> Option<String> {
+        self.inner.fstype().map(str::to_string)
+    }
+
+    #[napi(getter)]
+    pub fn checkpoint_manifest_digest(&self) -> Option<String> {
+        self.inner.checkpoint_manifest_digest().map(str::to_string)
     }
 
     #[napi(getter)]
     pub fn size_bytes(&self) -> Option<BigInt> {
         self.inner.size_bytes().map(BigInt::from)
+    }
+
+    #[napi(getter)]
+    pub fn locality(&self) -> String {
+        self.inner.locality().into()
+    }
+
+    #[napi(getter)]
+    pub fn availability(&self) -> String {
+        self.inner.availability().into()
+    }
+
+    #[napi(getter)]
+    pub fn migration_state(&self) -> String {
+        self.inner.migration_state().into()
+    }
+
+    #[napi(getter)]
+    pub fn migration_error_code(&self) -> Option<String> {
+        self.inner.migration_error_code().map(str::to_string)
     }
 
     #[napi(getter)]
@@ -320,14 +460,29 @@ fn format_str(f: RustSnapshotFormat) -> &'static str {
     }
 }
 
+fn format_scope(scope: RustSnapshotScope) -> &'static str {
+    match scope {
+        RustSnapshotScope::Disk => "disk",
+        RustSnapshotScope::Resumable => "resumable",
+    }
+}
+
 fn snapshot_handle_to_info(h: &RustSnapshotHandle) -> JsSnapshotInfo {
     JsSnapshotInfo {
         digest: h.digest().to_string(),
         name: h.name().map(|s| s.to_string()),
         parent_digest: h.parent_digest().map(|s| s.to_string()),
         image_ref: h.image_ref().to_string(),
-        format: format_str(h.format()).into(),
+        scope: format_scope(h.scope()).into(),
+        state_kind: h.state_kind().into(),
+        format: h.format().map(|format| format_str(format).into()),
+        fstype: h.fstype().map(str::to_string),
+        checkpoint_manifest_digest: h.checkpoint_manifest_digest().map(str::to_string),
         size_bytes: h.size_bytes().map(|n| n as f64),
+        locality: h.locality().into(),
+        availability: h.availability().into(),
+        migration_state: h.migration_state().into(),
+        migration_error_code: h.migration_error_code().map(str::to_string),
         created_at: h.created_at().and_utc().timestamp_millis() as f64,
         path: h.path().display().to_string(),
     }

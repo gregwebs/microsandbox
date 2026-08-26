@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use pyo3::exceptions::PyValueError;
+use pyo3::exceptions::{PyRuntimeError, PyTypeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyDict, PyList};
 use tokio::sync::Mutex;
@@ -9,7 +9,9 @@ use tokio::sync::Mutex;
 use crate::error::to_py_err;
 use crate::exec::{PyExecHandle, PyExecOutput};
 use crate::fs::PySandboxFs;
-use crate::helpers::sandbox_builder_from_args;
+use crate::helpers::{
+    extract_str_enum, is_exact_sdk_type, sandbox_builder_from_args, str_enum_member,
+};
 use crate::metrics::PyMetricsStream;
 use crate::metrics::convert_metrics;
 use crate::sandbox_handle::PySandboxHandle;
@@ -36,6 +38,27 @@ pub struct PySandboxStopResult {
     signal: Option<i32>,
     observed_at: f64,
     source: Option<String>,
+}
+
+/// Result returned by Sandbox.ping() / SandboxHandle.ping().
+#[pyclass(name = "SandboxPingResult")]
+pub struct PySandboxPingResult {
+    name: String,
+    latency_ms: f64,
+}
+
+/// Result returned by Sandbox.touch() / SandboxHandle.touch().
+#[pyclass(name = "SandboxTouchResult")]
+pub struct PySandboxTouchResult {
+    name: String,
+    activity_seq: u64,
+}
+
+/// One page returned by Sandbox.list() / Sandbox.list_with().
+#[pyclass(name = "SandboxPage")]
+pub struct PySandboxPage {
+    sandboxes: Vec<PySandboxHandle>,
+    next_cursor: Option<String>,
 }
 
 //--------------------------------------------------------------------------------------------------
@@ -83,6 +106,50 @@ impl PySandboxStopResult {
     }
 }
 
+impl PySandboxPingResult {
+    pub fn from_rust(inner: microsandbox::sandbox::SandboxPingResult) -> Self {
+        Self {
+            name: inner.name,
+            latency_ms: inner.latency.as_secs_f64() * 1000.0,
+        }
+    }
+}
+
+impl PySandboxTouchResult {
+    pub fn from_rust(inner: microsandbox::sandbox::SandboxTouchResult) -> Self {
+        Self {
+            name: inner.name,
+            activity_seq: inner.activity_seq,
+        }
+    }
+}
+
+impl PySandboxPage {
+    fn from_rust(page: microsandbox::sandbox::SandboxPage) -> Self {
+        Self {
+            sandboxes: page
+                .sandboxes
+                .into_iter()
+                .map(PySandboxHandle::from_rust)
+                .collect(),
+            next_cursor: page.next_cursor,
+        }
+    }
+}
+
+#[pymethods]
+impl PySandboxPage {
+    #[getter]
+    fn sandboxes(&self) -> Vec<PySandboxHandle> {
+        self.sandboxes.clone()
+    }
+
+    #[getter]
+    fn next_cursor(&self) -> Option<&str> {
+        self.next_cursor.as_deref()
+    }
+}
+
 #[pymethods]
 impl PySandboxStopResult {
     #[getter]
@@ -91,8 +158,8 @@ impl PySandboxStopResult {
     }
 
     #[getter]
-    fn status(&self) -> &str {
-        &self.status
+    fn status(&self, py: Python<'_>) -> PyResult<PyObject> {
+        str_enum_member(py, "SandboxStatus", &self.status)
     }
 
     #[getter]
@@ -117,10 +184,47 @@ impl PySandboxStopResult {
 }
 
 #[pymethods]
+impl PySandboxPingResult {
+    #[getter]
+    fn name(&self) -> &str {
+        &self.name
+    }
+
+    #[getter]
+    fn latency_ms(&self) -> f64 {
+        self.latency_ms
+    }
+}
+
+#[pymethods]
+impl PySandboxTouchResult {
+    #[getter]
+    fn name(&self) -> &str {
+        &self.name
+    }
+
+    #[getter]
+    fn activity_seq(&self) -> u64 {
+        self.activity_seq
+    }
+}
+
+#[pymethods]
 impl PySandbox {
     //----------------------------------------------------------------------------------------------
     // Static Methods — Creation
     //----------------------------------------------------------------------------------------------
+
+    /// Backend retained by this sandbox (`"local"` or `"cloud"`).
+    #[getter]
+    fn backend_kind(&self) -> PyResult<String> {
+        let guard = self
+            .inner
+            .try_lock()
+            .map_err(|_| pyo3::exceptions::PyRuntimeError::new_err("sandbox is busy"))?;
+        let sandbox = guard.as_ref().ok_or_else(crate::error::consumed)?;
+        Ok(sandbox.backend_kind().as_str().to_string())
+    }
 
     /// Create a sandbox from a name and keyword-only configuration.
     ///
@@ -220,48 +324,43 @@ impl PySandbox {
         })
     }
 
-    /// List all sandboxes.
+    /// List the first page of sandboxes.
     #[staticmethod]
     fn list<'py>(py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
-            let handles = microsandbox::sandbox::Sandbox::list()
+            let page = microsandbox::sandbox::Sandbox::list()
                 .await
                 .map_err(to_py_err)?;
-            let py_handles: Vec<PySandboxHandle> = handles
-                .into_iter()
-                .map(PySandboxHandle::from_rust)
-                .collect();
-            Ok(py_handles)
+            Ok(PySandboxPage::from_rust(page))
         })
     }
 
-    /// List sandboxes matching the given labels.
+    /// List a configured page of sandboxes.
     #[staticmethod]
-    #[pyo3(signature = (*, labels = None))]
+    #[pyo3(signature = (*, cursor = None, limit = None, labels = None))]
     fn list_with<'py>(
         py: Python<'py>,
+        cursor: Option<String>,
+        limit: Option<u32>,
         labels: Option<HashMap<String, String>>,
     ) -> PyResult<Bound<'py, PyAny>> {
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
-            let handles = match labels {
-                Some(labels) if !labels.is_empty() => {
-                    let filter = labels.into_iter().fold(
-                        microsandbox::sandbox::SandboxFilter::new(),
-                        |filter, (key, value)| filter.label(key, value),
-                    );
-                    microsandbox::sandbox::Sandbox::list_with(filter)
-                        .await
-                        .map_err(to_py_err)?
+            let page = microsandbox::sandbox::Sandbox::list_with(|list| {
+                let mut list = list;
+                if let Some(limit) = limit {
+                    list = list.limit(limit);
                 }
-                _ => microsandbox::sandbox::Sandbox::list()
-                    .await
-                    .map_err(to_py_err)?,
-            };
-            let py_handles: Vec<PySandboxHandle> = handles
-                .into_iter()
-                .map(PySandboxHandle::from_rust)
-                .collect();
-            Ok(py_handles)
+                if let Some(cursor) = cursor {
+                    list = list.cursor(cursor);
+                }
+                if let Some(labels) = labels {
+                    list = list.labels(labels);
+                }
+                list
+            })
+            .await
+            .map_err(to_py_err)?;
+            Ok(PySandboxPage::from_rust(page))
         })
     }
 
@@ -320,6 +419,78 @@ impl PySandbox {
     //----------------------------------------------------------------------------------------------
     // Execution
     //----------------------------------------------------------------------------------------------
+
+    /// Execute the sandbox's effective OCI entrypoint and CMD.
+    #[allow(clippy::too_many_arguments)]
+    #[pyo3(signature = (
+        *,
+        cwd = None,
+        user = None,
+        env = None,
+        timeout = None,
+        stdin = None,
+        tty = false,
+        rlimits = None,
+    ))]
+    fn exec_default<'py>(
+        &self,
+        py: Python<'py>,
+        cwd: Option<String>,
+        user: Option<String>,
+        env: Option<HashMap<String, String>>,
+        timeout: Option<f64>,
+        stdin: Option<&Bound<'py, PyAny>>,
+        tty: bool,
+        rlimits: Option<&Bound<'py, PyAny>>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let inner = self.inner.clone();
+        let opts = parse_shell_call(cwd, user, env, timeout, stdin, tty, rlimits)?;
+
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let sandbox = Self::clone_sandbox(&inner).await?;
+            let output = sandbox
+                .exec_default_with(|e| apply_exec_options(e, Vec::new(), opts))
+                .await
+                .map_err(to_py_err)?;
+            Ok(PyExecOutput::from_rust(output))
+        })
+    }
+
+    /// Execute the sandbox's effective OCI entrypoint and CMD with streaming I/O.
+    #[allow(clippy::too_many_arguments)]
+    #[pyo3(signature = (
+        *,
+        cwd = None,
+        user = None,
+        env = None,
+        timeout = None,
+        stdin = None,
+        tty = false,
+        rlimits = None,
+    ))]
+    fn exec_default_stream<'py>(
+        &self,
+        py: Python<'py>,
+        cwd: Option<String>,
+        user: Option<String>,
+        env: Option<HashMap<String, String>>,
+        timeout: Option<f64>,
+        stdin: Option<&Bound<'py, PyAny>>,
+        tty: bool,
+        rlimits: Option<&Bound<'py, PyAny>>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let inner = self.inner.clone();
+        let opts = parse_shell_call(cwd, user, env, timeout, stdin, tty, rlimits)?;
+
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let sandbox = Self::clone_sandbox(&inner).await?;
+            let handle = sandbox
+                .exec_default_stream_with(|e| apply_exec_options(e, Vec::new(), opts))
+                .await
+                .map_err(to_py_err)?;
+            Ok(PyExecHandle::from_rust(handle))
+        })
+    }
 
     /// Execute a command and wait for completion.
     #[allow(clippy::too_many_arguments)]
@@ -490,6 +661,35 @@ impl PySandbox {
     // Attach
     //----------------------------------------------------------------------------------------------
 
+    /// Attach to the sandbox's effective OCI entrypoint and CMD.
+    #[pyo3(signature = (
+        *,
+        cwd = None,
+        user = None,
+        env = None,
+        detach_keys = None,
+    ))]
+    fn attach_default<'py>(
+        &self,
+        py: Python<'py>,
+        cwd: Option<String>,
+        user: Option<String>,
+        env: Option<HashMap<String, String>>,
+        detach_keys: Option<String>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let inner = self.inner.clone();
+        let (args, opts) = parse_attach_call(None, cwd, user, env, detach_keys)?;
+
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let sandbox = Self::clone_sandbox(&inner).await?;
+            let exit_code = sandbox
+                .attach_default_with(|a| apply_attach_options(a, args, opts))
+                .await
+                .map_err(to_py_err)?;
+            Ok(exit_code)
+        })
+    }
+
     /// Attach to the sandbox with an interactive terminal session.
     /// Note: attach requires a real terminal (PTY) and blocks the calling thread.
     /// This is primarily useful for CLI tools, not library usage.
@@ -551,6 +751,103 @@ impl PySandbox {
     }
 
     //----------------------------------------------------------------------------------------------
+    // Health
+    //----------------------------------------------------------------------------------------------
+
+    /// Check whether agentd is reachable without refreshing idle activity.
+    fn ping<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let inner = self.inner.clone();
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let sandbox = Self::clone_sandbox(&inner).await?;
+            let result = sandbox.ping().await.map_err(to_py_err)?;
+            Ok(PySandboxPingResult::from_rust(result))
+        })
+    }
+
+    /// Explicitly refresh this sandbox's idle activity timer.
+    fn touch<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let inner = self.inner.clone();
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let sandbox = Self::clone_sandbox(&inner).await?;
+            let result = sandbox.touch().await.map_err(to_py_err)?;
+            Ok(PySandboxTouchResult::from_rust(result))
+        })
+    }
+
+    /// Plan or apply a sandbox modification. Returns the plan as a dict.
+    ///
+    /// `memory` / `max_memory` / `root_disk_size` are in MiB. `policy` is a
+    /// `ModificationPolicy`; with `dry_run=True` the plan is computed without
+    /// applying anything.
+    ///
+    /// `secrets` maps secret names to spec dicts with at most one of
+    /// `"env"` / `"value"` / `"store"`, plus optional `"placeholder"` and
+    /// `"allowed_hosts"`. `secrets_rm` removes secrets by name.
+    #[pyo3(signature = (
+        *,
+        cpus = None,
+        max_cpus = None,
+        memory = None,
+        max_memory = None,
+        root_disk_size = None,
+        env = None,
+        env_rm = None,
+        labels = None,
+        labels_rm = None,
+        workdir = None,
+        secrets = None,
+        secrets_rm = None,
+        policy = None,
+        dry_run = false,
+    ))]
+    #[allow(clippy::too_many_arguments)]
+    fn modify<'py>(
+        &self,
+        py: Python<'py>,
+        cpus: Option<u8>,
+        max_cpus: Option<u8>,
+        memory: Option<u32>,
+        max_memory: Option<u32>,
+        root_disk_size: Option<u32>,
+        env: Option<HashMap<String, String>>,
+        env_rm: Option<Vec<String>>,
+        labels: Option<HashMap<String, String>>,
+        labels_rm: Option<Vec<String>>,
+        workdir: Option<String>,
+        secrets: Option<HashMap<String, HashMap<String, Py<PyAny>>>>,
+        secrets_rm: Option<Vec<String>>,
+        policy: Option<Py<PyAny>>,
+        dry_run: bool,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let inner = self.inner.clone();
+        let secrets = build_secret_patches(py, secrets)?;
+        let patch = build_modify_patch(
+            cpus,
+            max_cpus,
+            memory,
+            max_memory,
+            root_disk_size,
+            env,
+            env_rm,
+            labels,
+            labels_rm,
+            workdir,
+            secrets,
+            secrets_rm,
+        );
+        let policy = policy
+            .as_ref()
+            .map(|value| extract_str_enum(value.bind(py), "ModificationPolicy"))
+            .transpose()?;
+        let policy = parse_modify_policy(policy.as_deref())?;
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let sandbox = Self::clone_sandbox(&inner).await?;
+            let builder = apply_modify_policy(sandbox.modify().with_patch(patch), policy);
+            run_modify(builder, dry_run).await
+        })
+    }
+
+    //----------------------------------------------------------------------------------------------
     // Logs
     //----------------------------------------------------------------------------------------------
 
@@ -565,10 +862,10 @@ impl PySandbox {
         tail: Option<usize>,
         since_ms: Option<f64>,
         until_ms: Option<f64>,
-        sources: Option<Vec<String>>,
+        sources: Option<Vec<Py<PyAny>>>,
     ) -> PyResult<Bound<'py, PyAny>> {
         let inner = self.inner.clone();
-        let opts = crate::logs::parse_log_options(tail, since_ms, until_ms, sources)?;
+        let opts = crate::logs::parse_log_options(py, tail, since_ms, until_ms, sources)?;
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
             let sandbox = Self::clone_sandbox(&inner).await?;
             let entries = sandbox.logs(&opts).await.map_err(to_py_err)?;
@@ -607,7 +904,7 @@ impl PySandbox {
     fn log_stream<'py>(
         &self,
         py: Python<'py>,
-        sources: Option<Vec<String>>,
+        sources: Option<Vec<Py<PyAny>>>,
         since_ms: Option<f64>,
         from_cursor: Option<String>,
         until_ms: Option<f64>,
@@ -615,6 +912,7 @@ impl PySandbox {
     ) -> PyResult<Bound<'py, PyAny>> {
         let inner = self.inner.clone();
         let opts = crate::logs::parse_log_stream_options(
+            py,
             sources,
             since_ms,
             from_cursor,
@@ -797,6 +1095,312 @@ impl PySandbox {
 }
 
 //--------------------------------------------------------------------------------------------------
+// Functions: Modification
+//--------------------------------------------------------------------------------------------------
+
+/// Build the canonical modification patch from `modify(...)` kwargs.
+///
+/// Mapping keys are sorted so repeated calls with the same arguments produce
+/// the same patch (and therefore the same plan ordering).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn build_modify_patch(
+    cpus: Option<u8>,
+    max_cpus: Option<u8>,
+    memory: Option<u32>,
+    max_memory: Option<u32>,
+    root_disk_size: Option<u32>,
+    env: Option<HashMap<String, String>>,
+    env_rm: Option<Vec<String>>,
+    labels: Option<HashMap<String, String>>,
+    labels_rm: Option<Vec<String>>,
+    workdir: Option<String>,
+    secrets: Vec<microsandbox::sandbox::SecretModificationPatch>,
+    secrets_rm: Option<Vec<String>>,
+) -> microsandbox::sandbox::SandboxModificationPatch {
+    let mut env_pairs: Vec<_> = env.unwrap_or_default().into_iter().collect();
+    env_pairs.sort();
+    let mut label_pairs: Vec<_> = labels.unwrap_or_default().into_iter().collect();
+    label_pairs.sort();
+
+    microsandbox::sandbox::SandboxModificationPatch {
+        cpus,
+        max_cpus,
+        memory_mib: memory,
+        max_memory_mib: max_memory,
+        root_disk_size_mib: root_disk_size,
+        env: env_pairs
+            .into_iter()
+            .map(|(key, value)| microsandbox::sandbox::EnvVar::new(key, value))
+            .collect(),
+        env_remove: env_rm.unwrap_or_default(),
+        labels: label_pairs,
+        labels_remove: labels_rm.unwrap_or_default(),
+        workdir,
+        secrets,
+        secrets_remove: secrets_rm.unwrap_or_default(),
+    }
+}
+
+/// Convert the `secrets=` kwarg into canonical secret patches, sorted by
+/// name for deterministic patch (and plan) ordering.
+///
+/// The raw value moves straight from the extracted Python string into the
+/// patch's `Zeroizing` field; no error path ever echoes secret material.
+pub(crate) fn build_secret_patches(
+    py: Python<'_>,
+    secrets: Option<HashMap<String, HashMap<String, Py<PyAny>>>>,
+) -> PyResult<Vec<microsandbox::sandbox::SecretModificationPatch>> {
+    use microsandbox::sandbox::{SecretModificationPatch, SecretSource};
+
+    let mut entries: Vec<_> = secrets.unwrap_or_default().into_iter().collect();
+    entries.sort_by(|(a, _), (b, _)| a.cmp(b));
+
+    let mut patches = Vec::with_capacity(entries.len());
+    for (name, spec) in entries {
+        let mut env = None;
+        let mut value: Option<String> = None;
+        let mut store = None;
+        let mut placeholder = None;
+        let mut allowed_hosts = Vec::new();
+        for (key, obj) in spec {
+            let obj = obj.bind(py);
+            match key.as_str() {
+                "env" => env = Some(extract_secret_str(&name, "env", obj)?),
+                "value" => value = Some(extract_secret_str(&name, "value", obj)?),
+                "store" => store = Some(extract_secret_str(&name, "store", obj)?),
+                "placeholder" => placeholder = Some(extract_secret_str(&name, "placeholder", obj)?),
+                "allowed_hosts" => {
+                    allowed_hosts = obj.extract().map_err(|_| {
+                        PyValueError::new_err(format!(
+                            "secret {name:?}: \"allowed_hosts\" must be a list of strings"
+                        ))
+                    })?
+                }
+                other => {
+                    return Err(PyValueError::new_err(format!(
+                        "secret {name:?}: unknown key {other:?}; expected \"env\", \"value\", \
+                         \"store\", \"placeholder\", or \"allowed_hosts\""
+                    )));
+                }
+            }
+        }
+
+        validate_secret_source_exclusivity(&name, env.is_some(), value.is_some(), store.is_some())
+            .map_err(PyValueError::new_err)?;
+
+        let source = match (env, store) {
+            (Some(var), _) => Some(SecretSource::Env { var }),
+            (_, Some(reference)) => Some(SecretSource::Store { reference }),
+            _ => None,
+        };
+        patches.push(SecretModificationPatch {
+            name,
+            source,
+            value: value.unwrap_or_default().into(),
+            placeholder,
+            allowed_hosts,
+        });
+    }
+    Ok(patches)
+}
+
+/// Reject specs that set more than one of `env` / `value` / `store`. The
+/// error names only the conflicting keys, never the secret material.
+pub(crate) fn validate_secret_source_exclusivity(
+    name: &str,
+    has_env: bool,
+    has_value: bool,
+    has_store: bool,
+) -> Result<(), String> {
+    let set: Vec<_> = [("env", has_env), ("value", has_value), ("store", has_store)]
+        .into_iter()
+        .filter(|(_, present)| *present)
+        .map(|(key, _)| format!("{key:?}"))
+        .collect();
+    if set.len() > 1 {
+        return Err(format!(
+            "secret {name:?}: {} are mutually exclusive; set at most one",
+            set.join(" and ")
+        ));
+    }
+    Ok(())
+}
+
+fn extract_secret_str(name: &str, key: &str, obj: &Bound<'_, PyAny>) -> PyResult<String> {
+    obj.extract()
+        .map_err(|_| PyValueError::new_err(format!("secret {name:?}: {key:?} must be a string")))
+}
+
+/// Parse the `policy=` kwarg into the core modification policy.
+pub(crate) fn parse_modify_policy(
+    policy: Option<&str>,
+) -> PyResult<microsandbox::sandbox::ModificationPolicy> {
+    use microsandbox::sandbox::ModificationPolicy;
+    match policy.unwrap_or("no_restart") {
+        "no_restart" => Ok(ModificationPolicy::NoRestart),
+        "next_start" => Ok(ModificationPolicy::NextStart),
+        "restart" => Ok(ModificationPolicy::Restart),
+        other => Err(PyValueError::new_err(format!(
+            "unknown policy {other:?}; expected \"no_restart\", \"next_start\", or \"restart\""
+        ))),
+    }
+}
+
+pub(crate) fn apply_modify_policy(
+    builder: microsandbox::sandbox::SandboxModificationBuilder,
+    policy: microsandbox::sandbox::ModificationPolicy,
+) -> microsandbox::sandbox::SandboxModificationBuilder {
+    use microsandbox::sandbox::ModificationPolicy;
+    match policy {
+        ModificationPolicy::NoRestart => builder,
+        ModificationPolicy::NextStart => builder.next_start(),
+        ModificationPolicy::Restart => builder.restart(),
+    }
+}
+
+/// Drive dry-run or apply and convert the resulting plan into a Python dict.
+pub(crate) async fn run_modify(
+    builder: microsandbox::sandbox::SandboxModificationBuilder,
+    dry_run: bool,
+) -> PyResult<PyObject> {
+    let plan = if dry_run {
+        builder.dry_run().await
+    } else {
+        builder.apply().await
+    }
+    .map_err(to_py_err)?;
+    let value = serde_json::to_value(&plan)
+        .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
+    Python::with_gil(|py| modification_plan_to_py(py, value))
+}
+
+/// Convert a serialized modification plan while restoring its closed domain types.
+///
+/// The public shape intentionally remains a dictionary, but known discriminators
+/// must not degrade back into raw strings at the native boundary.
+fn modification_plan_to_py(py: Python<'_>, value: serde_json::Value) -> PyResult<PyObject> {
+    let serde_json::Value::Object(values) = value else {
+        return Err(PyRuntimeError::new_err(
+            "serialized modification plan must be an object",
+        ));
+    };
+
+    let dict = PyDict::new(py);
+    for (key, value) in values {
+        let value = match key.as_str() {
+            "status" => serialized_enum_to_py(py, value, "SandboxStatus", "plan.status")?,
+            "policy" => serialized_enum_to_py(py, value, "ModificationPolicy", "plan.policy")?,
+            "changes" => planned_changes_to_py(py, value)?,
+            "resize_status" => resize_statuses_to_py(py, value)?,
+            _ => crate::sandbox_handle::json_value_to_py(py, value)?,
+        };
+        dict.set_item(key, value)?;
+    }
+    Ok(dict.unbind().into())
+}
+
+/// Convert planned changes, selecting the correct change enum from `kind`.
+fn planned_changes_to_py(py: Python<'_>, value: serde_json::Value) -> PyResult<PyObject> {
+    let serde_json::Value::Array(changes) = value else {
+        return Err(PyRuntimeError::new_err(
+            "serialized modification plan changes must be an array",
+        ));
+    };
+
+    let changes = changes
+        .into_iter()
+        .map(|change| planned_change_to_py(py, change))
+        .collect::<PyResult<Vec<_>>>()?;
+    Ok(PyList::new(py, changes)?.unbind().into())
+}
+
+fn planned_change_to_py(py: Python<'_>, value: serde_json::Value) -> PyResult<PyObject> {
+    let serde_json::Value::Object(values) = value else {
+        return Err(PyRuntimeError::new_err(
+            "serialized planned change must be an object",
+        ));
+    };
+    let kind = values
+        .get("kind")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| PyRuntimeError::new_err("serialized planned change must have a kind"))?;
+    let change_enum = match kind {
+        "config" => "ChangeKind",
+        "secret" => "SecretChangeKind",
+        other => {
+            return Err(PyRuntimeError::new_err(format!(
+                "unknown serialized planned change kind: {other}"
+            )));
+        }
+    };
+
+    let dict = PyDict::new(py);
+    for (key, value) in values {
+        let value = match key.as_str() {
+            "kind" => serialized_enum_to_py(py, value, "PlannedChangeKind", "change.kind")?,
+            "change" => serialized_enum_to_py(py, value, change_enum, "change.change")?,
+            "disposition" => {
+                serialized_enum_to_py(py, value, "ModificationDisposition", "change.disposition")?
+            }
+            _ => crate::sandbox_handle::json_value_to_py(py, value)?,
+        };
+        dict.set_item(key, value)?;
+    }
+    Ok(dict.unbind().into())
+}
+
+fn resize_statuses_to_py(py: Python<'_>, value: serde_json::Value) -> PyResult<PyObject> {
+    let serde_json::Value::Array(statuses) = value else {
+        return Err(PyRuntimeError::new_err(
+            "serialized modification resize_status must be an array",
+        ));
+    };
+
+    let statuses = statuses
+        .into_iter()
+        .map(|status| resize_status_to_py(py, status))
+        .collect::<PyResult<Vec<_>>>()?;
+    Ok(PyList::new(py, statuses)?.unbind().into())
+}
+
+fn resize_status_to_py(py: Python<'_>, value: serde_json::Value) -> PyResult<PyObject> {
+    let serde_json::Value::Object(values) = value else {
+        return Err(PyRuntimeError::new_err(
+            "serialized resource resize status must be an object",
+        ));
+    };
+
+    let dict = PyDict::new(py);
+    for (key, value) in values {
+        let value = match key.as_str() {
+            "resource" => {
+                serialized_enum_to_py(py, value, "ResourceKind", "resize_status.resource")?
+            }
+            "state" => {
+                serialized_enum_to_py(py, value, "ResourceConvergenceState", "resize_status.state")?
+            }
+            _ => crate::sandbox_handle::json_value_to_py(py, value)?,
+        };
+        dict.set_item(key, value)?;
+    }
+    Ok(dict.unbind().into())
+}
+
+fn serialized_enum_to_py(
+    py: Python<'_>,
+    value: serde_json::Value,
+    enum_name: &str,
+    field: &str,
+) -> PyResult<PyObject> {
+    let serde_json::Value::String(value) = value else {
+        return Err(PyRuntimeError::new_err(format!(
+            "serialized {field} must be a string"
+        )));
+    };
+    str_enum_member(py, enum_name, &value)
+}
+
+//--------------------------------------------------------------------------------------------------
 // Functions: Execution Options
 //--------------------------------------------------------------------------------------------------
 
@@ -845,11 +1449,10 @@ fn parse_exec_call(
     };
 
     if let Some(args_or_options) = args {
-        if is_options_like(args_or_options) {
-            let dict = options_dict(args_or_options, "exec options")?;
-            validate_exec_options_keys(&dict)?;
-            parsed_args = parse_options_args(&dict)?;
-            apply_exec_options_dict(&mut opts, &dict)?;
+        if let Ok(dict) = args_or_options.downcast::<PyDict>() {
+            validate_exec_options_keys(dict)?;
+            parsed_args = parse_options_args(dict)?;
+            apply_exec_options_dict(&mut opts, dict)?;
         } else {
             parsed_args = parse_args(Some(args_or_options))?;
         }
@@ -857,10 +1460,6 @@ fn parse_exec_call(
 
     validate_timeout(opts.timeout_secs)?;
     Ok((parsed_args, opts))
-}
-
-fn is_options_like(obj: &Bound<'_, PyAny>) -> bool {
-    obj.downcast::<PyDict>().is_ok() || obj.getattr("_to_dict").is_ok()
 }
 
 fn validate_exec_options_keys(dict: &Bound<'_, PyDict>) -> PyResult<()> {
@@ -907,12 +1506,7 @@ fn apply_exec_options_dict(opts: &mut ExecOpts, dict: &Bound<'_, PyDict>) -> PyR
     if let Some(stdin) = dict.get_item("stdin")?
         && !stdin.is_none()
     {
-        let stdin_data = extract_optional_dict_value::<Vec<u8>>(dict, "stdin_data")?;
-        let (mode, data) = if let Ok(mode) = stdin.extract::<String>() {
-            normalize_stdin(mode, stdin_data)?
-        } else {
-            parse_stdin(Some(&stdin))?
-        };
+        let (mode, data) = parse_stdin(Some(&stdin))?;
         opts.stdin_mode = mode;
         opts.stdin_data = data;
     } else if let Some(stdin_data) = extract_optional_dict_value::<Vec<u8>>(dict, "stdin_data")? {
@@ -1001,19 +1595,6 @@ fn parse_args(args: Option<&Bound<'_, PyAny>>) -> PyResult<Vec<String>> {
     list.iter().map(|item| item.extract::<String>()).collect()
 }
 
-fn options_dict<'py>(obj: &Bound<'py, PyAny>, label: &str) -> PyResult<Bound<'py, PyDict>> {
-    if let Ok(dict) = obj.downcast::<PyDict>() {
-        return Ok(dict.clone());
-    }
-    if let Ok(method) = obj.getattr("_to_dict") {
-        let result = method.call0()?;
-        return Ok(result.downcast::<PyDict>()?.clone());
-    }
-    Err(pyo3::exceptions::PyTypeError::new_err(format!(
-        "{label} must be a dict or object with _to_dict()",
-    )))
-}
-
 fn env_to_pairs(env: Option<HashMap<String, String>>) -> Vec<(String, String)> {
     env.unwrap_or_default().into_iter().collect()
 }
@@ -1026,18 +1607,17 @@ fn parse_stdin(stdin: Option<&Bound<'_, PyAny>>) -> PyResult<(Option<String>, Op
     if let Ok(bytes) = stdin.downcast::<PyBytes>() {
         return Ok((Some("bytes".to_string()), Some(bytes.as_bytes().to_vec())));
     }
-    if let Ok(mode) = stdin.extract::<String>() {
-        return normalize_stdin(mode, None);
-    }
 
-    let mode_obj = stdin.getattr("_mode").map_err(|_| {
-        pyo3::exceptions::PyTypeError::new_err("stdin must be Stdin, bytes, or a stdin mode string")
-    })?;
-    let mode: String = mode_obj.extract()?;
+    require_sdk_type(stdin, "Stdin", "stdin")?;
+
+    let mode_obj = stdin
+        .getattr("_mode")
+        .map_err(|_| PyTypeError::new_err("stdin must be Stdin, bytes, or None"))?;
+    let mode = extract_str_enum(&mode_obj, "StdinMode")?;
     let data = stdin
         .getattr("_data")
         .ok()
-        .and_then(|v| if v.is_none() { None } else { Some(v) })
+        .filter(|v| !v.is_none())
         .map(|v| v.extract::<Vec<u8>>())
         .transpose()?;
     normalize_stdin(mode, data)
@@ -1072,22 +1652,30 @@ fn parse_rlimits_iter(obj: &Bound<'_, PyAny>) -> PyResult<Vec<(String, u64, u64)
 }
 
 fn parse_rlimit(obj: &Bound<'_, PyAny>) -> PyResult<(String, u64, u64)> {
-    let (resource, soft, hard) = if let Ok(dict) = options_dict(obj, "rlimit") {
-        (
-            required_string_from_dict(&dict, "resource")?,
-            required_from_dict(&dict, "soft")?,
-            required_from_dict(&dict, "hard")?,
-        )
-    } else {
-        (
-            py_value_to_string(&obj.getattr("resource")?)?,
-            obj.getattr("soft")?.extract()?,
-            obj.getattr("hard")?.extract()?,
-        )
-    };
+    require_sdk_type(obj, "Rlimit", "rlimit")?;
+    // Rlimit._to_dict validates that `resource` is the exact RlimitResource
+    // enum before exposing its wire value to the native execution builder.
+    let dict = obj.call_method0("_to_dict")?;
+    let dict = dict
+        .downcast::<PyDict>()
+        .map_err(|_| PyRuntimeError::new_err("Rlimit._to_dict() must return a dict"))?;
+    let resource = required_string_from_dict(dict, "resource")?;
+    let soft = required_from_dict(dict, "soft")?;
+    let hard = required_from_dict(dict, "hard")?;
 
     validate_rlimit_resource(&resource)?;
     Ok((resource, soft, hard))
+}
+
+/// Require the exact public SDK config class at a native API boundary.
+fn require_sdk_type(obj: &Bound<'_, PyAny>, class_name: &str, label: &str) -> PyResult<()> {
+    if is_exact_sdk_type(obj, class_name)? {
+        return Ok(());
+    }
+    Err(PyTypeError::new_err(format!(
+        "{label} must be {class_name}, got {}",
+        obj.get_type().name()?
+    )))
 }
 
 fn validate_rlimit_resource(resource: &str) -> PyResult<()> {
@@ -1226,7 +1814,7 @@ fn apply_attach_options(
 }
 
 //--------------------------------------------------------------------------------------------------
-// Types: PullSession
+// Types: Pull Progress
 //--------------------------------------------------------------------------------------------------
 
 /// Context manager for sandbox creation with pull progress.
@@ -1243,6 +1831,43 @@ pub struct PyPullSession {
         >,
     >,
 }
+
+/// Async iterator over pull-progress events.
+#[pyclass(name = "PullProgressIter")]
+struct PyPullProgressIter {
+    handle: Arc<Mutex<Option<microsandbox::sandbox::PullProgressHandle>>>,
+}
+
+/// Pull-progress event exposed to Python.
+#[pyclass(name = "PullEvent")]
+#[derive(Default)]
+pub struct PyPullEvent {
+    event_type: &'static str,
+    #[pyo3(get)]
+    reference: Option<String>,
+    #[pyo3(get)]
+    manifest_digest: Option<String>,
+    #[pyo3(get)]
+    layer_count: Option<u32>,
+    #[pyo3(get)]
+    total_download_bytes: Option<i64>,
+    #[pyo3(get)]
+    layer_index: Option<u32>,
+    #[pyo3(get)]
+    digest: Option<String>,
+    #[pyo3(get)]
+    diff_id: Option<String>,
+    #[pyo3(get)]
+    downloaded_bytes: Option<i64>,
+    #[pyo3(get)]
+    total_bytes: Option<i64>,
+    #[pyo3(get)]
+    bytes_read: Option<i64>,
+}
+
+//--------------------------------------------------------------------------------------------------
+// Methods: PullSession
+//--------------------------------------------------------------------------------------------------
 
 impl PyPullSession {
     pub fn new(
@@ -1313,11 +1938,9 @@ impl PyPullSession {
     }
 }
 
-/// Async iterator over PullProgress events.
-#[pyclass(name = "PullProgressIter")]
-struct PyPullProgressIter {
-    handle: Arc<Mutex<Option<microsandbox::sandbox::PullProgressHandle>>>,
-}
+//--------------------------------------------------------------------------------------------------
+// Methods: PullProgressIter
+//--------------------------------------------------------------------------------------------------
 
 #[pymethods]
 impl PyPullProgressIter {
@@ -1344,7 +1967,24 @@ impl PyPullProgressIter {
     }
 }
 
-/// Convert a Rust PullProgress event to a Python dict.
+//--------------------------------------------------------------------------------------------------
+// Methods: PullEvent
+//--------------------------------------------------------------------------------------------------
+
+#[pymethods]
+impl PyPullEvent {
+    /// Canonical kind of pull-progress event.
+    #[getter]
+    fn event_type(&self, py: Python<'_>) -> PyResult<PyObject> {
+        str_enum_member(py, "PullEventType", self.event_type)
+    }
+}
+
+//--------------------------------------------------------------------------------------------------
+// Functions: Pull Progress
+//--------------------------------------------------------------------------------------------------
+
+/// Convert a Rust pull-progress event to its Python object.
 fn convert_pull_progress(event: microsandbox::sandbox::PullProgress) -> PyPullEvent {
     use microsandbox::sandbox::PullProgress;
     match event {
@@ -1462,6 +2102,10 @@ fn convert_pull_progress(event: microsandbox::sandbox::PullProgress) -> PyPullEv
     }
 }
 
+//--------------------------------------------------------------------------------------------------
+// Functions: Helpers
+//--------------------------------------------------------------------------------------------------
+
 pub fn optional_duration(value: Option<f64>) -> PyResult<Option<std::time::Duration>> {
     let Some(value) = value else {
         return Ok(None);
@@ -1474,30 +2118,121 @@ pub fn optional_duration(value: Option<f64>) -> PyResult<Option<std::time::Durat
     Ok(Some(std::time::Duration::from_secs_f64(value)))
 }
 
-/// Pull progress event exposed to Python.
-#[pyclass(name = "PullEvent")]
-#[derive(Default)]
-struct PyPullEvent {
-    #[pyo3(get)]
-    event_type: &'static str,
-    #[pyo3(get)]
-    reference: Option<String>,
-    #[pyo3(get)]
-    manifest_digest: Option<String>,
-    #[pyo3(get)]
-    layer_count: Option<u32>,
-    #[pyo3(get)]
-    total_download_bytes: Option<i64>,
-    #[pyo3(get)]
-    layer_index: Option<u32>,
-    #[pyo3(get)]
-    digest: Option<String>,
-    #[pyo3(get)]
-    diff_id: Option<String>,
-    #[pyo3(get)]
-    downloaded_bytes: Option<i64>,
-    #[pyo3(get)]
-    total_bytes: Option<i64>,
-    #[pyo3(get)]
-    bytes_read: Option<i64>,
+//--------------------------------------------------------------------------------------------------
+// Tests
+//--------------------------------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use microsandbox::sandbox::{SecretModificationPatch, SecretSource};
+
+    use super::*;
+
+    fn secret_patch(
+        name: &str,
+        source: Option<SecretSource>,
+        value: &str,
+    ) -> SecretModificationPatch {
+        SecretModificationPatch {
+            name: name.to_string(),
+            source,
+            value: value.to_string().into(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn modify_patch_serializes_each_secret_source_kind() {
+        let patch = build_modify_patch(
+            None,
+            None,
+            None,
+            None,
+            Some(8192),
+            None,
+            None,
+            None,
+            None,
+            None,
+            vec![
+                SecretModificationPatch {
+                    name: "API_KEY".to_string(),
+                    source: Some(SecretSource::Env {
+                        var: "HOST_API_KEY".to_string(),
+                    }),
+                    placeholder: Some("$API_KEY".to_string()),
+                    allowed_hosts: vec!["api.example.com".to_string()],
+                    ..Default::default()
+                },
+                secret_patch(
+                    "DB_PASS",
+                    Some(SecretSource::Store {
+                        reference: "vault://prod/db".to_string(),
+                    }),
+                    "",
+                ),
+                secret_patch("STRIPE_KEY", None, "sk_test_123"),
+            ],
+            Some(vec!["OLD".to_string()]),
+        );
+
+        let json = serde_json::to_value(&patch).expect("serialize patch");
+        assert_eq!(json["root_disk_size_mib"], 8192);
+        let secrets = json["secrets"].as_array().expect("secrets array");
+        assert_eq!(secrets.len(), 3);
+
+        assert_eq!(secrets[0]["name"], "API_KEY");
+        assert_eq!(secrets[0]["source"]["kind"], "env");
+        assert_eq!(secrets[0]["source"]["var"], "HOST_API_KEY");
+        assert_eq!(secrets[0]["placeholder"], "$API_KEY");
+        assert_eq!(secrets[0]["allowed_hosts"][0], "api.example.com");
+        assert!(
+            secrets[0].get("value").is_none(),
+            "empty value must be omitted"
+        );
+
+        assert_eq!(secrets[1]["source"]["kind"], "store");
+        assert_eq!(secrets[1]["source"]["reference"], "vault://prod/db");
+
+        assert!(secrets[2].get("source").is_none());
+        assert!(secrets[2]["value"] == "sk_test_123", "value field mismatch");
+
+        assert_eq!(json["secrets_remove"][0], "OLD");
+    }
+
+    #[test]
+    fn secret_patch_debug_redacts_value() {
+        let patch = secret_patch("STRIPE_KEY", None, "sk_test_123");
+        let debug = format!("{patch:?}");
+        assert!(!debug.contains("sk_test_123"), "debug output leaks value");
+    }
+
+    #[test]
+    fn secret_source_exclusivity_rejects_combinations() {
+        for (env, value, store) in [
+            (true, true, false),
+            (true, false, true),
+            (false, true, true),
+            (true, true, true),
+        ] {
+            let err = validate_secret_source_exclusivity("STRIPE_KEY", env, value, store)
+                .expect_err("combination must be rejected");
+            assert!(err.contains("\"STRIPE_KEY\""), "error must name the secret");
+            assert!(err.contains("mutually exclusive"));
+            assert!(!err.contains("sk_test_123"), "error message leaks value");
+        }
+    }
+
+    #[test]
+    fn secret_source_exclusivity_allows_single_or_none() {
+        for (env, value, store) in [
+            (false, false, false),
+            (true, false, false),
+            (false, true, false),
+            (false, false, true),
+        ] {
+            validate_secret_source_exclusivity("API_KEY", env, value, store)
+                .expect("single source must be accepted");
+        }
+    }
 }

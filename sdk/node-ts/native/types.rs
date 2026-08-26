@@ -17,6 +17,58 @@ pub struct SandboxStopResult {
     pub source: Option<String>,
 }
 
+/// Result returned by `Sandbox.ping()` / `SandboxHandle.ping()`.
+#[napi(object)]
+pub struct SandboxPingResult {
+    pub name: String,
+    pub latency_ms: f64,
+}
+
+/// Result returned by `Sandbox.touch()` / `SandboxHandle.touch()`.
+#[napi(object)]
+pub struct SandboxTouchResult {
+    pub name: String,
+    pub activity_seq: f64,
+}
+
+/// Options accepted by `Sandbox.modify()` / `SandboxHandle.modify()`.
+///
+/// `memoryMib` / `maxMemoryMib` / `rootDiskSizeMib` are in MiB. `policy` is `"no_restart"`
+/// (default), `"next_start"`, or `"restart"`. With `dryRun: true` the plan
+/// is computed without applying anything.
+#[napi(object)]
+#[derive(Default)]
+pub struct SandboxModifyOptions {
+    pub cpus: Option<u32>,
+    pub max_cpus: Option<u32>,
+    pub memory_mib: Option<u32>,
+    pub max_memory_mib: Option<u32>,
+    pub root_disk_size_mib: Option<u32>,
+    pub env: Option<HashMap<String, String>>,
+    pub env_remove: Option<Vec<String>>,
+    pub labels: Option<HashMap<String, String>>,
+    pub labels_remove: Option<Vec<String>>,
+    pub workdir: Option<String>,
+    pub secrets: Option<HashMap<String, SecretModifySpec>>,
+    pub secrets_remove: Option<Vec<String>>,
+    pub policy: Option<String>,
+    pub dry_run: Option<bool>,
+}
+
+/// Desired state for one secret in `SandboxModifyOptions.secrets`, keyed by
+/// secret name. `env` / `value` / `store` are mutually exclusive ways to
+/// provide the secret material; setting more than one is rejected at the
+/// boundary. Only `value` may carry raw secret material.
+#[napi(object)]
+#[derive(Default, Clone)]
+pub struct SecretModifySpec {
+    pub env: Option<String>,
+    pub value: Option<String>,
+    pub store: Option<String>,
+    pub placeholder: Option<String>,
+    pub allowed_hosts: Option<Vec<String>>,
+}
+
 /// Exit status for an executed command.
 #[napi(object)]
 pub struct ExitStatus {
@@ -24,11 +76,12 @@ pub struct ExitStatus {
     pub success: bool,
 }
 
-/// Filter for `Sandbox.list`. Matched sandboxes must carry all of `labels`
-/// (AND-matched). Omit or leave empty to match every sandbox.
+/// Options for one paginated sandbox list request.
 #[napi(object)]
 #[allow(dead_code)]
-pub struct SandboxListFilter {
+pub struct SandboxListOptions {
+    pub cursor: Option<String>,
+    pub limit: Option<u32>,
     pub labels: Option<HashMap<String, String>>,
 }
 
@@ -122,6 +175,7 @@ pub struct SshClientOptions {
     pub user: Option<String>,
     pub term: Option<String>,
     pub sftp: Option<bool>,
+    pub inactivity_timeout_secs: Option<u32>,
 }
 
 /// Options accepted by `SshClient.exec()`.
@@ -144,6 +198,7 @@ pub struct SshServerOptions {
     pub authorized_keys_path: Option<String>,
     pub user: Option<String>,
     pub sftp: Option<bool>,
+    pub inactivity_timeout_secs: Option<u32>,
 }
 
 /// Filesystem entry metadata returned by `fs.list()`.
@@ -208,6 +263,7 @@ pub struct ExecEvent {
 #[napi(object)]
 pub struct VolumeInfo {
     pub name: String,
+    pub is_default: bool,
     pub kind: String,
     pub quota_mib: Option<u32>,
     pub used_bytes: f64,

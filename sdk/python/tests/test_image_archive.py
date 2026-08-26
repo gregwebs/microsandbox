@@ -1,0 +1,23 @@
+"""Unit tests for image archive save argument validation."""
+
+from __future__ import annotations
+
+import pathlib
+
+import pytest
+
+from microsandbox import Image
+
+
+async def test_save_rejects_raw_format_strings(tmp_path: pathlib.Path) -> None:
+    with pytest.raises(TypeError, match="expected ImageArchiveFormat"):
+        await Image.save(
+            "python:3.12",
+            output_path=str(tmp_path / "image.tar"),
+            format="docker",
+        )
+
+
+async def test_save_rejects_empty_reference_list(tmp_path: pathlib.Path) -> None:
+    with pytest.raises(ValueError, match="at least one image reference"):
+        await Image.save([], output_path=str(tmp_path / "image.tar"))

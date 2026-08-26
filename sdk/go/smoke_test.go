@@ -5,7 +5,7 @@
 //
 // Run with:
 //
-//	MICROSANDBOX_FFI_PATH=/path/to/libmicrosandbox_go_ffi.{so,dylib} \
+//	MICROSANDBOX_FFI_PATH=/path/to/libmicrosandbox_go_ffi.{so,dylib,dll} \
 //	    go test -tags "smoke microsandbox_ffi_path" -count=1 ./...
 //
 // The microsandbox_ffi_path build tag swaps the embedded FFI for a
@@ -52,8 +52,11 @@ func smokeSetup(t *testing.T) context.Context {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	t.Cleanup(cancel)
 
-	if err := EnsureInstalled(ctx); err != nil {
-		t.Fatalf("EnsureInstalled: %v", err)
+	// These are no-KVM FFI boundary tests. Load the freshly built library
+	// directly instead of downloading a runtime from a release that may not
+	// exist yet while its version-bump PR is still under review.
+	if _, err := RuntimeVersion(); err != nil {
+		t.Fatalf("load FFI library: %v", err)
 	}
 	return ctx
 }
@@ -104,12 +107,12 @@ func TestSmokeGetVolumeNotFound(t *testing.T) {
 
 func TestSmokeListSandboxesEmpty(t *testing.T) {
 	ctx := smokeSetup(t)
-	handles, err := ListSandboxes(ctx)
+	page, err := ListSandboxes(ctx)
 	if err != nil {
 		t.Fatalf("ListSandboxes: %v", err)
 	}
-	if len(handles) != 0 {
-		t.Fatalf("fresh MSB_HOME should have zero sandboxes, got %d", len(handles))
+	if len(page.Sandboxes) != 0 {
+		t.Fatalf("fresh MSB_HOME should have zero sandboxes, got %d", len(page.Sandboxes))
 	}
 }
 
@@ -159,7 +162,7 @@ func TestSmokeSnapshotReindexEmpty(t *testing.T) {
 	}
 }
 
-func TestSmokeSnapshotImportBogusErrors(t *testing.T) {
+func TestSmokeSnapshotLoadBogusErrors(t *testing.T) {
 	ctx := smokeSetup(t)
 	tmp := t.TempDir()
 	archive := filepath.Join(tmp, "bogus.tar")
@@ -168,9 +171,9 @@ func TestSmokeSnapshotImportBogusErrors(t *testing.T) {
 	}
 	dest := filepath.Join(tmp, "imported")
 
-	_, err := Snapshot.Import(ctx, archive, dest)
+	_, err := Snapshot.Load(ctx, archive, dest)
 	if err == nil {
-		t.Fatal("expected import of bogus archive to fail")
+		t.Fatal("expected load of bogus archive to fail")
 	}
 	var me *Error
 	if !errors.As(err, &me) {

@@ -7,13 +7,15 @@ use std::path::PathBuf;
 use microsandbox_runtime::logging::LogLevel;
 use microsandbox_types::{
     EnvVar, SandboxLogLevel, SandboxResources, SandboxRuntimeOptions, SandboxSpec,
+    TransparentHugePagePolicy,
 };
 use serde::{Deserialize, Serialize};
 
 use microsandbox_image::{ImageConfig, RegistryAuth};
 use microsandbox_protocol::{HANDOFF_INIT_AUTO, HANDOFF_INIT_IMAGE_ENTRYPOINT_CANDIDATES};
+use typed_path::Utf8UnixPath;
 
-use super::types::{MountOptions, RootfsSource, VolumeMount};
+use super::types::{MountOptions, RootDisk, RootfsSource, VolumeMount};
 
 //--------------------------------------------------------------------------------------------------
 // Constants
@@ -75,6 +77,27 @@ fn default_disable_metrics_sample() -> bool {
 // Types
 //--------------------------------------------------------------------------------------------------
 
+/// Transient intent for the initial process requested by a CLI operation.
+///
+/// Foreground commands remain separate from the durable OCI command because an attached
+/// `msb run` is one-shot. Background commands use `runtime.cmd` so the resolved startup shape is
+/// visible through inspect and preserved with the sandbox configuration.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) enum LaunchIntent {
+    /// Boot the sandbox without starting an initial workload.
+    #[default]
+    None,
+
+    /// Run the resolved OCI command through the foreground attach/exec path.
+    Foreground {
+        /// Optional one-shot CMD override supplied after `--`.
+        command: Option<Vec<String>>,
+    },
+
+    /// Run the resolved OCI command in the background after the guest agent is ready.
+    Background,
+}
+
 /// Configuration for a sandbox.
 ///
 /// The durable task description lives in [`SandboxSpec`]. This type keeps
@@ -123,6 +146,15 @@ pub struct SandboxConfig {
     #[serde(skip)]
     pub replace_with_timeout: std::time::Duration,
 
+    /// Requested globally-unique slug for the sandbox (cloud backends only).
+    ///
+    /// When unset, the cloud assigns one. Create fails when the slug is
+    /// already taken.
+    ///
+    /// This is a create-time option, not persisted sandbox state.
+    #[serde(skip)]
+    pub slug: Option<String>,
+
     /// Manifest digest for the resolved OCI image.
     ///
     /// Set at create time. Used by spawn to derive VMDK and fsmeta paths
@@ -139,13 +171,17 @@ pub struct SandboxConfig {
     #[serde(skip)]
     pub(crate) snapshot_upper_source: Option<PathBuf>,
 
-    /// Whether `runtime.cmd` should be launched by the sandbox process after boot.
+    /// Transient process-launch intent for the current create operation.
     #[serde(skip)]
-    pub(crate) startup_command_requested: bool,
+    pub(crate) launch_intent: LaunchIntent,
 
-    /// One-shot foreground command requested by attached `msb run`.
+    /// Whether image-init routing consumed the requested boot workload.
     #[serde(skip)]
-    pub(crate) initial_command: Option<Vec<String>>,
+    pub(crate) init_owns_workload: bool,
+
+    /// Number of transient workload arguments appended to the init specification.
+    #[serde(skip)]
+    pub(crate) init_workload_arg_count: usize,
 }
 
 //--------------------------------------------------------------------------------------------------
@@ -167,13 +203,22 @@ impl SandboxConfig {
 
     /// Return the config shape that should be persisted for future starts.
     ///
-    /// Attached `msb run` commands are one-shot foreground intent. Detached startup intent stays
-    /// in `runtime.cmd` and is either executed by the host runtime after agentd is ready or, for
-    /// image-declared init entrypoints, passed to the init handoff as the container startup argv.
+    /// CLI `run` commands are one-shot launch intent. Their durable CMD template is retained, while
+    /// transient launch markers and any workload argv routed through an inherited init are removed.
     pub(crate) fn clone_for_persistence(&self) -> Self {
         let mut config = self.clone();
-        config.startup_command_requested = false;
-        config.initial_command = None;
+        config.launch_intent = LaunchIntent::None;
+        config.init_owns_workload = false;
+        if config.init_workload_arg_count > 0 {
+            if let Some(init) = config.spec.init.as_mut() {
+                let durable_len = init
+                    .args
+                    .len()
+                    .saturating_sub(config.init_workload_arg_count);
+                init.args.truncate(durable_len);
+            }
+            config.init_workload_arg_count = 0;
+        }
         for mount in &mut config.spec.mounts {
             if let VolumeMount::Named { create, .. } = mount {
                 *create = None;
@@ -182,21 +227,39 @@ impl SandboxConfig {
         config
     }
 
-    /// Clear detached startup intent for attached `msb run`.
-    pub(crate) fn set_initial_command(&mut self, command: Vec<String>) {
-        self.initial_command = (!command.is_empty()).then_some(command);
-        self.startup_command_requested = false;
+    /// Select the foreground launch path for attached `msb run`.
+    pub(crate) fn set_foreground_command(&mut self, command: Vec<String>) {
+        self.launch_intent = LaunchIntent::Foreground {
+            command: (!command.is_empty()).then_some(command),
+        };
     }
 
-    /// Set startup initial command intent for detached `msb run -d`.
-    pub(crate) fn set_persistent_initial_command(&mut self, command: Vec<String>) {
+    /// Select the background launch path for detached `msb run -d`.
+    ///
+    /// A non-empty command replaces the image CMD while preserving the effective entrypoint. An
+    /// empty command intentionally keeps the image CMD so detached and attached runs resolve the
+    /// same OCI process.
+    pub(crate) fn set_background_command(&mut self, command: Vec<String>) {
         if !command.is_empty() {
-            self.spec.runtime.cmd = Some(command.clone());
-            self.startup_command_requested = true;
-        } else {
-            self.startup_command_requested = false;
+            self.spec.runtime.cmd = Some(command);
         }
-        self.initial_command = None;
+        self.launch_intent = LaunchIntent::Background;
+    }
+
+    /// Return whether this create operation should launch the resolved command in the background.
+    pub(crate) fn should_launch_background_command(&self) -> bool {
+        self.launch_intent == LaunchIntent::Background
+    }
+
+    /// Clear process-launch intent after another mechanism takes ownership of the command.
+    pub(crate) fn clear_launch_intent(&mut self) {
+        self.launch_intent = LaunchIntent::None;
+    }
+
+    /// Return whether inherited image init routing owns this create operation's boot workload.
+    #[doc(hidden)]
+    pub fn init_owns_boot_workload(&self) -> bool {
+        self.init_owns_workload
     }
 
     /// Apply OCI image config as defaults. User-provided values take precedence.
@@ -241,9 +304,9 @@ impl SandboxConfig {
     /// Resolve `init = "auto"` from a known init path declared as the
     /// image entrypoint.
     ///
-    /// Docker starts containers by appending CMD to the image ENTRYPOINT. If that ENTRYPOINT is an
-    /// init binary, the init handoff must own the resolved argv; launching the same command later
-    /// through agentd skips init-established state such as s6's PATH.
+    /// Docker starts containers by appending CMD to the image ENTRYPOINT. Init selection always
+    /// removes a recognized inherited init token from the durable workload template. Only an
+    /// explicit boot-workload intent may transfer the already-resolved argv to PID 1.
     fn resolve_auto_init_from_image_entrypoint(
         &mut self,
         image_entrypoint: Option<&[String]>,
@@ -252,7 +315,7 @@ impl SandboxConfig {
         let Some(init) = self.spec.init.as_ref() else {
             return;
         };
-        if init.cmd.as_os_str() != HANDOFF_INIT_AUTO {
+        if init.cmd != HANDOFF_INIT_AUTO {
             return;
         }
         let Some(entrypoint) = image_entrypoint else {
@@ -272,51 +335,115 @@ impl SandboxConfig {
                 .init
                 .as_mut()
                 .expect("init was present at start of auto resolution");
-            init.cmd = PathBuf::from(init_path);
+            init.cmd = init_path.to_string();
             init.env = merge_init_env(&self.spec.env, &init.env);
             return;
         }
 
-        let Some(mut entrypoint) = self.spec.runtime.entrypoint.take() else {
+        let Some(entrypoint) = self.spec.runtime.entrypoint.take() else {
             return;
         };
-        if entrypoint
+        let mut workload_entrypoint = entrypoint.clone();
+        if workload_entrypoint
             .first()
             .is_some_and(|first| first.as_str() == init_path)
         {
-            entrypoint.remove(0);
+            workload_entrypoint.remove(0);
         }
-        let runtime_cmd = self
-            .initial_command
-            .as_deref()
-            .or(self.spec.runtime.cmd.as_deref());
-        let init_args = resolved_container_argv(&entrypoint, runtime_cmd);
 
         let init = self
             .spec
             .init
             .as_mut()
             .expect("init was present at start of auto resolution");
-        init.cmd = PathBuf::from(init_path);
-        init.args.extend(init_args);
+        init.cmd = init_path.to_string();
         init.env = merge_init_env(&self.spec.env, &init.env);
 
-        // The startup command is now part of the PID 1 argv. Running it again through agentd would
-        // both duplicate execution and bypass any state the image init establishes before execing.
-        if self.startup_command_requested {
-            self.startup_command_requested = false;
+        self.spec.runtime.entrypoint =
+            (!workload_entrypoint.is_empty()).then_some(workload_entrypoint.clone());
+
+        let cmd_override = match &self.launch_intent {
+            LaunchIntent::Foreground { command } => command.as_deref(),
+            LaunchIntent::Background => None,
+            LaunchIntent::None => return,
+        };
+        let is_container_init_contract = init_path == "/init" || !workload_entrypoint.is_empty();
+        if !is_container_init_contract {
+            return;
         }
-        self.spec.runtime.entrypoint = (!entrypoint.is_empty()).then_some(entrypoint);
+
+        let Ok(command) = microsandbox_types::resolve_default_command(
+            Some(entrypoint.as_slice()),
+            self.spec.runtime.cmd.as_deref(),
+            cmd_override,
+        ) else {
+            return;
+        };
+        if command.program != init_path {
+            return;
+        }
+
+        self.init_workload_arg_count = command.args.len();
+        self.spec
+            .init
+            .as_mut()
+            .expect("init remains configured")
+            .args
+            .extend(command.args);
+        self.init_owns_workload = true;
+
+        // The startup command is now part of PID 1's argv. Clearing launch intent prevents the
+        // direct runtime from issuing a duplicate agent exec for a detached invocation.
+        self.clear_launch_intent();
     }
 
     /// Materialize rootfs defaults that should be persisted with the sandbox.
-    pub(crate) fn apply_rootfs_defaults(&mut self, upper_size_mib: Option<u32>) {
-        if self.snapshot_upper_source.is_none()
-            && let RootfsSource::Oci(oci) = &mut self.spec.image
-            && oci.upper_size_mib.is_none()
-        {
-            oci.upper_size_mib = Some(upper_size_mib.unwrap_or(DEFAULT_OCI_UPPER_SIZE_MIB));
+    ///
+    /// The backend default may select the complete root-disk shape. The deprecated upper-size
+    /// setting remains managed-disk size sugar and cannot be combined with `root_disk`. An absent
+    /// root disk resolves to managed; a sizeless tmpfs resolves to half the sandbox memory.
+    pub(crate) fn apply_rootfs_defaults(
+        &mut self,
+        defaults: &crate::config::OciSandboxDefaults,
+    ) -> crate::MicrosandboxResult<()> {
+        if defaults.upper_size_mib.is_some() && defaults.root_disk.is_some() {
+            return Err(crate::MicrosandboxError::InvalidConfig(
+                "sandbox_defaults.oci.root_disk and deprecated sandbox_defaults.oci.upper_size_mib are mutually exclusive".into(),
+            ));
         }
+        if matches!(defaults.root_disk, Some(RootDisk::DiskImage { .. })) {
+            return Err(crate::MicrosandboxError::InvalidConfig(
+                "sandbox_defaults.oci.root_disk cannot be a shared disk-image; specify user-owned disk images per sandbox".into(),
+            ));
+        }
+
+        if self.snapshot_upper_source.is_some() {
+            return Ok(());
+        }
+
+        let default_size_mib = defaults.upper_size_mib;
+        let memory_mib = self.spec.resources.memory_mib;
+        if let RootfsSource::Oci(oci) = &mut self.spec.image {
+            if oci.root_disk.is_none() {
+                oci.root_disk = defaults.root_disk.clone();
+            }
+
+            match &mut oci.root_disk {
+                None => {
+                    oci.root_disk = Some(RootDisk::Managed {
+                        size_mib: Some(default_size_mib.unwrap_or(DEFAULT_OCI_UPPER_SIZE_MIB)),
+                    });
+                }
+                Some(RootDisk::Managed { size_mib }) if size_mib.is_none() => {
+                    *size_mib = Some(default_size_mib.unwrap_or(DEFAULT_OCI_UPPER_SIZE_MIB));
+                }
+                Some(RootDisk::Tmpfs { size_mib }) if size_mib.is_none() => {
+                    *size_mib = Some((memory_mib / 2).max(1));
+                }
+                _ => {}
+            }
+        }
+        Ok(())
     }
 
     /// Apply runtime defaults that should exist for OCI sandboxes unless the
@@ -375,14 +502,6 @@ fn merge_init_env(base: &[EnvVar], overrides: &[(String, String)]) -> Vec<(Strin
         .collect()
 }
 
-fn resolved_container_argv(entrypoint_tail: &[String], cmd: Option<&[String]>) -> Vec<String> {
-    entrypoint_tail
-        .iter()
-        .chain(cmd.into_iter().flatten())
-        .cloned()
-        .collect()
-}
-
 /// Merge image env vars (OCI `KEY=VALUE` strings) with user env var pairs.
 fn merge_env(image_env: &[String], user_env: &[EnvVar]) -> Vec<EnvVar> {
     let base: Vec<EnvVar> = image_env
@@ -435,14 +554,9 @@ fn guest_mount_is(mount: &VolumeMount, path: &str) -> bool {
         | VolumeMount::Named { guest, .. }
         | VolumeMount::Tmpfs { guest, .. }
         | VolumeMount::DiskImage { guest, .. } => {
-            normalized_guest_path(guest) == normalized_guest_path(path)
+            Utf8UnixPath::new(guest).normalize() == Utf8UnixPath::new(path).normalize()
         }
     }
-}
-
-fn normalized_guest_path(path: &str) -> &str {
-    let trimmed = path.trim_end_matches('/');
-    if trimmed.is_empty() { "/" } else { trimmed }
 }
 
 pub(crate) fn sandbox_log_level_from_runtime(level: LogLevel) -> SandboxLogLevel {
@@ -486,9 +600,79 @@ impl SandboxConfig {
     }
 }
 
+/// Resolve reference-model secret entries (host-side `source` references) into
+/// concrete values for this spawn.
+///
+/// The durable sandbox config stores only the source reference; the resolved
+/// value exists in the returned copy, which travels to the sandbox process
+/// over the private launch-config fd and never returns to the database.
+/// Returns `None` when no entry needs resolution so callers can skip the
+/// config clone.
+#[cfg(feature = "net")]
+pub(crate) fn resolve_config_secret_sources(
+    config: &SandboxConfig,
+) -> crate::MicrosandboxResult<Option<SandboxConfig>> {
+    use microsandbox_network::secrets::config::SecretSource;
+
+    if !config.spec.network.enabled {
+        return Ok(None);
+    }
+    let mut network = config.local_network_config()?;
+    let mut resolved_any = false;
+    for secret in &mut network.secrets.secrets {
+        let Some(source) = &secret.source else {
+            continue;
+        };
+        match source {
+            SecretSource::Env { var } => {
+                let value = std::env::var(var).map_err(|_| {
+                    crate::MicrosandboxError::InvalidConfig(format!(
+                        "secret {}: host environment variable {var} is not set",
+                        secret.env_var
+                    ))
+                })?;
+                if value.is_empty() {
+                    return Err(crate::MicrosandboxError::InvalidConfig(format!(
+                        "secret {}: host environment variable {var} is empty",
+                        secret.env_var
+                    )));
+                }
+                // Move the plaintext into the zeroizing wrapper; the source
+                // `String` is consumed by the move, leaving no separate copy.
+                secret.value = zeroize::Zeroizing::new(value);
+                resolved_any = true;
+            }
+            SecretSource::Store { .. } => {
+                return Err(crate::MicrosandboxError::InvalidConfig(format!(
+                    "secret {}: store-backed secret sources are not supported yet",
+                    secret.env_var
+                )));
+            }
+        }
+    }
+    if !resolved_any {
+        return Ok(None);
+    }
+
+    let mut resolved = config.clone();
+    resolved.set_local_network_config(network)?;
+    Ok(Some(resolved))
+}
+
 //--------------------------------------------------------------------------------------------------
 // Trait Implementations
 //--------------------------------------------------------------------------------------------------
+
+impl From<SandboxSpec> for SandboxConfig {
+    /// Build a config from a full durable spec, defaulting all local
+    /// operational state (registry auth, replace flags, snapshot metadata).
+    fn from(spec: SandboxSpec) -> Self {
+        Self {
+            spec,
+            ..Default::default()
+        }
+    }
+}
 
 impl Default for SandboxConfig {
     fn default() -> Self {
@@ -497,6 +681,11 @@ impl Default for SandboxConfig {
                 resources: SandboxResources {
                     cpus: default_cpus(),
                     memory_mib: default_memory_mib(),
+                    max_cpus: default_cpus(),
+                    max_memory_mib: default_memory_mib(),
+                    cpu_placement: Default::default(),
+                    placement_profile: None,
+                    thp: TransparentHugePagePolicy::Madvise,
                 },
                 runtime: SandboxRuntimeOptions {
                     log_level: default_log_level(),
@@ -512,10 +701,12 @@ impl Default for SandboxConfig {
             ca_certs: Vec::new(),
             replace_existing: false,
             replace_with_timeout: DEFAULT_REPLACE_TIMEOUT,
+            slug: None,
             manifest_digest: None,
             snapshot_upper_source: None,
-            startup_command_requested: false,
-            initial_command: None,
+            launch_intent: LaunchIntent::None,
+            init_owns_workload: false,
+            init_workload_arg_count: 0,
         }
     }
 }
@@ -526,16 +717,15 @@ impl Default for SandboxConfig {
 
 #[cfg(test)]
 mod tests {
-    use std::path::PathBuf;
-
     use super::{SandboxConfig, merge_env};
     use crate::sandbox::{
-        HandoffInit, MountOptions, NamedVolumeMode, RootfsSource, StatVirtualization, VolumeMount,
+        HandoffInit, MountOptions, NamedVolumeMode, RootDisk, RootfsSource, StatVirtualization,
+        VolumeMount,
     };
     use microsandbox_image::ImageConfig;
     use microsandbox_types::{
         EnvVar, NamedVolumeCreate, SandboxLogLevel, SandboxPolicy, SandboxResources,
-        SandboxRuntimeOptions, SandboxSpec, SecurityProfile, VolumeKind,
+        SandboxRuntimeOptions, SandboxSpec, SecurityProfile, TransparentHugePagePolicy, VolumeKind,
     };
 
     #[test]
@@ -643,7 +833,7 @@ mod tests {
     }
 
     #[test]
-    fn test_merge_image_defaults_resolves_auto_init_from_image_entrypoint() {
+    fn test_merge_image_defaults_selects_init_without_launching_default_workload() {
         let image = ImageConfig {
             entrypoint: Some(vec![
                 "/init".to_string(),
@@ -655,7 +845,7 @@ mod tests {
         let mut config = SandboxConfig {
             spec: SandboxSpec {
                 init: Some(HandoffInit {
-                    cmd: PathBuf::from("auto"),
+                    cmd: "auto".to_string(),
                     args: Vec::new(),
                     env: Vec::new(),
                 }),
@@ -670,19 +860,17 @@ mod tests {
             .init
             .as_ref()
             .expect("init should remain configured");
-        assert_eq!(init.cmd, PathBuf::from("/init"));
-        assert_eq!(
-            init.args,
-            vec!["/opt/hermes/docker/main-wrapper.sh".to_string()]
-        );
+        assert_eq!(init.cmd, "/init");
+        assert!(init.args.is_empty());
         assert_eq!(
             config.spec.runtime.entrypoint,
             Some(vec!["/opt/hermes/docker/main-wrapper.sh".to_string()])
         );
+        assert!(!config.init_owns_boot_workload());
     }
 
     #[test]
-    fn test_merge_image_defaults_keeps_attached_command_out_of_init_entrypoint() {
+    fn test_merge_image_defaults_routes_attached_command_through_init_entrypoint() {
         let image = ImageConfig {
             entrypoint: Some(vec![
                 "/init".to_string(),
@@ -694,7 +882,7 @@ mod tests {
         let mut config = SandboxConfig {
             spec: SandboxSpec {
                 init: Some(HandoffInit {
-                    cmd: PathBuf::from("auto"),
+                    cmd: "auto".to_string(),
                     args: Vec::new(),
                     env: Vec::new(),
                 }),
@@ -702,7 +890,7 @@ mod tests {
             },
             ..Default::default()
         };
-        config.set_initial_command(vec!["gateway".to_string(), "run".to_string()]);
+        config.set_foreground_command(vec!["gateway".to_string(), "run".to_string()]);
         config.merge_image_defaults(&image);
 
         let init = config
@@ -710,7 +898,7 @@ mod tests {
             .init
             .as_ref()
             .expect("init should remain configured");
-        assert_eq!(init.cmd, PathBuf::from("/init"));
+        assert_eq!(init.cmd, "/init");
         assert_eq!(
             init.args,
             vec![
@@ -723,6 +911,7 @@ mod tests {
             config.spec.runtime.entrypoint,
             Some(vec!["/opt/hermes/docker/main-wrapper.sh".to_string()])
         );
+        assert!(config.init_owns_boot_workload());
     }
 
     #[test]
@@ -743,7 +932,7 @@ mod tests {
         let mut config = SandboxConfig {
             spec: SandboxSpec {
                 init: Some(HandoffInit {
-                    cmd: PathBuf::from("auto"),
+                    cmd: "auto".to_string(),
                     args: Vec::new(),
                     env: vec![
                         ("PATH".to_string(), "/init/bin:/usr/bin:/bin".to_string()),
@@ -758,7 +947,7 @@ mod tests {
             },
             ..Default::default()
         };
-        config.set_initial_command(vec!["gateway".to_string(), "run".to_string()]);
+        config.set_foreground_command(vec!["gateway".to_string(), "run".to_string()]);
         config.merge_image_defaults(&image);
 
         let init = config
@@ -791,7 +980,7 @@ mod tests {
         let mut config = SandboxConfig {
             spec: SandboxSpec {
                 init: Some(HandoffInit {
-                    cmd: PathBuf::from("auto"),
+                    cmd: "auto".to_string(),
                     args: Vec::new(),
                     env: Vec::new(),
                 }),
@@ -799,11 +988,11 @@ mod tests {
             },
             ..Default::default()
         };
-        config.set_persistent_initial_command(vec!["gateway".to_string(), "run".to_string()]);
+        config.set_background_command(vec!["gateway".to_string(), "run".to_string()]);
         config.merge_image_defaults(&image);
 
         let init = config.spec.init.as_ref().expect("runtime init");
-        assert_eq!(init.cmd, PathBuf::from("/init"));
+        assert_eq!(init.cmd, "/init");
         assert_eq!(
             init.args,
             vec![
@@ -820,14 +1009,27 @@ mod tests {
             config.spec.runtime.cmd,
             Some(vec!["gateway".to_string(), "run".to_string()])
         );
-        assert!(!config.startup_command_requested);
+        assert!(!config.should_launch_background_command());
+        assert!(config.init_owns_boot_workload());
+
+        let persisted = config.clone_for_persistence();
+        assert!(
+            persisted
+                .spec
+                .init
+                .as_ref()
+                .expect("persisted init")
+                .args
+                .is_empty()
+        );
+        assert!(!persisted.init_owns_boot_workload());
     }
 
     #[test]
-    fn test_persistent_initial_command_sets_runtime_cmd() {
+    fn test_background_command_sets_runtime_cmd() {
         let mut config = SandboxConfig::default();
 
-        config.set_persistent_initial_command(vec![
+        config.set_background_command(vec![
             "/bin/sh".to_string(),
             "-lc".to_string(),
             "echo detached".to_string(),
@@ -841,10 +1043,11 @@ mod tests {
                 "echo detached".to_string(),
             ])
         );
+        assert!(config.should_launch_background_command());
     }
 
     #[test]
-    fn test_empty_persistent_initial_command_keeps_runtime_cmd() {
+    fn test_empty_background_command_keeps_runtime_cmd() {
         let mut config = SandboxConfig {
             spec: SandboxSpec {
                 runtime: SandboxRuntimeOptions {
@@ -856,9 +1059,38 @@ mod tests {
             ..Default::default()
         };
 
-        config.set_persistent_initial_command(Vec::new());
+        config.set_background_command(Vec::new());
 
         assert_eq!(config.spec.runtime.cmd, Some(vec!["python3".to_string()]));
+        assert!(config.should_launch_background_command());
+    }
+
+    #[test]
+    fn test_empty_background_command_uses_merged_image_cmd() {
+        let image = ImageConfig {
+            cmd: Some(vec!["bash".to_string()]),
+            ..Default::default()
+        };
+        let mut config = SandboxConfig {
+            spec: SandboxSpec {
+                runtime: SandboxRuntimeOptions {
+                    entrypoint: Some(vec!["start-desktop".to_string()]),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        config.set_background_command(Vec::new());
+        config.merge_image_defaults(&image);
+
+        assert_eq!(
+            config.spec.runtime.entrypoint,
+            Some(vec!["start-desktop".to_string()])
+        );
+        assert_eq!(config.spec.runtime.cmd, Some(vec!["bash".to_string()]));
+        assert!(config.should_launch_background_command());
     }
 
     #[test]
@@ -866,7 +1098,7 @@ mod tests {
         let config = SandboxConfig {
             spec: SandboxSpec {
                 init: Some(HandoffInit {
-                    cmd: PathBuf::from("/lib/systemd/systemd"),
+                    cmd: "/lib/systemd/systemd".to_string(),
                     args: vec!["--unit=multi-user.target".to_string()],
                     env: Vec::new(),
                 }),
@@ -902,6 +1134,7 @@ mod tests {
                     options: MountOptions::default(),
                     stat_virtualization: StatVirtualization::Strict,
                     host_permissions: crate::sandbox::HostPermissions::Private,
+                    follow_root_symlinks: false,
                 }],
                 ..Default::default()
             },
@@ -930,7 +1163,7 @@ mod tests {
         let mut config = SandboxConfig {
             spec: SandboxSpec {
                 init: Some(HandoffInit {
-                    cmd: PathBuf::from("auto"),
+                    cmd: "auto".to_string(),
                     args: Vec::new(),
                     env: Vec::new(),
                 }),
@@ -938,7 +1171,7 @@ mod tests {
             },
             ..Default::default()
         };
-        config.set_initial_command(Vec::new());
+        config.set_foreground_command(Vec::new());
         config.merge_image_defaults(&image);
 
         let init = config
@@ -946,7 +1179,7 @@ mod tests {
             .init
             .as_ref()
             .expect("init should remain configured");
-        assert_eq!(init.cmd, PathBuf::from("/init"));
+        assert_eq!(init.cmd, "/init");
         assert_eq!(
             init.args,
             vec!["/app/server".to_string(), "--serve".to_string()]
@@ -968,7 +1201,7 @@ mod tests {
         let mut config = SandboxConfig {
             spec: SandboxSpec {
                 init: Some(HandoffInit {
-                    cmd: PathBuf::from("auto"),
+                    cmd: "auto".to_string(),
                     args: Vec::new(),
                     env: Vec::new(),
                 }),
@@ -976,7 +1209,7 @@ mod tests {
             },
             ..Default::default()
         };
-        config.set_initial_command(vec!["bash".to_string()]);
+        config.set_foreground_command(vec!["bash".to_string()]);
         config.merge_image_defaults(&image);
 
         let init = config
@@ -984,9 +1217,10 @@ mod tests {
             .init
             .as_ref()
             .expect("init should remain configured");
-        assert_eq!(init.cmd, PathBuf::from("/lib/systemd/systemd"));
-        assert_eq!(init.args, vec!["bash".to_string()]);
+        assert_eq!(init.cmd, "/lib/systemd/systemd");
+        assert!(init.args.is_empty());
         assert_eq!(config.spec.runtime.entrypoint, None);
+        assert!(!config.init_owns_boot_workload());
     }
 
     #[test]
@@ -1006,7 +1240,7 @@ mod tests {
                     ..Default::default()
                 },
                 init: Some(HandoffInit {
-                    cmd: PathBuf::from("auto"),
+                    cmd: "auto".to_string(),
                     args: Vec::new(),
                     env: Vec::new(),
                 }),
@@ -1014,7 +1248,7 @@ mod tests {
             },
             ..Default::default()
         };
-        config.set_initial_command(vec!["gateway".to_string(), "run".to_string()]);
+        config.set_foreground_command(vec!["gateway".to_string(), "run".to_string()]);
         config.merge_image_defaults(&image);
 
         let init = config
@@ -1022,7 +1256,7 @@ mod tests {
             .init
             .as_ref()
             .expect("init should remain configured");
-        assert_eq!(init.cmd, PathBuf::from("/init"));
+        assert_eq!(init.cmd, "/init");
         assert!(init.args.is_empty());
         assert_eq!(
             config.spec.runtime.entrypoint,
@@ -1040,7 +1274,7 @@ mod tests {
         let mut config = SandboxConfig {
             spec: SandboxSpec {
                 init: Some(HandoffInit {
-                    cmd: PathBuf::from("auto"),
+                    cmd: "auto".to_string(),
                     args: Vec::new(),
                     env: Vec::new(),
                 }),
@@ -1052,7 +1286,7 @@ mod tests {
 
         assert_eq!(
             config.spec.init.expect("init should remain configured").cmd,
-            PathBuf::from("auto")
+            "auto"
         );
         assert_eq!(
             config.spec.runtime.entrypoint,
@@ -1166,6 +1400,11 @@ mod tests {
             resources: SandboxResources {
                 cpus: 2,
                 memory_mib: 1024,
+                max_cpus: 2,
+                max_memory_mib: 1024,
+                cpu_placement: Default::default(),
+                placement_profile: None,
+                thp: TransparentHugePagePolicy::Madvise,
             },
             runtime: SandboxRuntimeOptions {
                 workdir: Some("/app".into()),
@@ -1235,27 +1474,6 @@ mod tests {
     }
 
     #[test]
-    fn test_sandbox_config_deserializes_legacy_readonly_mounts() {
-        let json = r#"{"name":"legacy","mounts":[{"type":"Tmpfs","guest":"/tmp","size_mib":512,"readonly":false}]}"#;
-
-        let decoded: SandboxConfig = serde_json::from_str(json).unwrap();
-
-        assert_eq!(decoded.spec.mounts.len(), 1);
-        match &decoded.spec.mounts[0] {
-            VolumeMount::Tmpfs {
-                guest,
-                size_mib,
-                options,
-            } => {
-                assert_eq!(guest, "/tmp");
-                assert_eq!(*size_mib, Some(512));
-                assert_eq!(*options, MountOptions::default());
-            }
-            mount => panic!("expected tmpfs mount, got {mount:?}"),
-        }
-    }
-
-    #[test]
     fn test_apply_runtime_defaults_adds_tmpfs_for_oci_tmp() {
         let mut config = SandboxConfig {
             spec: SandboxSpec {
@@ -1287,7 +1505,7 @@ mod tests {
     }
 
     #[test]
-    fn test_apply_rootfs_defaults_sets_oci_upper_size() {
+    fn test_apply_rootfs_defaults_sets_managed_root_disk() {
         let mut config = SandboxConfig {
             spec: SandboxSpec {
                 image: RootfsSource::oci("python:3.12"),
@@ -1296,9 +1514,38 @@ mod tests {
             ..Default::default()
         };
 
-        config.apply_rootfs_defaults(None);
+        config
+            .apply_rootfs_defaults(&crate::config::OciSandboxDefaults::default())
+            .unwrap();
 
-        assert_eq!(config.spec.image.oci_upper_size_mib(), Some(4096));
+        assert_eq!(
+            config.spec.image.oci_root_disk(),
+            Some(&RootDisk::managed(4096))
+        );
+    }
+
+    #[test]
+    fn test_apply_rootfs_defaults_sizes_tmpfs_from_memory() {
+        let mut config = SandboxConfig {
+            spec: SandboxSpec {
+                image: RootfsSource::Oci(microsandbox_types::OciRootfsSource {
+                    reference: "python:3.12".into(),
+                    root_disk: Some(RootDisk::Tmpfs { size_mib: None }),
+                }),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        config.spec.resources.memory_mib = 2048;
+
+        config
+            .apply_rootfs_defaults(&crate::config::OciSandboxDefaults::default())
+            .unwrap();
+
+        assert_eq!(
+            config.spec.image.oci_root_disk(),
+            Some(&RootDisk::tmpfs(1024))
+        );
     }
 
     #[test]
@@ -1311,9 +1558,66 @@ mod tests {
             ..Default::default()
         };
 
-        config.apply_rootfs_defaults(Some(8192));
+        config
+            .apply_rootfs_defaults(&crate::config::OciSandboxDefaults {
+                upper_size_mib: Some(8192),
+                root_disk: None,
+            })
+            .unwrap();
 
-        assert_eq!(config.spec.image.oci_upper_size_mib(), Some(8192));
+        assert_eq!(
+            config.spec.image.oci_root_disk(),
+            Some(&RootDisk::managed(8192))
+        );
+    }
+
+    #[test]
+    fn test_apply_rootfs_defaults_uses_flat_backend_default() {
+        let mut config = SandboxConfig {
+            spec: SandboxSpec {
+                image: RootfsSource::oci("python:3.12"),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let expected = RootDisk::Flat {
+            size_mib: Some(8192),
+            fstype: Some("ext4".into()),
+            clone: microsandbox_types::FlatClone::Copy,
+        };
+
+        config
+            .apply_rootfs_defaults(&crate::config::OciSandboxDefaults {
+                upper_size_mib: None,
+                root_disk: Some(expected.clone()),
+            })
+            .unwrap();
+
+        assert_eq!(config.spec.image.oci_root_disk(), Some(&expected));
+    }
+
+    #[test]
+    fn test_apply_rootfs_defaults_rejects_conflicting_config_fields() {
+        let mut config = SandboxConfig {
+            spec: SandboxSpec {
+                image: RootfsSource::oci("python:3.12"),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        let error = config
+            .apply_rootfs_defaults(&crate::config::OciSandboxDefaults {
+                upper_size_mib: Some(8192),
+                root_disk: Some(RootDisk::Flat {
+                    size_mib: None,
+                    fstype: None,
+                    clone: microsandbox_types::FlatClone::Auto,
+                }),
+            })
+            .unwrap_err();
+
+        assert!(error.to_string().contains("mutually exclusive"));
     }
 
     #[test]
@@ -1327,9 +1631,14 @@ mod tests {
             ..Default::default()
         };
 
-        config.apply_rootfs_defaults(Some(8192));
+        config
+            .apply_rootfs_defaults(&crate::config::OciSandboxDefaults {
+                upper_size_mib: Some(8192),
+                root_disk: None,
+            })
+            .unwrap();
 
-        assert_eq!(config.spec.image.oci_upper_size_mib(), None);
+        assert!(config.spec.image.oci_root_disk().is_none());
     }
 
     #[test]
@@ -1343,6 +1652,7 @@ mod tests {
                     options: MountOptions::default(),
                     stat_virtualization: crate::sandbox::StatVirtualization::Strict,
                     host_permissions: crate::sandbox::HostPermissions::Private,
+                    follow_root_symlinks: false,
                     quota_mib: None,
                 }],
                 ..Default::default()
@@ -1360,10 +1670,38 @@ mod tests {
     }
 
     #[test]
+    fn test_apply_runtime_defaults_preserves_canonical_tmp_alias() {
+        let mut config = SandboxConfig {
+            spec: SandboxSpec {
+                image: RootfsSource::oci("python:3.12"),
+                mounts: vec![VolumeMount::Bind {
+                    host: "/host/tmp".into(),
+                    guest: "/tmp/.".into(),
+                    options: MountOptions::default(),
+                    stat_virtualization: crate::sandbox::StatVirtualization::Strict,
+                    host_permissions: crate::sandbox::HostPermissions::Private,
+                    follow_root_symlinks: false,
+                    quota_mib: None,
+                }],
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        config.apply_runtime_defaults();
+
+        assert_eq!(config.spec.mounts.len(), 1);
+        assert_eq!(config.spec.mounts[0].guest(), "/tmp/.");
+    }
+
+    #[test]
     fn test_apply_runtime_defaults_skips_non_oci_roots() {
         let mut config = SandboxConfig {
             spec: SandboxSpec {
-                image: RootfsSource::Bind("/tmp/rootfs".into()),
+                image: RootfsSource::Bind {
+                    path: "/tmp/rootfs".into(),
+                    follow_root_symlinks: false,
+                },
                 ..Default::default()
             },
             ..Default::default()
@@ -1396,5 +1734,129 @@ mod tests {
         config.apply_runtime_defaults();
 
         assert!(config.spec.mounts.is_empty());
+    }
+
+    //----------------------------------------------------------------------------------------------
+    // Tests: Secret source references (create path + spawn resolution)
+    //----------------------------------------------------------------------------------------------
+
+    #[cfg(feature = "net")]
+    const SECRET_SENTINEL: &str = "sentinel-secret-value";
+
+    /// Build a network-enabled config carrying one secret. When `source_var`
+    /// is `Some`, the entry is a reference (the create path) resolved from that
+    /// host variable; when `None`, it is a legacy inlined value.
+    #[cfg(feature = "net")]
+    fn config_with_source_secret(source_var: Option<&str>) -> SandboxConfig {
+        use microsandbox_network::secrets::config::{
+            HostPattern, SecretEntry, SecretInjection, SecretSource,
+        };
+
+        let mut config = SandboxConfig::default();
+        config.spec.network.enabled = true;
+        let mut network = config.local_network_config().unwrap();
+        network.secrets.secrets.push(SecretEntry {
+            env_var: "API_KEY".into(),
+            value: if source_var.is_some() {
+                zeroize::Zeroizing::new(String::new())
+            } else {
+                zeroize::Zeroizing::new(SECRET_SENTINEL.into())
+            },
+            source: source_var.map(|var| SecretSource::Env {
+                var: var.to_string(),
+            }),
+            placeholder: "$MSB_API_KEY".into(),
+            allowed_hosts: vec![HostPattern::Exact("api.example.com".into())],
+            injection: SecretInjection::default(),
+            on_violation: None,
+            require_tls_identity: true,
+        });
+        config.set_local_network_config(network).unwrap();
+        config
+    }
+
+    /// The create path persists a source reference, never the resolved value:
+    /// the durable config JSON and the active_config snapshot carry the
+    /// `{kind: env, var: ...}` reference and zero occurrences of the value.
+    #[cfg(feature = "net")]
+    #[test]
+    fn create_path_persists_reference_not_value() {
+        // No host env is touched: the reference is persisted without ever
+        // reading the value at create time.
+        let config = config_with_source_secret(Some("MSB_TEST_CREATE_SOURCE"));
+        let persisted = serde_json::to_string(&config).unwrap();
+        assert!(
+            !persisted.contains(SECRET_SENTINEL),
+            "persisted config must not contain the secret value"
+        );
+        assert!(persisted.contains("\"var\":\"MSB_TEST_CREATE_SOURCE\""));
+
+        // The active_config snapshot is written from the same config shape at
+        // start, so it inherits the reference and stays value-free.
+        let active = config.clone_for_persistence();
+        let active_json = serde_json::to_string(&active).unwrap();
+        assert!(!active_json.contains(SECRET_SENTINEL));
+        assert!(active_json.contains("\"var\":\"MSB_TEST_CREATE_SOURCE\""));
+    }
+
+    /// The spawn resolver reads the source from the host environment and yields
+    /// a config whose entry carries the value; the durable input is unchanged.
+    #[cfg(feature = "net")]
+    #[test]
+    fn spawn_resolver_reads_source_from_host_env() {
+        let _env_guard = crate::test_support::lock_env();
+        // SAFETY: every environment-mutating SDK unit test holds the shared lock.
+        unsafe { std::env::set_var("MSB_TEST_RESOLVE_SOURCE", SECRET_SENTINEL) };
+
+        let config = config_with_source_secret(Some("MSB_TEST_RESOLVE_SOURCE"));
+        let resolved = super::resolve_config_secret_sources(&config)
+            .unwrap()
+            .expect("a source entry must be resolved");
+
+        let network = resolved.local_network_config().unwrap();
+        assert_eq!(network.secrets.secrets[0].value.as_str(), SECRET_SENTINEL);
+        // The durable input still stores only the reference.
+        let durable = config.local_network_config().unwrap();
+        assert!(durable.secrets.secrets[0].value.is_empty());
+
+        unsafe { std::env::remove_var("MSB_TEST_RESOLVE_SOURCE") };
+    }
+
+    /// Back-compat: a legacy config that inlined the value (no `source`) still
+    /// spawns. The resolver treats a present non-empty value as the material
+    /// and returns `None` so the caller reuses the config as-is.
+    #[cfg(feature = "net")]
+    #[test]
+    fn spawn_resolver_preserves_legacy_inlined_value() {
+        let config = config_with_source_secret(None);
+        let resolved = super::resolve_config_secret_sources(&config).unwrap();
+        assert!(
+            resolved.is_none(),
+            "legacy inlined values need no resolution"
+        );
+
+        // The legacy value is still usable directly from the durable config.
+        let network = config.local_network_config().unwrap();
+        assert_eq!(network.secrets.secrets[0].value.as_str(), SECRET_SENTINEL);
+    }
+    #[test]
+    fn test_sandbox_config_deserializes_legacy_readonly_mounts() {
+        let json = r#"{"name":"legacy","mounts":[{"type":"Tmpfs","guest":"/tmp","size_mib":512,"readonly":false}]}"#;
+
+        let decoded: SandboxConfig = serde_json::from_str(json).unwrap();
+
+        assert_eq!(decoded.spec.mounts.len(), 1);
+        match &decoded.spec.mounts[0] {
+            VolumeMount::Tmpfs {
+                guest,
+                size_mib,
+                options,
+            } => {
+                assert_eq!(guest, "/tmp");
+                assert_eq!(*size_mib, Some(512));
+                assert_eq!(*options, MountOptions::default());
+            }
+            mount => panic!("expected tmpfs mount, got {mount:?}"),
+        }
     }
 }

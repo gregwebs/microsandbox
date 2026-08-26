@@ -6,7 +6,8 @@ use std::net::IpAddr;
 use ipnetwork::IpNetwork;
 
 use super::DestinationGroup;
-use crate::shared::SharedState;
+use crate::addr::normalize_ip_addr;
+use crate::netstack::shared::SharedState;
 
 //--------------------------------------------------------------------------------------------------
 // Functions
@@ -17,39 +18,44 @@ use crate::shared::SharedState;
 /// Built on a single private classifier (`addr_classify`) so adding a
 /// new `DestinationGroup` variant forces an exhaustive-match update
 /// in the classifier and a corresponding witness in the test suite.
-/// `Public` is the fallback when no other classification matches —
-/// there's no list of excluded groups to keep in sync.
+/// `Public` is the fallback for classified addresses that match no other
+/// group. Unspecified addresses intentionally belong to no group.
 ///
-/// Groups are disjoint: each IP belongs to exactly one. `Metadata`
-/// takes precedence over `LinkLocal` for `169.254.169.254`, and `Host`
-/// takes precedence over `Private` when the gateway IPs sit inside
+/// Groups are disjoint: each non-unspecified IP belongs to exactly one.
+/// `Metadata` takes precedence over `LinkLocal` for `169.254.169.254`, and
+/// `Host` takes precedence over `Private` when the gateway IPs sit inside
 /// CGNAT or ULA ranges (which they currently do).
 pub fn matches_group(group: DestinationGroup, addr: IpAddr, shared: &SharedState) -> bool {
-    addr_classify(addr, shared) == group
+    addr_classify(addr, shared) == Some(group)
 }
 
-/// Classify an IP into exactly one destination group.
+/// Classify an IP into at most one destination group.
 ///
 /// Order matters: more specific tests first. `Host` first because
 /// today's gateway IPs land in CGNAT (`100.64.0.0/10`) and ULA
 /// (`fc00::/7`) ranges that `is_private` would otherwise claim.
 /// `Metadata` before `LinkLocal` because `169.254.169.254` is in the
-/// link-local CIDR.
-fn addr_classify(addr: IpAddr, shared: &SharedState) -> DestinationGroup {
-    if matches_host(addr, shared) {
-        DestinationGroup::Host
+/// link-local CIDR. Unspecified addresses are deliberately unclassified so
+/// a public profile cannot make `0.0.0.0` or `::` reachable.
+fn addr_classify(addr: IpAddr, shared: &SharedState) -> Option<DestinationGroup> {
+    let addr = normalize_ip_addr(addr);
+
+    if addr.is_unspecified() {
+        None
+    } else if matches_host(addr, shared) {
+        Some(DestinationGroup::Host)
     } else if is_metadata(addr) {
-        DestinationGroup::Metadata
+        Some(DestinationGroup::Metadata)
     } else if is_loopback(addr) {
-        DestinationGroup::Loopback
+        Some(DestinationGroup::Loopback)
     } else if is_private(addr) {
-        DestinationGroup::Private
+        Some(DestinationGroup::Private)
     } else if is_link_local(addr) {
-        DestinationGroup::LinkLocal
+        Some(DestinationGroup::LinkLocal)
     } else if is_multicast(addr) {
-        DestinationGroup::Multicast
+        Some(DestinationGroup::Multicast)
     } else {
-        DestinationGroup::Public
+        Some(DestinationGroup::Public)
     }
 }
 
@@ -125,6 +131,8 @@ fn is_multicast(addr: IpAddr) -> bool {
 
 /// Returns `true` if `addr` matches a CIDR network.
 pub fn matches_cidr(network: &IpNetwork, addr: IpAddr) -> bool {
+    let addr = normalize_ip_addr(addr);
+
     network.contains(addr)
 }
 
@@ -222,6 +230,32 @@ mod tests {
     }
 
     #[test]
+    fn ipv4_mapped_ipv6_uses_embedded_ipv4_group() {
+        let s = no_host();
+
+        assert!(matches_group(
+            DestinationGroup::Metadata,
+            IpAddr::V6("::ffff:169.254.169.254".parse().unwrap()),
+            &s,
+        ));
+        assert!(matches_group(
+            DestinationGroup::Loopback,
+            IpAddr::V6("::ffff:127.0.0.1".parse().unwrap()),
+            &s,
+        ));
+        assert!(matches_group(
+            DestinationGroup::Private,
+            IpAddr::V6("::ffff:10.0.0.1".parse().unwrap()),
+            &s,
+        ));
+        assert!(!matches_group(
+            DestinationGroup::Public,
+            IpAddr::V6("::ffff:10.0.0.1".parse().unwrap()),
+            &s,
+        ));
+    }
+
+    #[test]
     fn link_local() {
         let s = no_host();
         assert!(matches_group(
@@ -295,6 +329,16 @@ mod tests {
     }
 
     #[test]
+    fn cidr_match_uses_embedded_ipv4_for_ipv4_mapped_ipv6() {
+        let net: IpNetwork = "169.254.0.0/16".parse().unwrap();
+
+        assert!(matches_cidr(
+            &net,
+            IpAddr::V6("::ffff:169.254.169.254".parse().unwrap()),
+        ));
+    }
+
+    #[test]
     fn public_v4_routable() {
         let s = no_host();
         for ip in [
@@ -321,12 +365,14 @@ mod tests {
     fn public_excludes_other_categories() {
         let s = no_host();
         let not_public = [
+            IpAddr::V4(Ipv4Addr::UNSPECIFIED),
             IpAddr::V4(Ipv4Addr::LOCALHOST),
             IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)),
             IpAddr::V4(Ipv4Addr::new(192, 168, 1, 1)),
             IpAddr::V4(Ipv4Addr::new(169, 254, 1, 1)),
             IpAddr::V4(Ipv4Addr::new(169, 254, 169, 254)),
             IpAddr::V4(Ipv4Addr::new(224, 0, 0, 1)),
+            IpAddr::V6(Ipv6Addr::UNSPECIFIED),
             IpAddr::V6(Ipv6Addr::LOCALHOST),
             IpAddr::V6("fd42:6d73:62:2a::1".parse().unwrap()),
             IpAddr::V6("fe80::1".parse().unwrap()),
@@ -411,7 +457,7 @@ mod tests {
         for (ip, expected) in cases {
             assert_eq!(
                 addr_classify(*ip, &s),
-                *expected,
+                Some(*expected),
                 "expected {ip:?} to classify as {expected:?}"
             );
         }

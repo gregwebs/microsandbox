@@ -3,7 +3,8 @@
 use std::path::{Path, PathBuf};
 
 use chrono::Utc;
-use microsandbox_image::snapshot::{MANIFEST_FILENAME, Manifest};
+use microsandbox_image::snapshot::migration::V066_DESCRIPTOR_FILENAME;
+use microsandbox_image::snapshot::{DESCRIPTOR_FILENAME, Manifest, SnapshotState};
 use sea_orm::{
     ActiveModelTrait, ActiveValue::Set, ColumnTrait, ConnectionTrait, EntityTrait, QueryFilter,
     QueryOrder,
@@ -13,7 +14,7 @@ use crate::backend::LocalBackend;
 use crate::db::entity::snapshot as snapshot_entity;
 use crate::{MicrosandboxError, MicrosandboxResult};
 
-use super::{Snapshot, SnapshotFormat, SnapshotHandle};
+use super::{Snapshot, SnapshotFormat, SnapshotHandle, SnapshotScope};
 
 //--------------------------------------------------------------------------------------------------
 // Functions
@@ -46,7 +47,10 @@ pub(super) async fn open_snapshot(
         ));
     }
 
-    let manifest_path = dir.join(MANIFEST_FILENAME);
+    let manifest_path = dir.join(DESCRIPTOR_FILENAME);
+    if !manifest_path.exists() && dir.join(V066_DESCRIPTOR_FILENAME).exists() {
+        super::migration::reconcile_explicit(local.db().await?, &dir).await?;
+    }
     let bytes = tokio::fs::read(&manifest_path).await.map_err(|e| {
         MicrosandboxError::SnapshotNotFound(format!("{}: {e}", manifest_path.display()))
     })?;
@@ -56,30 +60,31 @@ pub(super) async fn open_snapshot(
         .digest()
         .map_err(|e| MicrosandboxError::SnapshotIntegrity(format!("{e}")))?;
 
-    // Verify the upper file is present and matches the recorded size.
-    // Content verification is an explicit operation because raw upper
-    // files may be multi-GiB, dense files.
-    let upper_path = dir.join(&manifest.upper.file);
-    let upper_meta = tokio::fs::symlink_metadata(&upper_path)
-        .await
-        .map_err(|e| {
-            MicrosandboxError::SnapshotIntegrity(format!(
-                "missing upper file: {}: {e}",
+    if let SnapshotState::File(file_state) = &manifest.state {
+        // Metadata open proves the confined payload exists and has the bound
+        // apparent size. Explicit verify performs the potentially large hash.
+        let upper_path = dir.join(&file_state.upper.file);
+        let upper_meta = tokio::fs::symlink_metadata(&upper_path)
+            .await
+            .map_err(|e| {
+                MicrosandboxError::SnapshotIntegrity(format!(
+                    "missing upper file: {}: {e}",
+                    upper_path.display()
+                ))
+            })?;
+        if !upper_meta.file_type().is_file() {
+            return Err(MicrosandboxError::SnapshotIntegrity(format!(
+                "upper is not a regular file: {}",
                 upper_path.display()
-            ))
-        })?;
-    if !upper_meta.file_type().is_file() {
-        return Err(MicrosandboxError::SnapshotIntegrity(format!(
-            "upper is not a regular file: {}",
-            upper_path.display()
-        )));
-    }
-    let actual_size = upper_meta.len();
-    if actual_size != manifest.upper.size_bytes {
-        return Err(MicrosandboxError::SnapshotIntegrity(format!(
-            "upper size mismatch: manifest says {}, file is {}",
-            manifest.upper.size_bytes, actual_size
-        )));
+            )));
+        }
+        let actual_size = upper_meta.len();
+        if actual_size != file_state.upper.size_bytes {
+            return Err(MicrosandboxError::SnapshotIntegrity(format!(
+                "upper size mismatch: descriptor says {}, file is {}",
+                file_state.upper.size_bytes, actual_size
+            )));
+        }
     }
 
     let snap = Snapshot::from_parts(dir.clone(), digest.clone(), manifest);
@@ -123,35 +128,79 @@ pub(super) async fn index_upsert(
     // Delete any prior row for this digest, name, or path, then insert.
     // This keeps the rebuildable index aligned when an artifact is
     // replaced in-place or when a manifest rewrite changes its digest.
-    snapshot_entity::Entity::delete_by_id(digest.to_string())
-        .exec(db)
-        .await?;
+    // The superseded rows' parent edges disappear with them, so their
+    // parents' child_count must come down first; the fresh insert re-adds
+    // its own edge below.
+    let mut supersede = sea_orm::Condition::any()
+        .add(snapshot_entity::Column::Digest.eq(digest.to_string()))
+        .add(snapshot_entity::Column::ArtifactPath.eq(artifact_path_str.clone()));
     if let Some(name) = artifact_name.as_ref() {
-        snapshot_entity::Entity::delete_many()
-            .filter(snapshot_entity::Column::Name.eq(name.clone()))
-            .exec(db)
+        supersede = supersede.add(snapshot_entity::Column::Name.eq(name.clone()));
+    }
+    let superseded = snapshot_entity::Entity::find()
+        .filter(supersede.clone())
+        .all(db)
+        .await?;
+    for row in &superseded {
+        if let Some(parent) = row.parent_digest.as_ref() {
+            db.execute_unprepared(&format!(
+                "UPDATE snapshot_index SET child_count = MAX(0, child_count - 1) WHERE digest = '{}'",
+                parent.replace('\'', "''")
+            ))
             .await?;
+        }
     }
     snapshot_entity::Entity::delete_many()
-        .filter(snapshot_entity::Column::ArtifactPath.eq(artifact_path_str.clone()))
+        .filter(supersede)
         .exec(db)
         .await?;
 
-    let format_str = match manifest.format {
-        microsandbox_image::snapshot::SnapshotFormat::Raw => "raw",
-        microsandbox_image::snapshot::SnapshotFormat::Qcow2 => "qcow2",
+    let (state_kind, format, fstype, checkpoint_manifest_digest, size_bytes) = match &manifest.state
+    {
+        SnapshotState::File(state) => {
+            let format = match state.format {
+                microsandbox_image::snapshot::SnapshotFormat::Raw => "raw",
+                microsandbox_image::snapshot::SnapshotFormat::Qcow2 => "qcow2",
+            };
+            (
+                "file",
+                Some(format.to_string()),
+                Some(state.fstype.clone()),
+                None,
+                Some(i64::try_from(state.upper.size_bytes).map_err(|_| {
+                    MicrosandboxError::SnapshotIntegrity(
+                        "snapshot size does not fit the local index".into(),
+                    )
+                })?),
+            )
+        }
+        SnapshotState::Checkpoint(state) => {
+            ("checkpoint", None, None, Some(state.manifest.clone()), None)
+        }
+    };
+    let scope_str = match manifest.scope {
+        SnapshotScope::Disk => "disk",
+        SnapshotScope::Resumable => "resumable",
     };
 
     let row = snapshot_entity::ActiveModel {
         digest: Set(digest.to_string()),
         name: Set(artifact_name),
         parent_digest: Set(manifest.parent.clone()),
+        scope: Set(scope_str.into()),
+        state_kind: Set(state_kind.into()),
         image_ref: Set(manifest.image.reference.clone()),
         image_manifest_digest: Set(manifest.image.manifest_digest.clone()),
-        format: Set(format_str.into()),
-        fstype: Set(manifest.fstype.clone()),
+        format: Set(format),
+        fstype: Set(fstype),
+        checkpoint_manifest_digest: Set(checkpoint_manifest_digest),
         artifact_path: Set(artifact_path_str),
-        size_bytes: Set(Some(manifest.upper.size_bytes as i64)),
+        size_bytes: Set(size_bytes),
+        locality: Set("embedded".into()),
+        storage_binding_id: Set(None),
+        availability: Set("ready".into()),
+        migration_state: Set("canonical".into()),
+        migration_error_code: Set(None),
         created_at: Set(created_at),
         indexed_at: Set(indexed_at),
         child_count: Set(0),
@@ -175,8 +224,25 @@ pub(super) async fn index_upsert(
 // Functions: Helpers
 //--------------------------------------------------------------------------------------------------
 
-fn looks_like_path(s: &str) -> bool {
-    s.contains('/') || s.starts_with('.') || s.starts_with('~')
+/// Heuristic split between a bare snapshot name and a filesystem path.
+pub(super) fn looks_like_path(s: &str) -> bool {
+    if s.contains('/') || s.starts_with('.') || s.starts_with('~') {
+        return true;
+    }
+    // On Windows hosts, native separators and drive/UNC prefixes (`C:\snaps\foo`, `C:foo`, `\\server\share`) mark a path even when no forward slash appears.
+    #[cfg(windows)]
+    {
+        use typed_path::{Utf8WindowsComponent, Utf8WindowsPath};
+        s.contains('\\')
+            || matches!(
+                Utf8WindowsPath::new(s).components().next(),
+                Some(Utf8WindowsComponent::Prefix(_))
+            )
+    }
+    #[cfg(not(windows))]
+    {
+        false
+    }
 }
 
 pub(super) async fn list_indexed(local: &LocalBackend) -> MicrosandboxResult<Vec<SnapshotHandle>> {
@@ -202,7 +268,18 @@ pub(super) async fn list_dir(
         if !path.is_dir() {
             continue;
         }
-        if !path.join(MANIFEST_FILENAME).exists() {
+        // Dot-prefixed directories are never artifacts; create() stages
+        // in-progress snapshots as `.<name>.staging` siblings, and a crashed
+        // staging dir must not be listed or indexed as a snapshot.
+        if path
+            .file_name()
+            .and_then(|s| s.to_str())
+            .is_some_and(|s| s.starts_with('.'))
+        {
+            continue;
+        }
+        if !path.join(DESCRIPTOR_FILENAME).exists() && !path.join(V066_DESCRIPTOR_FILENAME).exists()
+        {
             continue;
         }
         match open_snapshot(local, path.to_string_lossy().as_ref()).await {
@@ -352,18 +429,66 @@ pub(super) async fn lookup_by_digest(
 }
 
 fn handle_from_model(m: snapshot_entity::Model) -> SnapshotHandle {
-    let format = match m.format.as_str() {
+    let format = m.format.as_deref().map(|format| match format {
         "qcow2" => SnapshotFormat::Qcow2,
         _ => SnapshotFormat::Raw,
+    });
+    let scope = match m.scope.as_str() {
+        "disk" => SnapshotScope::Disk,
+        "resumable" => SnapshotScope::Resumable,
+        other => {
+            tracing::warn!(digest = %m.digest, scope = other, "unknown snapshot scope in index; treating as disk");
+            SnapshotScope::Disk
+        }
     };
     SnapshotHandle {
         digest: m.digest,
         name: m.name,
         parent_digest: m.parent_digest,
+        scope,
         image_ref: m.image_ref,
+        state_kind: m.state_kind,
         format,
+        fstype: m.fstype,
+        checkpoint_manifest_digest: m.checkpoint_manifest_digest,
         size_bytes: m.size_bytes.map(|n| n as u64),
+        locality: m.locality,
+        availability: m.availability,
+        migration_state: m.migration_state,
+        migration_error_code: m.migration_error_code,
         created_at: m.created_at,
         artifact_path: PathBuf::from(m.artifact_path),
+    }
+}
+
+//--------------------------------------------------------------------------------------------------
+// Tests
+//--------------------------------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::looks_like_path;
+
+    #[test]
+    fn bare_names_are_not_paths() {
+        assert!(!looks_like_path("nightly"));
+        assert!(!looks_like_path("my-snapshot_2"));
+    }
+
+    #[test]
+    fn posix_anchors_and_separators_are_paths() {
+        assert!(looks_like_path("/srv/snaps/foo"));
+        assert!(looks_like_path("snaps/foo"));
+        assert!(looks_like_path("./foo"));
+        assert!(looks_like_path("~/snaps"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_forms_are_paths() {
+        assert!(looks_like_path(r"C:\snaps\foo"));
+        assert!(looks_like_path(r"C:foo"));
+        assert!(looks_like_path(r"\\server\share\foo"));
+        assert!(looks_like_path(r"snaps\foo"));
     }
 }

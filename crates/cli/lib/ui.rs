@@ -53,6 +53,10 @@ pub struct Table {
     rows: Vec<Vec<String>>,
 }
 
+/// Marker error for commands that already rendered a styled error block.
+#[derive(Debug)]
+pub struct AlreadyRenderedError;
+
 //--------------------------------------------------------------------------------------------------
 // Methods
 //--------------------------------------------------------------------------------------------------
@@ -121,6 +125,18 @@ impl Spinner {
                 self.target,
                 style(duration).dim()
             );
+        }
+    }
+
+    /// Finish with failure. Shows `✗ <label> <target>` in the same completion
+    /// format as [`finish_success`](Self::finish_success), in red.
+    pub fn finish_fail(self, label: &str) {
+        if let Some(pb) = self.pb {
+            pb.finish_and_clear();
+        }
+
+        if !self.quiet {
+            eprintln!("   {} {:<12} {}", style("✗").red(), label, self.target);
         }
     }
 
@@ -194,12 +210,21 @@ impl Table {
     }
 
     /// Print the table to stdout with column alignment.
+    pub fn print(&self) {
+        let rendered = self.render();
+        if !rendered.is_empty() {
+            print!("{rendered}");
+        }
+    }
+
+    /// Render the table to a string with column alignment.
     ///
     /// Uses visible (display) width so ANSI escape codes in cell values
-    /// don't break column alignment.
-    pub fn print(&self) {
+    /// don't break column alignment. Returns an empty string when there
+    /// are no rows.
+    pub fn render(&self) -> String {
         if self.rows.is_empty() {
-            return;
+            return String::new();
         }
 
         let col_count = self.headers.len();
@@ -213,7 +238,7 @@ impl Table {
             }
         }
 
-        // Print headers
+        let mut out = String::new();
         let header: String = self
             .headers
             .iter()
@@ -226,9 +251,9 @@ impl Table {
                 }
             })
             .collect();
-        println!("{}", style(header).cyan().bold());
+        out.push_str(&style(header).cyan().bold().to_string());
+        out.push('\n');
 
-        // Print rows
         for row in &self.rows {
             let line: String = row
                 .iter()
@@ -243,10 +268,24 @@ impl Table {
                     }
                 })
                 .collect();
-            println!("{line}");
+            out.push_str(&line);
+            out.push('\n');
         }
+        out
     }
 }
+
+//--------------------------------------------------------------------------------------------------
+// Trait Implementations
+//--------------------------------------------------------------------------------------------------
+
+impl std::fmt::Display for AlreadyRenderedError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("command failed")
+    }
+}
+
+impl std::error::Error for AlreadyRenderedError {}
 
 //--------------------------------------------------------------------------------------------------
 // Functions
@@ -329,12 +368,41 @@ pub fn warn(msg: &str) {
     eprintln!("{} {msg}", style("warn:").yellow().bold());
 }
 
+/// Print a concise informational notice to stderr.
+///
+/// This uses the same action-line geometry as progress and success output so
+/// diagnostics remain visually consistent without contaminating stdout.
+pub fn notice(label: &str, detail: &str) {
+    eprintln!("   {} {:<12} {}", style("•").cyan(), label, detail);
+}
+
+/// Print a warning message with `→`-prefixed context lines.
+///
+/// Mirrors [`error_with_lines`] but with a yellow `warn:` label. As there, the
+/// message and body text render uncolored; only the `→` bullet is dim.
+pub fn warn_with_lines(msg: &str, lines: &[ErrorLine<'_>]) {
+    eprintln!("{} {msg}", style("warn:").yellow().bold());
+    for line in lines {
+        let text = match line {
+            ErrorLine::Cause(t) | ErrorLine::Hint(t) => t,
+        };
+        eprintln!("  {} {}", style("→").dim(), text);
+    }
+}
+
 /// Print a one-shot success action to stderr.
 ///
 /// Follows the same format as spinner completions:
 /// `   ✓ {verb:<12} {target}`
 pub fn success(verb: &str, target: &str) {
     eprintln!("   {} {:<12} {}", style("✓").green(), verb, target);
+}
+
+/// Print a one-shot failure action to stderr, mirroring [`success`].
+///
+/// Same `   ✗ {label:<12} {detail}` shape as a spinner failure completion.
+pub fn failure(label: &str, detail: &str) {
+    eprintln!("   {} {:<12} {}", style("✗").red(), label, detail);
 }
 
 /// Format a sandbox status with appropriate color.
@@ -347,6 +415,17 @@ pub fn format_status(status: &str) -> String {
         "Paused" => format!("{}", style("paused").yellow().bold()),
         "Draining" => format!("{}", style("draining").yellow().bold()),
         "Crashed" => format!("{}", style("crashed").red().bold()),
+        other => other.to_lowercase(),
+    }
+}
+
+/// Format a modification disposition with status-badge colors.
+pub fn format_disposition(disposition: &str) -> String {
+    match disposition {
+        "live" => format!("{}", style("live").green().bold()),
+        "requires restart" => format!("{}", style("requires restart").yellow().bold()),
+        "next start" => format!("{}", style("next start").dim()),
+        "unsupported" => format!("{}", style("unsupported").red().bold()),
         other => other.to_lowercase(),
     }
 }
@@ -390,6 +469,32 @@ pub fn parse_size_mib(s: &str) -> Result<u32, String> {
         s.parse::<u32>()
             .map_err(|e| format!("invalid size (expected e.g. 512M, 1G): {e}"))
     }
+}
+
+/// Parse a byte-precision size string: raw bytes plus binary `K`, `M`,
+/// and `G` suffixes (e.g. `1048576`, `512K`, `1M`, `2G`).
+///
+/// The whole-byte sibling of [`parse_size_mib`], for values (like network
+/// rate limit buckets) that need finer than MiB granularity.
+pub fn parse_size_bytes(s: &str) -> Result<u64, String> {
+    let s = s.trim();
+    let (digits, multiplier) = if let Some(n) = s.strip_suffix('K').or_else(|| s.strip_suffix('k'))
+    {
+        (n, 1024u64)
+    } else if let Some(n) = s.strip_suffix('M').or_else(|| s.strip_suffix('m')) {
+        (n, 1024 * 1024)
+    } else if let Some(n) = s.strip_suffix('G').or_else(|| s.strip_suffix('g')) {
+        (n, 1024 * 1024 * 1024)
+    } else {
+        (s, 1)
+    };
+    let value: u64 = digits
+        .trim()
+        .parse()
+        .map_err(|e| format!("invalid size `{s}` (expected raw bytes or K/M/G suffix): {e}"))?;
+    value
+        .checked_mul(multiplier)
+        .ok_or_else(|| format!("size `{s}` overflows u64 bytes"))
 }
 
 /// Parse an environment variable specification (KEY=value or KEY).
@@ -449,6 +554,25 @@ pub fn format_rfc3339_datetime(s: &str) -> Result<String, chrono::ParseError> {
 #[cfg(test)]
 mod tests {
     #[test]
+    fn parse_size_bytes_accepts_raw_bytes_and_binary_suffixes() {
+        assert_eq!(super::parse_size_bytes("1048576").unwrap(), 1024 * 1024);
+        assert_eq!(super::parse_size_bytes("512K").unwrap(), 512 * 1024);
+        assert_eq!(super::parse_size_bytes("1M").unwrap(), 1024 * 1024);
+        assert_eq!(
+            super::parse_size_bytes("2G").unwrap(),
+            2 * 1024 * 1024 * 1024
+        );
+        assert_eq!(
+            super::parse_size_bytes("2g").unwrap(),
+            2 * 1024 * 1024 * 1024
+        );
+
+        assert!(super::parse_size_bytes("1.5M").is_err());
+        assert!(super::parse_size_bytes("abc").is_err());
+        assert!(super::parse_size_bytes(&format!("{}G", u64::MAX)).is_err());
+    }
+
+    #[test]
     fn json_datetime_uses_rfc3339_utc() {
         let dt = chrono::DateTime::parse_from_rfc3339("2026-05-31T09:09:00Z")
             .unwrap()
@@ -494,6 +618,7 @@ pub struct PullProgressDisplay {
     download_style: ProgressStyle,
     materialize_style: ProgressStyle,
     done_style: ProgressStyle,
+    verb: &'static str,
     _echo_guard: Option<EchoGuard>,
 }
 
@@ -504,15 +629,20 @@ pub struct PullProgressDisplay {
 impl PullProgressDisplay {
     /// Create a new pull progress display for the given image reference.
     pub fn new(reference: &str) -> Self {
-        Self::new_inner(reference, false)
+        Self::new_inner(reference, false, "Pulling")
     }
 
     /// Create a no-op pull progress display that produces no output.
     pub fn quiet(reference: &str) -> Self {
-        Self::new_inner(reference, true)
+        Self::new_inner(reference, true, "Pulling")
     }
 
-    fn new_inner(reference: &str, quiet: bool) -> Self {
+    /// Create a progress display for `msb image load` (header reads "Loading").
+    pub fn load(reference: &str, quiet: bool) -> Self {
+        Self::new_inner(reference, quiet, "Loading")
+    }
+
+    fn new_inner(reference: &str, quiet: bool, verb: &'static str) -> Self {
         let is_tty = !quiet && std::io::stderr().is_terminal();
 
         let mp = MultiProgress::new();
@@ -529,7 +659,7 @@ impl PullProgressDisplay {
                 .template("   {spinner} {msg}")
                 .unwrap(),
         );
-        header.set_message(format!("{:<12} {}", "Pulling", reference));
+        header.set_message(format!("{:<12} {}", verb, reference));
         header.enable_steady_tick(Duration::from_millis(80));
 
         Self {
@@ -537,6 +667,7 @@ impl PullProgressDisplay {
             header,
             layer_bars: Vec::new(),
             reference: reference.to_string(),
+            verb,
             _echo_guard: if is_tty { EchoGuard::acquire() } else { None },
             download_style: ProgressStyle::default_bar()
                 .template(
@@ -554,6 +685,21 @@ impl PullProgressDisplay {
         }
     }
 
+    /// Ensure a materialize-styled bar exists for `index`, creating any missing
+    /// bars up to it. No-op when the bar already exists (pull pre-creates them on
+    /// its `Resolved` event); load has no such event, so bars are made lazily as
+    /// each layer starts materializing.
+    fn ensure_layer_bar(&mut self, index: usize) {
+        while self.layer_bars.len() <= index {
+            let n = self.layer_bars.len() + 1;
+            let pb = self.mp.add(ProgressBar::new(1));
+            pb.set_style(self.materialize_style.clone());
+            pb.set_prefix(format!("layer {n}"));
+            pb.set_message("materializing");
+            self.layer_bars.push(pb);
+        }
+    }
+
     /// Process a single pull progress event, updating the display.
     pub fn handle_event(&mut self, event: PullProgress) {
         match event {
@@ -564,7 +710,7 @@ impl PullProgressDisplay {
             PullProgress::Resolved { layer_count, .. } => {
                 self.header.set_message(format!(
                     "{:<12} {} ({} layer{})",
-                    "Pulling",
+                    self.verb,
                     self.reference,
                     layer_count,
                     if layer_count == 1 { "" } else { "s" }
@@ -608,6 +754,7 @@ impl PullProgressDisplay {
                 }
             }
             PullProgress::LayerMaterializeStarted { layer_index, .. } => {
+                self.ensure_layer_bar(layer_index);
                 if let Some(pb) = self.layer_bars.get(layer_index) {
                     pb.set_style(self.materialize_style.clone());
                     pb.set_position(0);
@@ -620,18 +767,21 @@ impl PullProgressDisplay {
                 bytes_read,
                 total_bytes,
             } => {
+                self.ensure_layer_bar(layer_index);
                 if let Some(pb) = self.layer_bars.get(layer_index) {
                     pb.set_length(total_bytes);
                     pb.set_position(bytes_read);
                 }
             }
             PullProgress::LayerMaterializeWriting { layer_index } => {
+                self.ensure_layer_bar(layer_index);
                 if let Some(pb) = self.layer_bars.get(layer_index) {
                     pb.set_position(pb.length().unwrap_or(0));
                     pb.set_message("writing image");
                 }
             }
             PullProgress::LayerMaterializeComplete { layer_index, .. } => {
+                self.ensure_layer_bar(layer_index);
                 if let Some(pb) = self.layer_bars.get(layer_index) {
                     pb.set_position(pb.length().unwrap_or(0));
                     pb.set_style(self.done_style.clone());

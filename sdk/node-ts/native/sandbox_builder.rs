@@ -1,5 +1,4 @@
 use std::net::IpAddr;
-use std::path::PathBuf;
 use std::time::Duration;
 
 use napi::bindgen_prelude::*;
@@ -7,8 +6,9 @@ use napi_derive::napi;
 
 use microsandbox::sandbox::LogLevel as RustLogLevel;
 use microsandbox::sandbox::{
+    CpuPlacement as RustCpuPlacement, DeploymentProfile as RustDeploymentProfile,
     PullPolicy as RustPullPolicy, Sandbox as RustSandbox, SandboxBuilder as RustSandboxBuilder,
-    SecurityProfile as RustSecurityProfile,
+    SecurityProfile as RustSecurityProfile, TransparentHugePagePolicy as RustThpPolicy,
 };
 use microsandbox::size::Mebibytes;
 
@@ -22,6 +22,7 @@ use crate::network_builder::JsNetworkBuilder;
 use crate::patch_builder::JsPatchBuilder;
 use crate::pull_progress::JsPullProgressStream;
 use crate::registry_builder::JsRegistryConfigBuilder;
+use crate::root_disk_builder::JsRootDiskBuilder;
 use crate::sandbox::Sandbox as JsSandbox;
 use crate::secret_builder::JsSecretBuilder;
 use crate::tls_builder::JsTlsBuilder;
@@ -57,7 +58,7 @@ impl JsSandboxBuilder {
     #[napi(constructor)]
     pub fn new(name: String) -> Self {
         Self {
-            inner: Some(RustSandboxBuilder::new(name)),
+            inner: Some(microsandbox::Sandbox::builder(name)),
         }
     }
 
@@ -86,6 +87,46 @@ impl JsSandboxBuilder {
         Ok(self)
     }
 
+    /// Configure the writable rootfs layer (root disk) for the OCI image.
+    ///
+    /// Sugar over `imageWith((i) => i.oci(...).rootDisk(...))` — the root
+    /// disk lives on the OCI rootfs source, so an OCI image must be set
+    /// first. Pass a number of MiB for a managed root disk, or a callback
+    /// for the tmpfs, flat, and disk-image kinds:
+    ///
+    /// ```ts
+    /// .image("python").rootDisk(8192)
+    /// .image("python").rootDisk((d) => d.tmpfs().size(512))
+    /// .image("python").rootDisk((d) => d.flat().size(8192).cloneStrategy("auto"))
+    /// .image("python").rootDisk((d) => d.disk("./scratch.img"))
+    /// ```
+    #[napi(
+        js_name = "rootDisk",
+        ts_args_type = "sizeMibOrConfigure: number | ((d: RootDiskBuilder) => RootDiskBuilder)"
+    )]
+    pub fn root_disk(
+        &mut self,
+        env: &Env,
+        size_mib_or_configure: Either<
+            u32,
+            Function<ClassInstance<JsRootDiskBuilder>, ClassInstance<JsRootDiskBuilder>>,
+        >,
+    ) -> Result<&Self> {
+        let prev = self.take_inner();
+        match size_mib_or_configure {
+            Either::A(size_mib) => {
+                self.inner = Some(prev.root_disk(Mebibytes::from(size_mib)));
+            }
+            Either::B(configure) => {
+                let initial = JsRootDiskBuilder::new().into_instance(env)?;
+                let mut returned = configure.call(initial)?;
+                let disk_builder = returned.take_inner_builder()?;
+                self.inner = Some(prev.root_disk_with(|_default| disk_builder));
+            }
+        }
+        Ok(self)
+    }
+
     /// Boot a fresh sandbox from a snapshot artifact (path or name).
     /// Mutually exclusive with `image()` / `imageWith()` — the
     /// snapshot already pins the image reference and digest.
@@ -111,12 +152,67 @@ impl JsSandboxBuilder {
         Ok(self)
     }
 
+    /// Boot-time maximum possible virtual CPUs.
+    #[napi(js_name = "maxCpus")]
+    pub fn max_cpus(&mut self, count: u32) -> Result<&Self> {
+        let n =
+            u8::try_from(count).map_err(|_| napi::Error::from_reason("maxCpus out of u8 range"))?;
+        let prev = self.take_inner();
+        self.inner = Some(prev.max_cpus(n));
+        Ok(self)
+    }
+
+    /// Host CPU placement policy.
+    #[napi(js_name = "cpuPlacement")]
+    pub fn cpu_placement(&mut self, policy: String) -> Result<&Self> {
+        let policy = policy
+            .parse::<RustCpuPlacement>()
+            .map_err(napi::Error::from_reason)?;
+        let prev = self.take_inner();
+        self.inner = Some(prev.cpu_placement(policy));
+        Ok(self)
+    }
+
+    /// Host-defined placement profile name.
+    #[napi(js_name = "placementProfile")]
+    pub fn placement_profile(&mut self, profile: String) -> &Self {
+        let prev = self.take_inner();
+        self.inner = Some(prev.placement_profile(profile));
+        self
+    }
+
     /// Guest memory in MiB.
     #[napi]
     pub fn memory(&mut self, mib: u32) -> &Self {
         let prev = self.take_inner();
         self.inner = Some(prev.memory(Mebibytes::from(mib)));
         self
+    }
+
+    /// Boot-time maximum hotpluggable guest memory in MiB.
+    #[napi(js_name = "maxMemory")]
+    pub fn max_memory(&mut self, mib: u32) -> &Self {
+        let prev = self.take_inner();
+        self.inner = Some(prev.max_memory(Mebibytes::from(mib)));
+        self
+    }
+
+    /// Guest transparent huge-page policy selected at boot.
+    #[napi(ts_args_type = "policy: 'always' | 'madvise' | 'never'")]
+    pub fn thp(&mut self, policy: String) -> Result<&Self> {
+        let policy = match policy.as_str() {
+            "always" => RustThpPolicy::Always,
+            "madvise" => RustThpPolicy::Madvise,
+            "never" => RustThpPolicy::Never,
+            other => {
+                return Err(napi::Error::from_reason(format!(
+                    "invalid THP policy `{other}`; expected always, madvise, or never"
+                )));
+            }
+        };
+        let prev = self.take_inner();
+        self.inner = Some(prev.thp(policy));
+        Ok(self)
     }
 
     /// Override log verbosity: `"trace" | "debug" | "info" | "warn" | "error"`.
@@ -216,6 +312,24 @@ impl JsSandboxBuilder {
         Ok(self)
     }
 
+    /// Host-runtime deployment profile (`"single-tenant"` or `"multi-tenant"`).
+    /// Managed backends may enforce their own profile.
+    #[napi(js_name = "deploymentProfile")]
+    pub fn deployment_profile(&mut self, profile: String) -> Result<&Self> {
+        let profile = match profile.as_str() {
+            "single-tenant" | "single_tenant" => RustDeploymentProfile::SingleTenant,
+            "multi-tenant" | "multi_tenant" => RustDeploymentProfile::MultiTenant,
+            other => {
+                return Err(napi::Error::from_reason(format!(
+                    "invalid deployment profile `{other}` (expected single-tenant | multi-tenant)"
+                )));
+            }
+        };
+        let prev = self.take_inner();
+        self.inner = Some(prev.deployment_profile(profile));
+        Ok(self)
+    }
+
     /// Configure registry connection settings via a callback.
     #[napi]
     pub fn registry(
@@ -271,6 +385,14 @@ impl JsSandboxBuilder {
         self
     }
 
+    /// Override the image CMD used by default-workload execution.
+    #[napi]
+    pub fn cmd(&mut self, cmd: Vec<String>) -> &Self {
+        let prev = self.take_inner();
+        self.inner = Some(prev.cmd(cmd));
+        self
+    }
+
     /// Hand off PID 1 to a guest init binary after agentd's setup.
     ///
     /// `cmd` is either an absolute path inside the guest rootfs or
@@ -281,10 +403,9 @@ impl JsSandboxBuilder {
     #[napi]
     pub fn init(&mut self, cmd: String, args: Option<Vec<String>>) -> &Self {
         let prev = self.take_inner();
-        let cmd_path = PathBuf::from(cmd);
         self.inner = Some(match args {
-            Some(args) if !args.is_empty() => prev.init_with(cmd_path, |i| i.args(args)),
-            _ => prev.init(cmd_path),
+            Some(args) if !args.is_empty() => prev.init_with(cmd, |i| i.args(args)),
+            _ => prev.init(cmd),
         });
         self
     }
@@ -306,7 +427,7 @@ impl JsSandboxBuilder {
         let mut returned = configure.call(initial)?;
         let init_builder = returned.take_inner_builder()?;
         let prev = self.take_inner();
-        self.inner = Some(prev.init_with(PathBuf::from(cmd), |_default| init_builder));
+        self.inner = Some(prev.init_with(cmd, |_default| init_builder));
         Ok(self)
     }
 
@@ -435,6 +556,22 @@ impl JsSandboxBuilder {
         let prev = self.take_inner();
         self.inner = Some(prev.port_udp_bind(bind, h, g));
         Ok(self)
+    }
+
+    /// Expose a host Unix stream socket or local Windows named pipe on a guest-to-host vsock port.
+    #[napi]
+    pub fn vsock(&mut self, host_path: String, port: u32) -> &Self {
+        let prev = self.take_inner();
+        self.inner = Some(prev.vsock(host_path, port));
+        self
+    }
+
+    /// Expose a host Unix datagram socket on a guest-to-host vsock port.
+    #[napi(js_name = "vsockDgram")]
+    pub fn vsock_dgram(&mut self, host_path: String, port: u32) -> &Self {
+        let prev = self.take_inner();
+        self.inner = Some(prev.vsock_dgram(host_path, port));
+        self
     }
 
     /// Add a secret via a callback.

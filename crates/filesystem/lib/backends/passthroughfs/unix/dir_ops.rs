@@ -9,11 +9,12 @@ use std::{
     io,
     os::fd::{AsRawFd, FromRawFd},
     sync::{Arc, RwLock, atomic::Ordering},
+    time::Duration,
 };
 
 use super::{DirSnapshot, PassthroughDirEntry, PassthroughDirHandle, PassthroughFs, inode};
 use crate::{
-    Context, DirEntry, Entry, OpenOptions,
+    AddDirEntry, AddDirEntryPlus, Context, DirEntry, Entry, OpenOptions,
     backends::shared::{
         dir_snapshot::{self, SnapshotEntry},
         init_binary, platform,
@@ -71,6 +72,31 @@ pub(crate) fn do_readdir(
     ))
 }
 
+/// Stream directory entries from a point-in-time snapshot.
+pub(crate) fn do_readdir_for_each(
+    fs: &PassthroughFs,
+    _ctx: Context,
+    inode: u64,
+    handle: u64,
+    _size: u32,
+    offset: u64,
+    add_entry: &mut AddDirEntry<'_>,
+) -> io::Result<()> {
+    let handles = fs.dir_handles.read().unwrap();
+    let data = handles.get(&handle).ok_or_else(platform::ebadf)?;
+
+    let mut snapshot_lock = data.snapshot.lock().unwrap();
+    if snapshot_lock.is_none() {
+        #[allow(clippy::readonly_write_lock)]
+        let file = data.file.write().unwrap();
+        let inject_init = fs.injects_init() && inode == 1;
+        *snapshot_lock = Some(build_snapshot(file.as_raw_fd(), inject_init)?);
+    }
+
+    let snapshot = snapshot_lock.as_ref().unwrap();
+    dir_snapshot::serve_snapshot_entries_for_each(&snapshot.entries, offset, add_entry)
+}
+
 /// Read directory entries with attributes (readdirplus).
 pub(crate) fn do_readdirplus(
     fs: &PassthroughFs,
@@ -106,11 +132,99 @@ pub(crate) fn do_readdirplus(
                 de.type_ = mode_to_dtype(file_type);
                 result.push((de, entry));
             }
-            Err(_) => continue,
+            Err(err) if lookup_says_gone(&err) => continue,
+            Err(_) => result.push((de, no_lookup_entry())),
         }
     }
 
     Ok(result)
+}
+
+/// Stream directory entries with attributes.
+pub(crate) fn do_readdirplus_for_each(
+    fs: &PassthroughFs,
+    _ctx: Context,
+    inode: u64,
+    handle: u64,
+    _size: u32,
+    offset: u64,
+    add_entry: &mut AddDirEntryPlus<'_>,
+) -> io::Result<()> {
+    let handles = fs.dir_handles.read().unwrap();
+    let data = handles.get(&handle).ok_or_else(platform::ebadf)?;
+
+    let mut snapshot_lock = data.snapshot.lock().unwrap();
+    if snapshot_lock.is_none() {
+        #[allow(clippy::readonly_write_lock)]
+        let file = data.file.write().unwrap();
+        let inject_init = fs.injects_init() && inode == 1;
+        *snapshot_lock = Some(build_snapshot(file.as_raw_fd(), inject_init)?);
+    }
+
+    let snapshot = snapshot_lock.as_ref().unwrap();
+    let mut emitted_lookup_refs = Vec::new();
+
+    for snapshot_entry in dir_snapshot::snapshot_entries_after(&snapshot.entries, offset) {
+        let name_bytes = snapshot_entry.name();
+        if name_bytes == b"." || name_bytes == b".." {
+            continue;
+        }
+
+        let mut dir_entry = DirEntry {
+            ino: snapshot_entry.inode(),
+            offset: snapshot_entry.offset(),
+            type_: snapshot_entry.file_type(),
+            name: name_bytes,
+        };
+
+        if name_bytes == init_binary::INIT_FILENAME {
+            let entry = init_binary::init_entry(fs.cfg.entry_timeout, fs.cfg.attr_timeout);
+            if add_entry(dir_entry, entry)? == 0 {
+                break;
+            }
+            continue;
+        }
+
+        let name_cstr = match std::ffi::CString::new(name_bytes.to_vec()) {
+            Ok(c) => c,
+            Err(_) => continue,
+        };
+        let (entry, looked_up_inode) = match inode::do_lookup(fs, inode, &name_cstr) {
+            Ok(entry) => {
+                let file_type = platform::mode_file_type(entry.attr.st_mode);
+                dir_entry.type_ = mode_to_dtype(file_type);
+                let looked_up_inode = entry.inode;
+                (entry, Some(looked_up_inode))
+            }
+            Err(err) if lookup_says_gone(&err) => continue,
+            Err(_) => (no_lookup_entry(), None),
+        };
+
+        match add_entry(dir_entry, entry) {
+            Ok(0) => {
+                if let Some(ino) = looked_up_inode {
+                    inode::forget_one(fs, ino, 1);
+                }
+                break;
+            }
+            Ok(_) => {
+                if let Some(ino) = looked_up_inode {
+                    emitted_lookup_refs.push(ino);
+                }
+            }
+            Err(err) => {
+                if let Some(ino) = looked_up_inode {
+                    inode::forget_one(fs, ino, 1);
+                }
+                for emitted_inode in emitted_lookup_refs {
+                    inode::forget_one(fs, emitted_inode, 1);
+                }
+                return Err(err);
+            }
+        }
+    }
+
+    Ok(())
 }
 
 /// Release an open directory handle.
@@ -154,6 +268,26 @@ impl SnapshotEntry for PassthroughDirEntry {
 /// Convert a file mode type to a directory entry type.
 fn mode_to_dtype(mode_type: u32) -> u32 {
     platform::dirent_type_from_mode(mode_type)
+}
+
+/// Whether a failed per-entry lookup means the name is truly gone from the directory (deleted or replaced between snapshot and lookup) rather than temporarily unresolvable.
+///
+/// Errors from `do_lookup` are already translated to Linux errno values; `ENOENT` and `ENOTDIR` are numerically identical on Linux and macOS.
+fn lookup_says_gone(err: &io::Error) -> bool {
+    matches!(err.raw_os_error(), Some(libc::ENOENT) | Some(libc::ENOTDIR))
+}
+
+/// Entry for a dirent whose lookup failed for a reason other than the name being gone (fd exhaustion, I/O error, permissions). `inode: 0` tells the guest kernel that no
+/// lookup was performed: the name still appears in the listing and the real error surfaces when the entry is accessed, instead of silently vanishing from the guest's view.
+fn no_lookup_entry() -> Entry {
+    Entry {
+        inode: 0,
+        generation: 0,
+        attr: unsafe { std::mem::zeroed() },
+        attr_flags: 0,
+        attr_timeout: Duration::ZERO,
+        entry_timeout: Duration::ZERO,
+    }
 }
 
 /// Build a point-in-time directory snapshot with stable synthetic offsets.

@@ -27,6 +27,14 @@ use crate::types::*;
 #[napi]
 pub struct Sandbox {
     inner: Arc<Mutex<Option<microsandbox::sandbox::Sandbox>>>,
+    backend_kind: &'static str,
+}
+
+/// One page returned by `Sandbox.list` / `Sandbox.listWith`.
+#[napi(object, object_from_js = false)]
+pub struct JsSandboxPage {
+    pub sandboxes: Vec<JsSandboxHandle>,
+    pub next_cursor: Option<String>,
 }
 
 /// A streaming subscription for sandbox metrics at a regular interval.
@@ -63,8 +71,10 @@ pub struct JsLogStream {
 
 impl Sandbox {
     pub fn from_rust(inner: microsandbox::sandbox::Sandbox) -> Self {
+        let backend_kind = inner.backend_kind().as_str();
         Sandbox {
             inner: Arc::new(Mutex::new(Some(inner))),
+            backend_kind,
         }
     }
 }
@@ -83,9 +93,7 @@ impl Sandbox {
         let inner = microsandbox::sandbox::Sandbox::start(&name)
             .await
             .map_err(to_napi_error)?;
-        Ok(Sandbox {
-            inner: Arc::new(Mutex::new(Some(inner))),
-        })
+        Ok(Sandbox::from_rust(inner))
     }
 
     /// Start an existing stopped sandbox (detached mode).
@@ -96,9 +104,7 @@ impl Sandbox {
         let inner = microsandbox::sandbox::Sandbox::start_detached(&name)
             .await
             .map_err(to_napi_error)?;
-        Ok(Sandbox {
-            inner: Arc::new(Mutex::new(Some(inner))),
-        })
+        Ok(Sandbox::from_rust(inner))
     }
 
     //----------------------------------------------------------------------------------------------
@@ -116,39 +122,34 @@ impl Sandbox {
         Ok(JsSandboxHandle::from_rust(handle))
     }
 
-    /// List all sandboxes.
+    /// List the first page of sandboxes.
     #[napi]
-    pub async fn list() -> Result<Vec<JsSandboxHandle>> {
-        let handles = microsandbox::sandbox::Sandbox::list()
+    pub async fn list() -> Result<JsSandboxPage> {
+        let page = microsandbox::sandbox::Sandbox::list()
             .await
             .map_err(to_napi_error)?;
-        Ok(handles
-            .into_iter()
-            .map(JsSandboxHandle::from_rust)
-            .collect())
+        Ok(sandbox_page_to_js(page))
     }
 
-    /// List sandboxes matching a filter.
+    /// List a configured page of sandboxes.
     #[napi(js_name = "listWith")]
-    pub async fn list_with(filter: SandboxListFilter) -> Result<Vec<JsSandboxHandle>> {
-        let handles = match filter.labels {
-            Some(labels) if !labels.is_empty() => {
-                let filter = labels.into_iter().fold(
-                    microsandbox::sandbox::SandboxFilter::new(),
-                    |filter, (key, value)| filter.label(key, value),
-                );
-                microsandbox::sandbox::Sandbox::list_with(filter)
-                    .await
-                    .map_err(to_napi_error)?
+    pub async fn list_with(options: SandboxListOptions) -> Result<JsSandboxPage> {
+        let page = microsandbox::sandbox::Sandbox::list_with(|list| {
+            let mut list = list;
+            if let Some(limit) = options.limit {
+                list = list.limit(limit);
             }
-            _ => microsandbox::sandbox::Sandbox::list()
-                .await
-                .map_err(to_napi_error)?,
-        };
-        Ok(handles
-            .into_iter()
-            .map(JsSandboxHandle::from_rust)
-            .collect())
+            if let Some(cursor) = options.cursor {
+                list = list.cursor(cursor);
+            }
+            if let Some(labels) = options.labels {
+                list = list.labels(labels);
+            }
+            list
+        })
+        .await
+        .map_err(to_napi_error)?;
+        Ok(sandbox_page_to_js(page))
     }
 
     /// Remove a stopped sandbox from the database.
@@ -164,6 +165,12 @@ impl Sandbox {
     //----------------------------------------------------------------------------------------------
     // Properties
     //----------------------------------------------------------------------------------------------
+
+    /// Backend retained by this sandbox (`"local"` or `"cloud"`).
+    #[napi(getter)]
+    pub fn backend_kind(&self) -> &'static str {
+        self.backend_kind
+    }
 
     /// Sandbox name. Names are limited to 128 UTF-8 bytes.
     #[napi(getter)]
@@ -195,6 +202,56 @@ impl Sandbox {
     //----------------------------------------------------------------------------------------------
     // Execution
     //----------------------------------------------------------------------------------------------
+
+    /// Execute the sandbox's effective OCI entrypoint and CMD.
+    #[napi]
+    pub async fn exec_default(&self) -> Result<ExecOutput> {
+        let guard = self.inner.lock().await;
+        let sb = guard.as_ref().ok_or_else(consumed_error)?;
+        let output = sb.exec_default().await.map_err(to_napi_error)?;
+        Ok(ExecOutput::from_rust(output))
+    }
+
+    /// Execute the sandbox's effective OCI entrypoint and CMD using a populated options builder.
+    #[napi(js_name = "execDefaultWithBuilder")]
+    pub async unsafe fn exec_default_with_builder(
+        &self,
+        builder: &mut JsExecOptionsBuilder,
+    ) -> Result<ExecOutput> {
+        let opts_builder = builder.take_inner_builder()?;
+        let guard = self.inner.lock().await;
+        let sb = guard.as_ref().ok_or_else(consumed_error)?;
+        let output = sb
+            .exec_default_with(|_default| opts_builder)
+            .await
+            .map_err(to_napi_error)?;
+        Ok(ExecOutput::from_rust(output))
+    }
+
+    /// Execute the sandbox's effective OCI entrypoint and CMD with streaming I/O.
+    #[napi]
+    pub async fn exec_default_stream(&self) -> Result<JsExecHandle> {
+        let guard = self.inner.lock().await;
+        let sb = guard.as_ref().ok_or_else(consumed_error)?;
+        let handle = sb.exec_default_stream().await.map_err(to_napi_error)?;
+        Ok(JsExecHandle::from_rust(handle))
+    }
+
+    /// Stream the sandbox's effective OCI entrypoint and CMD using a populated options builder.
+    #[napi(js_name = "execDefaultStreamWithBuilder")]
+    pub async unsafe fn exec_default_stream_with_builder(
+        &self,
+        builder: &mut JsExecOptionsBuilder,
+    ) -> Result<JsExecHandle> {
+        let opts_builder = builder.take_inner_builder()?;
+        let guard = self.inner.lock().await;
+        let sb = guard.as_ref().ok_or_else(consumed_error)?;
+        let handle = sb
+            .exec_default_stream_with(|_default| opts_builder)
+            .await
+            .map_err(to_napi_error)?;
+        Ok(JsExecHandle::from_rust(handle))
+    }
 
     /// Execute a command and wait for completion.
     #[napi]
@@ -332,6 +389,40 @@ impl Sandbox {
         Ok(metrics_to_js(&m))
     }
 
+    //----------------------------------------------------------------------------------------------
+    // Health
+    //----------------------------------------------------------------------------------------------
+
+    /// Check whether agentd is reachable without refreshing idle activity.
+    #[napi]
+    pub async fn ping(&self) -> Result<SandboxPingResult> {
+        let guard = self.inner.lock().await;
+        let sb = guard.as_ref().ok_or_else(consumed_error)?;
+        let result = sb.ping().await.map_err(to_napi_error)?;
+        Ok(sandbox_ping_result_to_js(result))
+    }
+
+    /// Explicitly refresh this sandbox's idle activity timer.
+    #[napi]
+    pub async fn touch(&self) -> Result<SandboxTouchResult> {
+        let guard = self.inner.lock().await;
+        let sb = guard.as_ref().ok_or_else(consumed_error)?;
+        let result = sb.touch().await.map_err(to_napi_error)?;
+        Ok(sandbox_touch_result_to_js(result))
+    }
+
+    /// Plan or apply a sandbox modification. Returns the plan as a JSON
+    /// string; the TS wrapper parses it into a `SandboxModificationPlan`.
+    #[napi]
+    pub async fn modify(&self, options: Option<SandboxModifyOptions>) -> Result<String> {
+        let builder = {
+            let guard = self.inner.lock().await;
+            let sb = guard.as_ref().ok_or_else(consumed_error)?;
+            configure_modify(sb.modify(), options.as_ref())?
+        };
+        run_modify(builder, modify_dry_run(options.as_ref())).await
+    }
+
     /// Stream metrics snapshots at the requested interval (in milliseconds).
     #[napi]
     pub async fn metrics_stream(&self, interval_ms: f64) -> Result<JsMetricsStream> {
@@ -358,6 +449,28 @@ impl Sandbox {
     //----------------------------------------------------------------------------------------------
     // Attach
     //----------------------------------------------------------------------------------------------
+
+    /// Attach to the sandbox's effective OCI entrypoint and CMD.
+    #[napi]
+    pub async fn attach_default(&self) -> Result<i32> {
+        let guard = self.inner.lock().await;
+        let sb = guard.as_ref().ok_or_else(consumed_error)?;
+        sb.attach_default().await.map_err(to_napi_error)
+    }
+
+    /// Attach to the sandbox's effective OCI entrypoint and CMD using a populated options builder.
+    #[napi(js_name = "attachDefaultWithBuilder")]
+    pub async unsafe fn attach_default_with_builder(
+        &self,
+        builder: &mut JsAttachOptionsBuilder,
+    ) -> Result<i32> {
+        let opts_builder = builder.take_inner_builder()?;
+        let guard = self.inner.lock().await;
+        let sb = guard.as_ref().ok_or_else(consumed_error)?;
+        sb.attach_default_with(|_default| opts_builder)
+            .await
+            .map_err(to_napi_error)
+    }
 
     /// Attach to an interactive PTY session inside the sandbox.
     ///
@@ -542,6 +655,17 @@ impl Sandbox {
 //--------------------------------------------------------------------------------------------------
 // Functions
 //--------------------------------------------------------------------------------------------------
+
+fn sandbox_page_to_js(page: microsandbox::sandbox::SandboxPage) -> JsSandboxPage {
+    JsSandboxPage {
+        sandboxes: page
+            .sandboxes
+            .into_iter()
+            .map(JsSandboxHandle::from_rust)
+            .collect(),
+        next_cursor: page.next_cursor,
+    }
+}
 
 #[napi]
 impl JsMetricsStream {
@@ -780,6 +904,160 @@ pub fn sandbox_stop_result_to_js(
     }
 }
 
+pub fn sandbox_ping_result_to_js(
+    result: microsandbox::sandbox::SandboxPingResult,
+) -> SandboxPingResult {
+    SandboxPingResult {
+        name: result.name,
+        latency_ms: result.latency.as_secs_f64() * 1000.0,
+    }
+}
+
+pub fn sandbox_touch_result_to_js(
+    result: microsandbox::sandbox::SandboxTouchResult,
+) -> SandboxTouchResult {
+    SandboxTouchResult {
+        name: result.name,
+        activity_seq: result.activity_seq as f64,
+    }
+}
+
+/// Inject the modify options into a core modification builder.
+///
+/// Map entries are sorted so repeated calls with the same options produce the
+/// same patch (and therefore the same plan ordering).
+pub(crate) fn configure_modify(
+    builder: microsandbox::sandbox::SandboxModificationBuilder,
+    options: Option<&SandboxModifyOptions>,
+) -> Result<microsandbox::sandbox::SandboxModificationBuilder> {
+    use microsandbox::sandbox::{EnvVar, SandboxModificationPatch};
+
+    let Some(options) = options else {
+        return Ok(builder);
+    };
+
+    let mut env_pairs: Vec<_> = options
+        .env
+        .clone()
+        .unwrap_or_default()
+        .into_iter()
+        .collect();
+    env_pairs.sort();
+    let mut label_pairs: Vec<_> = options
+        .labels
+        .clone()
+        .unwrap_or_default()
+        .into_iter()
+        .collect();
+    label_pairs.sort();
+
+    // Secret names are sorted so identical options always produce the same
+    // patch (and plan ordering), matching the env/labels handling above.
+    let mut secret_entries: Vec<_> = options
+        .secrets
+        .clone()
+        .unwrap_or_default()
+        .into_iter()
+        .collect();
+    secret_entries.sort_by(|(a, _), (b, _)| a.cmp(b));
+    let secrets = secret_entries
+        .into_iter()
+        .map(|(name, spec)| secret_patch_from_spec(name, spec))
+        .collect::<Result<Vec<_>>>()?;
+
+    let patch = SandboxModificationPatch {
+        cpus: options.cpus.map(cpu_count_u8).transpose()?,
+        max_cpus: options.max_cpus.map(cpu_count_u8).transpose()?,
+        memory_mib: options.memory_mib,
+        max_memory_mib: options.max_memory_mib,
+        root_disk_size_mib: options.root_disk_size_mib,
+        env: env_pairs
+            .into_iter()
+            .map(|(key, value)| EnvVar::new(key, value))
+            .collect(),
+        env_remove: options.env_remove.clone().unwrap_or_default(),
+        labels: label_pairs,
+        labels_remove: options.labels_remove.clone().unwrap_or_default(),
+        workdir: options.workdir.clone(),
+        secrets,
+        secrets_remove: options.secrets_remove.clone().unwrap_or_default(),
+    };
+
+    let builder = builder.with_patch(patch);
+    Ok(match options.policy.as_deref().unwrap_or("no_restart") {
+        "no_restart" => builder,
+        "next_start" => builder.next_start(),
+        "restart" => builder.restart(),
+        other => {
+            return Err(Error::from_reason(format!(
+                "unknown policy {other:?}; expected \"no_restart\", \"next_start\", or \"restart\""
+            )));
+        }
+    })
+}
+
+pub(crate) fn modify_dry_run(options: Option<&SandboxModifyOptions>) -> bool {
+    options.and_then(|options| options.dry_run).unwrap_or(false)
+}
+
+/// Convert one `secrets` entry into the canonical secret patch, rejecting
+/// specs that set more than one of `env` / `value` / `store`. Errors name
+/// only the conflicting fields, never the secret material; the raw value
+/// moves straight into the patch's `Zeroizing` field.
+fn secret_patch_from_spec(
+    name: String,
+    spec: SecretModifySpec,
+) -> Result<microsandbox::sandbox::SecretModificationPatch> {
+    use microsandbox::sandbox::{SecretModificationPatch, SecretSource};
+
+    let set: Vec<_> = [
+        ("env", spec.env.is_some()),
+        ("value", spec.value.is_some()),
+        ("store", spec.store.is_some()),
+    ]
+    .into_iter()
+    .filter(|(_, present)| *present)
+    .map(|(key, _)| format!("{key:?}"))
+    .collect();
+    if set.len() > 1 {
+        return Err(Error::from_reason(format!(
+            "secret {name:?}: {} are mutually exclusive; set at most one",
+            set.join(" and ")
+        )));
+    }
+
+    let source = match (spec.env, spec.store) {
+        (Some(var), _) => Some(SecretSource::Env { var }),
+        (_, Some(reference)) => Some(SecretSource::Store { reference }),
+        _ => None,
+    };
+    Ok(SecretModificationPatch {
+        name,
+        source,
+        value: spec.value.unwrap_or_default().into(),
+        placeholder: spec.placeholder,
+        allowed_hosts: spec.allowed_hosts.unwrap_or_default(),
+    })
+}
+
+/// Drive dry-run or apply and serialize the resulting plan to JSON.
+pub(crate) async fn run_modify(
+    builder: microsandbox::sandbox::SandboxModificationBuilder,
+    dry_run: bool,
+) -> Result<String> {
+    let plan = if dry_run {
+        builder.dry_run().await
+    } else {
+        builder.apply().await
+    }
+    .map_err(to_napi_error)?;
+    serde_json::to_string(&plan).map_err(|e| Error::from_reason(e.to_string()))
+}
+
+fn cpu_count_u8(cpus: u32) -> Result<u8> {
+    u8::try_from(cpus).map_err(|_| Error::from_reason(format!("cpu count {cpus} exceeds 255")))
+}
+
 pub(crate) fn exit_status_to_js(status: std::process::ExitStatus) -> ExitStatus {
     #[cfg(unix)]
     let code = {
@@ -803,3 +1081,7 @@ pub(crate) fn exit_status_to_js(status: std::process::ExitStatus) -> ExitStatus 
 fn consumed_error() -> napi::Error {
     napi::Error::from_reason("Sandbox handle has been consumed (detached or removed)")
 }
+
+//--------------------------------------------------------------------------------------------------
+// Tests
+//--------------------------------------------------------------------------------------------------

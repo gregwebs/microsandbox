@@ -5,6 +5,7 @@ import type { PullProgress } from "../dist/index.js";
 
 const SANDBOX_NAME = "sdk-smoke-test";
 
+
 async function waitForSandboxMetrics(sb: Sandbox) {
   let lastError: unknown;
 
@@ -73,6 +74,52 @@ describe.skipIf(!msbPath())("end-to-end smoke", () => {
     expect(code).toBe(7);
   });
 
+  it("resizes a TTY while recv() is pending", async () => {
+    const handle = await sb.execStreamWith("sh", (exec) =>
+      exec
+        .args(["-c", "printf 'ready\\n'; read value; stty size"])
+        .stdinPipe()
+        .tty(true),
+    );
+    const stdin = await handle.takeStdin();
+    expect(stdin).not.toBeNull();
+
+    while (true) {
+      const event = await handle.recv();
+      expect(event).not.toBeNull();
+      if (
+        event?.kind === "stdout" &&
+        new TextDecoder().decode(event.data).includes("ready")
+      ) {
+        break;
+      }
+    }
+
+    const pendingEvent = handle.recv();
+    let timeout: ReturnType<typeof setTimeout> | undefined;
+    try {
+      await Promise.race([
+        handle.resize(40, 100),
+        new Promise<never>((_, reject) => {
+          timeout = setTimeout(() => reject(new Error("resize timed out")), 5_000);
+        }),
+      ]);
+    } finally {
+      if (timeout !== undefined) clearTimeout(timeout);
+    }
+
+    await stdin?.write("continue\n");
+    const events = [await pendingEvent];
+    for await (const event of handle) events.push(event);
+    let output = "";
+    for (const event of events) {
+      if (event?.kind === "stdout") {
+        output += new TextDecoder().decode(event.data);
+      }
+    }
+    expect(output).toContain("40 100");
+  });
+
   it("reads and writes files via SandboxFsOps", async () => {
     const fs = sb.fs();
     await fs.write("/tmp/x.txt", "data\n");
@@ -85,6 +132,44 @@ describe.skipIf(!msbPath())("end-to-end smoke", () => {
     const m = await waitForSandboxMetrics(sb);
     expect(m.timestamp).toBeInstanceOf(Date);
     expect(typeof m.cpuPercent).toBe("number");
+  });
+
+  it("pings and touches the running sandbox", async () => {
+    const ping = await sb.ping();
+    expect(ping.name).toBe(SANDBOX_NAME);
+    expect(ping.latencyMs).toBeGreaterThanOrEqual(0);
+
+    const touch = await sb.touch();
+    expect(touch.name).toBe(SANDBOX_NAME);
+    expect(touch.activitySeq).toBeGreaterThan(0);
+
+    const handle = await Sandbox.get(SANDBOX_NAME);
+    await expect(handle.ping()).resolves.toMatchObject({ name: SANDBOX_NAME });
+    await expect(handle.touch()).resolves.toMatchObject({ name: SANDBOX_NAME });
+  });
+
+  it("plans a dry-run modification without applying it", async () => {
+    const plan = await sb.modify({
+      cpus: 2,
+      rootDiskSize: 8192,
+      labels: { tier: "gold" },
+      dryRun: true,
+    });
+    expect(plan.sandbox).toBe(SANDBOX_NAME);
+    expect(plan.applied).toBe(false);
+    expect(plan.policy).toBe("no_restart");
+    const fields = plan.changes.map((change) => change.field);
+    expect(fields).toContain("cpus");
+    expect(fields).toContain("root_disk_size");
+    expect(fields).toContain("label");
+
+    const handle = await Sandbox.get(SANDBOX_NAME);
+    const handlePlan = await handle.modify({
+      env: { MODIFIED: "1" },
+      dryRun: true,
+    });
+    expect(handlePlan.sandbox).toBe(SANDBOX_NAME);
+    expect(handlePlan.applied).toBe(false);
   });
 });
 
@@ -262,7 +347,9 @@ describe.skipIf(!msbPath())("listWith by labels", () => {
   });
 
   it("filters by a single label (AND across sandboxes)", async () => {
-    const handles = await Sandbox.listWith({ labels: { owner } });
+    const { sandboxes: handles } = await Sandbox.listWith((list) =>
+      list.label("owner", owner),
+    );
     const names = handles.map((h) => h.name);
     expect(names).toContain(webName);
     expect(names).toContain(jobName);
@@ -274,9 +361,10 @@ describe.skipIf(!msbPath())("listWith by labels", () => {
   });
 
   it("AND-matches multiple labels", async () => {
-    const names = (
-      await Sandbox.listWith({ labels: { owner, tier: "web" } })
-    ).map((h) => h.name);
+    const { sandboxes } = await Sandbox.listWith((list) =>
+      list.labels({ owner, tier: "web" }),
+    );
+    const names = sandboxes.map((h) => h.name);
     expect(names).toContain(webName);
     expect(names).not.toContain(jobName);
     expect(names).not.toContain(otherName);
