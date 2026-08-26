@@ -457,6 +457,12 @@ export type CloudSecretSource = {
    * Store-specific secret reference.
    */
   reference: string;
+} | {
+  "type": "file";
+  /**
+   * Absolute host path to the credential file.
+   */
+  path: string;
 };
 
 export type CloudHostPattern = {

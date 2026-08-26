@@ -1203,6 +1203,14 @@ pub enum CloudSecretSource {
         /// Store-specific secret reference.
         reference: String,
     },
+    /// Read from a host file, re-read per connection. Twin of
+    /// [`SecretSource::File`].
+    File {
+        /// Absolute host path to the credential file.
+        #[cfg_attr(feature = "ts", ts(type = "string"))]
+        #[cfg_attr(feature = "utoipa", schema(value_type = String))]
+        path: std::path::PathBuf,
+    },
 }
 
 /// Host allowlist pattern for cloud secrets. Twin of [`HostPattern`], with the
@@ -1306,6 +1314,7 @@ impl From<SecretSource> for CloudSecretSource {
         match source {
             SecretSource::Env { var } => Self::Env { var },
             SecretSource::Store { reference } => Self::Store { reference },
+            SecretSource::File { path } => Self::File { path },
         }
     }
 }
@@ -1315,6 +1324,7 @@ impl From<CloudSecretSource> for SecretSource {
         match source {
             CloudSecretSource::Env { var } => Self::Env { var },
             CloudSecretSource::Store { reference } => Self::Store { reference },
+            CloudSecretSource::File { path } => Self::File { path },
         }
     }
 }
@@ -1462,6 +1472,27 @@ mod tests {
             .unwrap(),
             serde_json::json!({"type": "passthrough", "hosts": [{"type": "any"}]})
         );
+    }
+
+    #[test]
+    fn cloud_secret_source_file_wire_form_and_round_trip() {
+        assert_eq!(
+            serde_json::to_value(CloudSecretSource::File {
+                path: "/run/creds/token".into(),
+            })
+            .unwrap(),
+            serde_json::json!({"type": "file", "path": "/run/creds/token"})
+        );
+
+        let domain = SecretSource::File {
+            path: "/run/creds/token".into(),
+        };
+        let cloud: CloudSecretSource = domain.clone().into();
+        assert!(
+            matches!(cloud, CloudSecretSource::File { ref path } if path == std::path::Path::new("/run/creds/token"))
+        );
+        let back: SecretSource = cloud.into();
+        assert_eq!(back, domain);
     }
 
     #[test]

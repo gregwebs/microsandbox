@@ -423,6 +423,12 @@ enum SecretValueInput {
         #[serde(rename = "$msb_env")]
         env: String,
     },
+    File {
+        /// Absolute host path re-read on every eligible connection, so
+        /// rotating the file takes effect without a sandbox restart.
+        #[serde(rename = "$msb_file")]
+        file: String,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
@@ -1794,6 +1800,9 @@ fn materialize_secret_patch(
             Some(SecretValueInput::Environment { env }) => {
                 entry = entry.source(SecretSource::Env { var: env.clone() });
             }
+            Some(SecretValueInput::File { file }) => {
+                entry = entry.source(SecretSource::File { path: file.into() });
+            }
             None => {
                 entry = entry.source(SecretSource::Env { var: name.clone() });
             }
@@ -2308,6 +2317,36 @@ TOKEN:
             secret.value,
             Some(SecretValueInput::Environment { ref env }) if env == "HOST_TOKEN"
         ));
+    }
+
+    #[test]
+    fn secret_config_parses_msb_file_value() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_config(
+            dir.path(),
+            "secrets.yaml",
+            r#"
+TOKEN:
+  value:
+    $msb_file: /run/creds/token
+  allow: ["api.example.com"]
+"#,
+        );
+        let sources = SandboxConfigSources::default().source(SandboxConfigKind::Secrets, path);
+
+        let resolved = resolve(&sources).unwrap();
+        let secrets = resolved.patch.secrets.unwrap();
+        let secret = &secrets["TOKEN"];
+        assert!(matches!(
+            secret.value,
+            Some(SecretValueInput::File { ref file }) if file == "/run/creds/token"
+        ));
+
+        // `materialize_secret_patch` must accept the parsed File value
+        // without error; the resulting `SecretSource::File` reference then
+        // flows through the SDK's config-patch machinery unchanged (already
+        // covered by the sdk/rust `secret_material` tests).
+        assert!(materialize_secret_patch(&secrets).is_ok());
     }
 
     #[test]

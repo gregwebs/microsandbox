@@ -151,6 +151,16 @@ pub enum SecretSource {
         /// Store-specific secret reference.
         reference: String,
     },
+
+    /// Read the value from a host file, re-read per connection so a rotated
+    /// credential is picked up without restarting the sandbox. Only the path
+    /// is persisted; bytes are never stored.
+    File {
+        /// Absolute host path to the credential file.
+        #[cfg_attr(feature = "ts", ts(type = "string"))]
+        #[cfg_attr(feature = "utoipa", schema(value_type = String))]
+        path: std::path::PathBuf,
+    },
 }
 
 /// Serializable dry-run or apply plan for a sandbox modification.
@@ -407,5 +417,30 @@ impl std::fmt::Debug for SecretModificationPatch {
             .field("placeholder", &self.placeholder)
             .field("allowed_hosts", &self.allowed_hosts)
             .finish()
+    }
+}
+
+//--------------------------------------------------------------------------------------------------
+// Tests
+//--------------------------------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn secret_source_file_wire_form() {
+        let source = SecretSource::File {
+            path: "/run/creds/token".into(),
+        };
+        assert_eq!(
+            serde_json::to_value(&source).unwrap(),
+            serde_json::json!({"kind": "file", "path": "/run/creds/token"})
+        );
+
+        let decoded: SecretSource =
+            serde_json::from_value(serde_json::json!({"kind": "file", "path": "/run/creds/token"}))
+                .unwrap();
+        assert_eq!(decoded, source);
     }
 }
