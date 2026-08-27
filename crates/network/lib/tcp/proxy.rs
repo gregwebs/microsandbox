@@ -18,6 +18,7 @@ use tokio::sync::mpsc;
 
 use super::connection::ProxyConnectState;
 use super::upstream::UpstreamTcpTarget;
+use crate::extensions::{NetworkExtensions, OutboundProtocol};
 use crate::netstack::shared::SharedState;
 use crate::policy::{EgressEvaluation, HostnameSource, NetworkPolicy, Protocol};
 use crate::secrets::config::{SecretsConfig, SecretsConfigExt, ViolationAction};
@@ -74,6 +75,7 @@ pub(crate) struct TcpProxy {
     secrets: Arc<SecretsConfig>,
     tls_state: Option<Arc<TlsState>>,
     proxy_connect: Arc<ProxyConnectState>,
+    extensions: NetworkExtensions,
 }
 
 //--------------------------------------------------------------------------------------------------
@@ -138,6 +140,7 @@ impl TcpProxy {
         secrets: Arc<SecretsConfig>,
         tls_state: Option<Arc<TlsState>>,
         proxy_connect: Arc<ProxyConnectState>,
+        extensions: NetworkExtensions,
     ) -> Self {
         Self {
             guest_dst,
@@ -149,6 +152,7 @@ impl TcpProxy {
             secrets,
             tls_state,
             proxy_connect,
+            extensions,
         }
     }
 
@@ -179,6 +183,7 @@ impl TcpProxy {
             secrets,
             tls_state,
             proxy_connect,
+            extensions,
         } = self;
 
         // Pre-connect peek is only for domain policy: the hostname has to be known
@@ -245,6 +250,7 @@ impl TcpProxy {
                     network_policy,
                     tls_state,
                     proxy_connect,
+                    extensions,
                     None,
                 )
                 .await;
@@ -255,7 +261,16 @@ impl TcpProxy {
         // server-first protocol (SSH, SMTP, a database) sends nothing until it has
         // seen the server's banner; with the socket already open we can relay that
         // banner while we wait, instead of burning the peek budget pre-connect.
-        let stream = connect_target.connect(&proxy_connect, &shared).await?;
+        let stream = connect_target
+            .connect(
+                guest_dst,
+                sni.as_deref(),
+                OutboundProtocol::Tcp,
+                &extensions,
+                &proxy_connect,
+                &shared,
+            )
+            .await?;
         let connect_dst = stream.peer_addr().unwrap_or(connect_target.primary());
         let (mut server_rx, mut server_tx) = stream.into_split();
 
@@ -301,6 +316,7 @@ impl TcpProxy {
                 network_policy,
                 tls_state,
                 proxy_connect,
+                extensions,
                 Some(proxy_stream),
             )
             .await;
@@ -381,6 +397,7 @@ impl TcpProxy {
                                     network_policy,
                                     tls_state,
                                     proxy_connect,
+                                    extensions,
                                     Some(proxy_stream),
                                 )
                                 .await;
@@ -489,6 +506,7 @@ pub fn spawn_tcp_proxy(
         secrets,
         tls_state,
         proxy_connect,
+        NetworkExtensions::default(),
     );
 
     handle.spawn(proxy.run());
@@ -510,6 +528,7 @@ async fn handle_connect_tunnel(
     network_policy: Arc<NetworkPolicy>,
     tls_state: Arc<TlsState>,
     proxy_connect: Arc<ProxyConnectState>,
+    extensions: NetworkExtensions,
     preconnected_proxy: Option<TcpStream>,
 ) -> io::Result<()> {
     let proxy_dst = proxy_target.primary();
@@ -533,7 +552,18 @@ async fn handle_connect_tunnel(
     // Dial the proxy and forward the CONNECT request so it opens the tunnel.
     let mut proxy_stream = match preconnected_proxy {
         Some(stream) => stream,
-        None => proxy_target.connect(&proxy_connect, &shared).await?,
+        None => {
+            proxy_target
+                .connect(
+                    guest_dst,
+                    None,
+                    OutboundProtocol::Tcp,
+                    &extensions,
+                    &proxy_connect,
+                    &shared,
+                )
+                .await?
+        }
     };
 
     if !connect_req.target.is_intercepted(&tls_state) {
@@ -610,9 +640,10 @@ async fn handle_connect_tunnel(
         tls_state,
         network_policy,
         proxy_connect,
+        extensions,
     )
     .with_upstream(proxy_stream)
-    .with_expected_sni(expected_sni)
+    .with_connect_authority(expected_sni)
     .with_initial_buf(tls_seed)
     .try_run()
     .await
@@ -1070,7 +1101,78 @@ async fn peek_for_sni(
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Duration;
+
+    use futures::future::BoxFuture;
+    use microsandbox_types::{InterceptCaConfig, TlsConfig};
+    use tokio::sync::oneshot;
+
+    use crate::extensions::{
+        AuthorizedRouteRequestExtension, AuthorizedRouteRequestStream, AuthorizedTcpRoute,
+        AuthorizedTlsRoute, OutboundConnectionExtension,
+    };
+    use crate::secrets::handle::SecretsHandle;
+    use crate::tcp::connection::ProxyConnectStatus;
+
     use super::*;
+
+    type RecordedRoute = (
+        SocketAddr,
+        SocketAddr,
+        Option<SocketAddr>,
+        Option<String>,
+        OutboundProtocol,
+    );
+
+    struct DirectRecordingConnector {
+        routes: Mutex<Vec<RecordedRoute>>,
+    }
+
+    impl OutboundConnectionExtension for DirectRecordingConnector {
+        fn connect<'a>(
+            &'a self,
+            route: AuthorizedTcpRoute,
+        ) -> BoxFuture<'a, io::Result<TcpStream>> {
+            self.routes.lock().unwrap().push((
+                route.guest_destination(),
+                route.primary_destination(),
+                route.fallback_destination(),
+                route.server_name().map(ToOwned::to_owned),
+                route.protocol(),
+            ));
+            Box::pin(route.connect_direct())
+        }
+    }
+
+    struct CountingConnector(AtomicUsize);
+
+    struct RouteRecordingRequestExtension {
+        route: Mutex<Option<oneshot::Sender<AuthorizedTlsRoute>>>,
+    }
+
+    impl AuthorizedRouteRequestExtension for RouteRecordingRequestExtension {
+        fn open(
+            &self,
+            route: &AuthorizedTlsRoute,
+        ) -> Option<Box<dyn AuthorizedRouteRequestStream>> {
+            if let Some(sender) = self.route.lock().unwrap().take() {
+                let _ = sender.send(route.clone());
+            }
+            None
+        }
+    }
+
+    impl OutboundConnectionExtension for CountingConnector {
+        fn connect<'a>(
+            &'a self,
+            _route: AuthorizedTcpRoute,
+        ) -> BoxFuture<'a, io::Result<TcpStream>> {
+            self.0.fetch_add(1, Ordering::Relaxed);
+            Box::pin(async { Err(io::Error::other("unexpected connection extension call")) })
+        }
+    }
 
     /// Synthetic TLS ClientHello carrying SNI `example.com`. Bytes
     /// borrowed from `tls::sni` test fixtures so the parser sees a
@@ -1174,6 +1276,69 @@ mod tests {
         assert_eq!(target.host, "2001:db8::1");
         assert_eq!(target.port, 8443);
         assert_eq!(target.expected_sni, None);
+    }
+
+    #[tokio::test]
+    async fn tls_proxy_reports_ip_literal_connect_as_via_connect() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy_target = listener.local_addr().unwrap();
+        let proxy = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            while headers_end(&request).is_none() {
+                let mut buf = [0; 1024];
+                let read = stream.read(&mut buf).await.unwrap();
+                assert_ne!(read, 0, "CONNECT peer closed before request headers");
+                request.extend_from_slice(&buf[..read]);
+            }
+            assert!(request.starts_with(b"CONNECT 203.0.113.10:443 HTTP/1.1\r\n"));
+            stream
+                .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+                .await
+                .unwrap();
+            std::future::pending::<()>().await;
+        });
+        let (route_tx, route_rx) = oneshot::channel();
+        let (from_tx, from_rx) = mpsc::channel(1);
+        let (to_tx, _to_rx) = mpsc::channel(16);
+        let mut initial_buf =
+            b"CONNECT 203.0.113.10:443 HTTP/1.1\r\nHost: 203.0.113.10:443\r\n\r\n".to_vec();
+        initial_buf.extend_from_slice(&synthetic_client_hello("example.com"));
+
+        let tunnel = tokio::spawn(handle_connect_tunnel(
+            "198.51.100.20:3128".parse().unwrap(),
+            UpstreamTcpTarget::direct(proxy_target),
+            initial_buf,
+            from_rx,
+            to_tx,
+            Arc::new(SharedState::new(4)),
+            Arc::new(NetworkPolicy::allow_all()),
+            test_tls_state(),
+            Arc::new(ProxyConnectState::new()),
+            NetworkExtensions::new().with_authorized_requests(Arc::new(
+                RouteRecordingRequestExtension {
+                    route: Mutex::new(Some(route_tx)),
+                },
+            )),
+            None,
+        ));
+
+        let route = tokio::time::timeout(Duration::from_secs(1), route_rx)
+            .await
+            .expect("request factory was not opened")
+            .unwrap();
+        assert_eq!(
+            route.guest_destination(),
+            "203.0.113.10:443".parse::<SocketAddr>().unwrap()
+        );
+        assert_eq!(route.server_name(), "example.com");
+        assert!(route.via_connect());
+
+        drop(from_tx);
+        tunnel.abort();
+        let _ = tunnel.await;
+        proxy.abort();
     }
 
     #[test]
@@ -1652,6 +1817,25 @@ mod tests {
         );
     }
 
+    fn test_tls_state() -> Arc<TlsState> {
+        let dir = tempfile::tempdir().unwrap();
+        let ca = crate::tls::ca::CertAuthority::generate();
+        let cert_path = dir.path().join("ca.pem");
+        let key_path = dir.path().join("ca.key");
+        std::fs::write(&cert_path, ca.cert_pem()).unwrap();
+        std::fs::write(&key_path, ca.key_pem()).unwrap();
+
+        let config = TlsConfig {
+            verify_upstream: false,
+            intercept_ca: InterceptCaConfig {
+                cert_path: Some(cert_path),
+                key_path: Some(key_path),
+            },
+            ..Default::default()
+        };
+        Arc::new(TlsState::new(config, SecretsHandle::new(SecretsConfig::default())).unwrap())
+    }
+
     async fn spawn_sink() -> (SocketAddr, JoinHandle<Vec<u8>>) {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -1668,6 +1852,84 @@ mod tests {
             received
         });
         (addr, handle)
+    }
+
+    #[tokio::test]
+    async fn tcp_proxy_passes_authorized_route_context_to_connection_extension() {
+        let (target, sink) = spawn_sink().await;
+        let connector = Arc::new(DirectRecordingConnector {
+            routes: Mutex::new(Vec::new()),
+        });
+        let guest_destination: SocketAddr = "203.0.113.10:8080".parse().unwrap();
+        let (from_tx, from_rx) = mpsc::channel(2);
+        let (to_tx, _to_rx) = mpsc::channel(2);
+        let shared = Arc::new(SharedState::new(4));
+        let proxy_connect = Arc::new(ProxyConnectState::new());
+        from_tx.send(Bytes::from_static(b"request")).await.unwrap();
+        drop(from_tx);
+
+        TcpProxy::new(
+            guest_destination,
+            UpstreamTcpTarget::direct(target),
+            from_rx,
+            to_tx,
+            shared,
+            Arc::new(NetworkPolicy::default()),
+            Arc::new(SecretsConfig::default()),
+            None,
+            proxy_connect.clone(),
+            NetworkExtensions::new().with_outbound(connector.clone()),
+        )
+        .try_run()
+        .await
+        .unwrap();
+
+        assert_eq!(sink.await.unwrap(), b"request");
+        assert_eq!(proxy_connect.status(), ProxyConnectStatus::Connected);
+        assert_eq!(
+            connector.routes.lock().unwrap().as_slice(),
+            &[(guest_destination, target, None, None, OutboundProtocol::Tcp,)]
+        );
+    }
+
+    #[tokio::test]
+    async fn denied_tcp_policy_does_not_invoke_connection_extension() {
+        let connector = Arc::new(CountingConnector(AtomicUsize::new(0)));
+        let shared = Arc::new(SharedState::new(4));
+        shared.proxy_wake.drain();
+        let proxy_connect = Arc::new(ProxyConnectState::new());
+        let policy = NetworkPolicy {
+            default_egress: Action::Deny,
+            default_ingress: Action::Allow,
+            rules: vec![allow_https("allowed.example")],
+        };
+        let (from_tx, from_rx) = mpsc::channel(1);
+        let (to_tx, _to_rx) = mpsc::channel(1);
+        from_tx
+            .send(Bytes::from(synthetic_client_hello("denied.example")))
+            .await
+            .unwrap();
+        drop(from_tx);
+
+        TcpProxy::new(
+            "203.0.113.10:443".parse().unwrap(),
+            UpstreamTcpTarget::direct("127.0.0.1:9".parse().unwrap()),
+            from_rx,
+            to_tx,
+            shared.clone(),
+            Arc::new(policy),
+            Arc::new(SecretsConfig::default()),
+            None,
+            proxy_connect.clone(),
+            NetworkExtensions::new().with_outbound(connector.clone()),
+        )
+        .try_run()
+        .await
+        .unwrap();
+
+        assert_eq!(connector.0.load(Ordering::Relaxed), 0);
+        assert_eq!(proxy_connect.status(), ProxyConnectStatus::PolicyDenied);
+        assert!(shared.proxy_wake.wait_timeout(Duration::ZERO));
     }
 
     async fn relay_through_proxy(
@@ -1696,6 +1958,7 @@ mod tests {
             secrets,
             None,
             proxy_connect,
+            NetworkExtensions::default(),
         )
         .try_run()
         .await
@@ -1737,6 +2000,7 @@ mod tests {
             Arc::new(secrets),
             None,
             proxy_connect,
+            NetworkExtensions::default(),
         )
         .try_run()
         .await
@@ -1808,6 +2072,7 @@ mod tests {
             Arc::new(secrets),
             None,
             proxy_connect,
+            NetworkExtensions::default(),
         )
         .try_run()
         .await
@@ -1909,6 +2174,7 @@ mod tests {
             Arc::new(secrets),
             None,
             proxy_connect,
+            NetworkExtensions::default(),
         )
         .try_run()
         .await

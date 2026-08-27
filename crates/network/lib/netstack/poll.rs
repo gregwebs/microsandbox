@@ -27,6 +27,7 @@ use crate::dns::{
     interceptor::DnsInterceptor,
     proxies::{dot::DotProxy, tcp::DnsTcpProxy},
 };
+use crate::extensions::NetworkExtensions;
 use crate::icmp::relay::IcmpRelay;
 use crate::policy::{EgressEvaluation, HostnameSource, NetworkPolicy, Protocol};
 use crate::ports::PortPublisher;
@@ -222,6 +223,9 @@ pub fn create_interface(device: &mut SmoltcpDevice, config: &PollLoopConfig) -> 
 ///   [`ConnectionTracker`]; `None` uses the default.
 /// * `tokio_handle` - Runtime handle used for proxy tasks, DNS forwarding, port publishing,
 ///   and ICMP relays.
+///
+/// This compatibility entry point installs no host-local extensions. Use
+/// [`smoltcp_poll_loop_with_extensions`] only for advanced host integration.
 #[allow(clippy::too_many_arguments)]
 pub fn smoltcp_poll_loop(
     shared: Arc<SharedState>,
@@ -234,6 +238,39 @@ pub fn smoltcp_poll_loop(
     max_connections: Option<usize>,
     tokio_handle: tokio::runtime::Handle,
     secrets: SecretsHandle,
+) {
+    smoltcp_poll_loop_with_extensions(
+        shared,
+        config,
+        network_policy,
+        platform_policy,
+        dns_config,
+        tls_state,
+        published_ports,
+        max_connections,
+        tokio_handle,
+        secrets,
+        NetworkExtensions::default(),
+    );
+}
+
+/// Run the smoltcp poll loop with host-local, non-serialized extensions.
+///
+/// Normal runtime construction uses [`smoltcp_poll_loop`], which passes an
+/// empty extension set and preserves the established TCP/TLS forwarding path.
+#[allow(clippy::too_many_arguments)]
+pub fn smoltcp_poll_loop_with_extensions(
+    shared: Arc<SharedState>,
+    config: PollLoopConfig,
+    network_policy: NetworkPolicy,
+    platform_policy: Option<NetworkPolicy>,
+    dns_config: DnsConfig,
+    tls_state: Option<Arc<TlsState>>,
+    published_ports: Vec<PublishedPort>,
+    max_connections: Option<usize>,
+    tokio_handle: tokio::runtime::Handle,
+    secrets: SecretsHandle,
+    extensions: NetworkExtensions,
 ) {
     let mut device = SmoltcpDevice::new(shared.clone(), config.mtu);
     let mut iface = create_interface(&mut device, &config);
@@ -532,6 +569,7 @@ pub fn smoltcp_poll_loop(
                     tls_state.clone(),
                     network_policy.clone(),
                     conn.proxy_connect,
+                    extensions.clone(),
                 );
                 tokio_handle.spawn(proxy.run());
                 continue;
@@ -600,6 +638,7 @@ pub fn smoltcp_poll_loop(
                 secrets.load(),
                 tls_state.clone(),
                 conn.proxy_connect,
+                extensions.clone(),
             );
             tokio_handle.spawn(proxy.run());
         }

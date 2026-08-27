@@ -20,6 +20,7 @@ use microsandbox_types::{
 use msb_krun::backends::net::NetBackend;
 
 use crate::config::{MAX_NETWORK_CONNECTIONS, NetworkConfig};
+use crate::extensions::NetworkExtensions;
 use crate::netstack::{
     backend::SmoltcpBackend,
     poll::{self, GatewayIps, PollLoopConfig},
@@ -58,6 +59,7 @@ const MULTI_TENANT_MAX_CONNECTIONS: usize = 256;
 pub struct SmoltcpNetwork {
     config: NetworkConfig,
     deployment_profile: DeploymentProfile,
+    extensions: NetworkExtensions,
     shared: Arc<SharedState>,
     backend: Option<SmoltcpBackend>,
     poll_handle: Option<JoinHandle<()>>,
@@ -161,15 +163,34 @@ impl SmoltcpNetwork {
     /// Returns an error when the effective network configuration would allocate
     /// unsafe resources or TLS interception cannot initialize.
     pub fn new_with_profile(
+        config: NetworkConfig,
+        slot: u64,
+        deployment_profile: DeploymentProfile,
+    ) -> Result<Self, NetworkInitError> {
+        Self::new_with_profile_and_extensions(
+            config,
+            slot,
+            deployment_profile,
+            NetworkExtensions::default(),
+        )
+    }
+
+    /// Create the network backend with host-local, non-serialized extensions.
+    ///
+    /// Extensions are advanced host integration points. Normal runtime
+    /// construction uses [`Self::new_with_profile`] and installs none.
+    pub fn new_with_profile_and_extensions(
         mut config: NetworkConfig,
         slot: u64,
         deployment_profile: DeploymentProfile,
+        extensions: NetworkExtensions,
     ) -> Result<Self, NetworkInitError> {
         enforce_deployment_profile(&mut config, deployment_profile);
         Self::new_with_profile_and_routes(
             config,
             slot,
             deployment_profile,
+            extensions,
             host_has_ipv4_route(),
             host_has_ipv6_route(),
         )
@@ -186,6 +207,7 @@ impl SmoltcpNetwork {
             config,
             slot,
             DeploymentProfile::SingleTenant,
+            NetworkExtensions::default(),
             host_has_ipv4,
             host_has_ipv6,
         )
@@ -195,6 +217,7 @@ impl SmoltcpNetwork {
         config: NetworkConfig,
         slot: u64,
         deployment_profile: DeploymentProfile,
+        extensions: NetworkExtensions,
         host_has_ipv4: bool,
         host_has_ipv6: bool,
     ) -> Result<Self, NetworkInitError> {
@@ -291,6 +314,7 @@ impl SmoltcpNetwork {
         Ok(Self {
             config,
             deployment_profile,
+            extensions,
             shared,
             backend: Some(backend),
             poll_handle: None,
@@ -340,12 +364,13 @@ impl SmoltcpNetwork {
         let published_ports = self.config.ports.clone();
         let max_connections = self.config.max_connections;
         let secrets = self.secrets.clone();
+        let extensions = self.extensions.clone();
 
         self.poll_handle = Some(
             std::thread::Builder::new()
                 .name("smoltcp-poll".into())
                 .spawn(move || {
-                    poll::smoltcp_poll_loop(
+                    poll::smoltcp_poll_loop_with_extensions(
                         shared,
                         poll_config,
                         network_policy,
@@ -356,6 +381,7 @@ impl SmoltcpNetwork {
                         max_connections,
                         tokio_handle,
                         secrets,
+                        extensions,
                     );
                 })
                 .expect("failed to spawn smoltcp poll thread"),
