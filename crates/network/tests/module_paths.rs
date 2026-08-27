@@ -1,4 +1,25 @@
 use std::any::TypeId;
+use std::sync::Arc;
+
+use microsandbox_network::config::{DnsConfig, PublishedPort};
+use microsandbox_network::netstack::poll::PollLoopConfig;
+use microsandbox_network::netstack::shared::SharedState;
+use microsandbox_network::policy::NetworkPolicy;
+use microsandbox_network::secrets::handle::SecretsHandle;
+use microsandbox_network::tls::state::TlsState;
+
+type LegacyPollLoop = fn(
+    Arc<SharedState>,
+    PollLoopConfig,
+    NetworkPolicy,
+    Option<NetworkPolicy>,
+    DnsConfig,
+    Option<Arc<TlsState>>,
+    Vec<PublishedPort>,
+    Option<usize>,
+    tokio::runtime::Handle,
+    SecretsHandle,
+);
 
 fn assert_same_type<T: 'static, U: 'static>() {
     assert_eq!(TypeId::of::<T>(), TypeId::of::<U>());
@@ -45,4 +66,7 @@ fn legacy_module_paths_alias_canonical_modules() {
 
     let _legacy_proxy = microsandbox_network::proxy::spawn_tcp_proxy;
     let _canonical_proxy = microsandbox_network::tcp::proxy::spawn_tcp_proxy;
+
+    let _: LegacyPollLoop = microsandbox_network::stack::smoltcp_poll_loop;
+    let _: LegacyPollLoop = microsandbox_network::netstack::poll::smoltcp_poll_loop;
 }

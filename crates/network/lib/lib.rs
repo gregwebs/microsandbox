@@ -15,6 +15,7 @@ mod addr;
 
 pub mod config;
 pub mod dns;
+pub mod extensions;
 pub mod icmp;
 pub mod netstack;
 pub mod network;
