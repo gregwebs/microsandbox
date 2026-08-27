@@ -920,7 +920,13 @@ mod tests {
                 Err(error) => return Err(error),
             };
             let _ = request_tx.send(request);
-            stream.shutdown().await
+            match stream.shutdown().await {
+                Ok(()) => Ok(()),
+                // Fail-closed relay outcomes may drop the upstream socket before
+                // the fixture can send its TLS close notification.
+                Err(error) if error.kind() == io::ErrorKind::BrokenPipe => Ok(()),
+                Err(error) => Err(error),
+            }
         });
         (address, request_rx, server)
     }
