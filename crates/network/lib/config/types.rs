@@ -10,6 +10,7 @@ use microsandbox_types::{NetworkRateLimiterConfig, TlsConfig};
 use serde::{Deserialize, Serialize};
 
 use crate::dns::Nameserver;
+use crate::intercept::config::InterceptConfig;
 use crate::policy::NetworkPolicy;
 use crate::secrets::config::SecretsConfig;
 
@@ -59,6 +60,10 @@ pub struct NetworkConfig {
     /// TLS interception settings.
     #[serde(default)]
     pub tls: TlsConfig,
+
+    /// Fail-closed request-interception settings.
+    #[serde(default)]
+    pub intercept: InterceptConfig,
 
     /// Secret injection settings.
     #[serde(default)]
@@ -177,6 +182,7 @@ impl Default for NetworkConfig {
             policy: NetworkPolicy::default(),
             dns: DnsConfig::default(),
             tls: TlsConfig::default(),
+            intercept: InterceptConfig::default(),
             secrets: SecretsConfig::default(),
             max_connections: None,
             rate_limiter: None,
@@ -247,20 +253,61 @@ mod tests {
         config.interface.ipv4_address = Some("172.16.0.2".parse().unwrap());
         config.interface.ipv4_pool = Some("172.16.0.0/12".parse().unwrap());
         config.interface.mac = Some([0x02, 0, 0, 0, 0, 0x01]);
+        config.intercept = crate::intercept::config::InterceptConfig {
+            rules: vec![crate::intercept::config::InterceptRule {
+                host: "api.github.com".to_string(),
+                method: "GET".to_string(),
+                path_prefix: "/repos/".to_string(),
+                dispatch_on_headers: false,
+            }],
+            hook: Some(vec!["agent-vm".to_string(), "_intercept-hook".to_string()]),
+            max_request_bytes: 32 * 1024,
+        };
 
         // The engine's real serialization of each subdocument.
         let policy_json = serde_json::to_value(&config.policy).unwrap();
         let dns_json = serde_json::to_value(&config.dns).unwrap();
         let iface_json = serde_json::to_value(&config.interface).unwrap();
+        let intercept_json = serde_json::to_value(&config.intercept).unwrap();
 
         // It must deserialize into the wire types and re-serialize losslessly
-        // (policy/dns serialize every field on both sides, so compare raw JSON).
+        // (policy/dns/intercept serialize every field on both sides, so
+        // compare raw JSON).
         let wire_policy: microsandbox_types::NetworkPolicy =
             serde_json::from_value(policy_json.clone()).unwrap();
         let wire_dns: microsandbox_types::DnsConfig =
             serde_json::from_value(dns_json.clone()).unwrap();
+        let wire_intercept: microsandbox_types::InterceptConfig =
+            serde_json::from_value(intercept_json.clone()).unwrap();
         assert_eq!(policy_json, serde_json::to_value(&wire_policy).unwrap());
         assert_eq!(dns_json, serde_json::to_value(&wire_dns).unwrap());
+        assert_eq!(
+            intercept_json,
+            serde_json::to_value(&wire_intercept).unwrap()
+        );
+
+        // The full `NetworkConfig` <-> `NetworkSpec` round trip must also
+        // carry `intercept` through — this is the path a live-modify /
+        // sandbox-spec update actually takes (AC #4).
+        let spec: microsandbox_types::NetworkSpec =
+            serde_json::from_value(serde_json::to_value(&config).unwrap()).unwrap();
+        assert_eq!(
+            intercept_json,
+            serde_json::to_value(
+                spec.intercept
+                    .as_ref()
+                    .expect("intercept subdocument present")
+            )
+            .unwrap()
+        );
+        let back: NetworkConfig =
+            serde_json::from_value(serde_json::to_value(&spec).unwrap()).unwrap();
+        assert_eq!(back.intercept.hook, config.intercept.hook);
+        assert_eq!(back.intercept.rules.len(), config.intercept.rules.len());
+        assert_eq!(
+            back.intercept.max_request_bytes,
+            config.intercept.max_request_bytes
+        );
 
         // `InterfaceOverrides` skips `None` fields on the wire side, so prove
         // losslessness by round-tripping back into the engine type.
@@ -298,6 +345,18 @@ mod tests {
     fn config_without_rate_limiter_fields_stays_unlimited() {
         let config: NetworkConfig = serde_json::from_value(serde_json::json!({})).unwrap();
         assert!(config.rate_limiter.is_none());
+    }
+
+    /// A config persisted before request interception existed must keep
+    /// deserializing, and the resulting `InterceptConfig` must be inactive
+    /// (no extension installed at engine startup) — this is the "absent"
+    /// half of "no behavior change when absent".
+    #[test]
+    fn config_without_intercept_field_stays_inactive() {
+        let config: NetworkConfig = serde_json::from_value(serde_json::json!({})).unwrap();
+        assert!(!config.intercept.is_active());
+        assert!(config.intercept.rules.is_empty());
+        assert!(config.intercept.hook.is_none());
     }
 
     #[test]

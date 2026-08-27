@@ -1,0 +1,139 @@
+---
+title: Request Interception
+description: Fail-closed policy checkpoint on TLS-intercepted requests
+icon: "shield-halved"
+---
+
+Request interception adds a policy checkpoint in front of TLS interception's credential
+substitution: before a request reaches upstream, a host-run hook decides whether it is allowed.
+
+[Secrets](/sandboxes/secrets) let a sandbox call an allowed host with a real credential the guest
+never sees. Interception exists for the narrower case where "the host is allowed" isn't enough —
+you also need to approve *which requests* to that host get the credential, out-of-band, before
+they leave the sandbox (an OAuth refresh the host performs, or a GitHub API call scoped to one
+repo). A request on a policed host that no rule covers is refused, never forwarded: the
+credential substitution in [Secrets](/sandboxes/secrets) runs before interception sees the bytes,
+so once a rule fails to match, forwarding anyway would mean sending the real credential with no
+policy applied.
+
+## Configure a hook and rules
+
+<CodeGroup>
+```rust Rust
+use microsandbox::Sandbox;
+
+let sb = Sandbox::builder("worker")
+    .image("python")
+    .secret(|s| s
+        .env("GITHUB_TOKEN")
+        .value(std::env::var("GITHUB_TOKEN")?)
+        .allow_host("api.github.com")
+    )
+    .network(|n| n
+        .tls(|t| t.intercepted_ports(vec![443]))
+        .intercept(|i| i
+            .hook(vec!["/usr/local/bin/intercept-hook".into()])
+            .rule("api.github.com", "GET", "/repos/")
+            .streaming_rule("github.com", "POST", "/")
+        )
+    )
+    .create()
+    .await?;
+```
+
+```yaml agent.yaml
+network:
+  tls:
+    enabled: true
+  intercept:
+    hook: ["/usr/local/bin/intercept-hook"]
+    max_request_bytes: 65536
+    rules:
+      - { host: "api.github.com", method: "GET", path_prefix: "/repos/" }
+      - { host: "github.com", method: "POST", path_prefix: "/", dispatch_on_headers: true }
+```
+</CodeGroup>
+
+Each rule matches on SNI host (exact, case-insensitive), HTTP method (exact), and a path prefix
+(query string stripped; an RFC 7230 absolute-form target like `GET https://api.github.com/...` is
+normalized to origin-form before matching, so it can't bypass the prefix check). A host with at
+least one rule is "policed": every request to it must match some rule or it is refused with a
+synthesized `403`. Hosts with no rule at all are untouched — interception only ever narrows
+requests to hosts you've explicitly listed.
+
+`rule` buffers the full request (headers and body) before invoking the hook. `streaming_rule` sets
+`dispatch_on_headers`: the hook is invoked as soon as the headers are buffered, and the body then
+streams to upstream unbuffered. Use it for uploads that can exceed `max_request_bytes` (default 64
+KiB) — a `git push`'s pack data, for example — where the policy decision only needs the request
+line.
+
+## The hook contract
+
+The hook is a subprocess your host runtime supplies. For each dispatched request it receives the
+buffered bytes on stdin and four environment variables identifying which rule fired
+(`MSB_INTERCEPT_SNI`, `MSB_INTERCEPT_HOST_RULE`, `MSB_INTERCEPT_METHOD`,
+`MSB_INTERCEPT_PATH_PREFIX`). Its stdout decides the outcome:
+
+| Hook stdout | Result |
+|---|---|
+| Empty | Passthrough: the buffered bytes forward to upstream unchanged |
+| Starts with `HTTP/` | Synthesized response: sent to the guest verbatim, connection closes |
+| Anything else | Modified passthrough: these bytes forward to upstream *instead of* the original request (e.g. with a header stripped) |
+
+A hook that exits non-zero, or runs past a 90-second timeout, fails the connection closed — no
+partial forward. The hook runs on the host, outside the sandbox's CPU and memory limits, so the
+timeout is the only bound on it; a slow or hung hook costs one host-side task per in-flight
+request, not per guest resource.
+
+**Stdin may contain pipelined trailing bytes.** On a passthrough or modified-passthrough verdict,
+the entire accumulated buffer — not just the matched request — forwards to upstream. If a guest
+pipelines a second request into the same TLS record as the first (request head + body immediately
+followed by another request line), those trailing bytes ride upstream unpoliced along with the
+approved request, and state then latches to `Disabled` for the rest of the connection. The hook
+receives this same buffer on stdin, so it is the hook's responsibility to detect and reject
+pipelined trailing content if that matters for your policy — this is a facet of the
+single-request-per-connection design described below, not a bug that will be fixed underneath you.
+
+## Fail-closed behavior
+
+| Guest input on a policed host | Result |
+|---|---|
+| Unparseable / non-HTTP request line | `400`, connection closes |
+| Method or path matches no rule (including absolute-form targets) | `403`, connection closes |
+| Request head arrives split across TLS records | Held and reassembled — never forwarded early |
+| Matched request exceeds `max_request_bytes` (non-streaming rule) | `413`, connection closes |
+| Hook exits non-zero or exceeds the 90s timeout | Connection closes, nothing forwarded |
+
+Every one of these closes the connection rather than forwarding with the placeholder already
+substituted. In particular, a request that doesn't match any rule is refused — not passed through
+as if unpoliced — because by the time interception sees the bytes, [Secrets](/sandboxes/secrets)
+substitution has already run.
+
+Interception is per-connection state: a bypassed, refused, or hook-approved request never affects
+a different connection. HTTP/1.1 keep-alive connections are effectively single-request on a
+policed host once a rule has dispatched — the next request on the same TCP connection is not
+re-inspected — so if your workload needs several intercepted requests back-to-back, expect one
+connection per request rather than reusing keep-alive.
+
+## HTTP/2
+
+The hook's request parser reads HTTP/1.1 framing. When interception is active, both the
+guest-facing certificate and the upstream connector advertise only `http/1.1` over ALPN, so
+clients and servers that would otherwise negotiate HTTP/2 downgrade to HTTP/1.1 automatically. A
+guest that forces HTTP/2 with no HTTP/1.1 fallback (`curl --http2-prior-knowledge`) fails the TLS
+handshake against an HTTP/1.1-only server config — an intentional fail-closed outcome, not a bug.
+
+**Known limitation: the ALPN pin is engine-wide, not per-host.** Whether a TLS-intercepted route
+gets pinned to `http/1.1` depends only on whether interception is active *anywhere on the engine*,
+not on whether that specific host has a rule. Once you configure any intercept rule, every
+TLS-intercepted route on that engine downgrades to `http/1.1`, including hosts no rule targets. In
+practice this is rarely observable, since HTTP/1.1 fallback is near-universal, but an HTTP/2-only
+upstream on an unpoliced host will fail its handshake while interception is active elsewhere on
+the same engine.
+
+## Scope
+
+Interception is a local-engine feature: it runs the hook subprocess on the same host process as
+the sandbox runtime, so it is not available for cloud-hosted sandboxes. It layers on top of
+[TLS interception](#configure-a-hook-and-rules) — `tls.enabled` must be true and the target port
+must be in `tls.intercepted_ports` for a host's traffic to reach the interceptor at all.

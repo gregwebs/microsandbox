@@ -1,0 +1,28 @@
+---
+title: "Week of August 27, 2026"
+description: "Fail-closed request interception."
+icon: "shield-halved"
+---
+
+## New features
+
+**Fail-closed request interception**
+
+TLS-intercepted traffic can now be checked against a host-run hook before it reaches upstream. A
+rule matches a request by SNI host, HTTP method, and path prefix; the hook decides whether to
+forward, rewrite, or refuse it, and a request on a policed host that matches no rule is refused
+rather than forwarded — never sent upstream with a substituted credential and no policy applied.
+
+```yaml
+network:
+  intercept:
+    hook: ["/usr/local/bin/intercept-hook"]
+    rules:
+      - { host: "api.github.com", method: "GET", path_prefix: "/repos/" }
+```
+
+When interception is active, both the guest-facing certificate and the upstream connector pin
+ALPN to `http/1.1`, so HTTP/2-capable clients and servers downgrade cleanly instead of sending
+framing the interceptor's HTTP/1.1 parser can't read.
+
+See [Request Interception](/sandboxes/intercept).

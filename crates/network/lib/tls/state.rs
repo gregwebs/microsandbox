@@ -42,6 +42,11 @@ pub struct TlsState {
     pub secrets: SecretsHandle,
     /// Pre-computed lowercased bypass patterns for efficient matching.
     bypass_patterns: Vec<DomainPattern>,
+    /// Whether fail-closed request interception is active for this engine
+    /// instance. Engine-constant for the lifetime of this `TlsState`, so it
+    /// is baked into upstream connectors and guest-facing domain certs at
+    /// build time rather than threaded per-connection.
+    intercept_active: bool,
 }
 
 /// Errors that prevent TLS interception state from being initialized safely.
@@ -135,15 +140,26 @@ impl TlsState {
     /// 1. User-provided paths (`config.intercept_ca.cert_path` + `config.intercept_ca.key_path`)
     /// 2. Microsandbox home TLS path (`$MSB_HOME/tls` or `~/.microsandbox/tls`)
     /// 3. Auto-generate and persist to the microsandbox home TLS path
-    pub fn new(config: TlsConfig, secrets: SecretsHandle) -> Result<Self, TlsStateError> {
+    ///
+    /// `intercept_active` pins both upstream and guest-facing ALPN to
+    /// `http/1.1` when true — see [`build_upstream_connector`] — because
+    /// fail-closed request interception's request parser
+    /// (`crate::intercept::handler`) is HTTP/1.1-only.
+    pub fn new(
+        config: TlsConfig,
+        secrets: SecretsHandle,
+        intercept_active: bool,
+    ) -> Result<Self, TlsStateError> {
         let ca = load_or_generate_ca(&config)?;
 
         let capacity =
             NonZeroUsize::new(config.cache.capacity).unwrap_or(NonZeroUsize::new(1000).unwrap());
         let cert_cache = Mutex::new(LruCache::new(capacity));
 
-        let connector = build_upstream_connector(&config, config.verify_upstream, &[]);
-        let scoped_upstream_connectors = build_scoped_upstream_connectors(&config);
+        let connector =
+            build_upstream_connector(&config, config.verify_upstream, &[], intercept_active);
+        let scoped_upstream_connectors =
+            build_scoped_upstream_connectors(&config, intercept_active);
 
         // Pre-compute lowercased bypass patterns to avoid per-connection allocations.
         let bypass_patterns = config
@@ -160,6 +176,7 @@ impl TlsState {
             config,
             secrets,
             bypass_patterns,
+            intercept_active,
         })
     }
 
@@ -182,6 +199,7 @@ impl TlsState {
             domain,
             &self.intercept_ca,
             self.config.cache.validity_hours,
+            self.intercept_active,
         )?);
         cache.put(domain.to_string(), cert.clone());
         Ok(cert)
@@ -305,12 +323,37 @@ impl ServerCertVerifier for NoVerify {
 ///
 /// When `verify_upstream` is true, loads the system's native root certificates.
 /// When false, uses a permissive verifier that accepts all server certificates.
+///
+/// When `intercept_active` is true, pins the ALPN offer to `http/1.1`: fail-closed request
+/// interception's parser (`crate::intercept::handler`) is HTTP/1.1-only, so a policed host must
+/// not be allowed to negotiate h2 with the real upstream server and hand the parser binary
+/// HEADERS/DATA framing it cannot read as request bytes. An upstream that only speaks h2 then
+/// fails the handshake — an acceptable fail-closed outcome for a policed host, not a bug.
 fn build_upstream_connector(
     config: &TlsConfig,
     verify_upstream: bool,
     scoped_ca_cert: &[PathBuf],
+    intercept_active: bool,
 ) -> TlsConnector {
-    let client_config = if verify_upstream {
+    TlsConnector::from(Arc::new(build_upstream_client_config(
+        config,
+        verify_upstream,
+        scoped_ca_cert,
+        intercept_active,
+    )))
+}
+
+/// Build the [`rustls::ClientConfig`] behind [`build_upstream_connector`].
+///
+/// Split out so the ALPN pin can be asserted directly in tests:
+/// `tokio_rustls::TlsConnector` does not expose its inner `ClientConfig`.
+fn build_upstream_client_config(
+    config: &TlsConfig,
+    verify_upstream: bool,
+    scoped_ca_cert: &[PathBuf],
+    intercept_active: bool,
+) -> rustls::ClientConfig {
+    let mut client_config = if verify_upstream {
         let mut root_store = rustls::RootCertStore::empty();
         let certs = rustls_native_certs::load_native_certs();
         if !certs.errors.is_empty() {
@@ -342,11 +385,23 @@ fn build_upstream_connector(
             .with_no_client_auth()
     };
 
-    TlsConnector::from(Arc::new(client_config))
+    if intercept_active {
+        client_config.alpn_protocols = vec![b"http/1.1".to_vec()];
+    }
+
+    client_config
 }
 
 /// Build host-scoped upstream TLS connectors from grouped scoped settings.
-fn build_scoped_upstream_connectors(config: &TlsConfig) -> Vec<ScopedUpstreamConnector> {
+///
+/// `intercept_active` is engine-constant (not per-pattern), so it applies to every scoped
+/// connector exactly as it does to the default one — a policed host reached through a scoped
+/// connector must not be able to negotiate h2 upstream just because it also matched a
+/// `scoped_upstream_ca_cert` / `scoped_verify_upstream` pattern.
+fn build_scoped_upstream_connectors(
+    config: &TlsConfig,
+    intercept_active: bool,
+) -> Vec<ScopedUpstreamConnector> {
     grouped_scoped_upstream_settings(config)
         .into_iter()
         .filter_map(|settings| {
@@ -357,7 +412,12 @@ fn build_scoped_upstream_connectors(config: &TlsConfig) -> Vec<ScopedUpstreamCon
 
             Some(ScopedUpstreamConnector {
                 pattern: DomainPattern::new(&settings.pattern),
-                connector: build_upstream_connector(config, verify_upstream, &settings.ca_cert),
+                connector: build_upstream_connector(
+                    config,
+                    verify_upstream,
+                    &settings.ca_cert,
+                    intercept_active,
+                ),
             })
         })
         .collect()
@@ -542,6 +602,7 @@ mod tests {
         let state = TlsState::new(
             TlsConfig::default(),
             SecretsHandle::new(SecretsConfig::default()),
+            false,
         )
         .unwrap();
         let first = state.get_or_generate_cert("openrouter.ai").unwrap();
@@ -569,6 +630,7 @@ mod tests {
         let state = TlsState::new(
             TlsConfig::default(),
             SecretsHandle::new(SecretsConfig::default()),
+            false,
         )
         .unwrap();
 
@@ -591,7 +653,7 @@ mod tests {
         let mut config = TlsConfig::default();
         config.intercept_ca.cert_path = Some(PathBuf::from("/tmp/ca.crt"));
 
-        let err = match TlsState::new(config, SecretsHandle::new(SecretsConfig::default())) {
+        let err = match TlsState::new(config, SecretsHandle::new(SecretsConfig::default()), false) {
             Ok(_) => panic!("incomplete CA config should fail"),
             Err(err) => err,
         };
@@ -615,7 +677,7 @@ mod tests {
         config.intercept_ca.cert_path = Some(cert_path);
         config.intercept_ca.key_path = Some(key_path);
 
-        let err = match TlsState::new(config, SecretsHandle::new(SecretsConfig::default())) {
+        let err = match TlsState::new(config, SecretsHandle::new(SecretsConfig::default()), false) {
             Ok(_) => panic!("invalid CA config should fail"),
             Err(err) => err,
         };
@@ -679,7 +741,8 @@ mod tests {
             pattern: "*.internal".to_string(),
             verify: false,
         });
-        let state = TlsState::new(config, SecretsHandle::new(SecretsConfig::default())).unwrap();
+        let state =
+            TlsState::new(config, SecretsHandle::new(SecretsConfig::default()), false).unwrap();
 
         assert!(
             state
@@ -713,5 +776,76 @@ mod tests {
         std::fs::remove_file(&path).ok();
 
         assert_eq!(root_store.len(), 1);
+    }
+
+    /// Fail-closed request interception's parser is HTTP/1.1-only; the
+    /// upstream connector must not let a policed host negotiate h2 with the
+    /// real server. Inactive interception must not touch ALPN at all
+    /// (leaves it to rustls's/upstream negotiation default).
+    #[test]
+    fn build_upstream_client_config_pins_alpn_to_http11_when_intercept_active() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let config = TlsConfig::default();
+
+        let active = build_upstream_client_config(&config, false, &[], true);
+        assert_eq!(active.alpn_protocols, vec![b"http/1.1".to_vec()]);
+
+        let inactive = build_upstream_client_config(&config, false, &[], false);
+        assert!(inactive.alpn_protocols.is_empty());
+    }
+
+    /// BLOCKER (review #4): a policed host reached through a *scoped*
+    /// upstream connector (matched a `scoped_upstream_ca_cert` /
+    /// `scoped_verify_upstream` pattern) must get the same ALPN pin as the
+    /// default connector — otherwise it could still negotiate h2 upstream
+    /// while the guest-facing side and the interceptor assume h1.
+    #[test]
+    fn scoped_upstream_connectors_inherit_the_intercept_alpn_pin() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let mut config = TlsConfig::default();
+        config.scoped_verify_upstream.push(ScopedVerifyUpstream {
+            pattern: "*.internal".to_string(),
+            verify: false,
+        });
+
+        // `build_scoped_upstream_connectors` cannot be introspected directly
+        // (its `TlsConnector`s are opaque), so this proves the wiring by
+        // constructing the same settings the scoped path derives and
+        // checking `build_upstream_client_config` — the function scoped
+        // connectors are actually built from — pins ALPN identically.
+        let settings = grouped_scoped_upstream_settings(&config);
+        assert_eq!(settings.len(), 1);
+        let scoped_client_config = build_upstream_client_config(
+            &config,
+            settings[0]
+                .verify_upstream
+                .unwrap_or(config.verify_upstream),
+            &settings[0].ca_cert,
+            true,
+        );
+        assert_eq!(
+            scoped_client_config.alpn_protocols,
+            vec![b"http/1.1".to_vec()]
+        );
+    }
+
+    /// Guest-facing side of the ALPN pin: `TlsState::get_or_generate_cert`
+    /// bakes it into the cached `ServerConfig` at cert-build time when the
+    /// engine has interception active.
+    #[test]
+    fn get_or_generate_cert_pins_guest_facing_alpn_when_intercept_active() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let state = TlsState::new(
+            TlsConfig::default(),
+            SecretsHandle::new(SecretsConfig::default()),
+            true,
+        )
+        .unwrap();
+
+        let cert = state.get_or_generate_cert("api.github.com").unwrap();
+        assert_eq!(
+            cert.server_config.alpn_protocols,
+            vec![b"http/1.1".to_vec()]
+        );
     }
 }

@@ -757,6 +757,8 @@ mod tests {
     use crate::extensions::{
         AuthorizedRouteRequestExtension, AuthorizedTcpRoute, OutboundConnectionExtension,
     };
+    use crate::intercept::InterceptExtension;
+    use crate::intercept::config::{InterceptConfig, InterceptRule};
     use crate::secrets::config::{HostPattern, SecretEntry, SecretInjection, SecretsConfig};
     use crate::secrets::handle::SecretsHandle;
     use crate::tcp::connection::ProxyConnectStatus;
@@ -812,6 +814,13 @@ mod tests {
     }
 
     fn test_tls_state(secrets: SecretsConfig) -> Arc<TlsState> {
+        test_tls_state_with_intercept(secrets, false)
+    }
+
+    fn test_tls_state_with_intercept(
+        secrets: SecretsConfig,
+        intercept_active: bool,
+    ) -> Arc<TlsState> {
         let dir = tempfile::tempdir().unwrap();
         let ca = crate::tls::ca::CertAuthority::generate();
         let cert_path = dir.path().join("ca.pem");
@@ -827,7 +836,7 @@ mod tests {
             },
             ..Default::default()
         };
-        Arc::new(TlsState::new(config, SecretsHandle::new(secrets)).unwrap())
+        Arc::new(TlsState::new(config, SecretsHandle::new(secrets), intercept_active).unwrap())
     }
 
     fn guest_client(tls_state: &TlsState) -> rustls::ClientConnection {
@@ -1620,6 +1629,146 @@ mod tests {
         server.await.unwrap().unwrap();
     }
 
+    fn github_style_intercept_config() -> InterceptConfig {
+        InterceptConfig {
+            rules: vec![InterceptRule {
+                host: "example.com".into(),
+                method: "GET".into(),
+                path_prefix: "/allowed".into(),
+                dispatch_on_headers: false,
+            }],
+            hook: Some(vec!["/bin/cat".to_string()]),
+            max_request_bytes: 64 * 1024,
+        }
+    }
+
+    /// End-to-end through the real seam wiring (`open_authorized_request_stream`
+    /// → [`InterceptExtension`] → `Interceptor`), not a scripted stand-in:
+    /// a request on a policed host that matches no rule must be refused and
+    /// must not put a single byte — including any substituted credential —
+    /// on the wire to upstream. This is the security property the whole
+    /// feature exists for (AC "credentials are not exposed to unauthorized
+    /// destinations").
+    #[tokio::test]
+    async fn intercept_extension_refuses_unmatched_request_and_writes_nothing_upstream() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let tls_state = test_tls_state(SecretsConfig::default());
+        let (upstream, upstream_request, server) = spawn_upstream_request_sink().await;
+        let (from_tx, from_rx) = mpsc::channel(4);
+        let (to_tx, mut to_rx) = mpsc::channel(4);
+        let mut client = guest_client(&tls_state);
+        send_client_tls_output(&mut client, &from_tx).await;
+        let extensions = NetworkExtensions::new().with_authorized_requests(Arc::new(
+            InterceptExtension::new(github_style_intercept_config()),
+        ));
+        let relay = tokio::spawn(intercept_relay(
+            "203.0.113.10:443".parse().unwrap(),
+            UpstreamTcpTarget::direct(upstream),
+            "example.com",
+            false,
+            false,
+            Vec::new(),
+            from_rx,
+            to_tx,
+            Arc::new(SharedState::new(4)),
+            tls_state,
+            Arc::new(ProxyConnectState::new()),
+            extensions,
+            None,
+        ));
+
+        complete_relay_handshake(&mut client, &from_tx, &mut to_rx).await;
+        // "/denied" matches no rule — the only configured rule is `GET
+        // /allowed` — so this must be refused, not forwarded.
+        client
+            .writer()
+            .write_all(b"GET /denied HTTP/1.1\r\nHost: example.com\r\n\r\n")
+            .unwrap();
+        send_client_tls_output(&mut client, &from_tx).await;
+
+        let mut response = Vec::new();
+        for _ in 0..4 {
+            let encrypted = to_rx.recv().await.expect("relay closed before response");
+            let mut input = encrypted.as_ref();
+            client.read_tls(&mut input).unwrap();
+            client.process_new_packets().unwrap();
+            let mut buf = [0; RELAY_BUF_SIZE];
+            match client.reader().read(&mut buf) {
+                Ok(n) => response.extend_from_slice(&buf[..n]),
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
+                Err(error) => panic!("failed to decrypt refusal response: {error}"),
+            }
+            if response.starts_with(b"HTTP/1.1 403") {
+                break;
+            }
+        }
+        assert!(
+            response.starts_with(b"HTTP/1.1 403"),
+            "expected a 403 refusal, got: {}",
+            String::from_utf8_lossy(&response)
+        );
+        relay.await.unwrap().unwrap();
+        assert_eq!(
+            upstream_request.await.unwrap(),
+            b"",
+            "no bytes may reach upstream once a policed request is refused"
+        );
+        server.await.unwrap().unwrap();
+    }
+
+    /// The passthrough half of the same real-wiring path: a matched rule
+    /// whose hook approves (here `/bin/cat`, which echoes stdin — the
+    /// "modified passthrough" stdout shape) must reach the upstream fixture.
+    #[tokio::test]
+    async fn intercept_extension_forwards_matched_request_after_hook_approval() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let tls_state = test_tls_state(SecretsConfig::default());
+        let (upstream, upstream_request, server) = spawn_upstream_request_sink().await;
+        let (from_tx, from_rx) = mpsc::channel(4);
+        let (to_tx, mut to_rx) = mpsc::channel(4);
+        let mut client = guest_client(&tls_state);
+        send_client_tls_output(&mut client, &from_tx).await;
+        let extensions = NetworkExtensions::new().with_authorized_requests(Arc::new(
+            InterceptExtension::new(github_style_intercept_config()),
+        ));
+        let relay = tokio::spawn(intercept_relay(
+            "203.0.113.10:443".parse().unwrap(),
+            UpstreamTcpTarget::direct(upstream),
+            "example.com",
+            false,
+            false,
+            Vec::new(),
+            from_rx,
+            to_tx,
+            Arc::new(SharedState::new(4)),
+            tls_state,
+            Arc::new(ProxyConnectState::new()),
+            extensions,
+            None,
+        ));
+
+        complete_relay_handshake(&mut client, &from_tx, &mut to_rx).await;
+        client
+            .writer()
+            .write_all(b"GET /allowed HTTP/1.1\r\nHost: example.com\r\nContent-Length: 0\r\n\r\n")
+            .unwrap();
+        send_client_tls_output(&mut client, &from_tx).await;
+
+        let received = tokio::time::timeout(std::time::Duration::from_secs(1), upstream_request)
+            .await
+            .expect("upstream did not receive the approved request")
+            .unwrap();
+        assert!(
+            String::from_utf8_lossy(&received).contains("GET /allowed"),
+            "the hook-approved request must reach upstream: {}",
+            String::from_utf8_lossy(&received)
+        );
+
+        drop(from_tx);
+        relay.await.unwrap().unwrap();
+        server.await.unwrap().unwrap();
+    }
+
     #[tokio::test]
     async fn intercept_relay_opens_request_factory_before_connecting_upstream() {
         let _ = rustls::crypto::ring::default_provider().install_default();
@@ -1841,7 +1990,8 @@ mod tests {
     async fn synthetic_response_is_encrypted_for_the_guest_and_wakes_polling() {
         let _ = rustls::crypto::ring::default_provider().install_default();
         let ca = crate::tls::ca::CertAuthority::generate();
-        let domain = crate::tls::certgen::generate_domain_cert("example.com", &ca, 24).unwrap();
+        let domain =
+            crate::tls::certgen::generate_domain_cert("example.com", &ca, 24, false).unwrap();
         let mut roots = rustls::RootCertStore::empty();
         roots.add(ca.cert_der.clone()).unwrap();
         let client_config = rustls::ClientConfig::builder()

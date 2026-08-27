@@ -542,7 +542,7 @@ pub enum Patch {
 
 /// Complete network specification for a sandbox.
 ///
-/// Common, backend-visible fields are typed directly. Rich local-engine subdocuments such as policy, DNS, TLS, secrets, and interface overrides are carried as JSON so the shared contract can preserve them without depending on the local networking engine crate.
+/// Common, backend-visible fields are typed directly. Rich local-engine subdocuments such as policy, DNS, TLS, request interception, secrets, and interface overrides are carried as JSON so the shared contract can preserve them without depending on the local networking engine crate.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
@@ -569,6 +569,10 @@ pub struct NetworkSpec {
     /// TLS interception subdocument.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tls: Option<TlsConfig>,
+
+    /// Fail-closed request-interception subdocument.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub intercept: Option<InterceptConfig>,
 
     /// Secret injection subdocument.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1640,6 +1644,7 @@ impl Default for NetworkSpec {
             policy: None,
             dns: None,
             tls: None,
+            intercept: None,
             secrets: None,
             max_connections: None,
             rate_limiter: None,
@@ -2544,6 +2549,87 @@ fn default_cache_capacity() -> usize {
 
 fn default_cert_validity_hours() -> u64 {
     24
+}
+
+//--------------------------------------------------------------------------------------------------
+// Types: Request interception
+//--------------------------------------------------------------------------------------------------
+
+/// Fail-closed request-interception configuration. Carried in [`NetworkSpec::intercept`](NetworkSpec).
+///
+/// On a TLS-intercepted connection whose SNI matches at least one [`InterceptRule`], the local
+/// network engine buffers the decrypted HTTP/1.1 request (or just its headers, when
+/// [`InterceptRule::dispatch_on_headers`] is set) and hands it to `hook` before forwarding
+/// anything upstream. The hook's stdout decides the outcome: empty stdout passes the buffered
+/// bytes through unchanged, stdout starting with `HTTP/` is returned to the guest as a
+/// synthesized response and the connection closes, anything else replaces the buffered bytes
+/// before forwarding. A request on a policed SNI (any SNI a rule names) that matches no rule is
+/// refused rather than forwarded — see [`InterceptConfig::is_active`].
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+pub struct InterceptConfig {
+    /// Routes to intercept. Empty disables the interceptor entirely.
+    #[serde(default)]
+    pub rules: Vec<InterceptRule>,
+
+    /// Subprocess command + args invoked for matched requests. `None` is
+    /// equivalent to an empty `rules` list.
+    #[serde(default)]
+    pub hook: Option<Vec<String>>,
+
+    /// Maximum bytes to buffer per intercepted request before refusing it
+    /// rather than forwarding it unvetted.
+    #[serde(default = "default_max_request_bytes")]
+    pub max_request_bytes: usize,
+}
+
+/// One request-interception match rule. All fields must match for the rule to fire.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+pub struct InterceptRule {
+    /// SNI host. Exact match (case-insensitive).
+    pub host: String,
+
+    /// HTTP method. Exact match (case-sensitive — HTTP methods are
+    /// uppercase per RFC 9110).
+    pub method: String,
+
+    /// Path-prefix match against the request target's path, with the query
+    /// string stripped and RFC 7230 absolute-form normalized to origin-form
+    /// before matching.
+    pub path_prefix: String,
+
+    /// Dispatch the hook as soon as the request headers are buffered
+    /// instead of waiting for the full body. See the hook stdout contract
+    /// documented on [`InterceptConfig`].
+    #[serde(default)]
+    pub dispatch_on_headers: bool,
+}
+
+fn default_max_request_bytes() -> usize {
+    64 * 1024
+}
+
+/// Hand-written so `max_request_bytes` matches the serde default:
+/// `#[derive(Default)]` would zero it, and every buffered request would
+/// immediately exceed a zero cap.
+impl Default for InterceptConfig {
+    fn default() -> Self {
+        Self {
+            rules: Vec::new(),
+            hook: None,
+            max_request_bytes: default_max_request_bytes(),
+        }
+    }
+}
+
+impl InterceptConfig {
+    /// Active = at least one rule and a hook command are configured.
+    pub fn is_active(&self) -> bool {
+        !self.rules.is_empty() && self.hook.is_some()
+    }
 }
 
 //--------------------------------------------------------------------------------------------------

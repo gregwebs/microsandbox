@@ -1833,7 +1833,9 @@ mod tests {
             },
             ..Default::default()
         };
-        Arc::new(TlsState::new(config, SecretsHandle::new(SecretsConfig::default())).unwrap())
+        Arc::new(
+            TlsState::new(config, SecretsHandle::new(SecretsConfig::default()), false).unwrap(),
+        )
     }
 
     async fn spawn_sink() -> (SocketAddr, JoinHandle<Vec<u8>>) {

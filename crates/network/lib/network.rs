@@ -21,6 +21,8 @@ use msb_krun::backends::net::NetBackend;
 
 use crate::config::{MAX_NETWORK_CONNECTIONS, NetworkConfig};
 use crate::extensions::NetworkExtensions;
+use crate::intercept::InterceptExtension;
+use crate::intercept::config::InterceptConfig;
 use crate::netstack::{
     backend::SmoltcpBackend,
     poll::{self, GatewayIps, PollLoopConfig},
@@ -300,12 +302,14 @@ impl SmoltcpNetwork {
                 source,
             })?;
         let backend = SmoltcpBackend::new(shared.clone());
+        let extensions = install_intercept_extension(extensions, &config.intercept);
 
         let secrets = SecretsHandle::new(config.secrets.clone());
         let tls_state = if config.tls.enabled {
             Some(Arc::new(TlsState::new(
                 config.tls.clone(),
                 secrets.clone(),
+                config.intercept.is_active(),
             )?))
         } else {
             None
@@ -604,6 +608,27 @@ fn enforce_deployment_profile(config: &mut NetworkConfig, profile: DeploymentPro
             connection_limit_clamped,
             "multi-tenant deployment profile overrode unsafe network configuration"
         );
+    }
+}
+
+/// Install the built-in fail-closed request interceptor when `intercept` is
+/// active and the caller has not already installed its own authorized-route
+/// request extension.
+///
+/// A caller-installed extension always wins: `NetworkExtensions` supports at
+/// most one request extension, and an embedder of this crate may want its
+/// own policy in place of the built-in one. Gating strictly on
+/// [`InterceptConfig::is_active`] (not, say, `config.tls.enabled`) matters —
+/// see [`InterceptExtension`] for why returning no extension at all for a
+/// policed host would be a credential bypass.
+fn install_intercept_extension(
+    extensions: NetworkExtensions,
+    intercept: &InterceptConfig,
+) -> NetworkExtensions {
+    if intercept.is_active() && extensions.authorized_requests().is_none() {
+        extensions.with_authorized_requests(Arc::new(InterceptExtension::new(intercept.clone())))
+    } else {
+        extensions
     }
 }
 

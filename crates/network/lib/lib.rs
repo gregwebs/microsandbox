@@ -17,6 +17,7 @@ pub mod config;
 pub mod dns;
 pub mod extensions;
 pub mod icmp;
+pub mod intercept;
 pub mod netstack;
 pub mod network;
 pub mod policy;

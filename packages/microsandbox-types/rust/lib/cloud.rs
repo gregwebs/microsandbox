@@ -729,9 +729,10 @@ impl From<VolumeMount> for CloudVolumeMount {
 }
 
 /// Cloud network specification: a subset of the domain [`NetworkSpec`].
-/// Interface overrides, host port mapping, DNS, TLS interception, rate limits,
-/// and host-CA trust are not part of this type. `deny_unknown_fields` — posting
-/// an omitted field is an error, not a silent drop.
+/// Interface overrides, host port mapping, DNS, TLS interception, fail-closed
+/// request interception, rate limits, and host-CA trust are not part of this
+/// type. `deny_unknown_fields` — posting an omitted field is an error, not a
+/// silent drop.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
@@ -997,6 +998,11 @@ impl TryFrom<CloudSandboxSpec> for SandboxSpec {
             policy: spec.network.policy,
             dns: None,
             tls: None,
+            // Fail-closed request interception is a local-engine subprocess-hook
+            // mechanism (the hook runs on the host runtime process); the cloud
+            // wire has no host process to run it against, so — like `tls` — it
+            // is not part of `CloudNetworkSpec` and always defaults here.
+            intercept: None,
             secrets: spec.network.secrets.map(Into::into),
             max_connections: spec.network.max_connections,
             rate_limiter: None,

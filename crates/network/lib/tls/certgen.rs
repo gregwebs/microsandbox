@@ -53,10 +53,20 @@ pub enum DomainCertError {
 //--------------------------------------------------------------------------------------------------
 
 /// Generate a certificate for `domain` signed by the given CA.
+///
+/// `intercept_active` pins the guest-facing `ServerConfig`'s ALPN offer to
+/// `http/1.1` when true. This is a UX improvement, not a correctness
+/// requirement: fail-closed request interception's parser
+/// (`crate::intercept::handler`) is HTTP/1.1-only, so without this pin an
+/// h2-preferring guest would complete an h2 handshake and send a `PRI *
+/// HTTP/2.0` preface that the parser cannot read as a request line — the
+/// interceptor still refuses with a fail-closed 403 on a policed host, but
+/// pinning ALPN here gives the guest a clean protocol downgrade instead.
 pub fn generate_domain_cert(
     domain: &str,
     ca: &CertAuthority,
     validity_hours: u64,
+    intercept_active: bool,
 ) -> Result<DomainCert, DomainCertError> {
     let now: OffsetDateTime = OffsetDateTime::now_utc();
     let params: CertificateParams = build_domain_cert_params(domain, validity_hours, now)?;
@@ -75,10 +85,14 @@ pub fn generate_domain_cert(
     let key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(key_pair.serialize_der()));
 
     // Pre-build ServerConfig so it can be reused across connections to the same domain.
-    let server_config = rustls::ServerConfig::builder()
+    let mut server_config = rustls::ServerConfig::builder()
         .with_no_client_auth()
         .with_single_cert(chain.clone(), key.clone_key())
         .map_err(DomainCertError::ServerConfig)?;
+
+    if intercept_active {
+        server_config.alpn_protocols = vec![b"http/1.1".to_vec()];
+    }
 
     Ok(DomainCert {
         chain,
@@ -143,5 +157,24 @@ mod tests {
         let err = build_domain_cert_params("snowman.☃", 24, now).unwrap_err();
 
         assert!(matches!(err, DomainCertError::InvalidDomain { .. }));
+    }
+
+    /// The guest-facing half of the ALPN pin: fail-closed request
+    /// interception's parser is HTTP/1.1-only, so the domain `ServerConfig`
+    /// must advertise only `http/1.1` when interception is active, and must
+    /// not touch ALPN at all when it is not.
+    #[test]
+    fn generate_domain_cert_pins_alpn_to_http11_when_intercept_active() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let ca = CertAuthority::generate();
+
+        let active = generate_domain_cert("example.com", &ca, 24, true).unwrap();
+        assert_eq!(
+            active.server_config.alpn_protocols,
+            vec![b"http/1.1".to_vec()]
+        );
+
+        let inactive = generate_domain_cert("example.com", &ca, 24, false).unwrap();
+        assert!(inactive.server_config.alpn_protocols.is_empty());
     }
 }
