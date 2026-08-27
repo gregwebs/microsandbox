@@ -13,8 +13,8 @@ use microsandbox::sandbox::{
 };
 #[cfg(feature = "net")]
 use microsandbox::sandbox::{
-    DnsConfigPatch, NetworkConfigPatch, NetworkPolicyConfigPatch, SecretConfigPatch,
-    SecretEntryConfigPatch, TlsConfigPatch,
+    DnsConfigPatch, InterceptConfigPatch, NetworkConfigPatch, NetworkPolicyConfigPatch,
+    SecretConfigPatch, SecretEntryConfigPatch, TlsConfigPatch,
 };
 use microsandbox_image::RegistryAuth;
 use serde::Deserialize;
@@ -384,6 +384,7 @@ struct NetworkPatch {
     ports: Option<Vec<String>>,
     dns: Option<DnsInput>,
     tls: Option<TlsInput>,
+    intercept: Option<InterceptInput>,
     trust_host_cas: Option<bool>,
     max_connections: Option<usize>,
 }
@@ -403,6 +404,29 @@ struct TlsInput {
     bypass: Option<Vec<String>>,
     verify_upstream: Option<bool>,
     block_quic: Option<bool>,
+}
+
+/// Sparse fail-closed request-interception config-file surface.
+///
+/// Deliberately minimal (no CLI flag grammar — config-file only, mirroring
+/// the secrets PR's scoping): a hook command, match rules, and the buffer
+/// cap. See `docs/sandboxes/intercept.mdx`.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct InterceptInput {
+    hook: Option<Vec<String>>,
+    rules: Option<Vec<InterceptRuleInput>>,
+    max_request_bytes: Option<usize>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct InterceptRuleInput {
+    host: String,
+    method: String,
+    path_prefix: String,
+    #[serde(default)]
+    dispatch_on_headers: bool,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -1044,6 +1068,7 @@ fn merge_network(base: &mut Option<NetworkInput>, higher: Option<NetworkInput>) 
     replace(&mut base.ports, higher.ports);
     merge_dns(&mut base.dns, higher.dns);
     merge_tls(&mut base.tls, higher.tls);
+    merge_intercept(&mut base.intercept, higher.intercept);
     replace(&mut base.trust_host_cas, higher.trust_host_cas);
     replace(&mut base.max_connections, higher.max_connections);
 }
@@ -1067,6 +1092,16 @@ fn merge_tls(base: &mut Option<TlsInput>, higher: Option<TlsInput>) {
     replace(&mut base.bypass, higher.bypass);
     replace(&mut base.verify_upstream, higher.verify_upstream);
     replace(&mut base.block_quic, higher.block_quic);
+}
+
+fn merge_intercept(base: &mut Option<InterceptInput>, higher: Option<InterceptInput>) {
+    let Some(higher) = higher else {
+        return;
+    };
+    let base = base.get_or_insert_with(InterceptInput::default);
+    replace(&mut base.hook, higher.hook);
+    replace(&mut base.rules, higher.rules);
+    replace(&mut base.max_request_bytes, higher.max_request_bytes);
 }
 
 //--------------------------------------------------------------------------------------------------
@@ -1774,6 +1809,31 @@ fn materialize_network_patch(input: &NetworkInput) -> anyhow::Result<NetworkConf
         }
         patch = patch.tls(value);
     }
+    if let Some(intercept) = input.intercept {
+        let mut value = InterceptConfigPatch::new();
+        if let Some(hook) = intercept.hook {
+            value = value.hook(hook);
+        }
+        if let Some(rules) = intercept.rules {
+            value = value.rules(
+                rules
+                    .into_iter()
+                    .map(
+                        |rule| microsandbox_network::intercept::config::InterceptRule {
+                            host: rule.host,
+                            method: rule.method,
+                            path_prefix: rule.path_prefix,
+                            dispatch_on_headers: rule.dispatch_on_headers,
+                        },
+                    )
+                    .collect(),
+            );
+        }
+        if let Some(max) = intercept.max_request_bytes {
+            value = value.max_request_bytes(max);
+        }
+        patch = patch.intercept(value);
+    }
     if let Some(enabled) = input.trust_host_cas {
         patch = patch.trust_host_cas(enabled);
     }
@@ -2267,6 +2327,51 @@ secrets:
         assert_eq!(config.spec.network.ports.len(), 0);
         assert!(config.spec.network.tls.as_ref().unwrap().enabled);
         assert!(config.spec.network.dns.as_ref().unwrap().rebind_protection);
+    }
+
+    #[tokio::test]
+    async fn sparse_intercept_config_round_trips_into_the_sandbox_spec() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = write_config(
+            dir.path(),
+            "agent.yaml",
+            r#"
+image: "python:3.12"
+network:
+  policy: public
+  intercept:
+    hook: ["agent-vm", "_intercept-hook"]
+    max_request_bytes: 4096
+    rules:
+      - { host: "api.github.com", method: "GET", path_prefix: "/repos/" }
+      - { host: "github.com", method: "POST", path_prefix: "/", dispatch_on_headers: true }
+"#,
+        );
+        let sources = SandboxConfigSources::default().source(SandboxConfigKind::Root, root);
+        let resolved = resolve(&sources).unwrap();
+        let image = resolved.image(None, None).unwrap();
+        let builder = resolved
+            .apply(SandboxBuilder::new("intercept-config-test"))
+            .unwrap();
+        let config = image.apply(builder).unwrap().build().await.unwrap();
+
+        let intercept = config
+            .spec
+            .network
+            .intercept
+            .as_ref()
+            .expect("intercept subdocument present");
+        assert_eq!(
+            intercept.hook,
+            Some(vec!["agent-vm".to_string(), "_intercept-hook".to_string()])
+        );
+        assert_eq!(intercept.max_request_bytes, 4096);
+        assert_eq!(intercept.rules.len(), 2);
+        assert_eq!(intercept.rules[0].host, "api.github.com");
+        assert!(!intercept.rules[0].dispatch_on_headers);
+        assert_eq!(intercept.rules[1].host, "github.com");
+        assert!(intercept.rules[1].dispatch_on_headers);
+        assert!(intercept.is_active());
     }
 
     #[test]

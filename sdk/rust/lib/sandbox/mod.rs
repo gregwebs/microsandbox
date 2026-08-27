@@ -104,8 +104,8 @@ pub use builder::{RegistryConfigBuilder, SandboxBuilder};
 pub use config::SandboxConfig;
 #[cfg(feature = "net")]
 pub use config_patch::{
-    DnsConfigPatch, NetworkConfigPatch, NetworkPolicyConfigPatch, SecretConfigPatch,
-    SecretEntryConfigPatch, TlsConfigPatch,
+    DnsConfigPatch, InterceptConfigPatch, NetworkConfigPatch, NetworkPolicyConfigPatch,
+    SecretConfigPatch, SecretEntryConfigPatch, TlsConfigPatch,
 };
 pub use config_patch::{
     FilesystemConfigPatch, InitConfigPatch, ResourceConfigPatch, RuntimeConfigPatch,

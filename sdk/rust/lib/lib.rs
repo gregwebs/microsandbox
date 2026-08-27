@@ -71,9 +71,9 @@ pub use sandbox::{
 };
 #[cfg(feature = "net")]
 pub use sandbox::{
-    DnsConfigPatch, HostPattern, Nameserver, NetworkAction, NetworkConfigPatch, NetworkPolicy,
-    NetworkPolicyConfigPatch, NetworkProfile, NetworkRule, PublishedPort, SecretConfigPatch,
-    SecretEntryConfigPatch, SecretInjection, TlsConfigPatch,
+    DnsConfigPatch, HostPattern, InterceptConfigPatch, Nameserver, NetworkAction,
+    NetworkConfigPatch, NetworkPolicy, NetworkPolicyConfigPatch, NetworkProfile, NetworkRule,
+    PublishedPort, SecretConfigPatch, SecretEntryConfigPatch, SecretInjection, TlsConfigPatch,
 };
 pub use snapshot::{
     CheckpointSnapshotState, FileSnapshotState, SaveOpts, Snapshot, SnapshotBuilder,

@@ -44,6 +44,7 @@
               "sandboxes/commands",
               "sandboxes/filesystem",
               "sandboxes/secrets",
+              "sandboxes/intercept",
               "sandboxes/tuning",
               "sandboxes/ssh",
               "sandboxes/volumes",
@@ -390,6 +391,7 @@
                 "group": "August 2026",
                 "expanded": true,
                 "pages": [
+                  "changelog/2026-08-27",
                   "changelog/2026-08-26",
                   "changelog/2026-08-07"
                 ]
