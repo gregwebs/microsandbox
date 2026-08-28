@@ -77,6 +77,12 @@ msb create python --name worker \
 ```
 </CodeGroup>
 
+## Host HTTP proxy transport
+
+When the local runtime detects a supported host HTTP proxy, both TLS bypass and TLS interception can run over its CONNECT tunnel. The proxy sees the destination authority, while the TLS payload remains opaque unless the proxy separately performs TLS inspection.
+
+This transport is distinct from a corporate proxy that replaces server certificates and from `trust_host_cas` or Microsandbox's TLS interception. A certificate-replacing corporate proxy needs a CA the guest or Microsandbox trusts. `trust_host_cas` copies host roots into the guest; Microsandbox interception terminates and re-originates TLS itself. CONNECT alone does neither.
+
 ## Bypass patterns
 
 Some clients trust a specific certificate or public key instead of the guest's trust store. Interception will fail for these clients.

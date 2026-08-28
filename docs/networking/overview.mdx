@@ -336,6 +336,16 @@ msb create python --name devbox --net "public,host"
 
 `loopback` means the sandbox's own `127.0.0.1`, not your laptop's localhost. Use `host` for `host.microsandbox.internal`.
 
+## Host HTTP proxy
+
+A local runtime automatically reads `http_proxy`/`HTTP_PROXY`, `https_proxy`/`HTTPS_PROXY`, `all_proxy`/`ALL_PROXY`, and `no_proxy`/`NO_PROXY` when it starts. Lowercase takes precedence; empty values are ignored. Microsandbox supports HTTP forward proxies through `CONNECT`, including Basic authentication in proxy URL userinfo. Proxy endpoints and credentials stay host-local and are never serialized into sandbox configuration or guest environment.
+
+This applies to every authorized TCP connection, not just HTTP application traffic. `HTTPS_PROXY` selects TLS routes and `HTTP_PROXY` selects plain TCP routes; `ALL_PROXY` is the fallback, and a usable endpoint for one kind also covers the other kind rather than allowing a direct leak. HTTPS-to-proxy and SOCKS transports are unsupported. If every configured proxy value is malformed or uses an unsupported transport, Microsandbox emits a credential-free warning and preserves direct routing. Once a usable proxy is selected, DNS, connection, handshake, timeout (30 seconds), and proxy rejection failures fail the guest connection; Microsandbox does not retry the origin directly. A caller-installed outbound adapter takes precedence over ambient proxy detection.
+
+For a TLS route, the CONNECT authority is the validated SNI hostname whenever it is available, so the host proxy resolves that name. Otherwise it is the guest's already-resolved numeric destination. `NO_PROXY` accepts comma or ASCII-whitespace-separated `*`, exact names, dotted suffixes, optional leading or trailing dots, optional ignored ports, IP addresses, and IPv4/IPv6 CIDRs. Name matching needs SNI; use IP or CIDR exclusions for ordinary plain HTTP/TCP traffic. Loopback, unspecified, link-local, and host-alias rewrite targets bypass the proxy directly after destination policy has authorized the original route.
+
+The proxy is trusted host destination-policy infrastructure. Policy is evaluated before the adapter against the guest route, but a proxy resolving an SNI authority can return a different address under split DNS. Microsandbox does not revalidate that later proxy DNS answer against its IP/CIDR policy. Proxy operators can observe CONNECT authorities. UDP, ICMP, and host DNS-forwarder traffic do not use this TCP seam.
+
 ## Next
 
 - [DNS](/networking/dns): domain blocking, pinned nameservers, query timeouts

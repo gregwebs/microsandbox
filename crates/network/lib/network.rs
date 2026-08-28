@@ -21,6 +21,7 @@ use msb_krun::backends::net::NetBackend;
 
 use crate::config::{MAX_NETWORK_CONNECTIONS, NetworkConfig};
 use crate::extensions::NetworkExtensions;
+use crate::host_proxy::HostHttpProxyConnector;
 use crate::intercept::InterceptExtension;
 use crate::intercept::config::InterceptConfig;
 use crate::netstack::{
@@ -347,6 +348,9 @@ impl SmoltcpNetwork {
     /// Must be called before VM boot. Requires a tokio runtime handle for
     /// spawning proxy tasks, DNS resolution, and published port listeners.
     pub fn start(&mut self, tokio_handle: tokio::runtime::Handle) {
+        let host_proxy = HostHttpProxyConnector::from_env();
+        self.extensions = install_host_proxy_extension(self.extensions.clone(), host_proxy);
+
         let shared = self.shared.clone();
         let poll_config = PollLoopConfig {
             gateway_mac: self.gateway_mac,
@@ -632,6 +636,31 @@ fn install_intercept_extension(
     }
 }
 
+fn install_host_proxy_extension(
+    extensions: NetworkExtensions,
+    host_proxy: Option<HostHttpProxyConnector>,
+) -> NetworkExtensions {
+    let Some(host_proxy) = host_proxy else {
+        return extensions;
+    };
+
+    if extensions.outbound().is_some() {
+        tracing::debug!(
+            "caller-installed outbound connection extension takes precedence over host HTTP proxy"
+        );
+        return extensions;
+    }
+
+    let (https, http) = host_proxy.endpoint_displays();
+    tracing::info!(
+        https = ?https,
+        http = ?http,
+        no_proxy_configured = host_proxy.has_no_proxy_rules(),
+        "guest egress will use the host HTTP proxy"
+    );
+    extensions.with_outbound(Arc::new(host_proxy))
+}
+
 /// Derive a guest MAC address from the sandbox slot.
 ///
 /// Format: `02:ms:bx:SS:SS:02` where SS:SS encodes the slot.
@@ -745,9 +774,76 @@ fn host_has_ipv6_route() -> bool {
 
 #[cfg(test)]
 mod tests {
+    use std::io;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use futures::future::BoxFuture;
+
     use super::*;
     use crate::config::{PortProtocol, PublishedPort};
     use crate::dns::Nameserver;
+    use crate::extensions::{
+        AuthorizedRouteRequestExtension, AuthorizedTcpRoute, OutboundConnectionExtension,
+    };
+    use crate::tcp::upstream::UpstreamTcpTarget;
+
+    struct CountingOutboundExtension(AtomicUsize);
+
+    impl OutboundConnectionExtension for CountingOutboundExtension {
+        fn connect<'a>(
+            &'a self,
+            route: AuthorizedTcpRoute,
+        ) -> BoxFuture<'a, io::Result<tokio::net::TcpStream>> {
+            self.0.fetch_add(1, Ordering::Relaxed);
+            Box::pin(route.connect_direct())
+        }
+    }
+
+    struct UninterestedRequestExtension;
+
+    impl AuthorizedRouteRequestExtension for UninterestedRequestExtension {
+        fn open(
+            &self,
+            _route: &crate::extensions::AuthorizedTlsRoute,
+        ) -> Option<Box<dyn crate::extensions::AuthorizedRouteRequestStream>> {
+            None
+        }
+    }
+
+    #[test]
+    fn host_proxy_install_preserves_custom_outbound_and_request_extensions() {
+        let outbound = Arc::new(CountingOutboundExtension(AtomicUsize::new(0)));
+        let request = Arc::new(UninterestedRequestExtension);
+        let extensions = NetworkExtensions::new()
+            .with_outbound(outbound.clone())
+            .with_authorized_requests(request);
+        let host_proxy = HostHttpProxyConnector::from_url("http://proxy.example:3128");
+
+        let extensions = install_host_proxy_extension(extensions, host_proxy);
+        let route = AuthorizedTcpRoute::new(
+            "203.0.113.10:443".parse().unwrap(),
+            UpstreamTcpTarget::direct("127.0.0.1:9".parse().unwrap()),
+            None,
+            crate::extensions::OutboundProtocol::Tcp,
+        );
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let _ = runtime.block_on(extensions.outbound().unwrap().connect(route));
+
+        assert_eq!(outbound.0.load(Ordering::Relaxed), 1);
+        assert!(extensions.authorized_requests().is_some());
+    }
+
+    #[test]
+    fn host_proxy_install_preserves_existing_request_extension() {
+        let request = Arc::new(UninterestedRequestExtension);
+        let extensions = NetworkExtensions::new().with_authorized_requests(request);
+        let host_proxy = HostHttpProxyConnector::from_url("http://proxy.example:3128");
+
+        let extensions = install_host_proxy_extension(extensions, host_proxy);
+
+        assert!(extensions.outbound().is_some());
+        assert!(extensions.authorized_requests().is_some());
+    }
 
     #[test]
     fn derive_addresses_slot_0() {

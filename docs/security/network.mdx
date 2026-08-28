@@ -8,6 +8,12 @@ All sandbox traffic flows through a host-side network stack. From inside the VM 
 
 This is the network chapter of the security model: the threats the stack is built to stop and where each defense lives. For day-to-day configuration like policies, ports, DNS knobs, and TLS interception, see the [Networking guide](/networking/overview).
 
+## Host proxy trust boundary
+
+Platform and tenant destination policy authorize the original guest route before a trusted host-side outbound adapter can connect it. A host HTTP proxy endpoint, its credentials, and its environment remain host-local. `NO_PROXY` deliberately creates a direct route only after that policy authorization, while ambient proxy operators can observe CONNECT authorities.
+
+For hostname CONNECT routes, the proxy resolves the SNI authority after Microsandbox has authorized the guest destination. That creates a policy-to-dial identity gap: Microsandbox does not revalidate the proxy's DNS answer. In multi-tenant deployments, treat the proxy, its destination controls, environment, and credentials as trusted platform policy infrastructure.
+
 ## Default posture
 
 With no custom policy, a sandbox can reach the public internet and nothing inward:
