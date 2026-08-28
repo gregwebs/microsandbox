@@ -99,7 +99,14 @@ fn parse_sni_extension(data: &[u8]) -> Option<String> {
         if name_type == 0x00 {
             // HostName.
             let name_bytes = list.get(pos..pos + name_len)?;
-            return String::from_utf8(name_bytes.to_vec()).ok();
+            let name = String::from_utf8(name_bytes.to_vec()).ok()?;
+            if name
+                .bytes()
+                .any(|byte| byte.is_ascii_control() || byte.is_ascii_whitespace())
+            {
+                return None;
+            }
+            return Some(name);
         }
 
         pos += name_len;
@@ -200,6 +207,16 @@ mod tests {
     fn extract_sni_from_client_hello() {
         let hello = build_client_hello("example.com");
         assert_eq!(extract_sni(&hello), Some("example.com".to_string()));
+    }
+
+    #[test]
+    fn extract_sni_rejects_controls_and_whitespace() {
+        assert_eq!(
+            extract_sni(&build_client_hello("evil.test\r\nheader")),
+            None
+        );
+        assert_eq!(extract_sni(&build_client_hello("evil\ttest")), None);
+        assert_eq!(extract_sni(&build_client_hello("evil test")), None);
     }
 
     #[test]

@@ -12,6 +12,7 @@
 )]
 
 mod addr;
+mod host_proxy;
 
 pub mod config;
 pub mod dns;

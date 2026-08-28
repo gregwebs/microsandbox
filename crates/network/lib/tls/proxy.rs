@@ -745,6 +745,7 @@ mod tests {
     use std::net::SocketAddr;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
+    use std::time::Duration;
 
     use futures::future::BoxFuture;
     use microsandbox_types::{InterceptCaConfig, TlsConfig};
@@ -801,11 +802,33 @@ mod tests {
         }
     }
 
+    async fn accept_with_deadline(listener: TcpListener) -> io::Result<TcpStream> {
+        tokio::time::timeout(Duration::from_secs(1), listener.accept())
+            .await
+            .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "fixture accept timed out"))?
+            .map(|(stream, _)| stream)
+    }
+
+    async fn read_connect_request(stream: &mut TcpStream) -> io::Result<String> {
+        tokio::time::timeout(Duration::from_secs(1), async {
+            let mut request = Vec::new();
+            while !request.ends_with(b"\r\n\r\n") {
+                let mut byte = [0_u8; 1];
+                stream.read_exact(&mut byte).await?;
+                request.push(byte[0]);
+            }
+            String::from_utf8(request)
+                .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
+        })
+        .await
+        .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "CONNECT request timed out"))?
+    }
+
     async fn spawn_sink() -> (SocketAddr, tokio::task::JoinHandle<Vec<u8>>) {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let sink = tokio::spawn(async move {
-            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut stream = accept_with_deadline(listener).await.unwrap();
             let mut received = Vec::new();
             stream.read_to_end(&mut received).await.unwrap();
             received
@@ -918,7 +941,7 @@ mod tests {
         let address = listener.local_addr().unwrap();
         let (request_tx, request_rx) = oneshot::channel();
         let server = tokio::spawn(async move {
-            let (stream, _) = listener.accept().await?;
+            let stream = accept_with_deadline(listener).await?;
             let mut stream = TlsAcceptor::from(upstream_server_config())
                 .accept(stream)
                 .await?;
@@ -953,7 +976,7 @@ mod tests {
         let (eof_tx, eof_rx) = oneshot::channel();
         let (release_tx, release_rx) = oneshot::channel();
         let server = tokio::spawn(async move {
-            let (stream, _) = listener.accept().await?;
+            let stream = accept_with_deadline(listener).await?;
             let mut stream = TlsAcceptor::from(upstream_server_config())
                 .accept(stream)
                 .await?;
@@ -1306,6 +1329,233 @@ mod tests {
         assert_eq!(request_extension.0.load(Ordering::Relaxed), 0);
         assert_eq!(proxy_connect.status(), ProxyConnectStatus::PolicyDenied);
         assert!(shared.proxy_wake.wait_timeout(std::time::Duration::ZERO));
+    }
+
+    #[tokio::test]
+    async fn tls_proxy_tunnels_encrypted_application_bytes_through_host_http_proxy() {
+        use crate::host_proxy::HostHttpProxyConnector;
+
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let tls_state = test_tls_state(SecretsConfig::default());
+        let (origin, request_rx, release_origin, origin_task) =
+            spawn_upstream_after_eof(b"HTTP/1.1 204 No Content\r\n\r\n").await;
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy_address = listener.local_addr().unwrap();
+        let (authority_tx, authority_rx) = oneshot::channel();
+        let proxy = tokio::spawn(async move {
+            let mut client = accept_with_deadline(listener).await.unwrap();
+            let request = read_connect_request(&mut client).await.unwrap();
+            authority_tx
+                .send(request.split_whitespace().nth(1).unwrap().to_owned())
+                .unwrap();
+            client
+                .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+                .await
+                .unwrap();
+            let mut upstream = TcpStream::connect(origin).await.unwrap();
+            tokio::io::copy_bidirectional(&mut client, &mut upstream)
+                .await
+                .unwrap();
+        });
+        let (from_tx, from_rx) = mpsc::channel(4);
+        let (to_tx, mut to_rx) = mpsc::channel(4);
+        const REQUEST: &[u8] = b"GET / HTTP/1.1\r\nHost: example.com\r\n\r\n";
+        let mut client = guest_client(&tls_state);
+        send_client_tls_output(&mut client, &from_tx).await;
+        let relay = tokio::spawn(
+            TlsProxy::new(
+                "203.0.113.10:443".parse().unwrap(),
+                UpstreamTcpTarget::direct("198.51.100.2:443".parse().unwrap()),
+                from_rx,
+                to_tx,
+                Arc::new(SharedState::new(4)),
+                tls_state,
+                Arc::new(NetworkPolicy::allow_all()),
+                Arc::new(ProxyConnectState::new()),
+                NetworkExtensions::new().with_outbound(Arc::new(
+                    HostHttpProxyConnector::from_url(&format!("http://{proxy_address}")).unwrap(),
+                )),
+            )
+            .try_run(),
+        );
+
+        complete_relay_handshake(&mut client, &from_tx, &mut to_rx).await;
+        client.writer().write_all(REQUEST).unwrap();
+        send_client_tls_output(&mut client, &from_tx).await;
+        drop(from_tx);
+        assert_eq!(
+            tokio::time::timeout(std::time::Duration::from_secs(1), request_rx)
+                .await
+                .expect("proxied upstream did not observe guest FIN")
+                .unwrap(),
+            REQUEST
+        );
+        release_origin.send(()).unwrap();
+        let response = tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            let mut response = Vec::new();
+            while response.len() < b"HTTP/1.1 204 No Content\r\n\r\n".len() {
+                let encrypted = to_rx
+                    .recv()
+                    .await
+                    .expect("relay closed before upstream response");
+                let mut input = encrypted.as_ref();
+                client.read_tls(&mut input).unwrap();
+                client.process_new_packets().unwrap();
+
+                let mut buffer = [0_u8; RELAY_BUF_SIZE];
+                loop {
+                    match client.reader().read(&mut buffer) {
+                        Ok(0) => break,
+                        Ok(read) => response.extend_from_slice(&buffer[..read]),
+                        Err(error) if error.kind() == io::ErrorKind::WouldBlock => break,
+                        Err(error) => panic!("guest TLS response read failed: {error}"),
+                    }
+                }
+            }
+            response
+        })
+        .await
+        .expect("guest did not receive complete response after its FIN");
+        assert_eq!(response, b"HTTP/1.1 204 No Content\r\n\r\n");
+        tokio::time::timeout(std::time::Duration::from_secs(1), relay)
+            .await
+            .expect("TLS relay did not close")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(1), authority_rx)
+                .await
+                .expect("proxy did not record CONNECT authority")
+                .unwrap(),
+            "example.com:443"
+        );
+        tokio::time::timeout(std::time::Duration::from_secs(1), proxy)
+            .await
+            .expect("CONNECT proxy did not close")
+            .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(1), origin_task)
+            .await
+            .expect("TLS origin did not close")
+            .unwrap()
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn tls_policy_denial_happens_before_host_proxy_contact() {
+        use crate::host_proxy::HostHttpProxyConnector;
+
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let tls_state = test_tls_state(SecretsConfig::default());
+        let proxy = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy_address = proxy.local_addr().unwrap();
+        let (from_tx, from_rx) = mpsc::channel(1);
+        let (to_tx, _to_rx) = mpsc::channel(1);
+        let shared = Arc::new(SharedState::new(4));
+        shared.proxy_wake.drain();
+        let connect_state = Arc::new(ProxyConnectState::new());
+        from_tx.send(guest_client_hello(&tls_state)).await.unwrap();
+        drop(from_tx);
+
+        TlsProxy::new(
+            "203.0.113.10:443".parse().unwrap(),
+            UpstreamTcpTarget::direct("198.51.100.2:443".parse().unwrap()),
+            from_rx,
+            to_tx,
+            shared.clone(),
+            tls_state,
+            Arc::new(NetworkPolicy::none()),
+            connect_state.clone(),
+            NetworkExtensions::new().with_outbound(Arc::new(
+                HostHttpProxyConnector::from_url(&format!("http://{proxy_address}")).unwrap(),
+            )),
+        )
+        .try_run()
+        .await
+        .unwrap();
+
+        assert_eq!(connect_state.status(), ProxyConnectStatus::PolicyDenied);
+        assert!(shared.proxy_wake.wait_timeout(std::time::Duration::ZERO));
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(100), proxy.accept())
+                .await
+                .is_err(),
+            "denied TLS route contacted the host proxy"
+        );
+    }
+
+    #[tokio::test]
+    async fn tls_proxy_rejection_or_loss_never_falls_back_to_direct_origin() {
+        use crate::host_proxy::HostHttpProxyConnector;
+
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        for response in [
+            b"HTTP/1.1 407 Proxy Authentication Required\r\n\r\n".as_slice(),
+            b"",
+        ] {
+            let tls_state = test_tls_state(SecretsConfig::default());
+            let proxy = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let direct = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let proxy_address = proxy.local_addr().unwrap();
+            let fixture = tokio::spawn(async move {
+                let mut stream = accept_with_deadline(proxy).await.unwrap();
+                let _ = read_connect_request(&mut stream).await.unwrap();
+                if !response.is_empty() {
+                    stream.write_all(response).await.unwrap();
+                }
+            });
+            let (from_tx, from_rx) = mpsc::channel(4);
+            let (to_tx, mut to_rx) = mpsc::channel(4);
+            let mut client = guest_client(&tls_state);
+            send_client_tls_output(&mut client, &from_tx).await;
+            let connect_state = Arc::new(ProxyConnectState::new());
+
+            let relay = tokio::spawn(
+                TlsProxy::new(
+                    "203.0.113.10:443".parse().unwrap(),
+                    UpstreamTcpTarget::with_fallback(
+                        "198.51.100.2:443".parse().unwrap(),
+                        direct.local_addr().unwrap(),
+                    ),
+                    from_rx,
+                    to_tx,
+                    Arc::new(SharedState::new(4)),
+                    tls_state,
+                    Arc::new(NetworkPolicy::allow_all()),
+                    connect_state.clone(),
+                    NetworkExtensions::new().with_outbound(Arc::new(
+                        HostHttpProxyConnector::from_url(&format!("http://{proxy_address}"))
+                            .unwrap(),
+                    )),
+                )
+                .try_run(),
+            );
+
+            complete_relay_handshake(&mut client, &from_tx, &mut to_rx).await;
+            drop(from_tx);
+            let result = tokio::time::timeout(Duration::from_secs(1), relay)
+                .await
+                .expect("TLS relay did not close")
+                .unwrap();
+
+            assert!(
+                result.is_err(),
+                "proxy failure unexpectedly connected TLS route"
+            );
+            assert_eq!(
+                connect_state.status(),
+                ProxyConnectStatus::UpstreamConnectFailed
+            );
+            tokio::time::timeout(std::time::Duration::from_secs(1), fixture)
+                .await
+                .expect("proxy failure fixture hung")
+                .unwrap();
+            assert!(
+                tokio::time::timeout(std::time::Duration::from_millis(100), direct.accept())
+                    .await
+                    .is_err(),
+                "proxy failure fell back to direct TLS origin"
+            );
+        }
     }
 
     #[tokio::test]
