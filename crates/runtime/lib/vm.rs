@@ -1761,6 +1761,7 @@ fn build_vm(
     let mut network_termination_handle = None;
     let mut network_metrics_handle = None;
     let mut network_secrets_handle = None;
+    #[cfg_attr(not(unix), allow(unused_mut))]
     let mut auto_publish_handles: Option<AutoPublishHandles> = None;
 
     // Vsock routes are independent of virtio-net. Microsandbox owns the host
