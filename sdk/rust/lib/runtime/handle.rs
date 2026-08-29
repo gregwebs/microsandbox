@@ -6,6 +6,7 @@
 use std::fs::File;
 #[cfg(unix)]
 use std::os::fd::{AsRawFd, OwnedFd};
+use std::path::PathBuf;
 use std::process::ExitStatus;
 
 #[cfg(unix)]
@@ -68,6 +69,23 @@ pub struct ProcessHandle {
     /// Open disk-image lock files. Kept for the process lifetime so disk
     /// images cannot be attached with incompatible write modes.
     _disk_locks: Vec<File>,
+
+    /// Sandbox `--log-dir` (same directory `runtime.log`/`kernel.log` are
+    /// written to by the sandbox process). Used by `wait()` to append a
+    /// one-line post-mortem record (`msb-exit.log`) so the VMM's exit status
+    /// is recoverable after the sandbox process is gone. Cleared by
+    /// `disarm()` — once a sandbox is detached, the parent's eventual
+    /// `wait()` observes only kernel reparenting (reaps to `Ok(0)` instantly
+    /// or hangs forever), not the actual VMM termination, so logging that
+    /// observation would be actively misleading.
+    log_dir: Option<PathBuf>,
+
+    /// True once `wait()` has appended a line to `msb-exit.log` — makes that
+    /// append idempotent. Without this fuse, every subsequent `wait()` call
+    /// (tokio fuses `Child::wait` to keep returning the same `ExitStatus`)
+    /// would append a duplicate line with a fresh timestamp, misrepresenting
+    /// crash chronology in post-mortem analysis.
+    exit_logged: bool,
 }
 
 /// Token used to release a metrics reservation that never reached Active.
@@ -94,6 +112,7 @@ unsafe impl Send for WindowsJob {}
 
 impl ProcessHandle {
     /// Create a new handle.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         pid: u32,
         sandbox_name: String,
@@ -103,6 +122,7 @@ impl ProcessHandle {
         #[cfg(unix)] parent_watchdog: Option<OwnedFd>,
         #[cfg(windows)] job: Option<WindowsJob>,
         metrics_reservation: Option<MetricsReservationCleanup>,
+        log_dir: Option<PathBuf>,
     ) -> Self {
         Self {
             pid,
@@ -116,6 +136,8 @@ impl ProcessHandle {
             #[cfg(windows)]
             job,
             metrics_reservation,
+            log_dir,
+            exit_logged: false,
         }
     }
 
@@ -172,11 +194,32 @@ impl ProcessHandle {
     }
 
     /// Wait for the sandbox process to exit.
+    ///
+    /// Single owner of `self.child.wait()`: nothing else in this handle races
+    /// a competing reap, so the caller always observes the VMM's real
+    /// termination status rather than a kernel-reparenting artifact (see
+    /// `disarm()`'s doc comment for that hazard on the detached path).
     pub async fn wait(&mut self) -> MicrosandboxResult<ExitStatus> {
         tracing::debug!(pid = self.pid, sandbox = %self.sandbox_name, "waiting for exit");
         let status = self.child.wait().await?;
         tracing::debug!(pid = self.pid, ?status, "process exited");
         self.cleanup_metrics_reservation();
+
+        #[cfg(unix)]
+        let signaled = std::os::unix::process::ExitStatusExt::signal(&status).is_some();
+        #[cfg(not(unix))]
+        let signaled = false;
+        let abnormal = !status.success() || signaled;
+        if abnormal {
+            tracing::warn!(
+                pid = self.pid,
+                sandbox = %self.sandbox_name,
+                ?status,
+                "msb sandbox process exited abnormally"
+            );
+        }
+        self.log_exit_once(&status, abnormal).await;
+
         Ok(status)
     }
 
@@ -211,6 +254,11 @@ impl ProcessHandle {
         if let Some(td) = self._file_mounts_staging.take() {
             let _ = td.keep();
         }
+
+        // See the `log_dir` field doc comment: past this point wait() can no
+        // longer distinguish the real VMM exit from a reparenting artifact,
+        // so it must not write a post-mortem record.
+        self.log_dir = None;
     }
 
     fn cleanup_metrics_reservation(&mut self) {
@@ -218,6 +266,74 @@ impl ProcessHandle {
             return;
         };
         metrics_reservation.release_reserved(&self.sandbox_name);
+    }
+
+    /// Append one line to `<log_dir>/msb-exit.log` recording an *abnormal*
+    /// exit — but only the first time this handle observes one (see the
+    /// `exit_logged` field doc comment), and only while `log_dir` is set
+    /// (cleared by `disarm()` for detached sandboxes). A clean exit writes
+    /// nothing: the file is a post-mortem crash record, not a lifecycle
+    /// audit log, so every ordinary shutdown would otherwise dilute it.
+    /// Best-effort: a write failure here only costs a diagnostic hint, never
+    /// the caller's result.
+    async fn log_exit_once(&mut self, status: &ExitStatus, abnormal: bool) {
+        if !abnormal || self.exit_logged {
+            return;
+        }
+        let Some(dir) = self.log_dir.as_deref() else {
+            return;
+        };
+        self.exit_logged = true;
+
+        let now = match std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
+            Ok(d) => d.as_secs().to_string(),
+            Err(err) => {
+                // Host clock predates the epoch (fresh VM/container without
+                // RTC sync). Mark explicitly rather than silently writing 0,
+                // which would defeat the chronology the file exists for.
+                tracing::warn!(
+                    error = %err,
+                    "msb-exit.log: host clock predates UNIX_EPOCH; timestamp will be 'pre-epoch'"
+                );
+                "pre-epoch".to_string()
+            }
+        };
+        // The file is tab-delimited; sanitize the sandbox name so a stray
+        // '\t'/'\n' can't shift every later column for a downstream parser.
+        let safe_name: String = self
+            .sandbox_name
+            .chars()
+            .map(|c| {
+                if (c as u32) < 0x20 || c == '\u{7f}' {
+                    '?'
+                } else {
+                    c
+                }
+            })
+            .collect();
+        let line = format!(
+            "{now}\tpid={}\tsandbox={}\tstatus={:?}\tabnormal={}\n",
+            self.pid, safe_name, status, abnormal
+        );
+
+        use tokio::io::AsyncWriteExt as _;
+        let opened = tokio::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(dir.join("msb-exit.log"))
+            .await;
+        match opened {
+            Ok(mut f) => {
+                if let Err(err) = f.write_all(line.as_bytes()).await {
+                    tracing::debug!(error = %err, "msb-exit.log: write failed");
+                } else if let Err(err) = f.flush().await {
+                    tracing::debug!(error = %err, "msb-exit.log: flush failed");
+                }
+            }
+            Err(err) => {
+                tracing::debug!(error = %err, "msb-exit.log: open failed");
+            }
+        }
     }
 }
 
@@ -459,5 +575,110 @@ mod tests {
         let mut byte = [0_u8; 1];
         reader.read_exact(&mut byte).unwrap();
         assert_eq!(byte[0], microsandbox_runtime::vm::PARENT_WATCH_DETACH);
+    }
+
+    /// Builds a `ProcessHandle` around a real OS child (no VM involved) so
+    /// `wait()`'s reap/log-once behavior can be exercised without booting a
+    /// sandbox. `log_dir` is the seam Group C's diagnostics-preservation
+    /// requirement hangs off of.
+    fn handle_for(child: Child, log_dir: Option<PathBuf>) -> ProcessHandle {
+        let pid = child.id().expect("spawned child has a pid");
+        ProcessHandle::new(
+            pid,
+            "test-sandbox".to_string(),
+            child,
+            None,
+            Vec::new(),
+            None,
+            None,
+            log_dir,
+        )
+    }
+
+    fn read_msb_exit_log(dir: &std::path::Path) -> Vec<String> {
+        match std::fs::read_to_string(dir.join("msb-exit.log")) {
+            Ok(contents) => contents.lines().map(str::to_string).collect(),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+            Err(err) => panic!("failed to read msb-exit.log: {err}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn wait_does_not_log_msb_exit_for_a_clean_exit() {
+        let dir = tempfile::tempdir().unwrap();
+        let child = tokio::process::Command::new("sh")
+            .arg("-c")
+            .arg("exit 0")
+            .spawn()
+            .unwrap();
+        let mut handle = handle_for(child, Some(dir.path().to_path_buf()));
+
+        let status = handle.wait().await.unwrap();
+
+        assert!(status.success());
+        assert!(read_msb_exit_log(dir.path()).is_empty());
+    }
+
+    #[tokio::test]
+    async fn wait_logs_msb_exit_once_across_repeated_calls_for_a_nonzero_exit() {
+        let dir = tempfile::tempdir().unwrap();
+        let child = tokio::process::Command::new("sh")
+            .arg("-c")
+            .arg("exit 7")
+            .spawn()
+            .unwrap();
+        let mut handle = handle_for(child, Some(dir.path().to_path_buf()));
+
+        let first = handle.wait().await.unwrap();
+        // tokio fuses Child::wait: a second call must observe the same
+        // status, not re-enter and duplicate the log line.
+        let second = handle.wait().await.unwrap();
+
+        assert_eq!(first.code(), Some(7));
+        assert_eq!(second.code(), Some(7));
+        let lines = read_msb_exit_log(dir.path());
+        assert_eq!(lines.len(), 1, "expected exactly one line, got {lines:?}");
+        assert!(lines[0].contains("abnormal=true"));
+        assert!(lines[0].contains("sandbox=test-sandbox"));
+    }
+
+    #[tokio::test]
+    async fn wait_classifies_signal_death_as_abnormal() {
+        let dir = tempfile::tempdir().unwrap();
+        let child = tokio::process::Command::new("sleep")
+            .arg("300")
+            .spawn()
+            .unwrap();
+        let pid = child.id().unwrap();
+        signal::kill(Pid::from_raw(pid as i32), Signal::SIGTERM).unwrap();
+        let mut handle = handle_for(child, Some(dir.path().to_path_buf()));
+
+        let status = handle.wait().await.unwrap();
+
+        assert!(!status.success());
+        assert_eq!(
+            std::os::unix::process::ExitStatusExt::signal(&status),
+            Some(libc::SIGTERM)
+        );
+        let lines = read_msb_exit_log(dir.path());
+        assert_eq!(lines.len(), 1);
+        assert!(lines[0].contains("abnormal=true"));
+    }
+
+    #[tokio::test]
+    async fn disarmed_handle_does_not_write_msb_exit_log() {
+        let dir = tempfile::tempdir().unwrap();
+        let child = tokio::process::Command::new("sh")
+            .arg("-c")
+            .arg("exit 9")
+            .spawn()
+            .unwrap();
+        let mut handle = handle_for(child, Some(dir.path().to_path_buf()));
+
+        handle.disarm();
+        let status = handle.wait().await.unwrap();
+
+        assert_eq!(status.code(), Some(9));
+        assert!(read_msb_exit_log(dir.path()).is_empty());
     }
 }

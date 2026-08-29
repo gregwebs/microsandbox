@@ -12,6 +12,8 @@ use std::time::{Duration, Instant};
 
 use futures::{FutureExt, future::join_all};
 use microsandbox::Sandbox;
+use nix::sys::signal::{self, Signal};
+use nix::unistd::Pid;
 use test_utils::msb_test;
 
 //--------------------------------------------------------------------------------------------------
@@ -237,6 +239,68 @@ async fn agentd_manages_concurrent_exits_and_adopted_descendants() {
     match scenario {
         Ok(Ok(())) => {}
         Ok(Err(_)) => panic!("process lifecycle scenario exceeded {SCENARIO_TIMEOUT:?}"),
+        Err(payload) => resume_unwind(payload),
+    }
+}
+
+/// Issue #41: a killed VMM child must be reaped promptly (no zombie, no
+/// hang) and its exit reported as a diagnostic, rather than leaving a
+/// caller's `wait()` or exec stream pending forever.
+#[msb_test]
+async fn killed_vmm_child_is_reaped_and_reported_not_blocked() {
+    let name = "agentd-vmm-child-kill";
+    let sandbox = Sandbox::builder(name)
+        .image("mirror.gcr.io/library/alpine")
+        .cpus(1)
+        .memory(256)
+        .replace()
+        .create()
+        .await
+        .expect("create vmm-child-kill sandbox");
+
+    let scenario = async {
+        let pid = {
+            let local = sandbox.local().expect("sandbox has local state");
+            let handle = local
+                .handle
+                .as_ref()
+                .expect("this sandbox owns its lifecycle");
+            handle.lock().await.pid()
+        };
+
+        // Kill the msb VMM child out from under the SDK, simulating an
+        // external OOM-kill or crash rather than a normal shutdown path.
+        signal::kill(Pid::from_raw(pid as i32), Signal::SIGKILL)
+            .expect("SIGKILL the sandbox process");
+
+        // wait() must observe the real termination promptly — not hang on
+        // a reparenting artifact, not silently report success.
+        let status = tokio::time::timeout(CLEANUP_TIMEOUT, sandbox.wait())
+            .await
+            .expect("sandbox.wait() hung after the VMM child was killed")
+            .expect("sandbox.wait() failed after the VMM child was killed");
+        assert!(
+            !status.success(),
+            "killed VMM child reported a successful exit status"
+        );
+
+        // No zombie left behind: a second wait() (same fused Child::wait)
+        // must also resolve immediately rather than hang.
+        tokio::time::timeout(CLEANUP_TIMEOUT, sandbox.wait())
+            .await
+            .expect("second sandbox.wait() hung")
+            .expect("second sandbox.wait() failed");
+    };
+    let scenario = AssertUnwindSafe(tokio::time::timeout(SCENARIO_TIMEOUT, scenario))
+        .catch_unwind()
+        .await;
+
+    drop(sandbox);
+    stop_and_remove(name).await;
+
+    match scenario {
+        Ok(Ok(())) => {}
+        Ok(Err(_)) => panic!("vmm-child-kill scenario exceeded {SCENARIO_TIMEOUT:?}"),
         Err(payload) => resume_unwind(payload),
     }
 }
