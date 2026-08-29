@@ -142,7 +142,7 @@ impl TlsState {
     /// 3. Auto-generate and persist to the microsandbox home TLS path
     ///
     /// `intercept_active` pins both upstream and guest-facing ALPN to
-    /// `http/1.1` when true — see [`build_upstream_connector`] — because
+    /// `http/1.1` when true — see `build_upstream_connector` — because
     /// fail-closed request interception's request parser
     /// (`crate::intercept::handler`) is HTTP/1.1-only.
     pub fn new(

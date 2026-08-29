@@ -948,7 +948,19 @@ mod tests {
             let mut buf = [0; RELAY_BUF_SIZE];
             let request = match stream.read(&mut buf).await {
                 Ok(read) => buf[..read].to_vec(),
-                Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => Vec::new(),
+                // Fail-closed relay outcomes drop the upstream connection without
+                // reading queued-but-unsent bytes (e.g. TLS 1.3 session tickets the
+                // server sends unsolicited right after the handshake). Depending on
+                // scheduling, the kernel may report that abrupt drop as a reset
+                // rather than a clean EOF; both mean "no request bytes arrived".
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        io::ErrorKind::UnexpectedEof | io::ErrorKind::ConnectionReset
+                    ) =>
+                {
+                    Vec::new()
+                }
                 Err(error) => return Err(error),
             };
             let _ = request_tx.send(request);
