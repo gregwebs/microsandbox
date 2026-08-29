@@ -724,6 +724,7 @@ pub async fn spawn_sandbox(
                 Some(reservation.registry.clone()),
             )
         }),
+        Some(log_dir.clone()),
     );
 
     #[cfg(windows)]
@@ -742,6 +743,7 @@ pub async fn spawn_sandbox(
                 Some(reservation.registry.clone()),
             )
         }),
+        Some(log_dir.clone()),
     );
 
     Ok((handle, agent_sock_path))

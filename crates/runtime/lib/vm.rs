@@ -58,12 +58,35 @@ const EXIT_REASON_IDLE_TIMEOUT: u8 = 1;
 const EXIT_REASON_MAX_DURATION: u8 = 2;
 const EXIT_REASON_SIGNAL: u8 = 3;
 const EXIT_REASON_PARENT_EXIT: u8 = 4;
-/// Termination reason when agentd never signals readiness within the relay's
-/// boot window (the guest failed to come up). Reused for the boot-failure exit
-/// triggered from the relay's `wait_ready` path.
+/// Termination reason when agentd is unresponsive: either it never signals
+/// readiness within the relay's boot window (the guest failed to come up —
+/// triggered from the relay's `wait_ready` path), or an established
+/// heartbeat stops advancing for a confirmed period after boot (triggered
+/// from the heartbeat monitor below).
 const EXIT_REASON_AGENT_UNRESPONSIVE: u8 = 5;
 const EXIT_REASON_SHUTDOWN_REQUESTED: u8 = 6;
 const EXIT_REASON_STARTUP_COMMAND_FAILED: u8 = 7;
+
+/// Budget a heartbeat may go without advancing before the heartbeat monitor
+/// treats it as stale. A single crossing is not fatal on its own — see
+/// [`HeartbeatReader::check`] doc comment for the two-window confirmation
+/// rule this guards against transient virtiofs/host-load hiccups.
+const STALE_HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Budget a sandbox may run without ever producing a heartbeat before the
+/// heartbeat monitor treats agentd as unresponsive. Distinct from (and much
+/// longer than) [`STALE_HEARTBEAT_TIMEOUT`]: this covers a guest that boots
+/// the relay successfully (passing `wait_ready`) but whose agentd never
+/// starts writing `heartbeat.json` at all.
+const HEARTBEAT_BOOT_GRACE: Duration = Duration::from_secs(180);
+
+/// Bounds how long the heartbeat monitor's confirmed-unresponsive path waits
+/// to push the guest shutdown frame before giving up and exiting anyway. Kept
+/// short and separate from the normal 60s [`request_guest_shutdown`] default:
+/// an agent that has already been confirmed unresponsive is unlikely to
+/// service a shutdown request either, so this path must not block the host
+/// exit on a relay that is itself wedged.
+const AGENT_UNRESPONSIVE_SHUTDOWN_PUSH_TIMEOUT: Duration = Duration::from_secs(1);
 
 /// Bounds how long an existing VMM can retain an obsolete fair share after membership changes.
 const WRITEBACK_PRESSURE_REFRESH_INTERVAL: Duration = Duration::from_millis(250);
@@ -1220,10 +1243,16 @@ fn run(config: Config) -> RuntimeResult<std::convert::Infallible> {
         });
     }
 
-    // Idle monitor. Reclaims the sandbox only when an optional idle timeout is
-    // configured and the guest has been inactive that long. A stale or missing
-    // heartbeat is NOT treated as a failure here — a busy agent is still healthy,
-    // and a guest that never boots is reclaimed by the relay's wait_ready path.
+    // Heartbeat monitor. Reclaims the sandbox in two cases: an optional idle
+    // timeout configured and the guest inactive that long (Idle), or agentd
+    // gone unresponsive — either it never produces a heartbeat within
+    // HEARTBEAT_BOOT_GRACE, or an established heartbeat stops advancing for a
+    // confirmed STALE_HEARTBEAT_TIMEOUT-times-two window (AgentUnresponsive).
+    // A *brief* stale heartbeat is NOT treated as a failure — a busy agent
+    // under transient virtiofs/host-load latency is still healthy; see
+    // HeartbeatReader::check's doc comment for the confirmation rule. A guest
+    // that never boots the relay at all is still reclaimed by the relay's
+    // wait_ready path, unchanged by this monitor.
     {
         let mut heartbeat_reader = HeartbeatReader::new(&config.runtime_dir);
         let idle_timeout = config.idle_timeout_secs.map(Duration::from_secs);
@@ -1235,7 +1264,11 @@ fn run(config: Config) -> RuntimeResult<std::convert::Infallible> {
             let mut interval = tokio::time::interval(Duration::from_secs(1));
             loop {
                 interval.tick().await;
-                let decision = heartbeat_reader.check(idle_timeout);
+                let decision = heartbeat_reader.check(
+                    idle_timeout,
+                    STALE_HEARTBEAT_TIMEOUT,
+                    HEARTBEAT_BOOT_GRACE,
+                );
 
                 match decision {
                     HeartbeatDecision::Idle(status) => {
@@ -1265,6 +1298,39 @@ fn run(config: Config) -> RuntimeResult<std::convert::Infallible> {
                                 tracing::warn!(
                                     error = %err,
                                     "idle shutdown request failed, triggering host exit"
+                                );
+                            }
+                        }
+                        heartbeat_exit_handle.trigger();
+                        break;
+                    }
+                    HeartbeatDecision::AgentUnresponsive(status) => {
+                        tracing::warn!(
+                            heartbeat_seq = ?status.heartbeat_seq,
+                            activity_seq = ?status.activity_seq,
+                            heartbeat_stale_for = ?status.heartbeat_stale_for,
+                            active_exec_sessions = status.active_exec_sessions,
+                            active_fs_streams = status.active_fs_streams,
+                            active_tcp_streams = status.active_tcp_streams,
+                            "agent heartbeat stale, triggering host exit"
+                        );
+                        heartbeat_reason.store(
+                            EXIT_REASON_AGENT_UNRESPONSIVE,
+                            std::sync::atomic::Ordering::SeqCst,
+                        );
+                        match request_guest_shutdown_with_timeout(
+                            &heartbeat_shared,
+                            AGENT_UNRESPONSIVE_SHUTDOWN_PUSH_TIMEOUT,
+                        ) {
+                            Ok(()) => {
+                                tracing::info!(
+                                    "agent-unresponsive shutdown request sent, triggering host exit"
+                                );
+                            }
+                            Err(err) => {
+                                tracing::warn!(
+                                    error = %err,
+                                    "agent-unresponsive shutdown request failed, triggering host exit"
                                 );
                             }
                         }
