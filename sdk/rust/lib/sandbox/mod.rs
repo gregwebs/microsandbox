@@ -784,6 +784,50 @@ impl Sandbox {
         self.local().map(|s| s.handle.is_some()).unwrap_or(false)
     }
 
+    /// Subscribe to the runtime's published-port event stream.
+    ///
+    /// Yields each [`microsandbox_protocol::network::PortEvent`]
+    /// emitted by the runtime — today the auto-publish task pushes
+    /// `Added` / `Removed` events as guest LISTEN sockets appear
+    /// and disappear. The receiver gets `None` when the relay
+    /// connection drops (sandbox stopped).
+    ///
+    /// **Local-only**: panics if called on a cloud sandbox (mirrors
+    /// [`client`](Self::client)). The cloud worker owns the in-VM
+    /// bridge, so there is no local `AgentClient` to subscribe on.
+    ///
+    /// Only one subscriber per [`AgentClient`] instance: the
+    /// underlying dispatch table is keyed by correlation ID, so a
+    /// second call here overwrites the first subscription. For
+    /// multi-consumer fan-out, wrap the stream in `broadcast::channel`
+    /// at the call site.
+    #[cfg(feature = "net")]
+    pub async fn port_events(
+        &self,
+    ) -> tokio::sync::mpsc::UnboundedReceiver<microsandbox_protocol::network::PortEvent> {
+        let id = microsandbox_protocol::network::PORT_EVENT_BROADCAST_ID;
+        let mut raw = self.client().subscribe(id).await;
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        tokio::spawn(async move {
+            while let Some(msg) = raw.recv().await {
+                if msg.t != MessageType::PortEvent {
+                    continue;
+                }
+                match msg.payload::<microsandbox_protocol::network::PortEvent>() {
+                    Ok(event) => {
+                        if tx.send(event).is_err() {
+                            break;
+                        }
+                    }
+                    Err(e) => {
+                        tracing::debug!(?e, "port_events: failed to decode PortEvent payload");
+                    }
+                }
+            }
+        });
+        rx
+    }
+
     /// Read, write, and manage files inside the running sandbox.
     ///
     /// Routes through the [`SandboxBackend`](crate::backend::SandboxBackend)

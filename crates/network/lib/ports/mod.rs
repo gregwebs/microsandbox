@@ -1,5 +1,6 @@
 //! Host-to-guest port publishing.
 
+pub mod auto_publish;
 pub mod publisher;
 
 //--------------------------------------------------------------------------------------------------

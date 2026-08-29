@@ -387,6 +387,24 @@ struct NetworkPatch {
     intercept: Option<InterceptInput>,
     trust_host_cas: Option<bool>,
     max_connections: Option<usize>,
+    auto_publish: Option<AutoPublishInput>,
+}
+
+/// Auto-publish Sandboxfile input: `true` enables it with defaults (2s poll,
+/// `127.0.0.1` host bind); an object enables it with overrides. `false` or
+/// omitted leaves auto-publish disabled.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(untagged)]
+enum AutoPublishInput {
+    Enabled(bool),
+    Object(AutoPublishPatch),
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct AutoPublishPatch {
+    poll_interval_ms: Option<u64>,
+    host_bind: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -1840,6 +1858,26 @@ fn materialize_network_patch(input: &NetworkInput) -> anyhow::Result<NetworkConf
     if let Some(max) = input.max_connections {
         patch = patch.max_connections(max);
     }
+    if let Some(auto_publish) = input.auto_publish {
+        let enabled = match &auto_publish {
+            AutoPublishInput::Enabled(enabled) => *enabled,
+            AutoPublishInput::Object(_) => true,
+        };
+        if enabled {
+            let mut cfg = microsandbox_network::config::AutoPublishConfig::default();
+            if let AutoPublishInput::Object(object) = auto_publish {
+                if let Some(poll_interval_ms) = object.poll_interval_ms {
+                    cfg.poll_interval_ms = poll_interval_ms;
+                }
+                if let Some(host_bind) = object.host_bind {
+                    cfg.host_bind = host_bind.parse().map_err(|e| {
+                        anyhow::anyhow!("invalid network.auto_publish.host_bind {host_bind:?}: {e}")
+                    })?;
+                }
+            }
+            patch = patch.auto_publish(cfg);
+        }
+    }
     Ok(patch)
 }
 
@@ -2546,6 +2584,87 @@ scripts: { start: "python app.py" }
         assert_eq!(policy["default_egress"], "deny");
         assert_eq!(policy["default_ingress"], "deny");
         assert_eq!(policy["rules"], serde_json::json!([]));
+    }
+
+    /// A Sandboxfile `auto_publish` key must deserialize past
+    /// `deny_unknown_fields`, materialize into the `NetworkConfigPatch`
+    /// (via `NetworkPatch`/`materialize_network_patch`), and survive all
+    /// the way into the built `SandboxConfig`'s persisted `NetworkSpec` —
+    /// the acceptance criterion's "sandbox specs round-trip the setting".
+    #[cfg(feature = "net")]
+    #[tokio::test]
+    async fn cli_network_auto_publish_object_round_trips_into_spec() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = write_config(
+            dir.path(),
+            "agent.yaml",
+            "image: \"python\"\nnetwork:\n  auto_publish:\n    poll_interval_ms: 750\n    host_bind: \"0.0.0.0\"\n",
+        );
+        let sources = SandboxConfigSources::default().source(SandboxConfigKind::Root, root);
+        let resolved = resolve(&sources).unwrap();
+        let opts = SandboxOpts {
+            no_net: true,
+            ..SandboxOpts::default()
+        };
+        let builder = resolved
+            .image(None, None)
+            .unwrap()
+            .apply(SandboxBuilder::new("network-auto-publish"))
+            .unwrap();
+        let builder = resolved.apply(builder).unwrap();
+        let config = crate::commands::common::apply_sandbox_opts_after_config(builder, &opts)
+            .unwrap()
+            .build()
+            .await
+            .unwrap();
+
+        let auto_publish = config
+            .spec
+            .network
+            .auto_publish
+            .as_ref()
+            .expect("auto_publish should survive the Sandboxfile -> spec round trip");
+        assert_eq!(auto_publish.poll_interval_ms, 750);
+        assert_eq!(auto_publish.host_bind, "0.0.0.0");
+    }
+
+    /// `auto_publish: true` enables it with the documented defaults (2s
+    /// poll, `127.0.0.1` bind) rather than requiring every field.
+    #[cfg(feature = "net")]
+    #[tokio::test]
+    async fn cli_network_auto_publish_bool_enables_with_defaults() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = write_config(
+            dir.path(),
+            "agent.yaml",
+            "image: \"python\"\nnetwork:\n  auto_publish: true\n",
+        );
+        let sources = SandboxConfigSources::default().source(SandboxConfigKind::Root, root);
+        let resolved = resolve(&sources).unwrap();
+        let opts = SandboxOpts {
+            no_net: true,
+            ..SandboxOpts::default()
+        };
+        let builder = resolved
+            .image(None, None)
+            .unwrap()
+            .apply(SandboxBuilder::new("network-auto-publish-bool"))
+            .unwrap();
+        let builder = resolved.apply(builder).unwrap();
+        let config = crate::commands::common::apply_sandbox_opts_after_config(builder, &opts)
+            .unwrap()
+            .build()
+            .await
+            .unwrap();
+
+        let auto_publish = config
+            .spec
+            .network
+            .auto_publish
+            .as_ref()
+            .expect("auto_publish: true should enable with defaults");
+        assert_eq!(auto_publish.poll_interval_ms, 2000);
+        assert_eq!(auto_publish.host_bind, "127.0.0.1");
     }
 
     #[cfg(feature = "net")]

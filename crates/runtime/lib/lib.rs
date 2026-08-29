@@ -13,6 +13,8 @@ mod error;
 // Exports
 //--------------------------------------------------------------------------------------------------
 
+#[cfg(all(feature = "net", unix))]
+pub mod auto_publish;
 pub mod boot_error;
 pub mod console;
 pub mod control;

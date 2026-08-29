@@ -1007,6 +1007,10 @@ impl TryFrom<CloudSandboxSpec> for SandboxSpec {
             max_connections: spec.network.max_connections,
             rate_limiter: None,
             trust_host_cas: false,
+            // Auto-publish polls the guest over the local agent.sock relay,
+            // which has no cloud-wire equivalent — like `tls`/`intercept`
+            // above, it is a local-engine-only feature and always absent here.
+            auto_publish: None,
         };
         let runtime = SandboxRuntimeOptions {
             workdir: spec.runtime.workdir,

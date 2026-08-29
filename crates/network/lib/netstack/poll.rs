@@ -31,6 +31,7 @@ use crate::extensions::NetworkExtensions;
 use crate::icmp::relay::IcmpRelay;
 use crate::policy::{EgressEvaluation, HostnameSource, NetworkPolicy, Protocol};
 use crate::ports::PortPublisher;
+use crate::ports::publisher::PortCommand;
 use crate::secrets::handle::SecretsHandle;
 use crate::tcp::{connection::ConnectionTracker, proxy::TcpProxy, upstream::UpstreamTcpTarget};
 use crate::tls::{proxy::TlsProxy, state::TlsState};
@@ -235,6 +236,7 @@ pub fn smoltcp_poll_loop(
     dns_config: DnsConfig,
     tls_state: Option<Arc<TlsState>>,
     published_ports: Vec<PublishedPort>,
+    port_cmd_rx: tokio::sync::mpsc::UnboundedReceiver<PortCommand>,
     max_connections: Option<usize>,
     tokio_handle: tokio::runtime::Handle,
     secrets: SecretsHandle,
@@ -247,6 +249,7 @@ pub fn smoltcp_poll_loop(
         dns_config,
         tls_state,
         published_ports,
+        port_cmd_rx,
         max_connections,
         tokio_handle,
         secrets,
@@ -267,6 +270,7 @@ pub fn smoltcp_poll_loop_with_extensions(
     dns_config: DnsConfig,
     tls_state: Option<Arc<TlsState>>,
     published_ports: Vec<PublishedPort>,
+    port_cmd_rx: tokio::sync::mpsc::UnboundedReceiver<PortCommand>,
     max_connections: Option<usize>,
     tokio_handle: tokio::runtime::Handle,
     secrets: SecretsHandle,
@@ -320,6 +324,7 @@ pub fn smoltcp_poll_loop_with_extensions(
         network_policy.clone(),
         shared.clone(),
         &tokio_handle,
+        port_cmd_rx,
     );
     let mut udp_relay = UdpRelay::new(
         shared.clone(),

@@ -20,6 +20,7 @@ pub mod fs;
 pub mod handoff;
 pub mod heartbeat;
 pub mod init;
+pub mod loopback;
 pub mod network;
 pub mod process;
 pub mod serial;
