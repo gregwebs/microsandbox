@@ -45,6 +45,6 @@ pub(crate) const HOST_ALIAS: &str = "host.microsandbox.internal";
 pub use config::builder;
 pub use icmp::{error as icmp_error, relay as icmp_relay};
 pub use netstack::{backend, device, poll as stack, shared};
-pub use ports::publisher;
+pub use ports::{auto_publish, publisher};
 pub use tcp::{connection as conn, proxy};
 pub use udp::{fragments as udp_fragments, relay as udp_relay};

@@ -5,6 +5,7 @@ use microsandbox_network::config::{DnsConfig, PublishedPort};
 use microsandbox_network::netstack::poll::PollLoopConfig;
 use microsandbox_network::netstack::shared::SharedState;
 use microsandbox_network::policy::NetworkPolicy;
+use microsandbox_network::publisher::PortCommand;
 use microsandbox_network::secrets::handle::SecretsHandle;
 use microsandbox_network::tls::state::TlsState;
 
@@ -16,6 +17,7 @@ type LegacyPollLoop = fn(
     DnsConfig,
     Option<Arc<TlsState>>,
     Vec<PublishedPort>,
+    tokio::sync::mpsc::UnboundedReceiver<PortCommand>,
     Option<usize>,
     tokio::runtime::Handle,
     SecretsHandle,

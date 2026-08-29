@@ -122,6 +122,7 @@ pub struct NetworkConfigPatch {
     intercept: InterceptConfigPatch,
     trust_host_cas: Option<bool>,
     max_connections: Option<usize>,
+    auto_publish: Option<microsandbox_network::config::AutoPublishConfig>,
 }
 
 /// Sparse network-policy configuration.
@@ -732,6 +733,14 @@ impl NetworkConfigPatch {
         self
     }
 
+    /// Enable (or reconfigure) auto-publish: mirror guest TCP LISTEN
+    /// sockets onto host listeners. See
+    /// [`AutoPublishConfig`](microsandbox_network::config::AutoPublishConfig).
+    pub fn auto_publish(mut self, value: microsandbox_network::config::AutoPublishConfig) -> Self {
+        self.auto_publish = Some(value);
+        self
+    }
+
     /// Overlay another network patch.
     pub fn overlay(mut self, higher: Self) -> Self {
         self.policy = self.policy.overlay(higher.policy);
@@ -741,6 +750,7 @@ impl NetworkConfigPatch {
         self.intercept = self.intercept.overlay(higher.intercept);
         replace(&mut self.trust_host_cas, higher.trust_host_cas);
         replace(&mut self.max_connections, higher.max_connections);
+        replace(&mut self.auto_publish, higher.auto_publish);
         self
     }
 
@@ -752,6 +762,7 @@ impl NetworkConfigPatch {
         let intercept = self.intercept;
         let trust_host_cas = self.trust_host_cas;
         let max_connections = self.max_connections;
+        let auto_publish = self.auto_publish;
 
         if policy.is_some() {
             builder = builder.config_network_rules(configured_rules);
@@ -828,6 +839,9 @@ impl NetworkConfigPatch {
             }
             if let Some(max) = max_connections {
                 network = network.max_connections(max);
+            }
+            if let Some(cfg) = auto_publish {
+                network = network.auto_publish_with(cfg);
             }
             network
         });

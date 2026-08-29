@@ -30,6 +30,7 @@ use crate::netstack::{
     shared::{DEFAULT_QUEUE_CAPACITY, SharedState},
 };
 use crate::policy::{NetworkPolicy, NetworkProfile};
+use crate::ports::publisher::PortCommand;
 use crate::secrets::handle::SecretsHandle;
 use crate::tls::state::{TlsState, TlsStateError};
 
@@ -66,6 +67,13 @@ pub struct SmoltcpNetwork {
     shared: Arc<SharedState>,
     backend: Option<SmoltcpBackend>,
     poll_handle: Option<JoinHandle<()>>,
+
+    /// Sender for runtime [`PortCommand`]s. Created up front (before the poll
+    /// thread spawns) so clones can be handed out to any task that wants to
+    /// add/remove published ports at runtime (e.g. the auto-publish loop). The
+    /// matching receiver is taken once by `start()`.
+    port_cmd_tx: tokio::sync::mpsc::UnboundedSender<PortCommand>,
+    port_cmd_rx: Option<tokio::sync::mpsc::UnboundedReceiver<PortCommand>>,
 
     // Resolved from config + slot.
     guest_mac: [u8; 6],
@@ -316,6 +324,8 @@ impl SmoltcpNetwork {
             None
         };
 
+        let (port_cmd_tx, port_cmd_rx) = tokio::sync::mpsc::unbounded_channel();
+
         Ok(Self {
             config,
             deployment_profile,
@@ -323,6 +333,8 @@ impl SmoltcpNetwork {
             shared,
             backend: Some(backend),
             poll_handle: None,
+            port_cmd_tx,
+            port_cmd_rx: Some(port_cmd_rx),
             guest_mac,
             gateway_mac,
             mtu,
@@ -373,6 +385,10 @@ impl SmoltcpNetwork {
         let max_connections = self.config.max_connections;
         let secrets = self.secrets.clone();
         let extensions = self.extensions.clone();
+        let port_cmd_rx = self
+            .port_cmd_rx
+            .take()
+            .expect("SmoltcpNetwork::start called twice");
 
         self.poll_handle = Some(
             std::thread::Builder::new()
@@ -386,6 +402,7 @@ impl SmoltcpNetwork {
                         dns_config,
                         tls_state,
                         published_ports,
+                        port_cmd_rx,
                         max_connections,
                         tokio_handle,
                         secrets,
@@ -394,6 +411,25 @@ impl SmoltcpNetwork {
                 })
                 .expect("failed to spawn smoltcp poll thread"),
         );
+    }
+
+    /// Cloneable sender for runtime [`PortCommand`]s. Stays valid for the
+    /// lifetime of the network: the matching receiver is held by the poll
+    /// loop, so commands sent after the poll loop exits are silently dropped.
+    pub fn port_handle(&self) -> tokio::sync::mpsc::UnboundedSender<PortCommand> {
+        self.port_cmd_tx.clone()
+    }
+
+    /// Guest IPv4 address assigned to this sandbox, if any. Used by the
+    /// auto-publish loop to tell agentd which address to bind its loopback
+    /// forwarder on (so smoltcp's dial-to-VLAN-IP path reaches that listener).
+    pub fn guest_ipv4(&self) -> Option<Ipv4Addr> {
+        self.guest_ipv4
+    }
+
+    /// Guest IPv6 address assigned to this sandbox, if any.
+    pub fn guest_ipv6(&self) -> Option<Ipv6Addr> {
+        self.guest_ipv6
     }
 
     /// Take the `NetBackend` for `VmBuilder::net()`. One-shot.

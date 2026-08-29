@@ -418,6 +418,32 @@ type NetworkSecretsHandle = microsandbox_network::secrets::handle::SecretsHandle
 #[cfg(not(feature = "net"))]
 type NetworkSecretsHandle = ();
 
+/// Handles the auto-publish poll task needs to drive the live
+/// [`SmoltcpNetwork`](microsandbox_network::network::SmoltcpNetwork) and
+/// report mappings to SDK clients. Captured in `build_vm` right after the
+/// network is constructed (before `network.start()`), and consumed by
+/// `run()` once the relay's broadcast handle is also available.
+///
+/// Auto-publish dials the relay's loopback Unix socket directly (see
+/// `crate::auto_publish`'s module docs), so it is unix-only regardless of
+/// the `net` feature — the unit-struct fallback covers both "no net
+/// feature" and "net feature on a non-unix host".
+#[cfg(all(feature = "net", unix))]
+struct AutoPublishHandles {
+    port_handle: tokio::sync::mpsc::UnboundedSender<microsandbox_network::publisher::PortCommand>,
+    cfg: microsandbox_network::config::AutoPublishConfig,
+    guest_ipv4: Option<std::net::Ipv4Addr>,
+    guest_ipv6: Option<std::net::Ipv6Addr>,
+    /// Guest ports already covered by a boot-time `--publish` listener.
+    /// Passed to `auto_publish::spawn` so it never mirrors a guest LISTEN
+    /// that an explicit listener already serves — see that function's doc
+    /// comment for why (avoids a duplicate, ephemeral-port host listener).
+    explicit_guest_ports: std::collections::HashSet<u16>,
+}
+
+#[cfg(not(all(feature = "net", unix)))]
+struct AutoPublishHandles;
+
 type VmBuildOutput = (
     msb_krun::Vm,
     Option<NetworkTerminationHandle>,
@@ -425,6 +451,7 @@ type VmBuildOutput = (
     Option<NetworkSecretsHandle>,
     Vec<u8>,
     BindIdentityMapRegistration,
+    Option<AutoPublishHandles>,
 );
 
 //--------------------------------------------------------------------------------------------------
@@ -875,6 +902,7 @@ fn run(config: Config) -> RuntimeResult<std::convert::Infallible> {
         _network_secrets_handle,
         bootstrap_frame,
         bind_identity_map,
+        _auto_publish_handles,
     ) = match build_result {
         Ok(vm) => vm,
         Err(e) => {
@@ -1073,6 +1101,12 @@ fn run(config: Config) -> RuntimeResult<std::convert::Infallible> {
     let (_relay_shutdown_tx, relay_shutdown_rx) = tokio::sync::watch::channel(false);
     let (relay_drain_tx, mut relay_drain_rx) = tokio::sync::mpsc::channel::<()>(1);
 
+    // Captured before `relay` is moved into the wait_ready/run task below —
+    // the auto-publish task (spawned further down) needs a broadcast handle
+    // that outlives `relay.run()`'s ownership of the clients map.
+    #[cfg(all(feature = "net", unix))]
+    let relay_broadcast = relay.broadcast_handle();
+
     // Relay: spawn a blocking task for wait_ready, then run the accept loop.
     // wait_ready() must run AFTER enter() starts the VM (agentd sends core.ready),
     // so it runs on a background thread, not blocking the main thread.
@@ -1135,6 +1169,46 @@ fn run(config: Config) -> RuntimeResult<std::convert::Infallible> {
             }
         }
     });
+
+    // Auto-publish: poll the guest's /proc/net/tcp{,6} and mirror new LISTEN
+    // sockets onto host listeners. Only spawned when the sandbox opted in
+    // (`NetworkConfig.auto_publish`) and the network feature + a unix host
+    // made `auto_publish_handles` available (see `AutoPublishHandles` docs).
+    #[cfg(all(feature = "net", unix))]
+    if let Some(handles) = _auto_publish_handles {
+        /// Adapts the relay's best-effort broadcast into the
+        /// `auto_publish::EventBroadcast` trait the network-agnostic poll
+        /// task depends on, so that task never needs to import `AgentRelay`.
+        struct RelayBroadcastAdapter {
+            relay_broadcast: relay::RelayBroadcast,
+        }
+
+        impl crate::auto_publish::EventBroadcast for RelayBroadcastAdapter {
+            fn broadcast_port_event(&self, event: microsandbox_protocol::network::PortEvent) {
+                match Message::with_payload(
+                    MessageType::PortEvent,
+                    microsandbox_protocol::network::PORT_EVENT_BROADCAST_ID,
+                    &event,
+                ) {
+                    Ok(msg) => self.relay_broadcast.broadcast(&msg),
+                    Err(e) => {
+                        tracing::warn!(error = %e, "auto-publish: failed to encode PortEvent");
+                    }
+                }
+            }
+        }
+
+        crate::auto_publish::spawn(
+            tokio_rt.handle(),
+            config.agent_sock_path.clone(),
+            handles.cfg,
+            handles.port_handle,
+            handles.guest_ipv4,
+            handles.guest_ipv6,
+            Arc::new(RelayBroadcastAdapter { relay_broadcast }),
+            handles.explicit_guest_ports,
+        );
+    }
 
     // Shutdown listener: when the relay forwards a `core.shutdown` frame to
     // agentd, we give the guest a mode-specific window to flush block-backed
@@ -1687,6 +1761,8 @@ fn build_vm(
     let mut network_termination_handle = None;
     let mut network_metrics_handle = None;
     let mut network_secrets_handle = None;
+    #[cfg_attr(not(unix), allow(unused_mut))]
+    let mut auto_publish_handles: Option<AutoPublishHandles> = None;
 
     // Vsock routes are independent of virtio-net. Microsandbox owns the host
     // local IPC endpoints while libkrun retains framing, queues and credits.
@@ -1804,6 +1880,17 @@ fn build_vm(
             network_secrets_handle = Some(network.secrets_handle());
         }
 
+        #[cfg(unix)]
+        if let Some(ap_cfg) = vm.network.auto_publish.clone() {
+            auto_publish_handles = Some(AutoPublishHandles {
+                port_handle: network.port_handle(),
+                cfg: ap_cfg,
+                guest_ipv4: network.guest_ipv4(),
+                guest_ipv6: network.guest_ipv6(),
+                explicit_guest_ports: vm.network.ports.iter().map(|p| p.guest_port).collect(),
+            });
+        }
+
         network.start(tokio_handle.clone());
 
         let guest_mac = network.guest_mac();
@@ -1890,6 +1977,7 @@ fn build_vm(
         network_secrets_handle,
         bootstrap_frame,
         bind_identity_map,
+        auto_publish_handles,
     ))
 }
 

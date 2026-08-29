@@ -587,6 +587,39 @@ pub struct NetworkSpec {
 
     /// Whether to copy trusted host CAs into the guest at boot.
     pub trust_host_cas: bool,
+
+    /// Auto-publish subdocument: mirror guest TCP LISTEN sockets onto host
+    /// listeners (Lima-style). `None` means disabled.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub auto_publish: Option<AutoPublishConfig>,
+}
+
+/// Wire twin of the local network engine's auto-publish configuration.
+///
+/// Kept in this crate (rather than depending on the network engine) so the
+/// shared sandbox contract can carry the setting across process and
+/// persistence boundaries. `host_bind` is a string (not a typed `IpAddr`)
+/// for the same reason [`PublishedPortSpec::host_bind`] is: this crate
+/// stays free of a networking-address dependency.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[serde(default)]
+pub struct AutoPublishConfig {
+    /// Poll interval in milliseconds. Default 2000 (matches Lima).
+    pub poll_interval_ms: u64,
+
+    /// Host bind address for mirrored listeners. Default `127.0.0.1`.
+    pub host_bind: String,
+}
+
+impl Default for AutoPublishConfig {
+    fn default() -> Self {
+        Self {
+            poll_interval_ms: 2000,
+            host_bind: "127.0.0.1".into(),
+        }
+    }
 }
 
 /// A published port mapping between host and guest.
@@ -1649,6 +1682,7 @@ impl Default for NetworkSpec {
             max_connections: None,
             rate_limiter: None,
             trust_host_cas: false,
+            auto_publish: None,
         }
     }
 }

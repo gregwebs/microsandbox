@@ -85,6 +85,29 @@ pub struct NetworkConfig {
     /// this is explicitly enabled. Default: false.
     #[serde(default)]
     pub trust_host_cas: bool,
+
+    /// Auto-detect TCP LISTEN sockets inside the guest and mirror
+    /// each on `127.0.0.1:<same port>` on the host (Lima-style). The
+    /// runtime spawns a poll task on top of the smoltcp stack that
+    /// reads `/proc/net/tcp{,6}` over the agent.sock channel every
+    /// few seconds, diff-drives the [`crate::publisher::PortPublisher`]
+    /// via [`PortCommand`](crate::publisher::PortCommand), and emits
+    /// `MessageType::PortEvent` frames for SDK clients to observe.
+    /// Default: `None` (disabled).
+    #[serde(default)]
+    pub auto_publish: Option<AutoPublishConfig>,
+}
+
+/// Configuration for the runtime auto-publish loop.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AutoPublishConfig {
+    /// Poll interval in milliseconds. Default 2000 (matches Lima).
+    #[serde(default = "default_auto_publish_poll_ms")]
+    pub poll_interval_ms: u64,
+
+    /// Host bind address for mirrored listeners. Default `127.0.0.1`.
+    #[serde(default = "default_auto_publish_host_bind")]
+    pub host_bind: IpAddr,
 }
 
 /// Optional overrides for the guest interface.
@@ -187,6 +210,7 @@ impl Default for NetworkConfig {
             max_connections: None,
             rate_limiter: None,
             trust_host_cas: false,
+            auto_publish: None,
         }
     }
 }
@@ -201,12 +225,29 @@ impl Default for DnsConfig {
     }
 }
 
+impl Default for AutoPublishConfig {
+    fn default() -> Self {
+        Self {
+            poll_interval_ms: default_auto_publish_poll_ms(),
+            host_bind: default_auto_publish_host_bind(),
+        }
+    }
+}
+
 //--------------------------------------------------------------------------------------------------
 // Functions
 //--------------------------------------------------------------------------------------------------
 
 fn default_true() -> bool {
     true
+}
+
+fn default_auto_publish_poll_ms() -> u64 {
+    2000
+}
+
+fn default_auto_publish_host_bind() -> IpAddr {
+    IpAddr::V4(Ipv4Addr::LOCALHOST)
 }
 
 fn default_host_bind() -> IpAddr {
@@ -223,7 +264,7 @@ fn default_query_timeout_ms() -> u64 {
 
 #[cfg(test)]
 mod tests {
-    use super::{InterfaceOverrides, NetworkConfig, PortProtocol};
+    use super::{AutoPublishConfig, InterfaceOverrides, NetworkConfig, PortProtocol};
     use crate::dns::Nameserver;
     use crate::policy::{Destination, NetworkPolicy, Rule};
 
@@ -392,6 +433,44 @@ mod tests {
         let back: NetworkConfig =
             serde_json::from_value(serde_json::to_value(&spec).unwrap()).unwrap();
         assert_eq!(back.rate_limiter, config.rate_limiter);
+    }
+
+    /// `auto_publish` must survive the `NetworkConfig` <-> `NetworkSpec`
+    /// round trip — this is the path `Sandbox` persistence and spawn take
+    /// (`SandboxConfig::{local_network_config, set_local_network_config}`),
+    /// so a wire-twin field that's missing or shape-mismatched would make
+    /// the setting silently vanish before the guest even boots.
+    #[test]
+    fn auto_publish_survives_the_wire_spec_round_trip() {
+        let config = NetworkConfig {
+            auto_publish: Some(AutoPublishConfig {
+                poll_interval_ms: 1500,
+                host_bind: "0.0.0.0".parse().unwrap(),
+            }),
+            ..NetworkConfig::default()
+        };
+
+        let spec: microsandbox_types::NetworkSpec =
+            serde_json::from_value(serde_json::to_value(&config).unwrap()).unwrap();
+        let spec_auto_publish = spec
+            .auto_publish
+            .clone()
+            .expect("auto_publish present on the spec");
+        assert_eq!(spec_auto_publish.poll_interval_ms, 1500);
+        assert_eq!(spec_auto_publish.host_bind, "0.0.0.0");
+
+        let back: NetworkConfig =
+            serde_json::from_value(serde_json::to_value(&spec).unwrap()).unwrap();
+        assert_eq!(back.auto_publish, config.auto_publish);
+    }
+
+    /// A config persisted before auto-publish existed must keep
+    /// deserializing, with auto-publish absent (the "no behavior change
+    /// when absent" half of the compatibility guarantee).
+    #[test]
+    fn config_without_auto_publish_field_stays_disabled() {
+        let config: NetworkConfig = serde_json::from_value(serde_json::json!({})).unwrap();
+        assert!(config.auto_publish.is_none());
     }
 
     #[test]

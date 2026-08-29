@@ -27,11 +27,15 @@ use microsandbox_protocol::exec::{
 use microsandbox_protocol::fs::{FsData, FsRequest};
 use microsandbox_protocol::heartbeat::{ActivityCounters, Heartbeat};
 use microsandbox_protocol::message::{Message, MessageType};
+use microsandbox_protocol::network::{
+    LoopbackForwardCancelReq, LoopbackForwardReq, LoopbackForwardResp,
+};
 use microsandbox_protocol::tcp::{TcpClose, TcpConnect, TcpData, TcpEof, TcpFailed};
 
 use crate::config::{AgentdConfig, scripts_path};
 use crate::error::{AgentdError, AgentdResult};
 use crate::fs::{FsReadSession, FsState, FsStreamSession, FsWriteSession};
+use crate::loopback::ForwarderRegistry;
 use crate::process::ProcessManager;
 use crate::serial::AGENT_PORT_NAME;
 use crate::session::{
@@ -70,6 +74,10 @@ struct AgentState {
     read_sessions: HashMap<u32, FsReadSession>,
     tcp_sessions: HashMap<u32, TcpSession>,
     fs: FsState,
+    /// Active loopback forwarders (eth0_ip:port → 127.0.0.1:port).
+    /// One per published port; idempotent re-spawn and cancel are
+    /// driven by the host runtime via `LoopbackForward*` messages.
+    forwarders: ForwarderRegistry,
 }
 
 struct ActivityTracker {
@@ -723,6 +731,38 @@ async fn handle_message(
             }
         }
 
+        MessageType::LoopbackForward => {
+            let Some(req) = decode_payload_or_core_error::<LoopbackForwardReq>(&msg, out_buf)?
+            else {
+                return Ok(());
+            };
+            let resp = match state
+                .forwarders
+                .spawn(req.bind_addr, req.port, req.loopback_target)
+                .await
+            {
+                Ok(()) => LoopbackForwardResp {
+                    ok: true,
+                    error: None,
+                },
+                Err(e) => LoopbackForwardResp {
+                    ok: false,
+                    error: Some(e),
+                },
+            };
+            write_loopback_resp(out_buf, msg.id, resp.ok, resp.error)?;
+        }
+
+        MessageType::LoopbackForwardCancel => {
+            let Some(req) =
+                decode_payload_or_core_error::<LoopbackForwardCancelReq>(&msg, out_buf)?
+            else {
+                return Ok(());
+            };
+            state.forwarders.cancel(req.port);
+            write_loopback_resp(out_buf, msg.id, true, None)?;
+        }
+
         MessageType::Shutdown => {
             // Graceful shutdown — signal all sessions, then ask the guest
             // kernel to power off so block-root filesystems can shut down
@@ -983,6 +1023,24 @@ fn encode_tcp_failed(id: u32, error: String, out_buf: &mut Vec<u8>) -> AgentdRes
         .map_err(|e| AgentdError::ExecSession(format!("encode tcp failed: {e}")))?;
     codec::encode_to_buf(&reply, out_buf)
         .map_err(|e| AgentdError::ExecSession(format!("encode tcp failed frame: {e}")))?;
+    Ok(())
+}
+
+/// Encode a [`LoopbackForwardResp`] frame onto `out_buf` for the
+/// given correlation id. Used by both the LoopbackForward and
+/// LoopbackForwardCancel arms — both reply with the same terminal
+/// payload shape.
+fn write_loopback_resp(
+    out_buf: &mut Vec<u8>,
+    id: u32,
+    ok: bool,
+    error: Option<String>,
+) -> AgentdResult<()> {
+    let payload = LoopbackForwardResp { ok, error };
+    let msg = Message::with_payload(MessageType::LoopbackForwardResp, id, &payload)
+        .map_err(|e| AgentdError::ExecSession(format!("encode loopback resp: {e}")))?;
+    codec::encode_to_buf(&msg, out_buf)
+        .map_err(|e| AgentdError::ExecSession(format!("encode loopback resp frame: {e}")))?;
     Ok(())
 }
 
@@ -1355,7 +1413,11 @@ mod tests {
     fn bootstrap_rejects_older_protocol_generation() {
         let mut message =
             Message::with_payload(MessageType::Bootstrap, 0, &GuestBootstrap::default()).unwrap();
-        message.v = PROTOCOL_VERSION - 1;
+        // Anchor to Bootstrap's own introduction generation, not the live
+        // `PROTOCOL_VERSION` — the two no longer coincide now that later
+        // types (PortEvent et al.) were introduced at a newer generation
+        // without moving Bootstrap's.
+        message.v = MessageType::Bootstrap.min_protocol_version() - 1;
 
         let error = decode_bootstrap_message(message).unwrap_err();
         assert!(error.to_string().contains("or newer"));

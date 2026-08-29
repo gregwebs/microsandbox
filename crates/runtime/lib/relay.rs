@@ -112,6 +112,23 @@ pub struct AgentRelay {
     /// Number of user-volume mounts that use the shared bind identity map.
     #[cfg(unix)]
     bind_identity_map_mount_count: usize,
+    /// Connected-clients map. Lives on the struct (rather than as a local in
+    /// `run()`) so a [`RelayBroadcast`] handle obtained before `run()` is
+    /// called can push frames to every connected client for the relay's
+    /// lifetime. Used by the auto-publish loop to broadcast `PortEvent`s.
+    clients: Arc<Mutex<HashMap<u32, ClientState>>>,
+}
+
+/// Cloneable handle that pushes a frame to every connected client.
+///
+/// Used for host-originated broadcasts that aren't responses to a specific
+/// client request — currently just `PortEvent` from the auto-publish loop.
+/// Each event becomes one length-prefixed frame sent (best-effort,
+/// non-blocking) to every client's writer channel; a slow client whose
+/// channel is full simply misses the event rather than blocking the publisher.
+#[derive(Clone)]
+pub struct RelayBroadcast {
+    clients: Arc<Mutex<HashMap<u32, ClientState>>>,
 }
 
 /// Platform-specific listener for SDK client connections.
@@ -213,6 +230,27 @@ impl AgentListener {
     }
 }
 
+impl RelayBroadcast {
+    /// Encode `msg` into a length-prefixed frame and try-send it to each
+    /// connected client. Non-blocking: clients whose write channel is full
+    /// drop the event silently (fire-and-forget broadcast, not queued).
+    pub fn broadcast(&self, msg: &microsandbox_protocol::message::Message) {
+        let mut buf = Vec::new();
+        if microsandbox_protocol::codec::encode_to_buf(msg, &mut buf).is_err() {
+            return;
+        }
+        let bytes = Bytes::from(buf);
+        // try_lock keeps the call cheap; under contention we just retry on the
+        // next event (blocking_lock needs a runtime context we may not hold).
+        let Ok(map) = self.clients.try_lock() else {
+            return;
+        };
+        for client in map.values() {
+            let _ = client.write_tx.try_send(bytes.clone());
+        }
+    }
+}
+
 impl AgentRelay {
     /// Create a new agent relay.
     ///
@@ -235,7 +273,17 @@ impl AgentRelay {
             bind_identity_map: None,
             #[cfg(unix)]
             bind_identity_map_mount_count: 0,
+            clients: Arc::new(Mutex::new(HashMap::new())),
         })
+    }
+
+    /// Get a [`RelayBroadcast`] handle that can push frames to every connected
+    /// client for the relay's lifetime. Safe to call before [`run`](Self::run)
+    /// — the handle keeps an `Arc` to the clients map.
+    pub fn broadcast_handle(&self) -> RelayBroadcast {
+        RelayBroadcast {
+            clients: Arc::clone(&self.clients),
+        }
     }
 
     /// Attach a log writer for `exec.log` capture.
@@ -418,7 +466,10 @@ impl AgentRelay {
         })?;
 
         // Shared state: map from client slot index to client state.
-        let clients: Arc<Mutex<HashMap<u32, ClientState>>> = Arc::new(Mutex::new(HashMap::new()));
+        // Owned by `self.clients` so a `broadcast_handle()` obtained before
+        // run() (used by the auto-publish task) remains valid for the relay's
+        // lifetime.
+        let clients = self.clients.clone();
 
         // Bounded channel for client reader tasks to send frames to the ring writer.
         // Backpressure prevents unbounded memory growth from client floods.
