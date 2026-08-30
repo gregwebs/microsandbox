@@ -13,8 +13,8 @@ use microsandbox::sandbox::{
 };
 #[cfg(feature = "net")]
 use microsandbox::sandbox::{
-    DnsConfigPatch, NetworkConfigPatch, NetworkPolicyConfigPatch, SecretConfigPatch,
-    SecretEntryConfigPatch, TlsConfigPatch,
+    DnsConfigPatch, InterceptConfigPatch, NetworkConfigPatch, NetworkPolicyConfigPatch,
+    SecretConfigPatch, SecretEntryConfigPatch, TlsConfigPatch,
 };
 use microsandbox_image::RegistryAuth;
 use serde::Deserialize;
@@ -364,7 +364,7 @@ struct AppendPatchInput {
 #[serde(untagged)]
 enum NetworkInput {
     Preset(NetworkPreset),
-    Object(NetworkPatch),
+    Object(Box<NetworkPatch>),
 }
 
 #[derive(Debug, Clone, Copy, Deserialize)]
@@ -384,8 +384,27 @@ struct NetworkPatch {
     ports: Option<Vec<String>>,
     dns: Option<DnsInput>,
     tls: Option<TlsInput>,
+    intercept: Option<InterceptInput>,
     trust_host_cas: Option<bool>,
     max_connections: Option<usize>,
+    auto_publish: Option<AutoPublishInput>,
+}
+
+/// Auto-publish Sandboxfile input: `true` enables it with defaults (2s poll,
+/// `127.0.0.1` host bind); an object enables it with overrides. `false` or
+/// omitted leaves auto-publish disabled.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(untagged)]
+enum AutoPublishInput {
+    Enabled(bool),
+    Object(AutoPublishPatch),
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct AutoPublishPatch {
+    poll_interval_ms: Option<u64>,
+    host_bind: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -405,6 +424,29 @@ struct TlsInput {
     block_quic: Option<bool>,
 }
 
+/// Sparse fail-closed request-interception config-file surface.
+///
+/// Deliberately minimal (no CLI flag grammar — config-file only, mirroring
+/// the secrets PR's scoping): a hook command, match rules, and the buffer
+/// cap. See `docs/sandboxes/intercept.mdx`.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct InterceptInput {
+    hook: Option<Vec<String>>,
+    rules: Option<Vec<InterceptRuleInput>>,
+    max_request_bytes: Option<usize>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct InterceptRuleInput {
+    host: String,
+    method: String,
+    path_prefix: String,
+    #[serde(default)]
+    dispatch_on_headers: bool,
+}
+
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 struct SecretInput {
@@ -422,6 +464,12 @@ enum SecretValueInput {
     Environment {
         #[serde(rename = "$msb_env")]
         env: String,
+    },
+    File {
+        /// Absolute host path re-read on every eligible connection, so
+        /// rotating the file takes effect without a sandbox restart.
+        #[serde(rename = "$msb_file")]
+        file: String,
     },
 }
 
@@ -476,7 +524,7 @@ impl SandboxPatch {
         if let Some(ports) = self.ports.take() {
             let network = self
                 .network
-                .get_or_insert_with(|| NetworkInput::Object(NetworkPatch::default()));
+                .get_or_insert_with(|| NetworkInput::Object(Box::default()));
             network.object_mut().ports = Some(match network.object_mut().ports.take() {
                 Some(mut nested) => {
                     nested.extend(ports);
@@ -495,16 +543,16 @@ impl NetworkInput {
                 policy: Some(policy),
                 ..NetworkPatch::default()
             },
-            Self::Object(patch) => patch,
+            Self::Object(patch) => *patch,
         }
     }
 
     fn object_mut(&mut self) -> &mut NetworkPatch {
         if let Self::Preset(policy) = self {
-            *self = Self::Object(NetworkPatch {
+            *self = Self::Object(Box::new(NetworkPatch {
                 policy: Some(*policy),
                 ..NetworkPatch::default()
-            });
+            }));
         }
         let Self::Object(patch) = self else {
             unreachable!("preset was normalized to an object")
@@ -676,7 +724,7 @@ pub fn resolve(sources: &SandboxConfigSources) -> anyhow::Result<ResolvedSandbox
                 reject_scoped_wrapper(&source.path, "network", "--net-conf")?;
                 let network = load_typed::<NetworkPatch>(&source.path, "network config")?;
                 SandboxPatch {
-                    network: Some(NetworkInput::Object(network)),
+                    network: Some(NetworkInput::Object(Box::new(network))),
                     ..SandboxPatch::default()
                 }
             }
@@ -1030,7 +1078,7 @@ fn merge_network(base: &mut Option<NetworkInput>, higher: Option<NetworkInput>) 
     };
     let higher = higher.into_object();
     let base = base
-        .get_or_insert_with(|| NetworkInput::Object(NetworkPatch::default()))
+        .get_or_insert_with(|| NetworkInput::Object(Box::default()))
         .object_mut();
     replace(&mut base.policy, higher.policy);
     replace(&mut base.allow, higher.allow);
@@ -1038,6 +1086,7 @@ fn merge_network(base: &mut Option<NetworkInput>, higher: Option<NetworkInput>) 
     replace(&mut base.ports, higher.ports);
     merge_dns(&mut base.dns, higher.dns);
     merge_tls(&mut base.tls, higher.tls);
+    merge_intercept(&mut base.intercept, higher.intercept);
     replace(&mut base.trust_host_cas, higher.trust_host_cas);
     replace(&mut base.max_connections, higher.max_connections);
 }
@@ -1061,6 +1110,16 @@ fn merge_tls(base: &mut Option<TlsInput>, higher: Option<TlsInput>) {
     replace(&mut base.bypass, higher.bypass);
     replace(&mut base.verify_upstream, higher.verify_upstream);
     replace(&mut base.block_quic, higher.block_quic);
+}
+
+fn merge_intercept(base: &mut Option<InterceptInput>, higher: Option<InterceptInput>) {
+    let Some(higher) = higher else {
+        return;
+    };
+    let base = base.get_or_insert_with(InterceptInput::default);
+    replace(&mut base.hook, higher.hook);
+    replace(&mut base.rules, higher.rules);
+    replace(&mut base.max_request_bytes, higher.max_request_bytes);
 }
 
 //--------------------------------------------------------------------------------------------------
@@ -1768,11 +1827,56 @@ fn materialize_network_patch(input: &NetworkInput) -> anyhow::Result<NetworkConf
         }
         patch = patch.tls(value);
     }
+    if let Some(intercept) = input.intercept {
+        let mut value = InterceptConfigPatch::new();
+        if let Some(hook) = intercept.hook {
+            value = value.hook(hook);
+        }
+        if let Some(rules) = intercept.rules {
+            value = value.rules(
+                rules
+                    .into_iter()
+                    .map(
+                        |rule| microsandbox_network::intercept::config::InterceptRule {
+                            host: rule.host,
+                            method: rule.method,
+                            path_prefix: rule.path_prefix,
+                            dispatch_on_headers: rule.dispatch_on_headers,
+                        },
+                    )
+                    .collect(),
+            );
+        }
+        if let Some(max) = intercept.max_request_bytes {
+            value = value.max_request_bytes(max);
+        }
+        patch = patch.intercept(value);
+    }
     if let Some(enabled) = input.trust_host_cas {
         patch = patch.trust_host_cas(enabled);
     }
     if let Some(max) = input.max_connections {
         patch = patch.max_connections(max);
+    }
+    if let Some(auto_publish) = input.auto_publish {
+        let enabled = match &auto_publish {
+            AutoPublishInput::Enabled(enabled) => *enabled,
+            AutoPublishInput::Object(_) => true,
+        };
+        if enabled {
+            let mut cfg = microsandbox_network::config::AutoPublishConfig::default();
+            if let AutoPublishInput::Object(object) = auto_publish {
+                if let Some(poll_interval_ms) = object.poll_interval_ms {
+                    cfg.poll_interval_ms = poll_interval_ms;
+                }
+                if let Some(host_bind) = object.host_bind {
+                    cfg.host_bind = host_bind.parse().map_err(|e| {
+                        anyhow::anyhow!("invalid network.auto_publish.host_bind {host_bind:?}: {e}")
+                    })?;
+                }
+            }
+            patch = patch.auto_publish(cfg);
+        }
     }
     Ok(patch)
 }
@@ -1793,6 +1897,9 @@ fn materialize_secret_patch(
             }
             Some(SecretValueInput::Environment { env }) => {
                 entry = entry.source(SecretSource::Env { var: env.clone() });
+            }
+            Some(SecretValueInput::File { file }) => {
+                entry = entry.source(SecretSource::File { path: file.into() });
             }
             None => {
                 entry = entry.source(SecretSource::Env { var: name.clone() });
@@ -2260,6 +2367,51 @@ secrets:
         assert!(config.spec.network.dns.as_ref().unwrap().rebind_protection);
     }
 
+    #[tokio::test]
+    async fn sparse_intercept_config_round_trips_into_the_sandbox_spec() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = write_config(
+            dir.path(),
+            "agent.yaml",
+            r#"
+image: "python:3.12"
+network:
+  policy: public
+  intercept:
+    hook: ["agent-vm", "_intercept-hook"]
+    max_request_bytes: 4096
+    rules:
+      - { host: "api.github.com", method: "GET", path_prefix: "/repos/" }
+      - { host: "github.com", method: "POST", path_prefix: "/", dispatch_on_headers: true }
+"#,
+        );
+        let sources = SandboxConfigSources::default().source(SandboxConfigKind::Root, root);
+        let resolved = resolve(&sources).unwrap();
+        let image = resolved.image(None, None).unwrap();
+        let builder = resolved
+            .apply(SandboxBuilder::new("intercept-config-test"))
+            .unwrap();
+        let config = image.apply(builder).unwrap().build().await.unwrap();
+
+        let intercept = config
+            .spec
+            .network
+            .intercept
+            .as_ref()
+            .expect("intercept subdocument present");
+        assert_eq!(
+            intercept.hook,
+            Some(vec!["agent-vm".to_string(), "_intercept-hook".to_string()])
+        );
+        assert_eq!(intercept.max_request_bytes, 4096);
+        assert_eq!(intercept.rules.len(), 2);
+        assert_eq!(intercept.rules[0].host, "api.github.com");
+        assert!(!intercept.rules[0].dispatch_on_headers);
+        assert_eq!(intercept.rules[1].host, "github.com");
+        assert!(intercept.rules[1].dispatch_on_headers);
+        assert!(intercept.is_active());
+    }
+
     #[test]
     fn scoped_secrets_merge_recursively_by_name() {
         let dir = tempfile::tempdir().unwrap();
@@ -2308,6 +2460,36 @@ TOKEN:
             secret.value,
             Some(SecretValueInput::Environment { ref env }) if env == "HOST_TOKEN"
         ));
+    }
+
+    #[test]
+    fn secret_config_parses_msb_file_value() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_config(
+            dir.path(),
+            "secrets.yaml",
+            r#"
+TOKEN:
+  value:
+    $msb_file: /run/creds/token
+  allow: ["api.example.com"]
+"#,
+        );
+        let sources = SandboxConfigSources::default().source(SandboxConfigKind::Secrets, path);
+
+        let resolved = resolve(&sources).unwrap();
+        let secrets = resolved.patch.secrets.unwrap();
+        let secret = &secrets["TOKEN"];
+        assert!(matches!(
+            secret.value,
+            Some(SecretValueInput::File { ref file }) if file == "/run/creds/token"
+        ));
+
+        // `materialize_secret_patch` must accept the parsed File value
+        // without error; the resulting `SecretSource::File` reference then
+        // flows through the SDK's config-patch machinery unchanged (already
+        // covered by the sdk/rust `secret_material` tests).
+        assert!(materialize_secret_patch(&secrets).is_ok());
     }
 
     #[test]
@@ -2402,6 +2584,87 @@ scripts: { start: "python app.py" }
         assert_eq!(policy["default_egress"], "deny");
         assert_eq!(policy["default_ingress"], "deny");
         assert_eq!(policy["rules"], serde_json::json!([]));
+    }
+
+    /// A Sandboxfile `auto_publish` key must deserialize past
+    /// `deny_unknown_fields`, materialize into the `NetworkConfigPatch`
+    /// (via `NetworkPatch`/`materialize_network_patch`), and survive all
+    /// the way into the built `SandboxConfig`'s persisted `NetworkSpec` —
+    /// the acceptance criterion's "sandbox specs round-trip the setting".
+    #[cfg(feature = "net")]
+    #[tokio::test]
+    async fn cli_network_auto_publish_object_round_trips_into_spec() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = write_config(
+            dir.path(),
+            "agent.yaml",
+            "image: \"python\"\nnetwork:\n  auto_publish:\n    poll_interval_ms: 750\n    host_bind: \"0.0.0.0\"\n",
+        );
+        let sources = SandboxConfigSources::default().source(SandboxConfigKind::Root, root);
+        let resolved = resolve(&sources).unwrap();
+        let opts = SandboxOpts {
+            no_net: true,
+            ..SandboxOpts::default()
+        };
+        let builder = resolved
+            .image(None, None)
+            .unwrap()
+            .apply(SandboxBuilder::new("network-auto-publish"))
+            .unwrap();
+        let builder = resolved.apply(builder).unwrap();
+        let config = crate::commands::common::apply_sandbox_opts_after_config(builder, &opts)
+            .unwrap()
+            .build()
+            .await
+            .unwrap();
+
+        let auto_publish = config
+            .spec
+            .network
+            .auto_publish
+            .as_ref()
+            .expect("auto_publish should survive the Sandboxfile -> spec round trip");
+        assert_eq!(auto_publish.poll_interval_ms, 750);
+        assert_eq!(auto_publish.host_bind, "0.0.0.0");
+    }
+
+    /// `auto_publish: true` enables it with the documented defaults (2s
+    /// poll, `127.0.0.1` bind) rather than requiring every field.
+    #[cfg(feature = "net")]
+    #[tokio::test]
+    async fn cli_network_auto_publish_bool_enables_with_defaults() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = write_config(
+            dir.path(),
+            "agent.yaml",
+            "image: \"python\"\nnetwork:\n  auto_publish: true\n",
+        );
+        let sources = SandboxConfigSources::default().source(SandboxConfigKind::Root, root);
+        let resolved = resolve(&sources).unwrap();
+        let opts = SandboxOpts {
+            no_net: true,
+            ..SandboxOpts::default()
+        };
+        let builder = resolved
+            .image(None, None)
+            .unwrap()
+            .apply(SandboxBuilder::new("network-auto-publish-bool"))
+            .unwrap();
+        let builder = resolved.apply(builder).unwrap();
+        let config = crate::commands::common::apply_sandbox_opts_after_config(builder, &opts)
+            .unwrap()
+            .build()
+            .await
+            .unwrap();
+
+        let auto_publish = config
+            .spec
+            .network
+            .auto_publish
+            .as_ref()
+            .expect("auto_publish: true should enable with defaults");
+        assert_eq!(auto_publish.poll_interval_ms, 2000);
+        assert_eq!(auto_publish.host_bind, "127.0.0.1");
     }
 
     #[cfg(feature = "net")]

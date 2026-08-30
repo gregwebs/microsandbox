@@ -21,6 +21,7 @@ use smoltcp::wire::{EthernetAddress, IpEndpoint};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::sync::mpsc;
+use tokio::task::AbortHandle;
 
 use crate::config::{PortProtocol, PublishedPort};
 use crate::netstack::shared::SharedState;
@@ -54,6 +55,12 @@ const UDP_EPHEMERAL_PORT_START: u16 = 49152;
 const UDP_EPHEMERAL_PORT_COUNT: usize =
     (u16::MAX as usize) - (UDP_EPHEMERAL_PORT_START as usize) + 1;
 
+/// Initial backoff after an `accept()` failure in `run_accept_loop`.
+const ACCEPT_BACKOFF_INITIAL: Duration = Duration::from_millis(10);
+
+/// Cap on the exponential backoff between `accept()` failures.
+const ACCEPT_BACKOFF_MAX: Duration = Duration::from_secs(1);
+
 //--------------------------------------------------------------------------------------------------
 // Types
 //--------------------------------------------------------------------------------------------------
@@ -66,8 +73,21 @@ const UDP_EPHEMERAL_PORT_COUNT: usize =
 pub struct PortPublisher {
     /// Receives accepted connections from listener tasks.
     inbound_rx: mpsc::Receiver<InboundConnection>,
-    /// Held to keep the channel open (listener tasks hold clones).
-    _inbound_tx: mpsc::Sender<InboundConnection>,
+    /// Cloned into every spawned listener task — both the boot-time
+    /// `--publish` listeners and runtime-added ones from [`PortCommand::Add`]
+    /// (auto-publish). Also keeps the channel open.
+    inbound_tx: mpsc::Sender<InboundConnection>,
+    /// Network policy used to gate runtime-added listeners' ingress.
+    policy: Arc<NetworkPolicy>,
+    /// Runtime add/remove command receiver. `SmoltcpNetwork` owns the
+    /// matching sender (`port_handle()`), so callers can add/remove host
+    /// listeners at runtime (auto-publish) without the publisher owning the
+    /// sender lifetime. Drained at the head of each [`accept_inbound`] tick.
+    cmd_rx: mpsc::UnboundedReceiver<PortCommand>,
+    /// Per-runtime-listener `AbortHandle`, keyed by `(host_bind, host_port)`,
+    /// so [`PortCommand::Remove`] can stop the accept loop. Boot-time
+    /// `--publish` listeners are not tracked here (they are never removed).
+    listener_handles: HashMap<(IpAddr, u16), AbortHandle>,
     /// Tracked inbound connections (smoltcp socket → relay state).
     connections: Vec<InboundRelay>,
     /// Guest IP that inbound connections are dialed to. Prefers IPv4 (the
@@ -93,6 +113,40 @@ struct InboundConnection {
     stream: TcpStream,
     /// Guest port to connect to.
     guest_port: u16,
+}
+
+/// Runtime command sent to a live [`PortPublisher`] from outside the smoltcp
+/// poll thread, on the unbounded channel returned by
+/// [`crate::network::SmoltcpNetwork::port_handle`]. Processed at the head of
+/// each [`PortPublisher::accept_inbound`] tick. Used by the auto-publish loop
+/// to mirror guest LISTEN sockets onto host listeners as they appear.
+///
+/// `Add` carries a pre-bound listener (not a `host_bind + host_port` pair) so
+/// the caller picks its own bind strategy and knows the final port up front —
+/// useful for the auto-publish loop, which needs to emit a precise mapping
+/// back to the SDK. Static `--publish` ports at boot bypass this channel.
+#[derive(Debug)]
+pub enum PortCommand {
+    /// Take ownership of a host TCP listener and forward each accepted
+    /// connection into the guest at `guest_port`.
+    Add {
+        /// Pre-bound host TCP listener.
+        listener: TcpListener,
+        /// Bookkeeping key — `(host_bind, host_port)` from the listener's
+        /// `local_addr()` at bind time. A later `Remove` matches on this.
+        key: (IpAddr, u16),
+        /// Guest port to dial via smoltcp on each accepted connection.
+        guest_port: u16,
+    },
+    /// Stop the listener at `(host_bind, host_port)` if any. In-flight
+    /// connections keep draining on their smoltcp sockets; only the accept
+    /// loop stops.
+    Remove {
+        /// Host bind address of the listener to stop.
+        host_bind: IpAddr,
+        /// Host port of the listener to stop.
+        host_port: u16,
+    },
 }
 
 /// Shared UDP published-port route table.
@@ -181,6 +235,7 @@ impl PortPublisher {
         policy: Arc<NetworkPolicy>,
         shared: Arc<SharedState>,
         tokio_handle: &tokio::runtime::Handle,
+        cmd_rx: mpsc::UnboundedReceiver<PortCommand>,
     ) -> Self {
         let (inbound_tx, inbound_rx) = mpsc::channel(64);
         let udp_routes = Arc::new(Mutex::new(HashMap::new()));
@@ -202,7 +257,7 @@ impl PortPublisher {
                 ephemeral_port.clone(),
                 gateway_mac,
                 guest_mac,
-                policy,
+                policy.clone(),
                 shared,
                 tokio_handle,
             );
@@ -215,7 +270,10 @@ impl PortPublisher {
 
         Self {
             inbound_rx,
-            _inbound_tx: inbound_tx,
+            inbound_tx,
+            policy,
+            cmd_rx,
+            listener_handles: HashMap::new(),
             connections: Vec::new(),
             guest_ip,
             guest_ipv4,
@@ -224,6 +282,62 @@ impl PortPublisher {
             max_inbound: 256,
             udp_routes,
         }
+    }
+
+    /// Apply one runtime [`PortCommand`]. Called from `accept_inbound` so
+    /// spawn/abort runs on the poll loop's tokio handle.
+    fn apply_command(
+        &mut self,
+        cmd: PortCommand,
+        shared: &Arc<SharedState>,
+        tokio_handle: &tokio::runtime::Handle,
+    ) {
+        match cmd {
+            PortCommand::Add {
+                listener,
+                key,
+                guest_port,
+            } => {
+                if self.guest_ip.is_none() {
+                    tracing::warn!(
+                        guest_port,
+                        "ignoring PortCommand::Add: guest has no IPv4 or IPv6 address",
+                    );
+                    return;
+                }
+                if self.listener_handles.contains_key(&key) {
+                    tracing::debug!(
+                        bind = %key.0,
+                        port = key.1,
+                        "PortCommand::Add: listener already present, ignoring",
+                    );
+                    return;
+                }
+                let handle = spawn_accept_task(
+                    listener,
+                    guest_port,
+                    self.inbound_tx.clone(),
+                    self.policy.clone(),
+                    shared.clone(),
+                    tokio_handle,
+                );
+                self.listener_handles.insert(key, handle);
+            }
+            PortCommand::Remove {
+                host_bind,
+                host_port,
+            } => {
+                if let Some(handle) = self.listener_handles.remove(&(host_bind, host_port)) {
+                    handle.abort();
+                }
+            }
+        }
+    }
+
+    /// Snapshot of currently-active runtime-added listeners. For the
+    /// auto-publish loop's bookkeeping and tests.
+    pub fn active_listeners(&self) -> Vec<(IpAddr, u16)> {
+        self.listener_handles.keys().copied().collect()
     }
 
     /// Accept queued inbound connections: create smoltcp sockets and
@@ -237,6 +351,13 @@ impl PortPublisher {
         shared: &Arc<SharedState>,
         tokio_handle: &tokio::runtime::Handle,
     ) {
+        // Apply pending runtime commands first so an Add becomes observable on
+        // the very next inbound_rx.try_recv() (no need to wait another tick),
+        // and a Remove takes effect even when there is no guest IP.
+        while let Ok(cmd) = self.cmd_rx.try_recv() {
+            self.apply_command(cmd, shared, tokio_handle);
+        }
+
         // No guest IP means listeners weren't spawned; the channel is empty
         // and there's nothing to do.
         let Some(guest_ip) = self.guest_ip else {
@@ -545,6 +666,66 @@ impl PortPublisher {
 /// zero-cost — it borrows the underlying fd.
 fn reject_with_rst(stream: &TcpStream) {
     let _ = socket2::SockRef::from(stream).set_linger(Some(Duration::ZERO));
+}
+
+/// Spawn an accept loop for a pre-bound `TcpListener` (a runtime-added
+/// listener from [`PortCommand::Add`]) and return its [`AbortHandle`] so
+/// [`PortCommand::Remove`] can stop it.
+fn spawn_accept_task(
+    listener: TcpListener,
+    guest_port: u16,
+    inbound_tx: mpsc::Sender<InboundConnection>,
+    policy: Arc<NetworkPolicy>,
+    shared: Arc<SharedState>,
+    tokio_handle: &tokio::runtime::Handle,
+) -> AbortHandle {
+    tokio_handle
+        .spawn(async move {
+            run_accept_loop(listener, guest_port, inbound_tx, policy, shared).await;
+        })
+        .abort_handle()
+}
+
+/// Accept loop for an already-bound TCP listener: gate each connection
+/// through the policy's ingress evaluator and queue allowed connections.
+/// Returns when the publisher drops `inbound_tx`. `accept()` errors get
+/// capped exponential backoff (EMFILE/ENFILE/EBADF are sticky and would
+/// otherwise hot-spin); backoff resets on the next successful accept.
+async fn run_accept_loop(
+    listener: TcpListener,
+    guest_port: u16,
+    inbound_tx: mpsc::Sender<InboundConnection>,
+    policy: Arc<NetworkPolicy>,
+    shared: Arc<SharedState>,
+) {
+    let mut backoff = ACCEPT_BACKOFF_INITIAL;
+    loop {
+        let (stream, peer) = match listener.accept().await {
+            Ok(p) => {
+                backoff = ACCEPT_BACKOFF_INITIAL;
+                p
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, ?backoff, "published port: accept failed, backing off");
+                tokio::time::sleep(backoff).await;
+                backoff = (backoff * 2).min(ACCEPT_BACKOFF_MAX);
+                continue;
+            }
+        };
+
+        let action = policy.evaluate_ingress(peer, guest_port, Protocol::Tcp, &shared);
+        if action.is_deny() {
+            tracing::debug!(peer = %peer, guest_port, "ingress denied by policy; sending RST");
+            reject_with_rst(&stream);
+            drop(stream);
+            continue;
+        }
+
+        let conn = InboundConnection { stream, guest_port };
+        if !queue_inbound_connection(&inbound_tx, conn, &shared).await {
+            break; // Publisher dropped.
+        }
+    }
 }
 
 /// Listener task: accepts TCP connections on the host, runs each
@@ -1040,7 +1221,10 @@ mod tests {
 
         let publisher = PortPublisher {
             inbound_rx,
-            _inbound_tx: inbound_tx,
+            inbound_tx,
+            policy: Arc::new(NetworkPolicy::default()),
+            cmd_rx: mpsc::unbounded_channel().1,
+            listener_handles: HashMap::new(),
             connections: Vec::new(),
             guest_ip: Some(IpAddr::V4(guest_ip)),
             guest_ipv4: Some(guest_ip),
@@ -1084,7 +1268,10 @@ mod tests {
 
         let publisher = PortPublisher {
             inbound_rx,
-            _inbound_tx: inbound_tx,
+            inbound_tx,
+            policy: Arc::new(NetworkPolicy::default()),
+            cmd_rx: mpsc::unbounded_channel().1,
+            listener_handles: HashMap::new(),
             connections: Vec::new(),
             guest_ip: Some(IpAddr::V4(guest_ip)),
             guest_ipv4: Some(guest_ip),
@@ -1160,5 +1347,82 @@ mod tests {
             bind_exposure(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 10))),
             BindExposure::Interface
         );
+    }
+
+    /// Coexistence/dedupe regression for the auto-publish acceptance
+    /// criterion: a repeated `PortCommand::Add` for the same `(host_bind,
+    /// host_port)` key must not create a second tracked listener (the
+    /// auto-publish poll loop's RECONCILE pass can legitimately retry an
+    /// Add it already issued), and `PortCommand::Remove` must clear the
+    /// single tracked entry.
+    #[tokio::test]
+    async fn apply_command_add_is_idempotent_and_remove_clears_it() {
+        let shared = Arc::new(SharedState::new(4));
+        let guest_ip = Ipv4Addr::new(172, 16, 0, 2);
+        let (inbound_tx, inbound_rx) = mpsc::channel(1);
+        let mut publisher = PortPublisher {
+            inbound_rx,
+            inbound_tx,
+            policy: Arc::new(NetworkPolicy::default()),
+            cmd_rx: mpsc::unbounded_channel().1,
+            listener_handles: HashMap::new(),
+            connections: Vec::new(),
+            guest_ip: Some(IpAddr::V4(guest_ip)),
+            guest_ipv4: Some(guest_ip),
+            guest_ipv6: None,
+            ephemeral_port: Arc::new(AtomicU16::new(49152)),
+            max_inbound: 256,
+            udp_routes: Arc::new(Mutex::new(HashMap::new())),
+        };
+        let tokio_handle = tokio::runtime::Handle::current();
+
+        // `key` is the caller-supplied bookkeeping tuple `apply_command`
+        // dedupes on — bind two independent ephemeral listeners (real ports
+        // differ) but claim the same key for both, exactly mirroring how a
+        // RECONCILE retry would resend `Add` for a mapping already active.
+        let key = (IpAddr::V4(Ipv4Addr::LOCALHOST), 18080);
+
+        let listener1 = TcpListener::bind((IpAddr::V4(Ipv4Addr::LOCALHOST), 0))
+            .await
+            .unwrap();
+        publisher.apply_command(
+            PortCommand::Add {
+                listener: listener1,
+                key,
+                guest_port: 80,
+            },
+            &shared,
+            &tokio_handle,
+        );
+        assert_eq!(publisher.active_listeners(), vec![key]);
+
+        let listener2 = TcpListener::bind((IpAddr::V4(Ipv4Addr::LOCALHOST), 0))
+            .await
+            .unwrap();
+        publisher.apply_command(
+            PortCommand::Add {
+                listener: listener2,
+                key,
+                guest_port: 80,
+            },
+            &shared,
+            &tokio_handle,
+        );
+        let active = publisher.active_listeners();
+        assert_eq!(
+            active,
+            vec![key],
+            "duplicate Add for the same key must not create a second listener"
+        );
+
+        publisher.apply_command(
+            PortCommand::Remove {
+                host_bind: key.0,
+                host_port: key.1,
+            },
+            &shared,
+            &tokio_handle,
+        );
+        assert!(publisher.active_listeners().is_empty());
     }
 }

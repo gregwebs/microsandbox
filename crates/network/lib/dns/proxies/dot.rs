@@ -528,7 +528,7 @@ mod tests {
 
     fn connected_tls_pair() -> (rustls::ServerConnection, rustls::ClientConnection) {
         let ca = CertAuthority::generate();
-        let domain_cert = generate_domain_cert(TEST_DOMAIN, &ca, 1).unwrap();
+        let domain_cert = generate_domain_cert(TEST_DOMAIN, &ca, 1, false).unwrap();
         let mut roots = rustls::RootCertStore::empty();
         roots.add(ca.cert_der.clone()).unwrap();
         let client_config = rustls::ClientConfig::builder()

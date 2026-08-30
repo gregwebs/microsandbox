@@ -20,12 +20,17 @@ use microsandbox_types::{
 use msb_krun::backends::net::NetBackend;
 
 use crate::config::{MAX_NETWORK_CONNECTIONS, NetworkConfig};
+use crate::extensions::NetworkExtensions;
+use crate::host_proxy::HostHttpProxyConnector;
+use crate::intercept::InterceptExtension;
+use crate::intercept::config::InterceptConfig;
 use crate::netstack::{
     backend::SmoltcpBackend,
     poll::{self, GatewayIps, PollLoopConfig},
     shared::{DEFAULT_QUEUE_CAPACITY, SharedState},
 };
 use crate::policy::{NetworkPolicy, NetworkProfile};
+use crate::ports::publisher::PortCommand;
 use crate::secrets::handle::SecretsHandle;
 use crate::tls::state::{TlsState, TlsStateError};
 
@@ -58,9 +63,17 @@ const MULTI_TENANT_MAX_CONNECTIONS: usize = 256;
 pub struct SmoltcpNetwork {
     config: NetworkConfig,
     deployment_profile: DeploymentProfile,
+    extensions: NetworkExtensions,
     shared: Arc<SharedState>,
     backend: Option<SmoltcpBackend>,
     poll_handle: Option<JoinHandle<()>>,
+
+    /// Sender for runtime [`PortCommand`]s. Created up front (before the poll
+    /// thread spawns) so clones can be handed out to any task that wants to
+    /// add/remove published ports at runtime (e.g. the auto-publish loop). The
+    /// matching receiver is taken once by `start()`.
+    port_cmd_tx: tokio::sync::mpsc::UnboundedSender<PortCommand>,
+    port_cmd_rx: Option<tokio::sync::mpsc::UnboundedReceiver<PortCommand>>,
 
     // Resolved from config + slot.
     guest_mac: [u8; 6],
@@ -161,15 +174,34 @@ impl SmoltcpNetwork {
     /// Returns an error when the effective network configuration would allocate
     /// unsafe resources or TLS interception cannot initialize.
     pub fn new_with_profile(
+        config: NetworkConfig,
+        slot: u64,
+        deployment_profile: DeploymentProfile,
+    ) -> Result<Self, NetworkInitError> {
+        Self::new_with_profile_and_extensions(
+            config,
+            slot,
+            deployment_profile,
+            NetworkExtensions::default(),
+        )
+    }
+
+    /// Create the network backend with host-local, non-serialized extensions.
+    ///
+    /// Extensions are advanced host integration points. Normal runtime
+    /// construction uses [`Self::new_with_profile`] and installs none.
+    pub fn new_with_profile_and_extensions(
         mut config: NetworkConfig,
         slot: u64,
         deployment_profile: DeploymentProfile,
+        extensions: NetworkExtensions,
     ) -> Result<Self, NetworkInitError> {
         enforce_deployment_profile(&mut config, deployment_profile);
         Self::new_with_profile_and_routes(
             config,
             slot,
             deployment_profile,
+            extensions,
             host_has_ipv4_route(),
             host_has_ipv6_route(),
         )
@@ -186,6 +218,7 @@ impl SmoltcpNetwork {
             config,
             slot,
             DeploymentProfile::SingleTenant,
+            NetworkExtensions::default(),
             host_has_ipv4,
             host_has_ipv6,
         )
@@ -195,6 +228,7 @@ impl SmoltcpNetwork {
         config: NetworkConfig,
         slot: u64,
         deployment_profile: DeploymentProfile,
+        extensions: NetworkExtensions,
         host_has_ipv4: bool,
         host_has_ipv6: bool,
     ) -> Result<Self, NetworkInitError> {
@@ -277,23 +311,30 @@ impl SmoltcpNetwork {
                 source,
             })?;
         let backend = SmoltcpBackend::new(shared.clone());
+        let extensions = install_intercept_extension(extensions, &config.intercept);
 
         let secrets = SecretsHandle::new(config.secrets.clone());
         let tls_state = if config.tls.enabled {
             Some(Arc::new(TlsState::new(
                 config.tls.clone(),
                 secrets.clone(),
+                config.intercept.is_active(),
             )?))
         } else {
             None
         };
 
+        let (port_cmd_tx, port_cmd_rx) = tokio::sync::mpsc::unbounded_channel();
+
         Ok(Self {
             config,
             deployment_profile,
+            extensions,
             shared,
             backend: Some(backend),
             poll_handle: None,
+            port_cmd_tx,
+            port_cmd_rx: Some(port_cmd_rx),
             guest_mac,
             gateway_mac,
             mtu,
@@ -319,6 +360,9 @@ impl SmoltcpNetwork {
     /// Must be called before VM boot. Requires a tokio runtime handle for
     /// spawning proxy tasks, DNS resolution, and published port listeners.
     pub fn start(&mut self, tokio_handle: tokio::runtime::Handle) {
+        let host_proxy = HostHttpProxyConnector::from_env();
+        self.extensions = install_host_proxy_extension(self.extensions.clone(), host_proxy);
+
         let shared = self.shared.clone();
         let poll_config = PollLoopConfig {
             gateway_mac: self.gateway_mac,
@@ -340,12 +384,17 @@ impl SmoltcpNetwork {
         let published_ports = self.config.ports.clone();
         let max_connections = self.config.max_connections;
         let secrets = self.secrets.clone();
+        let extensions = self.extensions.clone();
+        let port_cmd_rx = self
+            .port_cmd_rx
+            .take()
+            .expect("SmoltcpNetwork::start called twice");
 
         self.poll_handle = Some(
             std::thread::Builder::new()
                 .name("smoltcp-poll".into())
                 .spawn(move || {
-                    poll::smoltcp_poll_loop(
+                    poll::smoltcp_poll_loop_with_extensions(
                         shared,
                         poll_config,
                         network_policy,
@@ -353,13 +402,34 @@ impl SmoltcpNetwork {
                         dns_config,
                         tls_state,
                         published_ports,
+                        port_cmd_rx,
                         max_connections,
                         tokio_handle,
                         secrets,
+                        extensions,
                     );
                 })
                 .expect("failed to spawn smoltcp poll thread"),
         );
+    }
+
+    /// Cloneable sender for runtime [`PortCommand`]s. Stays valid for the
+    /// lifetime of the network: the matching receiver is held by the poll
+    /// loop, so commands sent after the poll loop exits are silently dropped.
+    pub fn port_handle(&self) -> tokio::sync::mpsc::UnboundedSender<PortCommand> {
+        self.port_cmd_tx.clone()
+    }
+
+    /// Guest IPv4 address assigned to this sandbox, if any. Used by the
+    /// auto-publish loop to tell agentd which address to bind its loopback
+    /// forwarder on (so smoltcp's dial-to-VLAN-IP path reaches that listener).
+    pub fn guest_ipv4(&self) -> Option<Ipv4Addr> {
+        self.guest_ipv4
+    }
+
+    /// Guest IPv6 address assigned to this sandbox, if any.
+    pub fn guest_ipv6(&self) -> Option<Ipv6Addr> {
+        self.guest_ipv6
     }
 
     /// Take the `NetBackend` for `VmBuilder::net()`. One-shot.
@@ -581,6 +651,52 @@ fn enforce_deployment_profile(config: &mut NetworkConfig, profile: DeploymentPro
     }
 }
 
+/// Install the built-in fail-closed request interceptor when `intercept` is
+/// active and the caller has not already installed its own authorized-route
+/// request extension.
+///
+/// A caller-installed extension always wins: `NetworkExtensions` supports at
+/// most one request extension, and an embedder of this crate may want its
+/// own policy in place of the built-in one. Gating strictly on
+/// [`InterceptConfig::is_active`] (not, say, `config.tls.enabled`) matters —
+/// see [`InterceptExtension`] for why returning no extension at all for a
+/// policed host would be a credential bypass.
+fn install_intercept_extension(
+    extensions: NetworkExtensions,
+    intercept: &InterceptConfig,
+) -> NetworkExtensions {
+    if intercept.is_active() && extensions.authorized_requests().is_none() {
+        extensions.with_authorized_requests(Arc::new(InterceptExtension::new(intercept.clone())))
+    } else {
+        extensions
+    }
+}
+
+fn install_host_proxy_extension(
+    extensions: NetworkExtensions,
+    host_proxy: Option<HostHttpProxyConnector>,
+) -> NetworkExtensions {
+    let Some(host_proxy) = host_proxy else {
+        return extensions;
+    };
+
+    if extensions.outbound().is_some() {
+        tracing::debug!(
+            "caller-installed outbound connection extension takes precedence over host HTTP proxy"
+        );
+        return extensions;
+    }
+
+    let (https, http) = host_proxy.endpoint_displays();
+    tracing::info!(
+        https = ?https,
+        http = ?http,
+        no_proxy_configured = host_proxy.has_no_proxy_rules(),
+        "guest egress will use the host HTTP proxy"
+    );
+    extensions.with_outbound(Arc::new(host_proxy))
+}
+
 /// Derive a guest MAC address from the sandbox slot.
 ///
 /// Format: `02:ms:bx:SS:SS:02` where SS:SS encodes the slot.
@@ -694,9 +810,76 @@ fn host_has_ipv6_route() -> bool {
 
 #[cfg(test)]
 mod tests {
+    use std::io;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use futures::future::BoxFuture;
+
     use super::*;
     use crate::config::{PortProtocol, PublishedPort};
     use crate::dns::Nameserver;
+    use crate::extensions::{
+        AuthorizedRouteRequestExtension, AuthorizedTcpRoute, OutboundConnectionExtension,
+    };
+    use crate::tcp::upstream::UpstreamTcpTarget;
+
+    struct CountingOutboundExtension(AtomicUsize);
+
+    impl OutboundConnectionExtension for CountingOutboundExtension {
+        fn connect<'a>(
+            &'a self,
+            route: AuthorizedTcpRoute,
+        ) -> BoxFuture<'a, io::Result<tokio::net::TcpStream>> {
+            self.0.fetch_add(1, Ordering::Relaxed);
+            Box::pin(route.connect_direct())
+        }
+    }
+
+    struct UninterestedRequestExtension;
+
+    impl AuthorizedRouteRequestExtension for UninterestedRequestExtension {
+        fn open(
+            &self,
+            _route: &crate::extensions::AuthorizedTlsRoute,
+        ) -> Option<Box<dyn crate::extensions::AuthorizedRouteRequestStream>> {
+            None
+        }
+    }
+
+    #[test]
+    fn host_proxy_install_preserves_custom_outbound_and_request_extensions() {
+        let outbound = Arc::new(CountingOutboundExtension(AtomicUsize::new(0)));
+        let request = Arc::new(UninterestedRequestExtension);
+        let extensions = NetworkExtensions::new()
+            .with_outbound(outbound.clone())
+            .with_authorized_requests(request);
+        let host_proxy = HostHttpProxyConnector::from_url("http://proxy.example:3128");
+
+        let extensions = install_host_proxy_extension(extensions, host_proxy);
+        let route = AuthorizedTcpRoute::new(
+            "203.0.113.10:443".parse().unwrap(),
+            UpstreamTcpTarget::direct("127.0.0.1:9".parse().unwrap()),
+            None,
+            crate::extensions::OutboundProtocol::Tcp,
+        );
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let _ = runtime.block_on(extensions.outbound().unwrap().connect(route));
+
+        assert_eq!(outbound.0.load(Ordering::Relaxed), 1);
+        assert!(extensions.authorized_requests().is_some());
+    }
+
+    #[test]
+    fn host_proxy_install_preserves_existing_request_extension() {
+        let request = Arc::new(UninterestedRequestExtension);
+        let extensions = NetworkExtensions::new().with_authorized_requests(request);
+        let host_proxy = HostHttpProxyConnector::from_url("http://proxy.example:3128");
+
+        let extensions = install_host_proxy_extension(extensions, host_proxy);
+
+        assert!(extensions.outbound().is_some());
+        assert!(extensions.authorized_requests().is_some());
+    }
 
     #[test]
     fn derive_addresses_slot_0() {

@@ -15,10 +15,11 @@ use microsandbox_utils::size::Bytes;
 use zeroize::Zeroizing;
 
 use crate::config::{
-    DnsConfig, InterfaceOverrides, MAX_NETWORK_CONNECTIONS, NetworkConfig, PortProtocol,
-    PublishedPort,
+    AutoPublishConfig, DnsConfig, InterfaceOverrides, MAX_NETWORK_CONNECTIONS, NetworkConfig,
+    PortProtocol, PublishedPort,
 };
 use crate::dns::Nameserver;
+use crate::intercept::config::{InterceptConfig, InterceptRule};
 use crate::policy::{BuildError, NetworkPolicy};
 use crate::secrets::config::{
     HostPattern, SecretEntry, SecretInjection, SecretSource, ViolationAction,
@@ -43,6 +44,19 @@ pub struct DnsBuilder {
 /// Fluent builder for [`TlsConfig`].
 pub struct TlsBuilder {
     config: TlsConfig,
+}
+
+/// Fluent builder for [`InterceptConfig`].
+///
+/// ```ignore
+/// .intercept(|i| i
+///     .hook(vec!["agent-vm".into(), "_intercept-hook".into()])
+///     .rule("api.github.com", "GET", "/repos/")
+///     .streaming_rule("github.com", "POST", "/")
+/// )
+/// ```
+pub struct InterceptBuilder {
+    config: InterceptConfig,
 }
 
 /// Fluent builder for a single [`SecretEntry`].
@@ -222,6 +236,29 @@ impl NetworkBuilder {
         self
     }
 
+    /// Configure fail-closed request interception via a closure.
+    ///
+    /// ```ignore
+    /// .intercept(|i| i
+    ///     .hook(vec!["agent-vm".into(), "_intercept-hook".into()])
+    ///     .rule("api.github.com", "GET", "/repos/")
+    /// )
+    /// ```
+    pub fn intercept(mut self, f: impl FnOnce(InterceptBuilder) -> InterceptBuilder) -> Self {
+        self.config.intercept = f(InterceptBuilder::new()).build();
+        self
+    }
+
+    /// Configure request interception starting from the current values instead of defaults.
+    #[doc(hidden)]
+    pub fn intercept_overlay(
+        mut self,
+        f: impl FnOnce(InterceptBuilder) -> InterceptBuilder,
+    ) -> Self {
+        self.config.intercept = f(InterceptBuilder::from_config(self.config.intercept)).build();
+        self
+    }
+
     /// Add a secret via a closure builder.
     ///
     /// ```ignore
@@ -346,6 +383,22 @@ impl NetworkBuilder {
             Ok(limiter) => self.config.rate_limiter = Some(limiter),
             Err(err) => self.errors.push(err),
         }
+        self
+    }
+
+    /// Enable auto-publish: the runtime polls the guest's
+    /// `/proc/net/tcp{,6}` and mirrors each new LISTEN socket onto a host
+    /// listener (Lima-style). Uses the default poll interval (2s) and host
+    /// bind (`127.0.0.1`). For non-default values use
+    /// [`Self::auto_publish_with`].
+    pub fn auto_publish(mut self) -> Self {
+        self.config.auto_publish = Some(AutoPublishConfig::default());
+        self
+    }
+
+    /// Enable auto-publish with explicit config (poll interval, host bind).
+    pub fn auto_publish_with(mut self, cfg: AutoPublishConfig) -> Self {
+        self.config.auto_publish = Some(cfg);
         self
     }
 
@@ -535,6 +588,73 @@ impl TlsBuilder {
     }
 }
 
+impl InterceptBuilder {
+    /// Start building request-interception configuration.
+    pub fn new() -> Self {
+        Self {
+            config: InterceptConfig::default(),
+        }
+    }
+
+    fn from_config(config: InterceptConfig) -> Self {
+        Self { config }
+    }
+
+    /// Set the subprocess command + args invoked for matched requests.
+    pub fn hook(mut self, argv: Vec<String>) -> Self {
+        self.config.hook = Some(argv);
+        self
+    }
+
+    /// Add a rule that buffers the full request (headers + body) before
+    /// dispatching the hook.
+    pub fn rule(
+        mut self,
+        host: impl Into<String>,
+        method: impl Into<String>,
+        path_prefix: impl Into<String>,
+    ) -> Self {
+        self.config.rules.push(InterceptRule {
+            host: host.into(),
+            method: method.into(),
+            path_prefix: path_prefix.into(),
+            dispatch_on_headers: false,
+        });
+        self
+    }
+
+    /// Add a rule that dispatches the hook as soon as headers are buffered,
+    /// then streams the body through unbuffered. Use for uploads that can
+    /// exceed [`Self::max_request_bytes`] (e.g. `git push` pack data),
+    /// where the policy decision only needs the request line.
+    pub fn streaming_rule(
+        mut self,
+        host: impl Into<String>,
+        method: impl Into<String>,
+        path_prefix: impl Into<String>,
+    ) -> Self {
+        self.config.rules.push(InterceptRule {
+            host: host.into(),
+            method: method.into(),
+            path_prefix: path_prefix.into(),
+            dispatch_on_headers: true,
+        });
+        self
+    }
+
+    /// Set the maximum bytes to buffer per intercepted request before
+    /// refusing it. Default: 64 KiB.
+    pub fn max_request_bytes(mut self, max: usize) -> Self {
+        self.config.max_request_bytes = max;
+        self
+    }
+
+    /// Consume the builder and return the configuration.
+    pub fn build(self) -> InterceptConfig {
+        self.config
+    }
+}
+
 impl SecretBuilder {
     /// Start building a secret.
     pub fn new() -> Self {
@@ -578,6 +698,13 @@ impl SecretBuilder {
     pub fn source(mut self, source: SecretSource) -> Self {
         self.source = Some(source);
         self
+    }
+
+    /// Read the value from a host file, re-read on every eligible connection
+    /// so a rotated credential takes effect without a sandbox restart. Thin
+    /// sugar over `.source(SecretSource::File { path })`.
+    pub fn file(self, path: impl Into<std::path::PathBuf>) -> Self {
+        self.source(SecretSource::File { path: path.into() })
     }
 
     /// Set a custom placeholder string.
@@ -944,6 +1071,12 @@ impl Default for TlsBuilder {
     }
 }
 
+impl Default for InterceptBuilder {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl Default for SecretBuilder {
     fn default() -> Self {
         Self::new()
@@ -997,6 +1130,43 @@ mod tests {
             .unwrap_err();
 
         assert!(matches!(err, BuildError::IncompleteInterceptCaConfig));
+    }
+
+    #[test]
+    fn intercept_builder_sets_hook_rules_and_cap() {
+        let cfg = NetworkBuilder::new()
+            .intercept(|i| {
+                i.hook(vec!["agent-vm".into(), "_intercept-hook".into()])
+                    .rule("api.github.com", "GET", "/repos/")
+                    .streaming_rule("github.com", "POST", "/")
+                    .max_request_bytes(4096)
+            })
+            .build()
+            .unwrap();
+
+        assert_eq!(
+            cfg.intercept.hook,
+            Some(vec!["agent-vm".to_string(), "_intercept-hook".to_string()])
+        );
+        assert_eq!(cfg.intercept.max_request_bytes, 4096);
+        assert_eq!(cfg.intercept.rules.len(), 2);
+        assert_eq!(cfg.intercept.rules[0].host, "api.github.com");
+        assert!(!cfg.intercept.rules[0].dispatch_on_headers);
+        assert_eq!(cfg.intercept.rules[1].host, "github.com");
+        assert!(cfg.intercept.rules[1].dispatch_on_headers);
+        assert!(cfg.intercept.is_active());
+    }
+
+    #[test]
+    fn intercept_overlay_starts_from_current_values() {
+        let cfg = NetworkBuilder::new()
+            .intercept(|i| i.hook(vec!["/bin/cat".into()]))
+            .intercept_overlay(|i| i.rule("api.github.com", "GET", "/"))
+            .build()
+            .unwrap();
+
+        assert_eq!(cfg.intercept.hook, Some(vec!["/bin/cat".to_string()]));
+        assert_eq!(cfg.intercept.rules.len(), 1);
     }
 
     #[test]

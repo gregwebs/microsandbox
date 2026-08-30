@@ -46,6 +46,8 @@ pub use image::{
     Image, ImageConfigDetail, ImageDetail, ImageHandle, ImageLayerDetail, ImagePruneReport,
 };
 pub use microsandbox_image::{ImageArchiveFormat, RegistryAuth};
+#[cfg(feature = "net")]
+pub use microsandbox_network;
 pub use microsandbox_protocol as protocol;
 pub use microsandbox_runtime::logging::LogLevel;
 pub use microsandbox_utils::size;
@@ -71,9 +73,9 @@ pub use sandbox::{
 };
 #[cfg(feature = "net")]
 pub use sandbox::{
-    DnsConfigPatch, HostPattern, Nameserver, NetworkAction, NetworkConfigPatch, NetworkPolicy,
-    NetworkPolicyConfigPatch, NetworkProfile, NetworkRule, PublishedPort, SecretConfigPatch,
-    SecretEntryConfigPatch, SecretInjection, TlsConfigPatch,
+    DnsConfigPatch, HostPattern, InterceptConfigPatch, Nameserver, NetworkAction,
+    NetworkConfigPatch, NetworkPolicy, NetworkPolicyConfigPatch, NetworkProfile, NetworkRule,
+    PublishedPort, SecretConfigPatch, SecretEntryConfigPatch, SecretInjection, TlsConfigPatch,
 };
 pub use snapshot::{
     CheckpointSnapshotState, FileSnapshotState, SaveOpts, Snapshot, SnapshotBuilder,

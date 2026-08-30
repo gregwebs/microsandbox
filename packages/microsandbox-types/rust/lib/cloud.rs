@@ -729,9 +729,10 @@ impl From<VolumeMount> for CloudVolumeMount {
 }
 
 /// Cloud network specification: a subset of the domain [`NetworkSpec`].
-/// Interface overrides, host port mapping, DNS, TLS interception, rate limits,
-/// and host-CA trust are not part of this type. `deny_unknown_fields` — posting
-/// an omitted field is an error, not a silent drop.
+/// Interface overrides, host port mapping, DNS, TLS interception, fail-closed
+/// request interception, rate limits, and host-CA trust are not part of this
+/// type. `deny_unknown_fields` — posting an omitted field is an error, not a
+/// silent drop.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
@@ -997,10 +998,19 @@ impl TryFrom<CloudSandboxSpec> for SandboxSpec {
             policy: spec.network.policy,
             dns: None,
             tls: None,
+            // Fail-closed request interception is a local-engine subprocess-hook
+            // mechanism (the hook runs on the host runtime process); the cloud
+            // wire has no host process to run it against, so — like `tls` — it
+            // is not part of `CloudNetworkSpec` and always defaults here.
+            intercept: None,
             secrets: spec.network.secrets.map(Into::into),
             max_connections: spec.network.max_connections,
             rate_limiter: None,
             trust_host_cas: false,
+            // Auto-publish polls the guest over the local agent.sock relay,
+            // which has no cloud-wire equivalent — like `tls`/`intercept`
+            // above, it is a local-engine-only feature and always absent here.
+            auto_publish: None,
         };
         let runtime = SandboxRuntimeOptions {
             workdir: spec.runtime.workdir,
@@ -1203,6 +1213,14 @@ pub enum CloudSecretSource {
         /// Store-specific secret reference.
         reference: String,
     },
+    /// Read from a host file, re-read per connection. Twin of
+    /// [`SecretSource::File`].
+    File {
+        /// Absolute host path to the credential file.
+        #[cfg_attr(feature = "ts", ts(type = "string"))]
+        #[cfg_attr(feature = "utoipa", schema(value_type = String))]
+        path: std::path::PathBuf,
+    },
 }
 
 /// Host allowlist pattern for cloud secrets. Twin of [`HostPattern`], with the
@@ -1306,6 +1324,7 @@ impl From<SecretSource> for CloudSecretSource {
         match source {
             SecretSource::Env { var } => Self::Env { var },
             SecretSource::Store { reference } => Self::Store { reference },
+            SecretSource::File { path } => Self::File { path },
         }
     }
 }
@@ -1315,6 +1334,7 @@ impl From<CloudSecretSource> for SecretSource {
         match source {
             CloudSecretSource::Env { var } => Self::Env { var },
             CloudSecretSource::Store { reference } => Self::Store { reference },
+            CloudSecretSource::File { path } => Self::File { path },
         }
     }
 }
@@ -1462,6 +1482,27 @@ mod tests {
             .unwrap(),
             serde_json::json!({"type": "passthrough", "hosts": [{"type": "any"}]})
         );
+    }
+
+    #[test]
+    fn cloud_secret_source_file_wire_form_and_round_trip() {
+        assert_eq!(
+            serde_json::to_value(CloudSecretSource::File {
+                path: "/run/creds/token".into(),
+            })
+            .unwrap(),
+            serde_json::json!({"type": "file", "path": "/run/creds/token"})
+        );
+
+        let domain = SecretSource::File {
+            path: "/run/creds/token".into(),
+        };
+        let cloud: CloudSecretSource = domain.clone().into();
+        assert!(
+            matches!(cloud, CloudSecretSource::File { ref path } if path == std::path::Path::new("/run/creds/token"))
+        );
+        let back: SecretSource = cloud.into();
+        assert_eq!(back, domain);
     }
 
     #[test]

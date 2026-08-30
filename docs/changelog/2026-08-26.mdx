@@ -1,0 +1,20 @@
+---
+title: "Week of August 26, 2026"
+description: "File-backed rotating secrets."
+icon: "bolt"
+---
+
+## New features
+
+**File-backed (rotating) secrets**
+
+Secrets can now be bound to a host file instead of an environment variable. The network engine re-reads the file for every eligible connection, so rotating the credential on disk (`echo -n new-token > /run/creds/token`) takes effect on the next connection with no `msb modify` call and no sandbox restart. Only the file path is stored in the durable sandbox config; the bytes are never persisted, logged, or sent to the guest. A missing, unreadable, symlinked, oversized (over 64 KiB), empty, or non-UTF-8 file fails closed: the placeholder is blocked for that connection, even under a `Passthrough` violation policy for the host.
+
+```yaml
+TOKEN:
+  value:
+    $msb_file: /run/creds/token
+  allow: ["api.example.com"]
+```
+
+See [Secrets](/sandboxes/secrets#file-backed-rotating-secrets).

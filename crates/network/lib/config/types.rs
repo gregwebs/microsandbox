@@ -10,6 +10,7 @@ use microsandbox_types::{NetworkRateLimiterConfig, TlsConfig};
 use serde::{Deserialize, Serialize};
 
 use crate::dns::Nameserver;
+use crate::intercept::config::InterceptConfig;
 use crate::policy::NetworkPolicy;
 use crate::secrets::config::SecretsConfig;
 
@@ -60,6 +61,10 @@ pub struct NetworkConfig {
     #[serde(default)]
     pub tls: TlsConfig,
 
+    /// Fail-closed request-interception settings.
+    #[serde(default)]
+    pub intercept: InterceptConfig,
+
     /// Secret injection settings.
     #[serde(default)]
     pub secrets: SecretsConfig,
@@ -80,6 +85,29 @@ pub struct NetworkConfig {
     /// this is explicitly enabled. Default: false.
     #[serde(default)]
     pub trust_host_cas: bool,
+
+    /// Auto-detect TCP LISTEN sockets inside the guest and mirror
+    /// each on `127.0.0.1:<same port>` on the host (Lima-style). The
+    /// runtime spawns a poll task on top of the smoltcp stack that
+    /// reads `/proc/net/tcp{,6}` over the agent.sock channel every
+    /// few seconds, diff-drives the [`crate::publisher::PortPublisher`]
+    /// via [`PortCommand`](crate::publisher::PortCommand), and emits
+    /// `MessageType::PortEvent` frames for SDK clients to observe.
+    /// Default: `None` (disabled).
+    #[serde(default)]
+    pub auto_publish: Option<AutoPublishConfig>,
+}
+
+/// Configuration for the runtime auto-publish loop.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AutoPublishConfig {
+    /// Poll interval in milliseconds. Default 2000 (matches Lima).
+    #[serde(default = "default_auto_publish_poll_ms")]
+    pub poll_interval_ms: u64,
+
+    /// Host bind address for mirrored listeners. Default `127.0.0.1`.
+    #[serde(default = "default_auto_publish_host_bind")]
+    pub host_bind: IpAddr,
 }
 
 /// Optional overrides for the guest interface.
@@ -177,10 +205,12 @@ impl Default for NetworkConfig {
             policy: NetworkPolicy::default(),
             dns: DnsConfig::default(),
             tls: TlsConfig::default(),
+            intercept: InterceptConfig::default(),
             secrets: SecretsConfig::default(),
             max_connections: None,
             rate_limiter: None,
             trust_host_cas: false,
+            auto_publish: None,
         }
     }
 }
@@ -195,12 +225,29 @@ impl Default for DnsConfig {
     }
 }
 
+impl Default for AutoPublishConfig {
+    fn default() -> Self {
+        Self {
+            poll_interval_ms: default_auto_publish_poll_ms(),
+            host_bind: default_auto_publish_host_bind(),
+        }
+    }
+}
+
 //--------------------------------------------------------------------------------------------------
 // Functions
 //--------------------------------------------------------------------------------------------------
 
 fn default_true() -> bool {
     true
+}
+
+fn default_auto_publish_poll_ms() -> u64 {
+    2000
+}
+
+fn default_auto_publish_host_bind() -> IpAddr {
+    IpAddr::V4(Ipv4Addr::LOCALHOST)
 }
 
 fn default_host_bind() -> IpAddr {
@@ -217,7 +264,7 @@ fn default_query_timeout_ms() -> u64 {
 
 #[cfg(test)]
 mod tests {
-    use super::{InterfaceOverrides, NetworkConfig, PortProtocol};
+    use super::{AutoPublishConfig, InterfaceOverrides, NetworkConfig, PortProtocol};
     use crate::dns::Nameserver;
     use crate::policy::{Destination, NetworkPolicy, Rule};
 
@@ -247,20 +294,61 @@ mod tests {
         config.interface.ipv4_address = Some("172.16.0.2".parse().unwrap());
         config.interface.ipv4_pool = Some("172.16.0.0/12".parse().unwrap());
         config.interface.mac = Some([0x02, 0, 0, 0, 0, 0x01]);
+        config.intercept = crate::intercept::config::InterceptConfig {
+            rules: vec![crate::intercept::config::InterceptRule {
+                host: "api.github.com".to_string(),
+                method: "GET".to_string(),
+                path_prefix: "/repos/".to_string(),
+                dispatch_on_headers: false,
+            }],
+            hook: Some(vec!["agent-vm".to_string(), "_intercept-hook".to_string()]),
+            max_request_bytes: 32 * 1024,
+        };
 
         // The engine's real serialization of each subdocument.
         let policy_json = serde_json::to_value(&config.policy).unwrap();
         let dns_json = serde_json::to_value(&config.dns).unwrap();
         let iface_json = serde_json::to_value(&config.interface).unwrap();
+        let intercept_json = serde_json::to_value(&config.intercept).unwrap();
 
         // It must deserialize into the wire types and re-serialize losslessly
-        // (policy/dns serialize every field on both sides, so compare raw JSON).
+        // (policy/dns/intercept serialize every field on both sides, so
+        // compare raw JSON).
         let wire_policy: microsandbox_types::NetworkPolicy =
             serde_json::from_value(policy_json.clone()).unwrap();
         let wire_dns: microsandbox_types::DnsConfig =
             serde_json::from_value(dns_json.clone()).unwrap();
+        let wire_intercept: microsandbox_types::InterceptConfig =
+            serde_json::from_value(intercept_json.clone()).unwrap();
         assert_eq!(policy_json, serde_json::to_value(&wire_policy).unwrap());
         assert_eq!(dns_json, serde_json::to_value(&wire_dns).unwrap());
+        assert_eq!(
+            intercept_json,
+            serde_json::to_value(&wire_intercept).unwrap()
+        );
+
+        // The full `NetworkConfig` <-> `NetworkSpec` round trip must also
+        // carry `intercept` through — this is the path a live-modify /
+        // sandbox-spec update actually takes (AC #4).
+        let spec: microsandbox_types::NetworkSpec =
+            serde_json::from_value(serde_json::to_value(&config).unwrap()).unwrap();
+        assert_eq!(
+            intercept_json,
+            serde_json::to_value(
+                spec.intercept
+                    .as_ref()
+                    .expect("intercept subdocument present")
+            )
+            .unwrap()
+        );
+        let back: NetworkConfig =
+            serde_json::from_value(serde_json::to_value(&spec).unwrap()).unwrap();
+        assert_eq!(back.intercept.hook, config.intercept.hook);
+        assert_eq!(back.intercept.rules.len(), config.intercept.rules.len());
+        assert_eq!(
+            back.intercept.max_request_bytes,
+            config.intercept.max_request_bytes
+        );
 
         // `InterfaceOverrides` skips `None` fields on the wire side, so prove
         // losslessness by round-tripping back into the engine type.
@@ -300,6 +388,18 @@ mod tests {
         assert!(config.rate_limiter.is_none());
     }
 
+    /// A config persisted before request interception existed must keep
+    /// deserializing, and the resulting `InterceptConfig` must be inactive
+    /// (no extension installed at engine startup) — this is the "absent"
+    /// half of "no behavior change when absent".
+    #[test]
+    fn config_without_intercept_field_stays_inactive() {
+        let config: NetworkConfig = serde_json::from_value(serde_json::json!({})).unwrap();
+        assert!(!config.intercept.is_active());
+        assert!(config.intercept.rules.is_empty());
+        assert!(config.intercept.hook.is_none());
+    }
+
     #[test]
     fn rate_limiters_survive_the_wire_spec_round_trip() {
         use microsandbox_types::{NetworkRateLimiterConfig, RateLimiterConfig, TokenBucketConfig};
@@ -333,6 +433,44 @@ mod tests {
         let back: NetworkConfig =
             serde_json::from_value(serde_json::to_value(&spec).unwrap()).unwrap();
         assert_eq!(back.rate_limiter, config.rate_limiter);
+    }
+
+    /// `auto_publish` must survive the `NetworkConfig` <-> `NetworkSpec`
+    /// round trip — this is the path `Sandbox` persistence and spawn take
+    /// (`SandboxConfig::{local_network_config, set_local_network_config}`),
+    /// so a wire-twin field that's missing or shape-mismatched would make
+    /// the setting silently vanish before the guest even boots.
+    #[test]
+    fn auto_publish_survives_the_wire_spec_round_trip() {
+        let config = NetworkConfig {
+            auto_publish: Some(AutoPublishConfig {
+                poll_interval_ms: 1500,
+                host_bind: "0.0.0.0".parse().unwrap(),
+            }),
+            ..NetworkConfig::default()
+        };
+
+        let spec: microsandbox_types::NetworkSpec =
+            serde_json::from_value(serde_json::to_value(&config).unwrap()).unwrap();
+        let spec_auto_publish = spec
+            .auto_publish
+            .clone()
+            .expect("auto_publish present on the spec");
+        assert_eq!(spec_auto_publish.poll_interval_ms, 1500);
+        assert_eq!(spec_auto_publish.host_bind, "0.0.0.0");
+
+        let back: NetworkConfig =
+            serde_json::from_value(serde_json::to_value(&spec).unwrap()).unwrap();
+        assert_eq!(back.auto_publish, config.auto_publish);
+    }
+
+    /// A config persisted before auto-publish existed must keep
+    /// deserializing, with auto-publish absent (the "no behavior change
+    /// when absent" half of the compatibility guarantee).
+    #[test]
+    fn config_without_auto_publish_field_stays_disabled() {
+        let config: NetworkConfig = serde_json::from_value(serde_json::json!({})).unwrap();
+        assert!(config.auto_publish.is_none());
     }
 
     #[test]

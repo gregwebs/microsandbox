@@ -119,8 +119,10 @@ pub struct NetworkConfigPatch {
     ports: Option<Vec<microsandbox_network::config::PublishedPort>>,
     dns: DnsConfigPatch,
     tls: TlsConfigPatch,
+    intercept: InterceptConfigPatch,
     trust_host_cas: Option<bool>,
     max_connections: Option<usize>,
+    auto_publish: Option<microsandbox_network::config::AutoPublishConfig>,
 }
 
 /// Sparse network-policy configuration.
@@ -149,6 +151,15 @@ pub struct TlsConfigPatch {
     bypass: Option<Vec<String>>,
     verify_upstream: Option<bool>,
     block_quic: Option<bool>,
+}
+
+/// Sparse fail-closed request-interception configuration.
+#[cfg(feature = "net")]
+#[derive(Debug, Clone, Default)]
+pub struct InterceptConfigPatch {
+    hook: Option<Vec<String>>,
+    rules: Option<Vec<microsandbox_network::intercept::config::InterceptRule>>,
+    max_request_bytes: Option<usize>,
 }
 
 /// Sparse protected-secret configuration, keyed by guest environment variable name.
@@ -704,6 +715,12 @@ impl NetworkConfigPatch {
         self
     }
 
+    /// Overlay fail-closed request-interception fields.
+    pub fn intercept(mut self, value: InterceptConfigPatch) -> Self {
+        self.intercept = self.intercept.overlay(value);
+        self
+    }
+
     /// Set whether host certificate authorities are trusted in the guest.
     pub fn trust_host_cas(mut self, enabled: bool) -> Self {
         self.trust_host_cas = Some(enabled);
@@ -716,14 +733,24 @@ impl NetworkConfigPatch {
         self
     }
 
+    /// Enable (or reconfigure) auto-publish: mirror guest TCP LISTEN
+    /// sockets onto host listeners. See
+    /// [`AutoPublishConfig`](microsandbox_network::config::AutoPublishConfig).
+    pub fn auto_publish(mut self, value: microsandbox_network::config::AutoPublishConfig) -> Self {
+        self.auto_publish = Some(value);
+        self
+    }
+
     /// Overlay another network patch.
     pub fn overlay(mut self, higher: Self) -> Self {
         self.policy = self.policy.overlay(higher.policy);
         replace(&mut self.ports, higher.ports);
         self.dns = self.dns.overlay(higher.dns);
         self.tls = self.tls.overlay(higher.tls);
+        self.intercept = self.intercept.overlay(higher.intercept);
         replace(&mut self.trust_host_cas, higher.trust_host_cas);
         replace(&mut self.max_connections, higher.max_connections);
+        replace(&mut self.auto_publish, higher.auto_publish);
         self
     }
 
@@ -732,8 +759,10 @@ impl NetworkConfigPatch {
         let ports = self.ports;
         let dns = self.dns;
         let tls = self.tls;
+        let intercept = self.intercept;
         let trust_host_cas = self.trust_host_cas;
         let max_connections = self.max_connections;
+        let auto_publish = self.auto_publish;
 
         if policy.is_some() {
             builder = builder.config_network_rules(configured_rules);
@@ -785,11 +814,34 @@ impl NetworkConfigPatch {
                     value
                 });
             }
+            if intercept.is_present() {
+                network = network.intercept_overlay(move |mut value| {
+                    if let Some(hook) = intercept.hook {
+                        value = value.hook(hook);
+                    }
+                    if let Some(rules) = intercept.rules {
+                        for rule in rules {
+                            value = if rule.dispatch_on_headers {
+                                value.streaming_rule(rule.host, rule.method, rule.path_prefix)
+                            } else {
+                                value.rule(rule.host, rule.method, rule.path_prefix)
+                            };
+                        }
+                    }
+                    if let Some(max) = intercept.max_request_bytes {
+                        value = value.max_request_bytes(max);
+                    }
+                    value
+                });
+            }
             if let Some(enabled) = trust_host_cas {
                 network = network.trust_host_cas(enabled);
             }
             if let Some(max) = max_connections {
                 network = network.max_connections(max);
+            }
+            if let Some(cfg) = auto_publish {
+                network = network.auto_publish_with(cfg);
             }
             network
         });
@@ -939,6 +991,53 @@ impl TlsConfigPatch {
 }
 
 #[cfg(feature = "net")]
+impl InterceptConfigPatch {
+    /// Create an empty request-interception patch.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Set the subprocess command + args invoked for matched requests.
+    pub fn hook(mut self, argv: Vec<String>) -> Self {
+        self.hook = Some(argv);
+        self
+    }
+
+    /// Replace the match rules carried by this patch object. Overlaying this
+    /// patch onto another (`overlay`/`intercept`) replaces the lower
+    /// patch's rules wholesale rather than merging the two lists — the
+    /// "append" only happens later, at `apply_to` time, where each rule is
+    /// added one-by-one (via `.rule()`/`.streaming_rule()`) onto the
+    /// builder's own rule list, which starts empty for a fresh patch
+    /// application.
+    pub fn rules(
+        mut self,
+        value: Vec<microsandbox_network::intercept::config::InterceptRule>,
+    ) -> Self {
+        self.rules = Some(value);
+        self
+    }
+
+    /// Set the maximum bytes to buffer per intercepted request.
+    pub fn max_request_bytes(mut self, value: usize) -> Self {
+        self.max_request_bytes = Some(value);
+        self
+    }
+
+    /// Overlay another request-interception patch.
+    pub fn overlay(mut self, higher: Self) -> Self {
+        replace(&mut self.hook, higher.hook);
+        replace(&mut self.rules, higher.rules);
+        replace(&mut self.max_request_bytes, higher.max_request_bytes);
+        self
+    }
+
+    fn is_present(&self) -> bool {
+        self.hook.is_some() || self.rules.is_some() || self.max_request_bytes.is_some()
+    }
+}
+
+#[cfg(feature = "net")]
 impl SecretConfigPatch {
     /// Create an empty secret patch.
     pub fn new() -> Self {
@@ -1016,6 +1115,13 @@ impl SecretEntryConfigPatch {
     pub fn source(mut self, value: SecretSource) -> Self {
         self.material = Some(SecretMaterial::Source(value));
         self
+    }
+
+    /// Read the value from a host file, re-read on every eligible connection
+    /// so a rotated credential takes effect without a sandbox restart. Thin
+    /// sugar over `.source(SecretSource::File { path })`.
+    pub fn file(self, path: impl Into<std::path::PathBuf>) -> Self {
+        self.source(SecretSource::File { path: path.into() })
     }
 
     /// Replace allowed host patterns.
@@ -1201,5 +1307,44 @@ mod tests {
             .await
             .unwrap_err();
         assert!(explicit.to_string().contains("mutually exclusive"));
+    }
+
+    #[tokio::test]
+    async fn intercept_patch_carries_hook_rules_and_cap_into_the_spec() {
+        use microsandbox_network::intercept::config::InterceptRule;
+
+        let patch = SandboxConfigPatch::new()
+            .image(SandboxImagePatch::Image("alpine".into()))
+            .network(
+                NetworkConfigPatch::new().intercept(
+                    InterceptConfigPatch::new()
+                        .hook(vec!["/bin/cat".to_string()])
+                        .rules(vec![InterceptRule {
+                            host: "api.github.com".into(),
+                            method: "GET".into(),
+                            path_prefix: "/repos/".into(),
+                            dispatch_on_headers: false,
+                        }])
+                        .max_request_bytes(4096),
+                ),
+            );
+
+        let config = SandboxBuilder::new("patch-test")
+            .configure(patch)
+            .build()
+            .await
+            .unwrap();
+
+        let intercept = config
+            .spec
+            .network
+            .intercept
+            .as_ref()
+            .expect("intercept subdocument present");
+        assert_eq!(intercept.hook, Some(vec!["/bin/cat".to_string()]));
+        assert_eq!(intercept.max_request_bytes, 4096);
+        assert_eq!(intercept.rules.len(), 1);
+        assert_eq!(intercept.rules[0].host, "api.github.com");
+        assert!(intercept.is_active());
     }
 }

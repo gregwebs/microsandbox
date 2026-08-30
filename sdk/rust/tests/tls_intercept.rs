@@ -5,6 +5,7 @@ use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::Arc;
 use std::time::Duration;
 
+use microsandbox::sandbox::SecretSource;
 use microsandbox::{NetworkPolicy, Sandbox};
 use rcgen::CertificateParams;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
@@ -91,6 +92,72 @@ impl Drop for HostHttps {
     }
 }
 
+/// HTTPS fixture that accepts and records several *sequential* connections on
+/// the same port, so a test can assert on request N+1 after mutating host
+/// state (e.g. rotating a file-backed secret) between requests N and N+1.
+struct HostHttpsSequence {
+    port: u16,
+    bodies: tokio::sync::mpsc::Receiver<io::Result<Vec<u8>>>,
+    handle: Option<JoinHandle<()>>,
+}
+
+impl HostHttpsSequence {
+    /// Bind once and accept up to `count` connections in order.
+    async fn start(count: usize) -> io::Result<Self> {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+
+        let v4_listener = TcpListener::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0))).await?;
+        let port = v4_listener.local_addr()?.port();
+        let v6_listener = TcpListener::bind(SocketAddr::from((Ipv6Addr::LOCALHOST, port))).await?;
+        let acceptor = TlsAcceptor::from(test_server_config());
+        let (tx, rx) = tokio::sync::mpsc::channel(count.max(1));
+
+        let handle = tokio::spawn(async move {
+            for _ in 0..count {
+                let accepted = tokio::select! {
+                    accept = v4_listener.accept() => accept,
+                    accept = v6_listener.accept() => accept,
+                };
+                let result = async {
+                    let (stream, _) = accepted?;
+                    let tls = acceptor.accept(stream).await?;
+                    handle_https_request(tls).await.map(|req| req.body)
+                }
+                .await;
+                if tx.send(result).await.is_err() {
+                    return;
+                }
+            }
+        });
+
+        Ok(Self {
+            port,
+            bodies: rx,
+            handle: Some(handle),
+        })
+    }
+
+    fn port(&self) -> u16 {
+        self.port
+    }
+
+    /// Wait for the next connection's body, in accept order.
+    async fn next_body(&mut self) -> io::Result<Vec<u8>> {
+        self.bodies
+            .recv()
+            .await
+            .ok_or_else(|| io::Error::other("sequence fixture closed with no more connections"))?
+    }
+}
+
+impl Drop for HostHttpsSequence {
+    fn drop(&mut self) {
+        if let Some(handle) = self.handle.take() {
+            handle.abort();
+        }
+    }
+}
+
 //--------------------------------------------------------------------------------------------------
 // Functions
 //--------------------------------------------------------------------------------------------------
@@ -124,6 +191,101 @@ async fn spawn_secret_curl_sandbox(name: &str, port: u16, allowed_host: &str) ->
         .secret(|s| {
             s.env("API_KEY")
                 .value("real-secret")
+                .allow_host(allowed_host)
+                .inject_body(true)
+        })
+        .network(|n| {
+            n.policy(NetworkPolicy::allow_all())
+                .tls(|t| t.intercepted_ports(vec![port]).verify_upstream(false))
+        })
+        .create()
+        .await
+        .expect("create sandbox")
+}
+
+/// Boot a curl sandbox with one body-injected secret, TLS interception, and
+/// fail-closed request interception on the fixture port: only `POST
+/// /allowed` on the fixture host is policed by `hook_argv`. `POST`, not
+/// `GET`, because every caller uploads a body via `curl --data-binary`,
+/// which curl sends as a `POST` unless overridden.
+async fn spawn_intercept_curl_sandbox(
+    name: &str,
+    port: u16,
+    allowed_host: &str,
+    hook_argv: Vec<String>,
+) -> Sandbox {
+    let allowed_host = allowed_host.to_string();
+    Sandbox::builder(name)
+        .image(CURL_IMAGE)
+        .cpus(1)
+        .memory(256)
+        .user("0")
+        .replace()
+        .secret(|s| {
+            s.env("API_KEY")
+                .value("real-secret")
+                .allow_host(allowed_host)
+                .inject_body(true)
+        })
+        .network(|n| {
+            n.policy(NetworkPolicy::allow_all())
+                .tls(|t| t.intercepted_ports(vec![port]).verify_upstream(false))
+                .intercept(|i| {
+                    i.hook(hook_argv)
+                        .rule("host.microsandbox.internal", "POST", "/allowed")
+                })
+        })
+        .create()
+        .await
+        .expect("create sandbox")
+}
+
+/// Boot a curl sandbox with `dispatch_on_headers` request interception on
+/// the fixture port: the hook fires as soon as headers are buffered, and
+/// the body then streams to upstream unbuffered — used to prove a body far
+/// larger than `max_request_bytes` still reaches upstream (AC #1).
+async fn spawn_streaming_intercept_curl_sandbox(name: &str, port: u16) -> Sandbox {
+    Sandbox::builder(name)
+        .image(CURL_IMAGE)
+        .cpus(1)
+        .memory(256)
+        .user("0")
+        .replace()
+        .network(|n| {
+            n.policy(NetworkPolicy::allow_all())
+                .tls(|t| t.intercepted_ports(vec![port]).verify_upstream(false))
+                .intercept(|i| {
+                    i.hook(vec!["/bin/cat".to_string()])
+                        .max_request_bytes(4096)
+                        .streaming_rule("host.microsandbox.internal", "POST", "/upload")
+                })
+        })
+        .create()
+        .await
+        .expect("create sandbox")
+}
+
+/// Boot a curl sandbox with one file-backed, body-injected secret and TLS
+/// interception on the fixture port. `secret_path` is re-read by the network
+/// engine on every eligible connection, so rotating the file on the host
+/// takes effect on the sandbox's next request without a restart.
+async fn spawn_file_secret_curl_sandbox(
+    name: &str,
+    port: u16,
+    allowed_host: &str,
+    secret_path: &std::path::Path,
+) -> Sandbox {
+    let allowed_host = allowed_host.to_string();
+    let secret_path = secret_path.to_path_buf();
+    Sandbox::builder(name)
+        .image(CURL_IMAGE)
+        .cpus(1)
+        .memory(256)
+        .user("0")
+        .replace()
+        .secret(|s| {
+            s.env("API_KEY")
+                .source(SecretSource::File { path: secret_path })
                 .allow_host(allowed_host)
                 .inject_body(true)
         })
@@ -453,6 +615,138 @@ curl -k --http1.1 -m 30 -sS -o /tmp/response \
 }
 
 #[msb_test]
+async fn file_backed_secret_substitutes_current_file_contents() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let secret_path = dir.path().join("token");
+    std::fs::write(&secret_path, "file-secret-v1\n").expect("write fixture secret file");
+
+    let mut server = HostHttps::start().await.expect("https fixture");
+    let port = server.port();
+    let name = "file-secret-substitutes";
+    let sb = spawn_file_secret_curl_sandbox(name, port, "host.microsandbox.internal", &secret_path)
+        .await;
+
+    let out = sb
+        .shell(format!(
+            r#"set -eu
+body=/tmp/secret-body
+printf 'token=%s' "$API_KEY" > "$body"
+curl -k --http1.1 -m 30 -sS -o /tmp/response \
+  -w 'code=%{{http_code}} upload=%{{size_upload}}' \
+  -H 'content-type: text/plain' \
+  --data-binary @"$body" \
+  https://host.microsandbox.internal:{port}/secret
+"#
+        ))
+        .await
+        .expect("curl file secret fixture");
+
+    let stdout = out.stdout().expect("utf8 stdout");
+    assert!(
+        stdout.contains("code=200"),
+        "expected curl to receive 200, stdout: {stdout}, stderr: {}",
+        out.stderr().unwrap_or_default()
+    );
+
+    // The host received the file's current bytes (trailing newline trimmed).
+    let received = server.received_body().await.expect("read fixture body");
+    assert_eq!(received, b"token=file-secret-v1");
+
+    // The durable sandbox config stores only the path; the credential bytes
+    // never reach the database.
+    let handle = Sandbox::get(name).await.expect("get sandbox handle");
+    let config_json = handle.config_json();
+    assert!(!config_json.contains("file-secret-v1"));
+    assert!(config_json.contains(secret_path.to_str().unwrap()));
+
+    teardown(sb, name).await;
+}
+
+#[msb_test]
+async fn file_backed_secret_rotation_takes_effect_without_restart() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let secret_path = dir.path().join("token");
+    std::fs::write(&secret_path, "rotate-v1\n").expect("write fixture secret file");
+
+    let mut server = HostHttpsSequence::start(2).await.expect("https fixture");
+    let port = server.port();
+    let name = "file-secret-rotation";
+    let sb = spawn_file_secret_curl_sandbox(name, port, "host.microsandbox.internal", &secret_path)
+        .await;
+
+    let curl = |path: &str| {
+        format!(
+            r#"set -eu
+body=/tmp/secret-body
+printf 'token=%s' "$API_KEY" > "$body"
+curl -k --http1.1 -m 30 -sS -o /tmp/response \
+  -w 'code=%{{http_code}}' \
+  -H 'content-type: text/plain' \
+  --data-binary @"$body" \
+  https://host.microsandbox.internal:{port}/{path}
+"#
+        )
+    };
+
+    sb.shell(curl("first")).await.expect("first curl");
+    let first = server.next_body().await.expect("read first fixture body");
+    assert_eq!(first, b"token=rotate-v1");
+
+    // Rotate by editing the file directly. No control-socket call, no restart.
+    std::fs::write(&secret_path, "rotate-v2\n").expect("rewrite fixture secret file");
+
+    sb.shell(curl("second")).await.expect("second curl");
+    let second = server.next_body().await.expect("read second fixture body");
+    assert_eq!(second, b"token=rotate-v2");
+
+    teardown(sb, name).await;
+}
+
+#[msb_test]
+async fn file_backed_secret_missing_file_blocks_request() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let secret_path = dir.path().join("does-not-exist");
+
+    let mut server = HostHttps::start().await.expect("https fixture");
+    let port = server.port();
+    let name = "file-secret-missing";
+    let sb = spawn_file_secret_curl_sandbox(name, port, "host.microsandbox.internal", &secret_path)
+        .await;
+
+    let out = sb
+        .shell(format!(
+            r#"set +e
+body=/tmp/secret-body
+printf 'token=%s' "$API_KEY" > "$body"
+curl -k --http1.1 -m 10 -sS -o /tmp/response \
+  -w 'code=%{{http_code}}' \
+  -H 'content-type: text/plain' \
+  --data-binary @"$body" \
+  https://host.microsandbox.internal:{port}/secret
+status=$?
+echo "status=$status"
+"#
+        ))
+        .await
+        .expect("curl missing file secret fixture");
+
+    let stdout = out.stdout().expect("utf8 stdout");
+    assert!(
+        !stdout.contains("status=0"),
+        "expected curl to fail (placeholder blocked), stdout: {stdout}, stderr: {}",
+        out.stderr().unwrap_or_default()
+    );
+
+    let received = tokio::time::timeout(Duration::from_secs(5), server.received_body()).await;
+    assert!(
+        received.is_err() || received.expect("timeout checked").is_err(),
+        "upstream fixture should not receive a valid HTTP request when the secret file is missing"
+    );
+
+    teardown(sb, name).await;
+}
+
+#[msb_test]
 async fn tls_intercept_substitutes_secret_in_chunked_body() {
     let mut server = HostHttps::start().await.expect("https fixture");
     let port = server.port();
@@ -628,6 +922,230 @@ echo "status=$status"
         received.is_err() || received.expect("timeout checked").is_err(),
         "upstream fixture should not receive a valid HTTP request"
     );
+
+    teardown(sb, name).await;
+}
+
+/// AC "credentials are not exposed to unauthorized destinations": a policed
+/// rule (`GET /allowed`) does not cover `/denied` on the same host. Even
+/// though a secret is configured to allow that host, the mismatched request
+/// must be refused with a synthesized 403 and the fixture upstream must
+/// never see it — proving the secret's host allow-list alone is not enough
+/// to move a credential once interception is policing that host.
+#[msb_test]
+async fn intercept_refuses_unpoliced_request_with_credentials() {
+    let mut server = HostHttps::start().await.expect("https fixture");
+    let port = server.port();
+    let name = "intercept-refuses-unpoliced";
+    let sb = spawn_intercept_curl_sandbox(
+        name,
+        port,
+        "host.microsandbox.internal",
+        vec!["/bin/cat".to_string()],
+    )
+    .await;
+
+    let out = sb
+        .shell(format!(
+            r#"set +e
+body=/tmp/secret-body
+printf 'token=%s' "$API_KEY" > "$body"
+curl -k --http1.1 -m 10 -sS -o /tmp/response \
+  -w 'code=%{{http_code}}' \
+  -H 'content-type: text/plain' \
+  --data-binary @"$body" \
+  https://host.microsandbox.internal:{port}/denied
+status=$?
+echo "status=$status"
+"#
+        ))
+        .await
+        .expect("curl denied path fixture");
+
+    let stdout = out.stdout().expect("utf8 stdout");
+    assert!(
+        stdout.contains("code=403"),
+        "expected the interceptor's synthesized 403, stdout: {stdout}, stderr: {}",
+        out.stderr().unwrap_or_default()
+    );
+
+    let received = tokio::time::timeout(Duration::from_secs(5), server.received_body()).await;
+    assert!(
+        received.is_err() || received.expect("timeout checked").is_err(),
+        "upstream fixture must never receive a request the interceptor refused"
+    );
+
+    teardown(sb, name).await;
+}
+
+/// The passthrough half: a matched rule whose hook approves (empty stdout)
+/// must let the request reach upstream, still carrying the network
+/// secret-substitution layer's real credential — proving interception and
+/// secret substitution compose rather than one disabling the other.
+#[msb_test]
+async fn intercept_passthrough_forwards_after_hook_approval() {
+    let mut server = HostHttps::start().await.expect("https fixture");
+    let port = server.port();
+    let name = "intercept-passthrough-approval";
+    // Reads and discards stdin, writes nothing to stdout: the empty-stdout
+    // passthrough shape from the hook contract.
+    let sb = spawn_intercept_curl_sandbox(
+        name,
+        port,
+        "host.microsandbox.internal",
+        vec![
+            "/bin/sh".to_string(),
+            "-c".to_string(),
+            "cat >/dev/null".to_string(),
+        ],
+    )
+    .await;
+
+    let out = sb
+        .shell(format!(
+            r#"set -eu
+body=/tmp/secret-body
+printf 'token=%s' "$API_KEY" > "$body"
+curl -k --http1.1 -m 30 -sS -o /tmp/response \
+  -w 'code=%{{http_code}} upload=%{{size_upload}}' \
+  -H 'content-type: text/plain' \
+  --data-binary @"$body" \
+  https://host.microsandbox.internal:{port}/allowed
+"#
+        ))
+        .await
+        .expect("curl allowed path fixture");
+
+    let stdout = out.stdout().expect("utf8 stdout");
+    assert!(
+        stdout.contains("code=200"),
+        "expected the hook-approved request to reach upstream, stdout: {stdout}, stderr: {}",
+        out.stderr().unwrap_or_default()
+    );
+
+    let received = server.received_body().await.expect("read fixture body");
+    assert_eq!(received, b"token=real-secret");
+
+    teardown(sb, name).await;
+}
+
+/// AC #3: a failed or bypassed request cannot disable interception for
+/// later requests. The first connection sends an unmatched request and gets
+/// refused; a second, independent connection to the same policed host is
+/// still fully policed and a matching request still reaches the hook.
+///
+/// Uses [`HostHttpsSequence`], not the single-shot [`HostHttps`]: the relay
+/// dials and TLS-handshakes the upstream fixture *before* the interceptor
+/// has seen any plaintext (interception only inspects already-decrypted
+/// bytes), so even a refused request consumes one upstream accept — it just
+/// never writes any request bytes over it. A single-shot fixture would have
+/// that first, byte-less connection consume its only accept and starve the
+/// second, actually-approved connection.
+#[msb_test]
+async fn intercept_survives_multiple_requests_on_one_connection() {
+    let mut server = HostHttpsSequence::start(2).await.expect("https fixture");
+    let port = server.port();
+    let name = "intercept-survives-multiple-requests";
+    let sb = spawn_intercept_curl_sandbox(
+        name,
+        port,
+        "host.microsandbox.internal",
+        vec!["/bin/cat".to_string()],
+    )
+    .await;
+
+    let out = sb
+        .shell(format!(
+            r#"set -eu
+body=/tmp/secret-body
+printf 'token=%s' "$API_KEY" > "$body"
+
+# First connection: unmatched path, must be refused.
+first=$(curl -k --http1.1 -m 10 -sS -o /dev/null -w '%{{http_code}}' \
+  -H 'content-type: text/plain' --data-binary @"$body" \
+  https://host.microsandbox.internal:{port}/denied || true)
+echo "first=$first"
+
+# Second, independent connection: matched path, must still be policed
+# and forwarded — proves the first connection's refusal did not disable
+# interception for this one.
+second=$(curl -k --http1.1 -m 10 -sS -o /dev/null -w '%{{http_code}}' \
+  -H 'content-type: text/plain' --data-binary @"$body" \
+  https://host.microsandbox.internal:{port}/allowed)
+echo "second=$second"
+"#
+        ))
+        .await
+        .expect("curl multi-connection fixture");
+
+    let stdout = out.stdout().expect("utf8 stdout");
+    assert!(
+        stdout.contains("first=403"),
+        "expected the first, unmatched connection to be refused, stdout: {stdout}, stderr: {}",
+        out.stderr().unwrap_or_default()
+    );
+    assert!(
+        stdout.contains("second=200"),
+        "expected the second, matched connection to still be policed and forwarded, stdout: {stdout}, stderr: {}",
+        out.stderr().unwrap_or_default()
+    );
+
+    // The refused first connection reaches the fixture's listener (the
+    // relay dials upstream before it knows the outcome) but never sends
+    // any request bytes over it before the relay drops the connection.
+    let first_upstream = server.next_body().await;
+    assert!(
+        first_upstream.is_err(),
+        "the refused connection must not deliver a well-formed request upstream"
+    );
+
+    let second_upstream = server.next_body().await.expect("read second fixture body");
+    assert_eq!(second_upstream, b"token=real-secret");
+
+    teardown(sb, name).await;
+}
+
+/// AC #1: a `dispatch_on_headers` rule's body streams to upstream unbuffered
+/// even though it is far larger than `max_request_bytes` — the hook only
+/// ever sees the (small) headers, never the body, so the byte cap that
+/// protects the *buffered* fail-closed path does not apply to it.
+#[msb_test]
+async fn intercept_streaming_rule_forwards_large_body_without_buffering() {
+    let mut server = HostHttps::start().await.expect("https fixture");
+    let port = server.port();
+    let name = "intercept-streaming-large-body";
+    let sb = spawn_streaming_intercept_curl_sandbox(name, port).await;
+
+    let out = sb
+        .shell(format!(
+            r#"set -eu
+body=/tmp/large-upload-body
+head -c {LARGE_POST_BODY_LEN} /dev/zero | tr '\000' a > "$body"
+curl -k --http1.1 -m 30 -sS -o /tmp/response \
+  -w 'code=%{{http_code}} upload=%{{size_upload}}' \
+  -H 'content-type: application/octet-stream' \
+  --data-binary @"$body" \
+  https://host.microsandbox.internal:{port}/upload
+"#
+        ))
+        .await
+        .expect("curl streaming upload fixture");
+
+    let stdout = out.stdout().expect("utf8 stdout");
+    assert!(
+        stdout.contains("code=200"),
+        "expected the streaming rule to forward past its cap, not refuse with 413, stdout: {stdout}, stderr: {}",
+        out.stderr().unwrap_or_default()
+    );
+    assert!(
+        stdout.contains(&format!("upload={LARGE_POST_BODY_LEN}")),
+        "expected curl to upload the full body, stdout: {stdout}, stderr: {}",
+        out.stderr().unwrap_or_default()
+    );
+
+    let received = server.received_body().await.expect("read fixture body");
+    assert_eq!(received.len(), LARGE_POST_BODY_LEN);
+    assert!(received.iter().all(|b| *b == b'a'));
 
     teardown(sb, name).await;
 }

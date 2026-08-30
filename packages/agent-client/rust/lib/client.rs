@@ -447,6 +447,24 @@ impl AgentClient {
         Ok((id, rx))
     }
 
+    /// Subscribe to frames addressed to a specific, well-known correlation id —
+    /// e.g. host-originated broadcasts like `PortEvent` sent by the runtime on
+    /// the reserved `PORT_EVENT_BROADCAST_ID`.
+    ///
+    /// Unlike [`stream`](Self::stream)/[`request`](Self::request), this does
+    /// NOT allocate a fresh id; it registers a receiver for the id the caller
+    /// names so the reader loop routes those frames here. Broadcast frames are
+    /// non-terminal, so the subscription stays live for the connection's
+    /// lifetime (until the receiver is dropped). Returns a receiver of decoded
+    /// [`Message`]s. Only one active subscriber per id.
+    pub async fn subscribe(&self, id: u32) -> mpsc::Receiver<Message> {
+        let (raw_tx, raw_rx) = mpsc::channel(STREAM_QUEUE_CAPACITY);
+        self.pending.lock().await.insert(id, raw_tx);
+        let (tx, rx) = mpsc::channel(STREAM_QUEUE_CAPACITY);
+        tokio::spawn(decode_stream_task(raw_rx, tx));
+        rx
+    }
+
     /// Send a follow-up typed message on an existing correlation id.
     pub async fn send<T: Serialize>(
         &self,
