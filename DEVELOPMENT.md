@@ -14,7 +14,7 @@ For contribution guidelines (forking, commit signing, pull requests), see [CONTR
   - Linux: `sudo apt install just git` and `pip install pre-commit` (or `sudo apt install pre-commit`)
   - macOS: `brew install just git pre-commit`
   - Windows: install Git for Windows, `just`, Visual Studio Build Tools with MSVC, and Windows SDK; install `pre-commit` with `pip install pre-commit` if you want `just setup` to install Git hooks
-- **Linux build backend** (macOS and Windows): Required for building the Linux guest `agentd` binary from non-Linux hosts and for building the libkrunfw kernel bundle when it has not already been generated. On Windows, Docker Desktop with Linux containers is preferred when available; Windows Server can use Ubuntu WSL instead.
+- **Linux build backend** (macOS and Windows): Docker remains required on macOS for building the Linux guest `agentd` binary. The macOS libkrunfw kernel-bundle helper separately accepts `LIBKRUNFW_BUILD_BACKEND=auto|container|docker`; `auto` prefers Apple's `container` CLI, then Docker. Both copy a filtered source snapshot into container-native `/work` and copy only `kernel.c` back, avoiding Linux extraction on a macOS bind mount. On Windows, Docker Desktop with Linux containers is preferred when available; Windows Server can use Ubuntu WSL instead.
 - **Rust**: Installed automatically by `just setup` if missing, or install via [rustup](https://rustup.rs)
 
 ## Initial Setup

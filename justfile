@@ -66,7 +66,8 @@ _install-dev-deps:
     set -euo pipefail
 
     echo "==> Checking prerequisites..."
-    command -v docker &>/dev/null || { echo "error: Docker is required on macOS. Install Docker Desktop."; exit 1; }
+    command -v docker &>/dev/null || { echo "error: Docker is required on macOS for the agentd image build. Install Docker Desktop."; exit 1; }
+    command -v container &>/dev/null || echo "==> Apple's container CLI is optional; libkrunfw will fall back to Docker."
     xcode-select -p &>/dev/null || { echo "==> Installing Xcode Command Line Tools..."; xcode-select --install; }
 
     echo "==> Checking Rust toolchain..."
@@ -167,7 +168,9 @@ build-libkrunfw:
     ln -sf libkrunfw.so.{{ LIBKRUNFW_VERSION }} libkrunfw.so.{{ LIBKRUNFW_ABI }}
     ln -sf libkrunfw.so.{{ LIBKRUNFW_ABI }} libkrunfw.so
 
-# Build libkrunfw on macOS via Docker kernel build + host linking. Requires: docker, cc (Xcode CLT).
+# Build libkrunfw on macOS via container-native Linux storage + host linking.
+# LIBKRUNFW_BUILD_BACKEND=auto|container|docker selects the kernel builder;
+# Docker is still required separately by build-agentd.
 [macos]
 build-libkrunfw:
     #!/usr/bin/env bash
