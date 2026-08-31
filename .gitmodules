@@ -1,6 +1,6 @@
 [submodule "vendor/libkrunfw"]
 	path = vendor/libkrunfw
-	url = https://github.com/superradcompany/libkrunfw.git
+	url = https://github.com/gregwebs/libkrunfw.git
 	branch = krunfw
 [submodule "examples/root-bind/rootfs-alpine"]
 	path = examples/rust/root-bind/rootfs-alpine
