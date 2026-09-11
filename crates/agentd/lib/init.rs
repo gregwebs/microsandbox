@@ -101,7 +101,7 @@ fn ensure_scripts_profile_block(profile: &str) -> String {
 //--------------------------------------------------------------------------------------------------
 
 mod linux {
-    use std::os::unix::fs::{self as unix_fs, PermissionsExt};
+    use std::os::unix::fs::{self as unix_fs, OpenOptionsExt, PermissionsExt};
     use std::path::Path;
     use std::{fs, thread, time::Duration};
 
@@ -696,6 +696,47 @@ mod linux {
         Ok(())
     }
 
+    fn prepare_file_bind_target(path: &Path) -> AgentdResult<()> {
+        let file = open_file_bind_target(path).map_err(|error| {
+            AgentdError::Init(format!("prepare bind target {}: {error}", path.display()))
+        })?;
+        verify_opened_bind_target_is_regular(path, &file)
+    }
+
+    fn open_file_bind_target(path: &Path) -> std::io::Result<fs::File> {
+        let nofollow_nonblocking = libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC;
+        match fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(nofollow_nonblocking)
+            .open(path)
+        {
+            Ok(file) => Ok(file),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .custom_flags(nofollow_nonblocking)
+                .open(path),
+            Err(error) => Err(error),
+        }
+    }
+
+    fn verify_opened_bind_target_is_regular(path: &Path, file: &fs::File) -> AgentdResult<()> {
+        let metadata = file.metadata().map_err(|error| {
+            AgentdError::Init(format!(
+                "stat opened bind target {}: {error}",
+                path.display()
+            ))
+        })?;
+        if metadata.file_type().is_file() {
+            Ok(())
+        } else {
+            Err(AgentdError::Init(format!(
+                "unsafe bind target: {}",
+                path.display()
+            )))
+        }
+    }
+
     /// Mounts a single file from a virtiofs share via bind mount.
     fn mount_file(spec: &FileMountSpec) -> AgentdResult<()> {
         let staging_path = format!("{}/{}", microsandbox_protocol::FILE_MOUNTS_DIR, spec.tag);
@@ -746,18 +787,10 @@ mod linux {
                 })?;
             }
 
-            // 4. Create the target file (touch) as a bind mount target.
-            fs::OpenOptions::new()
-                .create(true)
-                .truncate(false)
-                .write(true)
-                .open(&spec.guest_path)
-                .map_err(|e| {
-                    AgentdError::Init(format!(
-                        "failed to create bind target {}: {e}",
-                        spec.guest_path
-                    ))
-                })?;
+            // 4. A readonly parent can contain a readonly existing target.
+            // Never open it writable merely to prepare a bind mount, and do
+            // not follow a hostile/surprising symlink at the guest leaf.
+            prepare_file_bind_target(Path::new(&spec.guest_path))?;
 
             // 5. Bind mount the file from staging to the guest path.
             let source_path = format!("{staging_path}/{}", spec.filename);
@@ -1069,6 +1102,98 @@ mod linux {
             Ok(()) => Ok(()),
             Err(nix::Error::EBUSY) => Ok(()),
             Err(e) => Err(AgentdError::Init(format!("failed to mount {target}: {e}"))),
+        }
+    }
+
+    //--------------------------------------------------------------------------------------------------
+    // Tests
+    //--------------------------------------------------------------------------------------------------
+
+    #[cfg(test)]
+    mod tests {
+        use std::fs;
+        use std::os::unix::fs::{self as unix_fs, FileTypeExt, PermissionsExt};
+        use std::path::PathBuf;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        use nix::sys::stat::Mode;
+        use nix::unistd;
+
+        use super::*;
+
+        static TEMP_DIR_COUNTER: AtomicUsize = AtomicUsize::new(0);
+
+        struct TestDir(PathBuf);
+
+        impl TestDir {
+            fn new() -> Self {
+                let sequence = TEMP_DIR_COUNTER.fetch_add(1, Ordering::Relaxed);
+                let path = std::env::temp_dir().join(format!(
+                    "microsandbox-agentd-init-{}-{sequence}",
+                    std::process::id()
+                ));
+                fs::create_dir(&path).unwrap();
+                Self(path)
+            }
+        }
+
+        impl Drop for TestDir {
+            fn drop(&mut self) {
+                fs::remove_dir_all(&self.0).unwrap();
+            }
+        }
+
+        #[test]
+        fn prepare_file_bind_target_accepts_existing_readonly_regular_file() {
+            let directory = TestDir::new();
+            let target = directory.0.join("readonly");
+            fs::write(&target, "contents").unwrap();
+            fs::set_permissions(&target, fs::Permissions::from_mode(0o400)).unwrap();
+
+            prepare_file_bind_target(&target).unwrap();
+        }
+
+        #[test]
+        fn prepare_file_bind_target_creates_missing_regular_file() {
+            let directory = TestDir::new();
+            let target = directory.0.join("missing");
+
+            prepare_file_bind_target(&target).unwrap();
+
+            assert!(fs::symlink_metadata(target).unwrap().file_type().is_file());
+        }
+
+        #[test]
+        fn prepare_file_bind_target_rejects_unsafe_existing_types_without_blocking() {
+            let directory = TestDir::new();
+            let regular = directory.0.join("regular");
+            let nested_directory = directory.0.join("directory");
+            let symlink = directory.0.join("symlink");
+            let fifo = directory.0.join("fifo");
+            let socket = directory.0.join("socket");
+            fs::write(&regular, "contents").unwrap();
+            fs::create_dir(&nested_directory).unwrap();
+            unix_fs::symlink(&regular, &symlink).unwrap();
+            unistd::mkfifo(&fifo, Mode::from_bits_truncate(0o600)).unwrap();
+            let _socket = std::os::unix::net::UnixDatagram::bind(&socket).unwrap();
+
+            for target in [&nested_directory, &symlink, &fifo, &socket] {
+                assert!(prepare_file_bind_target(target).is_err(), "{target:?}");
+            }
+        }
+
+        #[test]
+        fn verify_opened_bind_target_uses_the_opened_descriptor_after_a_swap() {
+            let directory = TestDir::new();
+            let target = directory.0.join("target");
+            fs::write(&target, "contents").unwrap();
+
+            let file = open_file_bind_target(&target).unwrap();
+            fs::remove_file(&target).unwrap();
+            unistd::mkfifo(&target, Mode::from_bits_truncate(0o600)).unwrap();
+            assert!(fs::symlink_metadata(&target).unwrap().file_type().is_fifo());
+
+            verify_opened_bind_target_is_regular(&target, &file).unwrap();
         }
     }
 }

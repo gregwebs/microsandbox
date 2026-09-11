@@ -2135,17 +2135,31 @@ async fn terminate_startup_process(
     child.wait().await.ok()
 }
 
+#[derive(Clone, Copy)]
+enum FileMountStagingMode {
+    Automatic,
+    #[cfg(test)]
+    ForceInitialCrossDevice,
+    #[cfg(test)]
+    ForceInitialCrossDeviceAndRejectSourceParentStage,
+}
+
 /// Scan `config.spec.mounts` for file bind mounts and stage each file in its own
 /// isolated directory inside an ephemeral [`TempDir`].
 ///
 /// Returns a map from guest path to `(file_mount_dir, filename, tag)` for
-/// each staged file, plus the `TempDir` handle that must be kept alive for
+/// each staged file, plus the `TempDir` handles that must be kept alive for
 /// the VM's lifetime.
 async fn stage_file_mounts(
     config: &SandboxConfig,
-) -> MicrosandboxResult<(HashMap<String, (PathBuf, String, String)>, Option<TempDir>)> {
-    // Collect file bind mounts first so we can skip TempDir creation when
-    // there are none.
+) -> MicrosandboxResult<(HashMap<String, (PathBuf, String, String)>, Vec<TempDir>)> {
+    stage_file_mounts_with_mode(config, FileMountStagingMode::Automatic).await
+}
+
+async fn stage_file_mounts_with_mode(
+    config: &SandboxConfig,
+    mode: FileMountStagingMode,
+) -> MicrosandboxResult<(HashMap<String, (PathBuf, String, String)>, Vec<TempDir>)> {
     let file_mounts: Vec<_> = config
         .spec
         .mounts
@@ -2160,80 +2174,85 @@ async fn stage_file_mounts(
             _ => None,
         })
         .collect();
-
     if file_mounts.is_empty() {
-        return Ok((HashMap::new(), None));
+        return Ok((HashMap::new(), Vec::new()));
     }
 
+    // The normal staging root is cheap and keeps readonly EXDEV copies isolated.
     let tempdir = tempfile::tempdir()?;
+    let mut staging = vec![tempdir];
     let mut staged = HashMap::new();
-
     for (host, guest, readonly) in file_mounts {
-        // Generate a random tag to avoid collisions.
         let id: u32 = rand::rng().random();
         let tag = format!("fm_{id:08x}");
-
-        let file_mount_dir = tempdir.path().join(&tag);
-        tokio::fs::create_dir_all(&file_mount_dir).await?;
-
-        // Canonicalize the staging directory so the mount root is symlink-free
-        // (the system temp dir often sits under a symlinked prefix, e.g. macOS
-        // `/var` -> `/private/var`). This resolves the one benign system symlink
-        // here in the trusted host context, so the mount stays under the default
-        // no-follow root protection instead of needing an exemption.
-        let file_mount_dir = tokio::fs::canonicalize(&file_mount_dir).await?;
-
         let filename_os = host.file_name().ok_or_else(|| {
             crate::MicrosandboxError::InvalidConfig(format!(
                 "file mount has no filename: {}",
                 host.display()
             ))
         })?;
+        let filename = filename_os
+            .to_str()
+            .ok_or_else(|| {
+                crate::MicrosandboxError::InvalidConfig(format!(
+                    "file mount filename is not valid UTF-8: {}",
+                    host.display()
+                ))
+            })?
+            .to_owned();
 
-        let filename = filename_os.to_str().ok_or_else(|| {
-            crate::MicrosandboxError::InvalidConfig(format!(
-                "file mount filename is not valid UTF-8: {}",
-                host.display()
-            ))
-        })?;
-
-        let target = file_mount_dir.join(filename);
-
-        // Hard-link preserves the same inode — writes in the guest propagate
-        // to the host and vice-versa. Falls back to copy for cross-filesystem
-        // mounts (different device IDs).
-        match tokio::fs::hard_link(host, &target).await {
-            Ok(()) => {
-                tracing::debug!(
-                    host = %host.display(),
-                    file_mount_dir = %target.display(),
-                    "file mount: hard-linked"
-                );
+        let mut file_mount_dir = staging[0].path().join(&tag);
+        tokio::fs::create_dir_all(&file_mount_dir).await?;
+        let mut target = file_mount_dir.join(&filename);
+        let initial_link = match mode {
+            FileMountStagingMode::Automatic => tokio::fs::hard_link(host, &target).await,
+            #[cfg(test)]
+            FileMountStagingMode::ForceInitialCrossDevice
+            | FileMountStagingMode::ForceInitialCrossDeviceAndRejectSourceParentStage => {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::CrossesDevices,
+                    "forced cross-device file mount staging",
+                ))
+            }
+        };
+        match initial_link {
+            Ok(()) => {}
+            Err(e) if is_cross_device_link_error(&e) && readonly => {
+                tokio::fs::copy(host, &target).await?;
             }
             Err(e) if is_cross_device_link_error(&e) => {
-                if !readonly {
-                    tracing::warn!(
-                        host = %host.display(),
-                        file_mount_dir = %target.display(),
-                        "file mount: cross-filesystem, falling back to copy \
-                         (guest writes will NOT propagate to host)"
-                    );
-                } else {
-                    tracing::debug!(
-                        host = %host.display(),
-                        file_mount_dir = %target.display(),
-                        "file mount: cross-filesystem, copying (read-only)"
-                    );
-                }
-                tokio::fs::copy(host, &target).await?;
+                // A writable mount must retain inode identity. Stage beside the
+                // source instead of copying, otherwise guest writes are lost.
+                let parent = host.parent().ok_or_else(|| {
+                    crate::MicrosandboxError::InvalidConfig(format!(
+                        "file mount has no parent: {}",
+                        host.display()
+                    ))
+                })?;
+                let local = match mode {
+                    #[cfg(test)]
+                    FileMountStagingMode::ForceInitialCrossDeviceAndRejectSourceParentStage => {
+                        Err(std::io::Error::new(
+                            std::io::ErrorKind::PermissionDenied,
+                            "forced unwritable source parent for file mount staging",
+                        ))
+                    }
+                    _ => tempfile::Builder::new()
+                        .prefix(".microsandbox-file-mount-")
+                        .tempdir_in(parent),
+                }?;
+                file_mount_dir = local.path().join(&tag);
+                tokio::fs::create_dir(&file_mount_dir).await?;
+                target = file_mount_dir.join(&filename);
+                tokio::fs::hard_link(host, &target).await?;
+                staging.push(local);
             }
             Err(e) => return Err(e.into()),
         }
-
-        staged.insert(guest.clone(), (file_mount_dir, filename.to_string(), tag));
+        let file_mount_dir = tokio::fs::canonicalize(&file_mount_dir).await?;
+        staged.insert(guest.clone(), (file_mount_dir, filename, tag));
     }
-
-    Ok((staged, Some(tempdir)))
+    Ok((staged, staging))
 }
 
 /// Return whether a host hard-link failed because the target is on another device.
@@ -2885,6 +2904,8 @@ mod tests {
     use std::ffi::{OsStr, OsString};
     #[cfg(target_os = "linux")]
     use std::num::NonZero;
+    #[cfg(unix)]
+    use std::os::unix::fs::MetadataExt;
     use std::path::{Path, PathBuf};
 
     use microsandbox_protocol::{
@@ -4937,6 +4958,153 @@ mod tests {
             .await
             .unwrap_err();
         assert!(format!("{err}").contains("must not contain '='"));
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn stage_file_mounts_hard_links_same_filesystem_source() {
+        let source_dir = tempdir().unwrap();
+        let source = source_dir.path().join("source.txt");
+        std::fs::write(&source, b"source").unwrap();
+        let config = file_mount_config(&source, "/guest/source.txt", false).await;
+
+        let (staged, staging) = super::stage_file_mounts(&config).await.unwrap();
+        let (mount_dir, filename, _) = staged.get("/guest/source.txt").unwrap();
+        let staged_file = mount_dir.join(filename);
+
+        assert_eq!(staging.len(), 1);
+        assert_eq!(std::fs::read(&staged_file).unwrap(), b"source");
+        assert_eq!(
+            std::fs::metadata(&source).unwrap().ino(),
+            std::fs::metadata(&staged_file).unwrap().ino(),
+            "ordinary file mounts must retain the hard-link fast path"
+        );
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn stage_file_mounts_forced_exdev_copies_readonly_source() {
+        let source_dir = tempdir().unwrap();
+        let source = source_dir.path().join("readonly.txt");
+        std::fs::write(&source, b"before").unwrap();
+        let config = file_mount_config(&source, "/guest/readonly.txt", true).await;
+
+        let (staged, staging) = super::stage_file_mounts_with_mode(
+            &config,
+            super::FileMountStagingMode::ForceInitialCrossDevice,
+        )
+        .await
+        .unwrap();
+        let (mount_dir, filename, _) = staged.get("/guest/readonly.txt").unwrap();
+        let staged_file = mount_dir.join(filename);
+        std::fs::write(&source, b"after").unwrap();
+
+        assert_eq!(staging.len(), 1);
+        assert_eq!(std::fs::read(&staged_file).unwrap(), b"before");
+        assert_ne!(
+            std::fs::metadata(&source).unwrap().ino(),
+            std::fs::metadata(&staged_file).unwrap().ino(),
+            "readonly EXDEV staging must copy rather than retain a source link"
+        );
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn stage_file_mounts_forced_exdev_hard_links_writable_source_parent() {
+        let source_dir = tempdir().unwrap();
+        let source = source_dir.path().join("writable.txt");
+        std::fs::write(&source, b"before").unwrap();
+        let config = file_mount_config(&source, "/guest/writable.txt", false).await;
+
+        let (staged, staging) = super::stage_file_mounts_with_mode(
+            &config,
+            super::FileMountStagingMode::ForceInitialCrossDevice,
+        )
+        .await
+        .unwrap();
+        let (mount_dir, filename, _) = staged.get("/guest/writable.txt").unwrap();
+        let staged_file = mount_dir.join(filename);
+        std::fs::write(&staged_file, b"guest write").unwrap();
+
+        assert_eq!(staging.len(), 2, "keep both system and local staging alive");
+        assert!(mount_dir.starts_with(std::fs::canonicalize(source_dir.path()).unwrap()));
+        assert_eq!(std::fs::read(&source).unwrap(), b"guest write");
+        assert_eq!(
+            std::fs::metadata(&source).unwrap().ino(),
+            std::fs::metadata(&staged_file).unwrap().ino(),
+            "writable EXDEV staging must preserve writeback through a hard link"
+        );
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn stage_file_mounts_retains_every_writable_exdev_staging_directory() {
+        let sources = tempdir().unwrap();
+        let first_parent = sources.path().join("first");
+        let second_parent = sources.path().join("second");
+        std::fs::create_dir_all(&first_parent).unwrap();
+        std::fs::create_dir_all(&second_parent).unwrap();
+        let first = first_parent.join("first.txt");
+        let second = second_parent.join("second.txt");
+        std::fs::write(&first, b"first").unwrap();
+        std::fs::write(&second, b"second").unwrap();
+        let config = file_mounts_config(&[
+            (&first, "/guest/first.txt", false),
+            (&second, "/guest/second.txt", false),
+        ])
+        .await;
+
+        let (staged, staging) = super::stage_file_mounts_with_mode(
+            &config,
+            super::FileMountStagingMode::ForceInitialCrossDevice,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(staging.len(), 3, "one system and one local stage per file");
+        for (source, guest) in [(&first, "/guest/first.txt"), (&second, "/guest/second.txt")] {
+            let (mount_dir, filename, _) = staged.get(guest).unwrap();
+            let staged_file = mount_dir.join(filename);
+            assert!(staged_file.exists());
+            assert_eq!(
+                std::fs::metadata(source).unwrap().ino(),
+                std::fs::metadata(&staged_file).unwrap().ino()
+            );
+        }
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn stage_file_mounts_forced_exdev_fails_when_source_parent_is_unwritable() {
+        let source_dir = tempdir().unwrap();
+        let source = source_dir.path().join("source.txt");
+        std::fs::write(&source, b"source").unwrap();
+        let config = file_mount_config(&source, "/guest/source.txt", false).await;
+
+        let result = super::stage_file_mounts_with_mode(
+            &config,
+            super::FileMountStagingMode::ForceInitialCrossDeviceAndRejectSourceParentStage,
+        )
+        .await;
+        assert!(
+            result.is_err(),
+            "writable EXDEV staging must not fall back to a copy"
+        );
+    }
+
+    async fn file_mount_config(host: &Path, guest: &str, readonly: bool) -> SandboxConfig {
+        file_mounts_config(&[(host, guest, readonly)]).await
+    }
+
+    async fn file_mounts_config(mounts: &[(&Path, &str, bool)]) -> SandboxConfig {
+        let mut builder = SandboxBuilder::new("test").image("/tmp/rootfs");
+        for (host, guest, readonly) in mounts {
+            builder = builder.volume(*guest, |mount| {
+                let mount = mount.bind(*host);
+                if *readonly { mount.readonly() } else { mount }
+            });
+        }
+        builder.build().await.unwrap()
     }
 
     #[test]

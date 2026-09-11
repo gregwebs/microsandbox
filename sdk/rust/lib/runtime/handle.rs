@@ -63,7 +63,7 @@ pub struct ProcessHandle {
 
     /// Ephemeral staging directory for file mounts. Dropped when the
     /// process handle is dropped, which auto-removes all staged files.
-    _file_mounts_staging: Option<TempDir>,
+    _file_mounts_staging: Vec<TempDir>,
 
     /// Open disk-image lock files. Kept for the process lifetime so disk
     /// images cannot be attached with incompatible write modes.
@@ -98,7 +98,7 @@ impl ProcessHandle {
         pid: u32,
         sandbox_name: String,
         child: Child,
-        file_mounts_staging: Option<TempDir>,
+        file_mounts_staging: Vec<TempDir>,
         disk_locks: Vec<File>,
         #[cfg(unix)] parent_watchdog: Option<OwnedFd>,
         #[cfg(windows)] job: Option<WindowsJob>,
@@ -208,7 +208,7 @@ impl ProcessHandle {
 
         // Consume the TempDir without deleting its contents — the detached
         // VM process still reads from it via virtiofs.
-        if let Some(td) = self._file_mounts_staging.take() {
+        for td in self._file_mounts_staging.drain(..) {
             let _ = td.keep();
         }
     }
@@ -443,8 +443,64 @@ fn terminate_process(pid: u32) -> std::io::Result<()> {
 mod tests {
     use std::io::Read;
     use std::os::fd::FromRawFd;
+    use std::path::PathBuf;
 
     use super::*;
+
+    fn staged_dirs() -> (Vec<TempDir>, Vec<PathBuf>) {
+        let first = tempfile::tempdir().unwrap();
+        let second = tempfile::tempdir().unwrap();
+        let paths = vec![first.path().to_path_buf(), second.path().to_path_buf()];
+        (vec![first, second], paths)
+    }
+
+    fn process_handle_with_staging(staging: Vec<TempDir>) -> ProcessHandle {
+        let child = tokio::process::Command::new("true").spawn().unwrap();
+        let pid = child.id().unwrap();
+        ProcessHandle::new(
+            pid,
+            "file-mount-staging-test".to_string(),
+            child,
+            staging,
+            Vec::new(),
+            None,
+            None,
+        )
+    }
+
+    #[tokio::test]
+    async fn attached_handle_drops_every_file_mount_staging_directory() {
+        let (staging, paths) = staged_dirs();
+        let handle = process_handle_with_staging(staging);
+
+        drop(handle);
+
+        for path in paths {
+            assert!(
+                !path.exists(),
+                "attached handle must clean every file-mount stage: {}",
+                path.display()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn detached_handle_keeps_every_file_mount_staging_directory() {
+        let (staging, paths) = staged_dirs();
+        let mut handle = process_handle_with_staging(staging);
+
+        handle.disarm();
+        drop(handle);
+
+        for path in &paths {
+            assert!(
+                path.exists(),
+                "detached handle must preserve every file-mount stage: {}",
+                path.display()
+            );
+            std::fs::remove_dir_all(path).unwrap();
+        }
+    }
 
     #[test]
     fn test_send_parent_watchdog_detach_writes_detach_byte() {
