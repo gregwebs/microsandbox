@@ -696,6 +696,22 @@ mod linux {
         Ok(())
     }
 
+    /// Prepare the guest-side bind target for a file mount.
+    ///
+    /// The target is only ever used as a mount point, so it is opened read-only
+    /// (an existing mode-`0400` target beneath a read-only parent is legitimate,
+    /// and a writable open fails there with `EROFS`) and never opened for write
+    /// merely to prepare the mount. The type check goes through the opened
+    /// descriptor, so a leaf swapped between the open and the stat cannot be
+    /// mistaken for a regular file.
+    ///
+    /// The descriptor is dropped once the type is known, so a leaf swapped in the
+    /// final window before `mount_file` issues the bind mount would still be
+    /// followed by `mount(2)`. That window is not reachable from a guest: file
+    /// mount preparation runs during init, before any other guest process exists,
+    /// and a leaf that is already a symlink at open time is refused by
+    /// `O_NOFOLLOW`. Anything stronger (binding onto `/proc/self/fd/N`) would only
+    /// matter if a guest process could run concurrently with init.
     fn prepare_file_bind_target(path: &Path) -> AgentdResult<()> {
         let file = open_file_bind_target(path).map_err(|error| {
             AgentdError::Init(format!("prepare bind target {}: {error}", path.display()))
@@ -1112,7 +1128,7 @@ mod linux {
     #[cfg(test)]
     mod tests {
         use std::fs;
-        use std::os::unix::fs::{self as unix_fs, FileTypeExt, PermissionsExt};
+        use std::os::unix::fs::{self as unix_fs, FileTypeExt, MetadataExt, PermissionsExt};
         use std::path::PathBuf;
         use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -1139,18 +1155,67 @@ mod linux {
 
         impl Drop for TestDir {
             fn drop(&mut self) {
-                fs::remove_dir_all(&self.0).unwrap();
+                // Never panic while unwinding: a failing test must not turn into a
+                // double panic (abort), and a test that removed the directory itself
+                // must not fail the harness.
+                let _ = fs::remove_dir_all(&self.0);
             }
+        }
+
+        /// Whether the test process can bypass mode bits (`CAP_DAC_OVERRIDE`).
+        ///
+        /// Several checks below assert that preparation never opens the target for
+        /// writing, which a root process cannot be denied. Skipping them loudly keeps
+        /// a root run from looking like coverage it is not.
+        fn running_as_root() -> bool {
+            // SAFETY: `geteuid` has no preconditions and cannot fail.
+            unsafe { libc::geteuid() == 0 }
+        }
+
+        fn mode_of(path: &std::path::Path) -> u32 {
+            fs::metadata(path).unwrap().permissions().mode() & 0o7777
         }
 
         #[test]
         fn prepare_file_bind_target_accepts_existing_readonly_regular_file() {
+            if running_as_root() {
+                eprintln!(
+                    "SKIP: as root, mode 0400 does not deny a writable open; the read-only \
+                     filesystem case is only covered by script/test/mount-fork-live.sh"
+                );
+                return;
+            }
             let directory = TestDir::new();
             let target = directory.0.join("readonly");
             fs::write(&target, "contents").unwrap();
             fs::set_permissions(&target, fs::Permissions::from_mode(0o400)).unwrap();
+            let before = fs::metadata(&target).unwrap();
 
             prepare_file_bind_target(&target).unwrap();
+
+            // Preparation must not open the target for writing: no truncation, no
+            // mode change, no replacement of the inode.
+            let after = fs::metadata(&target).unwrap();
+            assert_eq!(fs::read_to_string(&target).unwrap(), "contents");
+            assert_eq!(mode_of(&target), 0o400);
+            assert_eq!(before.ino(), after.ino());
+        }
+
+        #[test]
+        fn prepare_file_bind_target_leaves_an_existing_writable_target_untouched() {
+            let directory = TestDir::new();
+            let target = directory.0.join("writable");
+            fs::write(&target, "contents").unwrap();
+            let before = fs::metadata(&target).unwrap();
+
+            prepare_file_bind_target(&target).unwrap();
+
+            // The mount target only has to exist: preparing it must never truncate,
+            // rewrite, or replace the file that the bind mount is about to cover.
+            assert_eq!(fs::read_to_string(&target).unwrap(), "contents");
+            let after = fs::metadata(&target).unwrap();
+            assert_eq!(before.ino(), after.ino());
+            assert_eq!(before.mode(), after.mode());
         }
 
         #[test]
@@ -1160,7 +1225,10 @@ mod linux {
 
             prepare_file_bind_target(&target).unwrap();
 
-            assert!(fs::symlink_metadata(target).unwrap().file_type().is_file());
+            let metadata = fs::symlink_metadata(&target).unwrap();
+            assert!(metadata.file_type().is_file());
+            assert_eq!(metadata.len(), 0, "a prepared mount target is empty");
+            assert_eq!(fs::read_dir(&directory.0).unwrap().count(), 1);
         }
 
         #[test]
@@ -1169,17 +1237,80 @@ mod linux {
             let regular = directory.0.join("regular");
             let nested_directory = directory.0.join("directory");
             let symlink = directory.0.join("symlink");
+            let dangling_symlink = directory.0.join("dangling");
             let fifo = directory.0.join("fifo");
             let socket = directory.0.join("socket");
             fs::write(&regular, "contents").unwrap();
             fs::create_dir(&nested_directory).unwrap();
             unix_fs::symlink(&regular, &symlink).unwrap();
+            unix_fs::symlink(directory.0.join("absent"), &dangling_symlink).unwrap();
             unistd::mkfifo(&fifo, Mode::from_bits_truncate(0o600)).unwrap();
             let _socket = std::os::unix::net::UnixDatagram::bind(&socket).unwrap();
 
-            for target in [&nested_directory, &symlink, &fifo, &socket] {
-                assert!(prepare_file_bind_target(target).is_err(), "{target:?}");
+            for target in [&nested_directory, &symlink, &dangling_symlink, &socket] {
+                let error = prepare_file_bind_target(target).unwrap_err();
+                assert!(
+                    error.to_string().contains(&target.display().to_string()),
+                    "the diagnostic must name the rejected target: {error}"
+                );
             }
+
+            // A FIFO must be rejected without ever opening it for I/O: a blocking
+            // open would hang guest init forever, so the check runs on a detached
+            // thread and fails the test instead of hanging the whole suite when the
+            // open never returns.
+            let (sender, receiver) = std::sync::mpsc::channel();
+            let probe = fifo.clone();
+            std::thread::spawn(move || {
+                let _ = sender.send(prepare_file_bind_target(&probe).is_err());
+            });
+            match receiver.recv_timeout(std::time::Duration::from_secs(10)) {
+                Ok(rejected) => assert!(rejected, "a FIFO target must be rejected"),
+                Err(_) => panic!("prepare_file_bind_target blocked on a FIFO target"),
+            }
+
+            assert_eq!(fs::read_to_string(&regular).unwrap(), "contents");
+            assert!(
+                fs::symlink_metadata(&symlink)
+                    .unwrap()
+                    .file_type()
+                    .is_symlink()
+            );
+            assert!(
+                fs::symlink_metadata(&dangling_symlink)
+                    .unwrap()
+                    .file_type()
+                    .is_symlink()
+            );
+            assert!(fs::symlink_metadata(&fifo).unwrap().file_type().is_fifo());
+            assert!(
+                fs::symlink_metadata(&socket)
+                    .unwrap()
+                    .file_type()
+                    .is_socket()
+            );
+            assert!(nested_directory.is_dir());
+        }
+
+        /// A target that the agent cannot read is refused with a diagnostic rather
+        /// than replaced. agentd runs as guest root, where this is unreachable, so the
+        /// check is skipped there instead of silently passing.
+        #[test]
+        fn prepare_file_bind_target_rejects_an_unreadable_existing_target() {
+            if running_as_root() {
+                eprintln!("SKIP: as root, mode 0000 does not deny a read-only open");
+                return;
+            }
+            let directory = TestDir::new();
+            let target = directory.0.join("unreadable");
+            fs::write(&target, "contents").unwrap();
+            fs::set_permissions(&target, fs::Permissions::from_mode(0o000)).unwrap();
+
+            let error = prepare_file_bind_target(&target).unwrap_err();
+
+            assert!(error.to_string().contains("unreadable"));
+            // The refusal must be a refusal, not a silent replacement.
+            assert!(fs::read_to_string(&target).is_err());
         }
 
         #[test]

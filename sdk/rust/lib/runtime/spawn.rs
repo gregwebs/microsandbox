@@ -2178,7 +2178,10 @@ async fn stage_file_mounts_with_mode(
         return Ok((HashMap::new(), Vec::new()));
     }
 
-    // The normal staging root is cheap and keeps readonly EXDEV copies isolated.
+    // The system staging root is created eagerly: the hard-link fast path needs a
+    // directory in the system temp dir to link into, and readonly cross-device
+    // mounts copy into it. A writable cross-device mount abandons its (empty)
+    // system-temp directory and stages in a second root beside its source.
     let tempdir = tempfile::tempdir()?;
     let mut staging = vec![tempdir];
     let mut staged = HashMap::new();
@@ -2223,12 +2226,18 @@ async fn stage_file_mounts_with_mode(
             Err(e) if is_cross_device_link_error(&e) => {
                 // A writable mount must retain inode identity. Stage beside the
                 // source instead of copying, otherwise guest writes are lost.
-                let parent = host.parent().ok_or_else(|| {
-                    crate::MicrosandboxError::InvalidConfig(format!(
-                        "file mount has no parent: {}",
-                        host.display()
-                    ))
-                })?;
+                //
+                // `parent()` is `Some("")` for a bare relative path such as
+                // `foo.txt`, which is not a directory to stage in.
+                let parent = host
+                    .parent()
+                    .filter(|parent| !parent.as_os_str().is_empty())
+                    .ok_or_else(|| {
+                        crate::MicrosandboxError::InvalidConfig(format!(
+                            "file mount has no parent directory: {}",
+                            host.display()
+                        ))
+                    })?;
                 let local = match mode {
                     #[cfg(test)]
                     FileMountStagingMode::ForceInitialCrossDeviceAndRejectSourceParentStage => {
@@ -2240,7 +2249,24 @@ async fn stage_file_mounts_with_mode(
                     _ => tempfile::Builder::new()
                         .prefix(".microsandbox-file-mount-")
                         .tempdir_in(parent),
-                }?;
+                }
+                .map_err(|error| {
+                    crate::MicrosandboxError::InvalidConfig(format!(
+                        "cannot stage writable file mount {} across a filesystem boundary: the \
+                         staging directory must live beside the source in {}, which must be \
+                         writable so guest writes reach the host file: {error}",
+                        host.display(),
+                        parent.display()
+                    ))
+                })?;
+                // The stage root holds a hard link to a possibly private source
+                // file, so keep it owner-only instead of inheriting the umask.
+                restrict_stage_root_to_owner(local.path()).map_err(|error| {
+                    crate::MicrosandboxError::InvalidConfig(format!(
+                        "failed to restrict file mount staging {} to its owner: {error}",
+                        local.path().display()
+                    ))
+                })?;
                 file_mount_dir = local.path().join(&tag);
                 tokio::fs::create_dir(&file_mount_dir).await?;
                 target = file_mount_dir.join(&filename);
@@ -2253,6 +2279,23 @@ async fn stage_file_mounts_with_mode(
         staged.insert(guest.clone(), (file_mount_dir, filename, tag));
     }
     Ok((staged, staging))
+}
+
+/// Restrict a staging root to its owner (mode `0700`).
+///
+/// A writable cross-device stage lives inside the user's own source directory and
+/// holds a hard link to the source file, so it must not be listable or
+/// traversable by other local users no matter what the process umask is.
+#[cfg(unix)]
+fn restrict_stage_root_to_owner(path: &Path) -> std::io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))
+}
+
+#[cfg(not(unix))]
+fn restrict_stage_root_to_owner(_path: &Path) -> std::io::Result<()> {
+    Ok(())
 }
 
 /// Return whether a host hard-link failed because the target is on another device.
@@ -5089,6 +5132,453 @@ mod tests {
         assert!(
             result.is_err(),
             "writable EXDEV staging must not fall back to a copy"
+        );
+    }
+
+    /// A source directory on a filesystem other than the system temp dir, if this
+    /// host has a writable one.
+    ///
+    /// Cross-device staging is only reachable when the hard-link fast path really
+    /// fails, so the tests below skip loudly (never silently) on a host without a
+    /// second filesystem instead of pretending to cover the branch.
+    #[cfg(unix)]
+    fn cross_device_source_dir() -> Option<tempfile::TempDir> {
+        let system_temp = std::fs::canonicalize(std::env::temp_dir()).ok()?;
+        let system_dev = std::fs::metadata(&system_temp).ok()?.dev();
+
+        let mut candidates: Vec<PathBuf> = ["/dev/shm", "/run"].iter().map(PathBuf::from).collect();
+        // macOS: any mounted volume (a RAM disk or a disk image both work). The
+        // entries of `/Volumes` for the boot volume resolve to the same device and
+        // are filtered out below.
+        if let Ok(entries) = std::fs::read_dir("/Volumes") {
+            candidates.extend(entries.flatten().map(|entry| entry.path()));
+        }
+
+        candidates.into_iter().find_map(|candidate| {
+            if std::fs::metadata(&candidate).ok()?.dev() == system_dev {
+                return None;
+            }
+            // A second filesystem is only useful if it can hold the stage, so probe
+            // it with the same call the staging path makes.
+            tempfile::Builder::new()
+                .prefix("microsandbox-cross-device-")
+                .tempdir_in(candidate)
+                .ok()
+        })
+    }
+
+    #[cfg(unix)]
+    fn file_mode(path: &Path) -> u32 {
+        use std::os::unix::fs::PermissionsExt;
+
+        std::fs::metadata(path).unwrap().permissions().mode() & 0o7777
+    }
+
+    #[cfg(unix)]
+    fn running_as_root() -> bool {
+        // SAFETY: `geteuid` has no preconditions and cannot fail.
+        unsafe { libc::geteuid() == 0 }
+    }
+
+    #[cfg(unix)]
+    fn set_mode(path: &Path, mode: u32) {
+        use std::os::unix::fs::PermissionsExt;
+
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap();
+    }
+
+    #[cfg(unix)]
+    fn directory_entries(path: &Path) -> Vec<String> {
+        let mut entries: Vec<String> = std::fs::read_dir(path)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        entries.sort();
+        entries
+    }
+
+    #[cfg(unix)]
+    fn assert_no_staging_residue(path: &Path) {
+        let residue: Vec<String> = directory_entries(path)
+            .into_iter()
+            .filter(|entry| entry.starts_with(".microsandbox-file-mount-"))
+            .collect();
+        assert!(
+            residue.is_empty(),
+            "staging residue left in {}: {residue:?}",
+            path.display()
+        );
+    }
+
+    #[cfg(unix)]
+    fn probe_handle(staging: Vec<tempfile::TempDir>, label: &str) -> crate::runtime::ProcessHandle {
+        let child = tokio::process::Command::new("true").spawn().unwrap();
+        let pid = child.id().unwrap();
+        crate::runtime::ProcessHandle::new(
+            pid,
+            label.to_string(),
+            child,
+            staging,
+            Vec::new(),
+            None,
+            None,
+        )
+    }
+
+    /// The forced modes above synthesize `EXDEV`; this drives the same branch
+    /// with a real cross-device `hard_link` failure, which is the only check that
+    /// validates the classifier against the OS instead of a hand-built error.
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn stage_file_mounts_real_cross_device_keeps_writable_inode_identity() {
+        let Some(source_dir) = cross_device_source_dir() else {
+            eprintln!("SKIP: no second filesystem available for a real cross-device mount");
+            return;
+        };
+        let source = source_dir.path().join("writable.txt");
+        std::fs::write(&source, b"before").unwrap();
+
+        let probe_target = std::env::temp_dir().join("microsandbox-cross-device-probe");
+        let real_error = std::fs::hard_link(&source, &probe_target)
+            .expect_err("a second filesystem must make the system-temp hard link fail");
+        let _ = std::fs::remove_file(&probe_target);
+        assert!(
+            super::is_cross_device_link_error(&real_error),
+            "a real cross-device link failure must be classified as one: {real_error:?}"
+        );
+
+        let config = file_mount_config(&source, "/guest/writable.txt", false).await;
+        let (staged, staging) = super::stage_file_mounts(&config).await.unwrap();
+        let (mount_dir, filename, _) = staged.get("/guest/writable.txt").unwrap();
+        let staged_file = mount_dir.join(filename);
+
+        assert_eq!(staging.len(), 2, "one system stage plus one per source");
+        assert_eq!(
+            std::fs::metadata(&source).unwrap().dev(),
+            std::fs::metadata(&staged_file).unwrap().dev(),
+            "a writable cross-device stage must live on the source's filesystem"
+        );
+        assert_eq!(
+            std::fs::metadata(&source).unwrap().ino(),
+            std::fs::metadata(&staged_file).unwrap().ino(),
+            "a writable cross-device mount must keep inode identity"
+        );
+        std::fs::write(&staged_file, b"guest write").unwrap();
+        assert_eq!(std::fs::read(&source).unwrap(), b"guest write");
+
+        // The stage survives until the handle that owns it goes away, and then it is
+        // gone from the user's own directory.
+        let stage_root = mount_dir.parent().unwrap().to_path_buf();
+        assert!(stage_root.exists());
+        drop(staging);
+        assert!(
+            !stage_root.exists(),
+            "dropping the staging handle must remove {}",
+            stage_root.display()
+        );
+        assert_no_staging_residue(source_dir.path());
+    }
+
+    /// A readonly cross-device mount must stay an isolated copy in the system
+    /// staging root: no link to the host source, frozen content, private root.
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn stage_file_mounts_real_cross_device_copies_readonly_into_system_staging() {
+        let Some(source_dir) = cross_device_source_dir() else {
+            eprintln!("SKIP: no second filesystem available for a real cross-device mount");
+            return;
+        };
+        let source = source_dir.path().join("readonly.txt");
+        std::fs::write(&source, b"before").unwrap();
+
+        let config = file_mount_config(&source, "/guest/readonly.txt", true).await;
+        let (staged, staging) = super::stage_file_mounts(&config).await.unwrap();
+        let (mount_dir, filename, _) = staged.get("/guest/readonly.txt").unwrap();
+        let staged_file = mount_dir.join(filename);
+
+        assert_eq!(
+            staging.len(),
+            1,
+            "a readonly copy needs no per-source stage"
+        );
+        let system_staging = std::fs::canonicalize(std::env::temp_dir()).unwrap();
+        assert!(
+            mount_dir.starts_with(&system_staging),
+            "readonly copies stay in the system staging root: {}",
+            mount_dir.display()
+        );
+        std::fs::write(&source, b"after").unwrap();
+        assert_eq!(std::fs::read(&staged_file).unwrap(), b"before");
+        assert_ne!(
+            std::fs::metadata(&source).unwrap().ino(),
+            std::fs::metadata(&staged_file).unwrap().ino(),
+            "a readonly cross-device mount must not link the host source"
+        );
+        assert_eq!(
+            std::fs::metadata(&staged_file).unwrap().nlink(),
+            1,
+            "the readonly copy must not share the source inode"
+        );
+        assert_no_staging_residue(source_dir.path());
+    }
+
+    /// A readonly mount and a writable mount of the same directory: exactly one
+    /// system stage plus one per-source stage, each with the right identity.
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn stage_file_mounts_real_cross_device_mixes_readonly_and_writable() {
+        let Some(source_dir) = cross_device_source_dir() else {
+            eprintln!("SKIP: no second filesystem available for a real cross-device mount");
+            return;
+        };
+        let writable = source_dir.path().join("writable.txt");
+        let readonly = source_dir.path().join("readonly.txt");
+        std::fs::write(&writable, b"w").unwrap();
+        std::fs::write(&readonly, b"r").unwrap();
+        let config = file_mounts_config(&[
+            (&writable, "/guest/writable.txt", false),
+            (&readonly, "/guest/readonly.txt", true),
+        ])
+        .await;
+
+        let (staged, staging) = super::stage_file_mounts(&config).await.unwrap();
+        assert_eq!(
+            staging.len(),
+            2,
+            "one system root plus one writable source root"
+        );
+
+        let (writable_dir, writable_name, _) = staged.get("/guest/writable.txt").unwrap();
+        let writable_staged = writable_dir.join(writable_name);
+        std::fs::write(&writable_staged, b"guest").unwrap();
+        assert_eq!(std::fs::read(&writable).unwrap(), b"guest");
+
+        let (readonly_dir, readonly_name, _) = staged.get("/guest/readonly.txt").unwrap();
+        let readonly_staged = readonly_dir.join(readonly_name);
+        std::fs::write(&readonly, b"changed").unwrap();
+        assert_eq!(std::fs::read(&readonly_staged).unwrap(), b"r");
+        assert_ne!(
+            std::fs::metadata(&readonly).unwrap().ino(),
+            std::fs::metadata(&readonly_staged).unwrap().ino()
+        );
+
+        drop(staging);
+        assert_no_staging_residue(source_dir.path());
+    }
+
+    /// The per-source stage is created inside the user's own directory, so it must
+    /// be owner-only (mode `0700`) and hold nothing but the mount's own directory.
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn stage_file_mounts_real_cross_device_stage_root_is_owner_only() {
+        let Some(source_dir) = cross_device_source_dir() else {
+            eprintln!("SKIP: no second filesystem available for a real cross-device mount");
+            return;
+        };
+        let source = source_dir.path().join("writable.txt");
+        std::fs::write(&source, b"before").unwrap();
+        let config = file_mount_config(&source, "/guest/writable.txt", false).await;
+
+        let (staged, _staging) = super::stage_file_mounts(&config).await.unwrap();
+        let (mount_dir, filename, _) = staged.get("/guest/writable.txt").unwrap();
+        let stage_root = mount_dir.parent().unwrap();
+
+        assert_eq!(
+            file_mode(stage_root),
+            0o700,
+            "the per-source stage must not be world-traversable"
+        );
+        assert_eq!(
+            stage_root.parent().unwrap(),
+            std::fs::canonicalize(source_dir.path()).unwrap(),
+            "the stage must live beside the source"
+        );
+        assert!(
+            stage_root
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .starts_with(".microsandbox-file-mount-"),
+            "the stage name is user-visible: {}",
+            stage_root.display()
+        );
+        let entries = directory_entries(stage_root);
+        assert_eq!(
+            entries,
+            vec![
+                mount_dir
+                    .file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .into_owned()
+            ],
+            "the stage holds only its own mount directory"
+        );
+        assert_eq!(
+            file_mode(&mount_dir.join(filename)),
+            file_mode(&source),
+            "the staged link must keep the source's mode"
+        );
+    }
+
+    /// The per-source stage can only be dropped while the VM runs, so an attached
+    /// handle must drop it and a detached (`disarm`ed) handle must keep it for the
+    /// VM that is still reading through it.
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn stage_file_mounts_real_cross_device_stages_follow_the_handle_lifetime() {
+        let Some(source_dir) = cross_device_source_dir() else {
+            eprintln!("SKIP: no second filesystem available for a real cross-device mount");
+            return;
+        };
+        let source = source_dir.path().join("writable.txt");
+        std::fs::write(&source, b"before").unwrap();
+        let config = file_mount_config(&source, "/guest/writable.txt", false).await;
+
+        let (_, staging) = super::stage_file_mounts(&config).await.unwrap();
+        drop(probe_handle(staging, "cross-device-attached"));
+        assert_eq!(
+            directory_entries(source_dir.path()),
+            vec!["writable.txt".to_string()],
+            "an attached VM must not leave a stage inside the source directory"
+        );
+
+        let (_, staging) = super::stage_file_mounts(&config).await.unwrap();
+        let mut detached = probe_handle(staging, "cross-device-detached");
+        detached.disarm();
+        drop(detached);
+        // Note: `disarm` keeps the stage for the detached VM, and nothing removes it
+        // once that VM exits - a residue the SDK does not clean up today. This
+        // asserts the current contract so a change to it is deliberate.
+        assert!(
+            directory_entries(source_dir.path())
+                .iter()
+                .any(|entry| entry.starts_with(".microsandbox-file-mount-")),
+            "a detached VM must keep reading its stage"
+        );
+    }
+
+    /// Staging failures must be actionable (the caller cannot tell which mount
+    /// broke from a bare `io::Error`) and must not leave earlier stages behind.
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn stage_file_mounts_real_unwritable_source_parent_names_the_mount() {
+        if running_as_root() {
+            eprintln!("SKIP: as root, mode 0500 does not deny directory writes");
+            return;
+        }
+        let Some(source_dir) = cross_device_source_dir() else {
+            eprintln!("SKIP: no second filesystem available for a real cross-device mount");
+            return;
+        };
+        let source = source_dir.path().join("writable.txt");
+        std::fs::write(&source, b"before").unwrap();
+        let config = file_mount_config(&source, "/guest/writable.txt", false).await;
+
+        set_mode(source_dir.path(), 0o500);
+        let result = super::stage_file_mounts_with_mode(
+            &config,
+            super::FileMountStagingMode::ForceInitialCrossDevice,
+        )
+        .await;
+        // Restore first: a panic here would otherwise poison the TempDir cleanup.
+        set_mode(source_dir.path(), 0o700);
+
+        let rendered = result
+            .expect_err("an unwritable source parent cannot stage a writable mount")
+            .to_string();
+        assert!(
+            rendered.contains(&source.display().to_string()),
+            "the error must name the mount that could not be staged: {rendered}"
+        );
+        assert!(
+            rendered.contains("writable"),
+            "the error must explain what the caller can change: {rendered}"
+        );
+        assert_no_staging_residue(source_dir.path());
+    }
+
+    /// A failure on a later mount must not leave the earlier mount's stage inside
+    /// the user's directory.
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn stage_file_mounts_failure_on_a_later_mount_drops_earlier_stages() {
+        if running_as_root() {
+            eprintln!("SKIP: as root, mode 0500 does not deny directory writes");
+            return;
+        }
+        let Some(source_dir) = cross_device_source_dir() else {
+            eprintln!("SKIP: no second filesystem available for a real cross-device mount");
+            return;
+        };
+        let staged_parent = source_dir.path().join("staged");
+        let broken_parent = source_dir.path().join("broken");
+        std::fs::create_dir(&staged_parent).unwrap();
+        std::fs::create_dir(&broken_parent).unwrap();
+        let first = staged_parent.join("first.txt");
+        let second = broken_parent.join("second.txt");
+        std::fs::write(&first, b"first").unwrap();
+        std::fs::write(&second, b"second").unwrap();
+        let config = file_mounts_config(&[
+            (&first, "/guest/first.txt", false),
+            (&second, "/guest/second.txt", false),
+        ])
+        .await;
+
+        set_mode(&broken_parent, 0o500);
+        let result = super::stage_file_mounts_with_mode(
+            &config,
+            super::FileMountStagingMode::ForceInitialCrossDevice,
+        )
+        .await;
+        set_mode(&broken_parent, 0o700);
+
+        assert!(
+            result.is_err(),
+            "the second mount cannot be staged, so the whole spawn must fail"
+        );
+        assert_no_staging_residue(&staged_parent);
+    }
+
+    /// Two mounts of one host file must not share a virtiofs tag or a stage
+    /// directory, and both must still reach the same inode.
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn stage_file_mounts_stages_every_mount_of_the_same_source() {
+        let source_dir = tempdir().unwrap();
+        let source = source_dir.path().join("shared.txt");
+        std::fs::write(&source, b"shared").unwrap();
+        let config = file_mounts_config(&[
+            (&source, "/guest/a.txt", false),
+            (&source, "/guest/b.txt", false),
+        ])
+        .await;
+
+        let (staged, staging) = super::stage_file_mounts(&config).await.unwrap();
+        assert_eq!(staging.len(), 1);
+
+        let (first_dir, first_name, _) = staged.get("/guest/a.txt").unwrap();
+        let (second_dir, second_name, _) = staged.get("/guest/b.txt").unwrap();
+        assert_ne!(first_dir, second_dir);
+        for (dir, name) in [(first_dir, first_name), (second_dir, second_name)] {
+            assert_eq!(
+                std::fs::metadata(&source).unwrap().ino(),
+                std::fs::metadata(dir.join(name)).unwrap().ino()
+            );
+        }
+    }
+
+    /// A config without file mounts must not create any staging root at all.
+    #[tokio::test]
+    async fn stage_file_mounts_creates_nothing_without_file_mounts() {
+        let directory = tempdir().unwrap();
+        let config = file_mounts_config(&[(directory.path(), "/guest/directory", false)]).await;
+
+        let (staged, staging) = super::stage_file_mounts(&config).await.unwrap();
+        assert!(staged.is_empty());
+        assert!(
+            staging.is_empty(),
+            "a directory mount is not a file mount and needs no staging root"
         );
     }
 
