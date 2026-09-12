@@ -807,11 +807,36 @@ jobs:
         working-directory: packages/microsandbox-types/typescript
         run: npm ci && npm run build && npm run typecheck
 
+      # The Node build installs the committed lockfile, so it must resolve every
+      # platform package npm has published. `npm install --package-lock-only` is
+      # a no-op when the lock is in sync, so a diff here means package.json was
+      # bumped without regenerating the lock. Release-bump PRs intentionally
+      # leave not-yet-published platform packages unresolved, and that state is
+      # a fixed point too, so it passes; release.yml's post-publish
+      # `refresh-lockfile` job closes the gap afterwards. Runs before the prune
+      # step below, which rewrites package.json and would make the check lie.
+      - name: Check Node SDK lockfile is in sync
+        working-directory: sdk/node-ts
+        run: |
+          npm install --package-lock-only --ignore-scripts
+          if ! git diff --exit-code -- package-lock.json >/dev/null; then
+            echo "::error::sdk/node-ts/package-lock.json is out of sync with package.json"
+            git --no-pager diff -- package-lock.json
+            echo "Regenerate it with: (cd sdk/node-ts && npm install --package-lock-only --ignore-scripts)"
+            exit 1
+          fi
+
+      # `npm install` re-resolves the manifest against the registry, so a
+      # floating peer dependency can break this build (a new @vitejs/devtools-*
+      # release made npm 10 crash with "Cannot read properties of null (reading
+      # 'edgesOut')" in every job that installed this way). `npm ci` installs the
+      # committed lockfile instead. The platform packages are pruned first
+      # because release-bump PRs reference versions that are not published yet.
       - name: Build Node SDK
         working-directory: sdk/node-ts
         run: |
           node scripts/prune-platform-optional-deps.mjs
-          npm install --package-lock=false
+          npm ci
           npm run build:ci
 
       - name: Build MCP server
@@ -1553,8 +1578,9 @@ jobs:
       - name: Install Node.js dependencies
         working-directory: sdk/node-ts
         run: |
+          # See the lockfile note on check.yml's "Build Node SDK" step.
           node scripts/prune-platform-optional-deps.mjs
-          npm install --package-lock=false --ignore-scripts
+          npm ci --ignore-scripts
 
       # The published platform-pkg msb may lag the SDK; replace it with the
       # freshly-built binaries so the smoke test runs against current code.

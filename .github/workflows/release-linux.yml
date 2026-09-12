@@ -250,8 +250,9 @@ jobs:
       - name: Build Node native binding
         working-directory: sdk/node-ts
         run: |
+          # See the lockfile note on check.yml's "Build Node SDK" step.
           node scripts/prune-platform-optional-deps.mjs
-          npm install --package-lock=false
+          npm ci
           npm run build:native -- --target ${{ inputs.napi_target }}
           node -e 'require("./native/index.cjs")'
 

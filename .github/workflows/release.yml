@@ -610,7 +610,7 @@ jobs:
         working-directory: sdk/node-ts
         run: |
           node scripts/prune-platform-optional-deps.mjs
-          npm install --package-lock=false
+          npm ci
           npm run build:native -- --target ${{ matrix.napi_target }}
           npm run build:ts
 
@@ -832,7 +832,7 @@ jobs:
           . "$env:GITHUB_WORKSPACE\vendor\libkrunfw\scripts\msvc-env.ps1"
           Set-MsvcEnvironment -Architecture ${{ matrix.vs_arch }} -HostArchitecture ${{ matrix.vs_host_arch }}
           node scripts/prune-platform-optional-deps.mjs
-          npm install --package-lock=false
+          npm ci
           npm run build:native -- --target ${{ matrix.napi_target }}
           npm run build:ts
 
@@ -1210,7 +1210,14 @@ jobs:
       - name: Build TypeScript output (root package dist/)
         working-directory: sdk/node-ts
         run: |
-          npm install --omit=optional --package-lock=false
+          # Platform packages are not published yet at this point, so the
+          # committed lockfile cannot resolve them. Prune them for the install
+          # (`npm install` instead re-resolves the registry, which crashes npm 10
+          # on vitest's peer graph), then restore package.json so the published
+          # root tarball keeps its platform optional dependencies.
+          node scripts/prune-platform-optional-deps.mjs
+          npm ci --omit=optional
+          git checkout -- package.json
           npm run build:ts
 
       - name: Build and publish agent client package
