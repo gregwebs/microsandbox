@@ -755,6 +755,13 @@ jobs:
       - name: Check generated microsandbox types
         run: cargo +stable run -p microsandbox-types --features ts --bin microsandbox-types-generate -- --check
 
+      # The guest agent is embedded in the host binary and the protocol generation
+      # gate cannot detect guest-side changes, so the policy that decides which
+      # artifact gets embedded needs its own regression check. Runs last: it
+      # re-stamps the guest sources to exercise the staleness guard.
+      - name: Check agentd provenance policy
+        run: scripts/ci/check-agentd-provenance.sh
+
   node-sdk-build:
     name: TypeScript and Node Quality
     needs: [build-linux-x86_64, changes]
