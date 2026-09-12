@@ -5139,22 +5139,37 @@ mod tests {
     /// host has a writable one.
     ///
     /// Cross-device staging is only reachable when the hard-link fast path really
-    /// fails, so the tests below skip loudly (never silently) on a host without a
-    /// second filesystem instead of pretending to cover the branch.
+    /// fails, so a host without a second filesystem cannot cover the branch. The
+    /// situation is reported instead of silently passing, and CI overrides it:
+    ///
+    /// - `MSB_TEST_CROSS_DEVICE_DIR` names the directory to stage from (the macOS
+    ///   job points it at the RAM disk it creates; Linux auto-discovers `/dev/shm`).
+    /// - `MSB_TEST_REQUIRE_CROSS_DEVICE_TESTS` turns the missing-precondition case
+    ///   into a failure, so a job that is supposed to run these tests cannot quietly
+    ///   stop running them.
     #[cfg(unix)]
     fn cross_device_source_dir() -> Option<tempfile::TempDir> {
         let system_temp = std::fs::canonicalize(std::env::temp_dir()).ok()?;
         let system_dev = std::fs::metadata(&system_temp).ok()?.dev();
+        let required = std::env::var_os("MSB_TEST_REQUIRE_CROSS_DEVICE_TESTS").is_some();
 
-        let mut candidates: Vec<PathBuf> = ["/dev/shm", "/run"].iter().map(PathBuf::from).collect();
-        // macOS: any mounted volume (a RAM disk or a disk image both work). The
-        // entries of `/Volumes` for the boot volume resolve to the same device and
-        // are filtered out below.
-        if let Ok(entries) = std::fs::read_dir("/Volumes") {
-            candidates.extend(entries.flatten().map(|entry| entry.path()));
-        }
+        let explicit = std::env::var_os("MSB_TEST_CROSS_DEVICE_DIR").map(PathBuf::from);
+        let candidates: Vec<PathBuf> = match &explicit {
+            Some(explicit) => vec![explicit.clone()],
+            None => {
+                let mut candidates: Vec<PathBuf> =
+                    ["/dev/shm", "/run"].iter().map(PathBuf::from).collect();
+                // macOS: any mounted volume (a RAM disk or a disk image both work).
+                // Entries for the boot volume resolve to the same device and are
+                // filtered out below.
+                if let Ok(entries) = std::fs::read_dir("/Volumes") {
+                    candidates.extend(entries.flatten().map(|entry| entry.path()));
+                }
+                candidates
+            }
+        };
 
-        candidates.into_iter().find_map(|candidate| {
+        let found = candidates.iter().find_map(|candidate| {
             if std::fs::metadata(&candidate).ok()?.dev() == system_dev {
                 return None;
             }
@@ -5164,7 +5179,21 @@ mod tests {
                 .prefix("microsandbox-cross-device-")
                 .tempdir_in(candidate)
                 .ok()
-        })
+        });
+        if found.is_none() {
+            let message = format!(
+                "cross-device staging tests need a writable directory on a filesystem other than \
+                 the system temp dir ({}, device {}): none of {candidates:?} is on a different \
+                 device and writable",
+                system_temp.display(),
+                system_dev
+            );
+            if required {
+                panic!("MSB_TEST_REQUIRE_CROSS_DEVICE_TESTS is set but {message}");
+            }
+            eprintln!("SKIP: {message}");
+        }
+        found
     }
 
     #[cfg(unix)]
@@ -5232,7 +5261,6 @@ mod tests {
     #[cfg(unix)]
     async fn stage_file_mounts_real_cross_device_keeps_writable_inode_identity() {
         let Some(source_dir) = cross_device_source_dir() else {
-            eprintln!("SKIP: no second filesystem available for a real cross-device mount");
             return;
         };
         let source = source_dir.path().join("writable.txt");
@@ -5285,7 +5313,6 @@ mod tests {
     #[cfg(unix)]
     async fn stage_file_mounts_real_cross_device_copies_readonly_into_system_staging() {
         let Some(source_dir) = cross_device_source_dir() else {
-            eprintln!("SKIP: no second filesystem available for a real cross-device mount");
             return;
         };
         let source = source_dir.path().join("readonly.txt");
@@ -5328,7 +5355,6 @@ mod tests {
     #[cfg(unix)]
     async fn stage_file_mounts_real_cross_device_mixes_readonly_and_writable() {
         let Some(source_dir) = cross_device_source_dir() else {
-            eprintln!("SKIP: no second filesystem available for a real cross-device mount");
             return;
         };
         let writable = source_dir.path().join("writable.txt");
@@ -5372,7 +5398,6 @@ mod tests {
     #[cfg(unix)]
     async fn stage_file_mounts_real_cross_device_stage_root_is_owner_only() {
         let Some(source_dir) = cross_device_source_dir() else {
-            eprintln!("SKIP: no second filesystem available for a real cross-device mount");
             return;
         };
         let source = source_dir.path().join("writable.txt");
@@ -5428,7 +5453,6 @@ mod tests {
     #[cfg(unix)]
     async fn stage_file_mounts_real_cross_device_stages_follow_the_handle_lifetime() {
         let Some(source_dir) = cross_device_source_dir() else {
-            eprintln!("SKIP: no second filesystem available for a real cross-device mount");
             return;
         };
         let source = source_dir.path().join("writable.txt");
@@ -5468,7 +5492,6 @@ mod tests {
             return;
         }
         let Some(source_dir) = cross_device_source_dir() else {
-            eprintln!("SKIP: no second filesystem available for a real cross-device mount");
             return;
         };
         let source = source_dir.path().join("writable.txt");
@@ -5508,7 +5531,6 @@ mod tests {
             return;
         }
         let Some(source_dir) = cross_device_source_dir() else {
-            eprintln!("SKIP: no second filesystem available for a real cross-device mount");
             return;
         };
         let staged_parent = source_dir.path().join("staged");
