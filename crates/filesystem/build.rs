@@ -1,5 +1,4 @@
 use std::path::{Path, PathBuf};
-#[cfg(not(feature = "prebuilt"))]
 use std::time::SystemTime;
 
 use microsandbox_utils::AGENTD_BINARY;
@@ -21,86 +20,134 @@ fn main() {
     build_agentd(&workspace_root, &out_dir);
 }
 
+/// The guest agent's sources, present only when this build is inside a checkout.
+///
+/// A published crate carries neither directory. That is the difference between a
+/// build that can rebuild the guest agent and one that can only consume a
+/// released artifact.
+struct GuestAgentdSources {
+    agentd: PathBuf,
+    protocol: PathBuf,
+}
+
 fn build_agentd(workspace_root: &Path, out_dir: &Path) {
     let local = workspace_root.join("build").join(AGENTD_BINARY);
+    let sources = guest_agentd_sources(workspace_root);
+    let dest = out_dir.join(AGENTD_BINARY);
     println!("cargo:rerun-if-changed={}", local.display());
+
+    // `MSB_AGENTD_PATH` is the caller choosing this build's guest payload, so it
+    // wins over the local artifact and the cache. Ignored without `prebuilt`,
+    // where the local artifact is the only supported source.
+    #[cfg(feature = "prebuilt")]
+    {
+        println!("cargo:rerun-if-env-changed=MSB_AGENTD_PATH");
+        if let Some(staged) = std::env::var_os("MSB_AGENTD_PATH").map(PathBuf::from) {
+            if !staged.is_file() {
+                panic!(
+                    "MSB_AGENTD_PATH does not point to an agentd file: {}",
+                    staged.display()
+                );
+            }
+            println!("cargo:rerun-if-changed={}", staged.display());
+            println!(
+                "cargo:warning=microsandbox: embedding the guest agent from \
+                 MSB_AGENTD_PATH={}, not from build/{AGENTD_BINARY}",
+                staged.display()
+            );
+            copy_agentd(&staged, &dest);
+            return;
+        }
+    }
+
+    if local.is_file() {
+        ensure_local_agentd_is_current(&local, sources.as_ref());
+        copy_agentd(&local, &dest);
+        return;
+    }
+
+    if let Some(sources) = &sources {
+        // A checkout can always rebuild the guest agent, so it must never
+        // substitute a released artifact for a missing local one: the guest agent
+        // is embedded in the host binary, so that would silently ship a payload
+        // built from a different revision of this tree (upstream's, for a fork).
+        panic!("{}", missing_local_agentd_message(&local, sources));
+    }
 
     #[cfg(feature = "prebuilt")]
     {
-        let dest = out_dir.join(AGENTD_BINARY);
-
-        // Local development recipes rebuild build/agentd before compiling msb.
-        // Prefer it over a cached OUT_DIR copy so the embedded PID 1 binary
-        // cannot silently lag behind the freshly built guest agent.
-        if local.is_file() {
-            copy_agentd(&local, &dest);
-            return;
-        }
-
-        println!("cargo:rerun-if-env-changed=MSB_AGENTD_PATH");
-
-        // A caller-supplied agentd stages the binary instead of using the cache or downloading.
-        if apply_msb_agentd_path(out_dir) {
-            return;
-        }
-
         if dest.exists() {
+            println!(
+                "cargo:warning=microsandbox: this build has no guest agent source tree; \
+                 reusing the {AGENTD_BINARY} staged in OUT_DIR by an earlier build of this \
+                 target. Guest-side behaviour is whatever that artifact contains."
+            );
             return;
         }
 
         let arch = std::env::var("CARGO_CFG_TARGET_ARCH").unwrap();
         let url = agentd_download_url(PREBUILT_VERSION, &arch);
-
+        println!(
+            "cargo:warning=microsandbox: this build has no guest agent source tree; \
+             embedding the released {AGENTD_BINARY} for v{PREBUILT_VERSION} from {url}. \
+             Guest-side behaviour is that release's, not any checkout's."
+        );
         download_to(&url, &dest);
     }
 
     #[cfg(not(feature = "prebuilt"))]
-    {
-        if !local.exists() {
-            panic!(
-                "{AGENTD_BINARY} binary not found at `{}`.\n\
-                 Run `just build-deps` first.",
-                local.display()
-            );
-        }
-
-        // Fail fast if build/agentd is stale relative to the guest source tree.
-        // A warning is too easy to miss and leads to confusing runtime behavior
-        // when msb embeds an older guest payload than the source implies.
-        let agentd_src = workspace_root.join("crates/agentd");
-        let protocol_src = workspace_root.join("crates/protocol");
-        if let Ok(bin_time) = std::fs::metadata(&local).and_then(|m| m.modified())
-            && newest_tree_mtime(&agentd_src)
-                .into_iter()
-                .chain(newest_tree_mtime(&protocol_src))
-                .any(|src_time| src_time > bin_time)
-        {
-            panic!(
-                "build/{AGENTD_BINARY} is older than crates/agentd or crates/protocol source.\n\
-                 Run `just build-agentd` to rebuild the guest agent binary."
-            );
-        }
-
-        let dest = out_dir.join(AGENTD_BINARY);
-        copy_agentd(&local, &dest);
-    }
+    panic!(
+        "no guest agent source tree and the `prebuilt` feature is off, so there is no \
+         {AGENTD_BINARY} to embed.\n\
+         Run `just build-agentd` to build one, or enable the `prebuilt` feature."
+    );
 }
 
-#[cfg(feature = "prebuilt")]
-fn apply_msb_agentd_path(out_dir: &Path) -> bool {
-    let Some(staged) = std::env::var_os("MSB_AGENTD_PATH").map(PathBuf::from) else {
-        return false;
+/// The guest agent source tree, when this build sees one.
+fn guest_agentd_sources(workspace_root: &Path) -> Option<GuestAgentdSources> {
+    let agentd = workspace_root.join("crates/agentd");
+    agentd.is_dir().then(|| GuestAgentdSources {
+        agentd,
+        protocol: workspace_root.join("crates/protocol"),
+    })
+}
+
+fn missing_local_agentd_message(local: &Path, sources: &GuestAgentdSources) -> String {
+    format!(
+        "{AGENTD_BINARY} binary not found at `{}`.\n\
+         This is a source checkout ({} exists), so it will not download a released guest\n\
+         agent: that would embed a guest payload built from a different revision of this tree.\n\
+         Run `just build-agentd` (or `just build-deps`) to build it, or point\n\
+         MSB_AGENTD_PATH at an agentd binary that belongs to this build.",
+        local.display(),
+        sources.agentd.display()
+    )
+}
+
+/// Fail when `build/agentd` is older than the guest sources it embeds.
+///
+/// The guest agent is compiled into the host binary, so a stale artifact silently
+/// changes guest-side behaviour, and the protocol generation gate cannot detect a
+/// change that does not introduce a message type. A warning is too easy to miss.
+fn ensure_local_agentd_is_current(local: &Path, sources: Option<&GuestAgentdSources>) {
+    let Some(sources) = sources else {
+        return;
     };
-    if !staged.is_file() {
+    let Ok(built_at) = std::fs::metadata(local).and_then(|meta| meta.modified()) else {
+        return;
+    };
+    let newest_source = newest_tree_mtime(&sources.agentd)
+        .into_iter()
+        .chain(newest_tree_mtime(&sources.protocol))
+        .max();
+    if let Some(newest_source) = newest_source
+        && newest_source > built_at
+    {
         panic!(
-            "MSB_AGENTD_PATH does not point to an agentd file: {}",
-            staged.display()
+            "build/{AGENTD_BINARY} is older than crates/agentd or crates/protocol source.\n\
+             Run `just build-agentd` to rebuild the guest agent binary."
         );
     }
-
-    println!("cargo:rerun-if-changed={}", staged.display());
-    copy_agentd(&staged, &out_dir.join(AGENTD_BINARY));
-    true
 }
 
 fn copy_agentd(local: &Path, dest: &Path) {
@@ -114,7 +161,6 @@ fn copy_agentd(local: &Path, dest: &Path) {
     std::fs::copy(local, dest).expect("failed to copy agentd to OUT_DIR");
 }
 
-#[cfg(not(feature = "prebuilt"))]
 fn newest_tree_mtime(root: &Path) -> Option<SystemTime> {
     fn walk(path: &Path, newest: &mut Option<SystemTime>) {
         let entries = match std::fs::read_dir(path) {

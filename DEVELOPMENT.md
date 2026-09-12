@@ -96,19 +96,31 @@ just build release && just install
 
 ### Using a Prebuilt agentd Binary
 
-With the default `prebuilt` feature enabled, downstream consumers of
-`microsandbox-filesystem` can set `MSB_AGENTD_PATH` to an existing guest
-`agentd` binary.
+The guest `agentd` binary is embedded into the host binary, so *which* artifact is
+embedded matters: it is the guest PID 1 process, and the protocol generation gate
+cannot detect a guest-side change that does not add a message type. Resolution
+order:
 
-The repository-local `build/agentd` takes precedence. Otherwise, the supplied
-binary is copied into Cargo's `OUT_DIR` instead of downloading the release
-artifact. If no repository-local `build/agentd` exists and `MSB_AGENTD_PATH` is
-set, it must point to an existing file or the build fails.
-The variable is ignored when the `prebuilt` feature is disabled.
+1. `MSB_AGENTD_PATH` — an explicit choice, used verbatim, and the build warns that
+   it did so. Requires the `prebuilt` feature; ignored without it, where the
+   checkout's own build is the only supported source.
+2. `build/agentd` — this checkout's own build. It must not be older than
+   `crates/agentd` or `crates/protocol`; otherwise the build fails and asks for
+   `just build-agentd`.
+3. The release artifact for the workspace version — downloaded **only when the
+   build has no guest source tree at all** (a published crate rather than a
+   checkout), announced with a `cargo:warning`. A checkout never falls back to it:
+   that would silently embed a guest payload built from a different revision of
+   this tree (upstream's, for a fork).
 
 ```bash
+just build-agentd
+# or, with the default `prebuilt` feature:
 MSB_AGENTD_PATH=/path/to/agentd cargo build
 ```
+
+`scripts/ci/check-agentd-provenance.sh` asserts this policy, including the failure
+messages, and runs in the `Rust Quality` CI job.
 
 ## Project Structure
 
