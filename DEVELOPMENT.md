@@ -251,6 +251,8 @@ Dispatch the **Release version bump** workflow (`.github/workflows/release-bump.
 
 The workflow then regenerates `Cargo.lock` and the npm lockfiles and opens a PR titled `chore: release vX.Y.Z`.
 
+`sdk/node-ts/package-lock.json` cannot resolve the `@superradcompany/microsandbox-*` platform sub-packages until they exist on npm, so the bump PR deliberately leaves those entries unresolved and `release.yml` regenerates them after publishing (step 11 below). The `TypeScript and Node Quality` job fails when the committed lockfile is out of sync with `package.json` (or with a platform package that npm already serves), so this gap cannot sit unnoticed again.
+
 `microsandbox-mcp` is versioned in its own repository (the `mcp/` submodule). Bump it there and advance the `mcp/` (and, when changed, `skills/`) submodule pointers in the release PR — `release.yml` publishes whatever `microsandbox-mcp` version the submodule pointer holds.
 
 ### 2. Tag and Release
