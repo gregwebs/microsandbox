@@ -70,5 +70,24 @@ jobs:
         if: inputs.os == 'linux'
         uses: rui314/setup-mold@9c9c13bf4c3f1adef0cc596abc155580bcb04444 # 2.41.0
 
+      # macOS has no `/dev/shm`, so the cross-device file-mount staging tests would
+      # skip there. A RAM disk gives them a real second filesystem to stage from.
+      - name: Create a second filesystem for cross-device tests (macOS)
+        if: inputs.os == 'darwin'
+        run: |
+          set -euo pipefail
+          device="$(hdiutil attach -nomount ram://81920 | awk '{print $1}')"
+          diskutil eraseVolume HFS+ microsandbox-cross-device "$device" >/dev/null
+          echo "MSB_TEST_CROSS_DEVICE_DIR=/Volumes/microsandbox-cross-device" >> "$GITHUB_ENV"
+
       - name: Test workspace
+        env:
+          # Fail rather than skip when the second filesystem is missing: a silent
+          # skip would leave the cross-device staging path untested. Linux stages
+          # from `/dev/shm`; the macOS step above supplies the RAM disk.
+          MSB_TEST_REQUIRE_CROSS_DEVICE_TESTS: "1"
         run: cargo +stable test --workspace --exclude microsandbox-agentd
+
+      - name: Detach the second filesystem (macOS)
+        if: always() && inputs.os == 'darwin'
+        run: hdiutil detach /Volumes/microsandbox-cross-device || true
