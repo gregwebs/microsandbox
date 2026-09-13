@@ -61,8 +61,12 @@ pub struct ProcessHandle {
     /// `Reserved` if the runtime exits before activation.
     metrics_reservation: Option<MetricsReservationCleanup>,
 
-    /// Ephemeral staging directory for file mounts. Dropped when the
-    /// process handle is dropped, which auto-removes all staged files.
+    /// Temporary file-mount stage roots this handle owns: source-parent roots
+    /// on Unix, and both the system root and any source-parent roots on
+    /// Windows/non-Unix. Dropped when the process handle is dropped, which
+    /// auto-removes the staged files. Unix sandbox-dir stages
+    /// (`<sandbox_dir>/file-mounts`) are not owned here; they survive drop and
+    /// disarm until the next spawn of the same name or `rm`.
     _file_mounts_staging: Vec<TempDir>,
 
     /// Open disk-image lock files. Kept for the process lifetime so disk
@@ -188,8 +192,10 @@ impl ProcessHandle {
     /// Disarm the SIGTERM safety net so the sandbox keeps running after
     /// this handle is dropped. Used by detached sandbox flows.
     ///
-    /// Also prevents the file-mounts staging directory from being deleted,
-    /// since the detached VM process still needs the backing files.
+    /// Also prevents the temporary file-mount stage roots owned by this
+    /// handle from being deleted, since the detached VM process still needs
+    /// the backing files. Unix sandbox-dir stages are not owned here and are
+    /// unaffected.
     pub fn disarm(&mut self) {
         self.detached = true;
 
@@ -206,8 +212,8 @@ impl ProcessHandle {
             }
         }
 
-        // Consume the TempDir without deleting its contents — the detached
-        // VM process still reads from it via virtiofs.
+        // Consume the temporary stage roots without deleting their contents —
+        // the detached VM process still reads from them via virtiofs.
         for td in self._file_mounts_staging.drain(..) {
             let _ = td.keep();
         }

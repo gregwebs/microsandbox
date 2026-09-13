@@ -228,18 +228,18 @@ sb = await Sandbox.create(
 
 </Accordion>
 
-Mount a host directory into the sandbox. Changes in the guest are reflected on the host and vice versa.
+Mount a host directory into the sandbox. Changes in the guest are reflected on the host and vice versa. A host *file* may also be bound; on the local Unix backend its staging location and lifetime are described in [File bind-mount storage](/sandboxes/volumes#file-bind-mount-storage).
 
 <p className="msb-label">Parameters</p>
 
 <div className="msb-params">
   <div className="msb-param">
     <div className="msb-param-key"><code>path</code><span className="msb-type">str</span></div>
-    <div className="msb-param-desc">Directory path on the host.</div>
+    <div className="msb-param-desc">Host path of a directory or file to bind.</div>
   </div>
   <div className="msb-param">
     <div className="msb-param-key"><code>readonly</code><span className="msb-type">bool</span></div>
-    <div className="msb-param-desc">Mount as read-only; virtiofs-backed mounts also reject writes in the host filesystem server.</div>
+    <div className="msb-param-desc">Mount as read-only; virtiofs-backed mounts also reject writes in the host filesystem server. A readonly file bind is not a snapshot (see [File bind-mount storage](/sandboxes/volumes#file-bind-mount-storage)).</div>
   </div>
   <div className="msb-param">
     <div className="msb-param-key"><code>noexec</code><span className="msb-type">bool</span></div>
@@ -804,7 +804,7 @@ Frozen dataclass representing a mount configuration. Build one with a [mount fac
 | named_kind | [`VolumeKind`](#volumekind)` \| None` | `None` | Storage kind for created named volumes |
 | quota_mib | `int \| None` | `None` | Quota in MiB for directory named volumes |
 | size_mib | `int \| None` | `None` | Size limit for tmpfs, or capacity for disk named volumes |
-| readonly | `bool` | `False` | Whether the mount is read-only |
+| readonly | `bool` | `False` | Whether the mount is read-only (a readonly file bind is not a snapshot; see [File bind-mount storage](/sandboxes/volumes#file-bind-mount-storage)) |
 | noexec | `bool` | `False` | Whether direct execution from the mount is disabled |
 | nosuid | `bool` | `False` | Whether setuid/setgid privilege elevation is ignored |
 | nodev | `bool` | `False` | Whether device files on the mount are ignored |
