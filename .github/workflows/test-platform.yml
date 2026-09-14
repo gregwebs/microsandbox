@@ -82,6 +82,22 @@ jobs:
           diskutil eraseVolume HFS+ microsandbox-cross-device "$device" >/dev/null
           echo "MSB_TEST_CROSS_DEVICE_DIR=/Volumes/microsandbox-cross-device" >> "$GITHUB_ENV"
 
+      - name: Create a non-owner search-only fixture
+        run: |
+          set -euo pipefail
+          root="$RUNNER_TEMP/msb-search-only"
+          sudo rm -rf "$root"
+          mkdir -p "$root/child"
+          printf 'search-only\n' > "$root/source.txt"
+          chmod 0700 "$root/child"
+          # Only the root directory becomes another uid; the file and child stay
+          # owned by the runner, so protected_hardlinks does not confound the link.
+          # Set the mode before giving ownership away: once the directory is owned
+          # by root, the unprivileged chmod would fail EPERM under `set -e`.
+          chmod 0711 "$root"
+          sudo chown root "$root"
+          echo "MSB_TEST_SEARCH_ONLY_DIR=$root" >> "$GITHUB_ENV"
+
       - name: Test workspace
         env:
           # Fail rather than skip when the second filesystem is missing: a silent
@@ -94,3 +110,7 @@ jobs:
       - name: Detach the second filesystem (macOS)
         if: always() && inputs.os == 'darwin'
         run: hdiutil detach /Volumes/microsandbox-cross-device || true
+
+      - name: Remove the non-owner search-only fixture
+        if: always()
+        run: sudo rm -rf "$RUNNER_TEMP/msb-search-only"

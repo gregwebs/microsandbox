@@ -13,7 +13,6 @@ use nix::{
     sys::signal::{self, Signal},
     unistd::Pid,
 };
-use tempfile::TempDir;
 use tokio::process::Child;
 #[cfg(windows)]
 use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
@@ -67,7 +66,7 @@ pub struct ProcessHandle {
     /// auto-removes the staged files. Unix sandbox-dir stages
     /// (`<sandbox_dir>/file-mounts`) are not owned here; they survive drop and
     /// disarm until the next spawn of the same name or `rm`.
-    _file_mounts_staging: Vec<TempDir>,
+    _file_mounts_staging: Vec<crate::runtime::spawn::FileMountStageOwner>,
 
     /// Open disk-image lock files. Kept for the process lifetime so disk
     /// images cannot be attached with incompatible write modes.
@@ -102,7 +101,7 @@ impl ProcessHandle {
         pid: u32,
         sandbox_name: String,
         child: Child,
-        file_mounts_staging: Vec<TempDir>,
+        file_mounts_staging: Vec<crate::runtime::spawn::FileMountStageOwner>,
         disk_locks: Vec<File>,
         #[cfg(unix)] parent_watchdog: Option<OwnedFd>,
         #[cfg(windows)] job: Option<WindowsJob>,
@@ -214,8 +213,8 @@ impl ProcessHandle {
 
         // Consume the temporary stage roots without deleting their contents —
         // the detached VM process still reads from them via virtiofs.
-        for td in self._file_mounts_staging.drain(..) {
-            let _ = td.keep();
+        for owner in self._file_mounts_staging.drain(..) {
+            owner.detach();
         }
     }
 
@@ -452,15 +451,22 @@ mod tests {
     use std::path::PathBuf;
 
     use super::*;
+    use crate::runtime::spawn::FileMountStageOwner;
 
-    fn staged_dirs() -> (Vec<TempDir>, Vec<PathBuf>) {
+    fn staged_dirs() -> (Vec<FileMountStageOwner>, Vec<PathBuf>) {
         let first = tempfile::tempdir().unwrap();
         let second = tempfile::tempdir().unwrap();
         let paths = vec![first.path().to_path_buf(), second.path().to_path_buf()];
-        (vec![first, second], paths)
+        (
+            vec![
+                FileMountStageOwner::Temp(first),
+                FileMountStageOwner::Temp(second),
+            ],
+            paths,
+        )
     }
 
-    fn process_handle_with_staging(staging: Vec<TempDir>) -> ProcessHandle {
+    fn process_handle_with_staging(staging: Vec<FileMountStageOwner>) -> ProcessHandle {
         let child = tokio::process::Command::new("true").spawn().unwrap();
         let pid = child.id().unwrap();
         ProcessHandle::new(

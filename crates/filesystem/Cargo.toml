@@ -21,6 +21,11 @@ tracing.workspace = true
 [features]
 default = ["prebuilt"]
 prebuilt = ["microsandbox-utils/http-client"]
+# Exposes the `nofollow` fault-injection seams (`StageOverrides`, `LinkFaults`,
+# `CopyFaults` and their `*_with_override` / `*_with_faults` entry points) so
+# the SDK crate's `#[cfg(test)]` tests can drive otherwise-unreachable branches.
+# Never enabled in shipping builds; enabled only by the SDK's dev-dependencies.
+test-internals = []
 
 [build-dependencies]
 microsandbox-utils.workspace = true

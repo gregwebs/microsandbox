@@ -4725,4 +4725,110 @@ mod tests {
         .unwrap_err();
         assert_eq!(err.to_string(), "--net `all` may only be specified once");
     }
+    //----------------------------------------------------------------------------------------------
+    // Tests: follow-root-symlinks on file binds (issue #24)
+    //----------------------------------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn cli_bind_defaults_to_no_follow_root_symlinks() {
+        let mount = build_one("/host/f:/guest").await;
+        match mount {
+            VolumeMount::Bind {
+                follow_root_symlinks,
+                ..
+            } => assert!(!follow_root_symlinks, "no-follow must be the default"),
+            other => panic!("expected Bind, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn cli_bind_opt_in_sets_follow_root_symlinks() {
+        match build_one("/host/f:/guest:follow-root-symlinks").await {
+            VolumeMount::Bind {
+                follow_root_symlinks,
+                ..
+            } => assert!(follow_root_symlinks),
+            other => panic!("expected Bind, got {other:?}"),
+        }
+        match build_one("/host/f:/guest:ro,follow-root-symlinks").await {
+            VolumeMount::Bind {
+                follow_root_symlinks,
+                options,
+                ..
+            } => {
+                assert!(follow_root_symlinks);
+                assert!(options.readonly, "the ro flag must still apply");
+            }
+            other => panic!("expected Bind, got {other:?}"),
+        }
+    }
+
+    #[cfg(unix)]
+    fn mount_file_fixture() -> (tempfile::TempDir, PathBuf, PathBuf, PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().join("real.toml");
+        std::fs::write(&real, b"key = 1").unwrap();
+        let link = dir.path().join("link.toml");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let subdir = dir.path().join("subdir");
+        std::fs::create_dir(&subdir).unwrap();
+        (dir, real, link, subdir)
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn mount_file_defaults_to_no_follow_root_symlinks() {
+        let (_dir, real, _link, _subdir) = mount_file_fixture();
+        let spec = format!("{}:/guest", real.display());
+        match build_explicit(&spec, apply_explicit_file_mount).await {
+            VolumeMount::Bind {
+                follow_root_symlinks,
+                ..
+            } => assert!(!follow_root_symlinks),
+            other => panic!("expected Bind, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn mount_file_opt_in_sets_follow_root_symlinks() {
+        let (_dir, real, _link, _subdir) = mount_file_fixture();
+        let spec = format!("{}:/guest:follow-root-symlinks", real.display());
+        match build_explicit(&spec, apply_explicit_file_mount).await {
+            VolumeMount::Bind {
+                follow_root_symlinks,
+                ..
+            } => assert!(follow_root_symlinks),
+            other => panic!("expected Bind, got {other:?}"),
+        }
+    }
+
+    /// `ensure_host_kind` follows symlinks, so a symlinked source passes the
+    /// parse-time check and is then refused by the SDK at create time. This
+    /// pins that deliberately unchanged behaviour so a future change to the
+    /// check is visible here (see `stage_file_mounts_rejects_a_symlinked_leaf_by_default`).
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn mount_file_accepts_a_symlinked_source_at_parse_time() {
+        let (_dir, _real, link, _subdir) = mount_file_fixture();
+        let spec = format!("{}:/guest", link.display());
+        let mount = build_explicit(&spec, apply_explicit_file_mount).await;
+        assert!(matches!(mount, VolumeMount::Bind { .. }));
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn mount_file_still_rejects_a_directory_source() {
+        let (_dir, _real, _link, subdir) = mount_file_fixture();
+        let spec = format!("{}:/guest", subdir.display());
+        let builder = microsandbox::sandbox::SandboxBuilder::new("test").image("alpine");
+        let error = match apply_explicit_file_mount(builder, &spec) {
+            Err(error) => error.to_string(),
+            Ok(_) => panic!("a directory source must be rejected for --mount-file"),
+        };
+        assert!(
+            error.contains("source is not a regular file"),
+            "the unchanged kind check must still fire: {error}"
+        );
+    }
 }

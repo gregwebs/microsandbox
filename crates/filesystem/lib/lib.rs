@@ -18,6 +18,8 @@
 pub mod agentd;
 #[cfg(any(unix, windows))]
 pub mod backends;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub mod nofollow;
 
 //--------------------------------------------------------------------------------------------------
 // Re-Exports

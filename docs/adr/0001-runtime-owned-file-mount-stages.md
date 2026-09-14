@@ -27,7 +27,11 @@ On Unix (Linux and macOS) the local backend now:
    the sandbox lifecycle guard is held; `rm` removes it with the rest of the
    sandbox directory.
 2. **Chooses the stage root per mount by filesystem identity, before doing any
-   work.** The source's `st_dev` is compared with the sandbox-dir stage's:
+   work.** The source's `st_dev` is compared with the sandbox-dir stage's. The
+   device is read from a held-parent no-follow `fstatat`, and a writable mount
+   that still gets `EXDEV` from the sandbox-dir link retries exactly once in a
+   source-parent stage, so device equality is treated as a preflight check
+   rather than mount-instance identity:
    - same device: hard link into `<sandbox_dir>/file-mounts/<fm_tag>/<file>`;
    - different device, readonly: copy into the same sandbox-dir stage, since a
      link cannot cross filesystems and a readonly mount needs no writeback;
@@ -104,4 +108,5 @@ by #23. This is not a commitment to Windows parity for this design.
 ## Links
 
 - Issue: https://github.com/gregwebs/microsandbox/issues/23
+- File sources honor `follow_root_symlinks` and stage from no-follow descriptors: https://github.com/gregwebs/microsandbox/issues/24
 - Follow-up (source-parent cleanup): https://github.com/gregwebs/microsandbox/issues/25

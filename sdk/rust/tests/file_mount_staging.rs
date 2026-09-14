@@ -84,8 +84,14 @@ async fn assert_shell_ok(sandbox: &Sandbox, command: &str, expected: &str) {
 #[ignore = "requires a signed runtime + VM support; run with --ignored"]
 async fn file_mount_stage_lives_in_sandbox_and_is_cleared_and_removed() {
     let fixture = TempDir::new().unwrap();
-    let home = fixture_home(&fixture.path().join("home"));
-    let sources = fixture.path().join("sources");
+    // Derive every path from the canonicalized root: on macOS the `TempDir`
+    // lives under `/var/folders/...`, and `/var` is a symlink to `/private/var`.
+    // The source is a *file* bind, so under the no-follow policy it is admitted
+    // by the gate and then refused for a symlinked ancestor unless the fixture
+    // is canonicalized. Keep `fixture` alive for cleanup.
+    let root = fixture.path().canonicalize().unwrap();
+    let home = fixture_home(&root.join("home"));
+    let sources = root.join("sources");
     std::fs::create_dir_all(&sources).unwrap();
     let source = sources.join("settings.toml");
     std::fs::write(&source, b"before\n").unwrap();
@@ -195,4 +201,110 @@ async fn run_e2e(
     assert!(source.exists(), "removal must not touch the source file");
     assert!(sources.exists());
     Ok(())
+}
+
+/// A symlinked file source is refused without the opt-in, and mounted with it;
+/// a guest write then reaches the symlink's target while the symlink itself is
+/// untouched. Built on an explicitly planted symlink so it is deterministic on
+/// both platforms rather than depending on `/var`.
+#[tokio::test]
+#[ignore = "requires a signed runtime + VM support; run with --ignored"]
+async fn file_mount_symlinked_source_requires_opt_in_and_writes_through() {
+    const SYMLINK_NAME: &str = "file-mount-symlink";
+
+    let fixture = TempDir::new().unwrap();
+    let root = fixture.path().canonicalize().unwrap();
+    let home = fixture_home(&root.join("home"));
+    let sources = root.join("sources");
+    std::fs::create_dir_all(&sources).unwrap();
+    let real = sources.join("real.toml");
+    std::fs::write(&real, b"key = \"before\"\n").unwrap();
+    let link = sources.join("link.toml");
+    std::os::unix::fs::symlink("real.toml", &link).unwrap();
+
+    let backend = isolated_backend(&home).await;
+    let sandbox_dir = home.join("sandboxes").join(SYMLINK_NAME);
+    let image = image();
+
+    let outcome = microsandbox::with_backend(backend, {
+        let link = link.clone();
+        let real = real.clone();
+        let sandbox_dir = sandbox_dir.clone();
+        let image = image.clone();
+        async move {
+            // 1. Without the opt-in, creation is refused and names the mount and
+            //    the opt-in, and leaves no stage tag behind.
+            let refused = SandboxBuilder::new(SYMLINK_NAME)
+                .image(image.clone())
+                .cpus(1)
+                .memory(256)
+                .volume("/etc/app/settings.toml", |mount| mount.bind(&link))
+                .replace()
+                .create()
+                .await;
+            let error = match refused {
+                Err(error) => error.to_string(),
+                Ok(_) => return Err("a symlinked source must be refused by default".into()),
+            };
+            if !error.contains(&link.display().to_string())
+                || !error.contains("follow-root-symlinks")
+            {
+                return Err(format!(
+                    "refusal must name the mount and the opt-in: {error}"
+                ));
+            }
+            if !directory_entries(&sandbox_stage(&sandbox_dir)).is_empty() {
+                return Err("a refused mount must leave no stage tag".into());
+            }
+
+            // 2. With the opt-in the sandbox boots and the guest reads the host
+            //    target, never a guest-resolved path.
+            let sandbox = SandboxBuilder::new(SYMLINK_NAME)
+                .image(image.clone())
+                .cpus(1)
+                .memory(256)
+                .volume("/etc/app/settings.toml", |mount| {
+                    mount.bind(&link).follow_root_symlinks(true)
+                })
+                .replace()
+                .create()
+                .await
+                .map_err(|error| error.to_string())?;
+            assert_shell_ok(&sandbox, "cat /etc/app/settings.toml", "key = \"before\"").await;
+
+            // 3. A guest write reaches the host target, and the symlink survives.
+            assert_shell_ok(
+                &sandbox,
+                "printf 'key = \"after\"\n' > /etc/app/settings.toml",
+                "",
+            )
+            .await;
+            if std::fs::read_to_string(&real).unwrap() != "key = \"after\"\n" {
+                return Err("the guest write must reach the symlink target".into());
+            }
+            if !std::fs::symlink_metadata(&link)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+            {
+                return Err("the source symlink must be untouched".into());
+            }
+
+            sandbox
+                .stop_and_wait()
+                .await
+                .map_err(|error| error.to_string())?;
+            drop(sandbox);
+            Sandbox::remove(SYMLINK_NAME)
+                .await
+                .map_err(|error| error.to_string())?;
+            if !real.exists() || std::fs::symlink_metadata(&link).is_err() {
+                return Err("removal must not touch either host file".into());
+            }
+            Ok(())
+        }
+    })
+    .await;
+
+    assert!(outcome.is_ok(), "symlinked-source e2e failed: {outcome:?}");
 }

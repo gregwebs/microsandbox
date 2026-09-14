@@ -388,7 +388,10 @@ pub enum VolumeMount {
         /// Defaults to `false`: the host path is resolved following no symlink in
         /// any component, so a symlink planted at (or under) the mount root cannot
         /// redirect the mount out of its intended target. Set `true` to opt out
-        /// when the host path legitimately traverses a symlink.
+        /// when the host path legitimately traverses a symlink. On Linux and macOS
+        /// this also governs file binds (a symlinked host file is refused by
+        /// default); on Windows, and on other Unix targets that keep the legacy
+        /// staging path, file binds get no no-follow enforcement.
         follow_root_symlinks: bool,
         /// Guest-write byte budget in MiB.
         ///
