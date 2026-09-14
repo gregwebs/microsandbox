@@ -108,6 +108,20 @@ msb create alpine --name config-reader \
   --mount-file ./config.toml:/etc/app/config.toml:ro,nodev
 ```
 
+### File bind-mount storage
+
+A bind mount can target a single host file as well as a directory. For a file, microsandbox shares only that file with the guest, not the files next to it, so it stages the file in a host-side **file-mount stage** first.
+
+For the **local backend on Unix (Linux/macOS)** the stage is chosen per mount by filesystem identity:
+
+- Files on the same filesystem as the sandbox directory are hard-linked into `<sandbox_dir>/file-mounts`, normally `MSB_HOME/sandboxes/<name>/file-mounts`. A hard link keeps the host inode, so writable guest changes reach the source file. This uses the **configured backend's home**, not an ambient home when you supplied an explicit backend.
+- Readonly files on a different filesystem are isolated copies under `<sandbox_dir>/file-mounts` instead of the system temp directory (which may be tmpfs). These copies consume storage under that home and persist after the handle is dropped or the sandbox is stopped, until the next spawn of that name or `msb rm`. Available space there matters; microsandbox does not guarantee physical disk if you placed that home on tmpfs. A same-filesystem readonly file is a hard link, not a snapshot, so it reflects later host edits.
+- Writable files on a different filesystem are hard-linked beside their source, in the source's own directory, because a hard link must stay on one filesystem. That parent directory must be writable, and microsandbox errors rather than falling back to a copy. These stages live in your own tree; they are removed when an attached sandbox handle is dropped and kept when a detached run is disarmed, and a runtime-owned cleanup sweep is tracked in [#25](https://github.com/gregwebs/microsandbox/issues/25).
+
+**Windows is unchanged:** file mounts use temporary staging, try a hard link there, then readonly cross-volume copies stay in that temporary root and writable cross-volume files stage beside the source. Temporary roots are removed on ordinary handle drop or kept on detach. The Unix sandbox-dir persistence and reset guarantee above does not apply.
+
+See [CONTEXT.md](https://github.com/gregwebs/microsandbox/blob/main/CONTEXT.md) for the domain terms and [ADR 0001](https://github.com/gregwebs/microsandbox/blob/main/docs/adr/0001-runtime-owned-file-mount-stages.md) for the rationale.
+
 ## Named volumes
 
 <Tooltip tip="On microsandbox cloud, create named volumes before mounting them; create-on-mount, disk-kind volumes, and size are not available, and quota must be a whole number of GiB."><span className="msb-badge-limited">Limited on cloud <Icon icon="circle-info" size={11} /></span></Tooltip>

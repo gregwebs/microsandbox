@@ -71,7 +71,9 @@ jobs:
         uses: rui314/setup-mold@9c9c13bf4c3f1adef0cc596abc155580bcb04444 # 2.41.0
 
       # macOS has no `/dev/shm`, so the cross-device file-mount staging tests would
-      # skip there. A RAM disk gives them a real second filesystem to stage from.
+      # skip there. A RAM disk gives them a real second filesystem whose device
+      # differs from the sandbox directory the tests stage into (the checkout
+      # filesystem), which is the comparison base #23 introduced.
       - name: Create a second filesystem for cross-device tests (macOS)
         if: inputs.os == 'darwin'
         run: |
@@ -83,8 +85,9 @@ jobs:
       - name: Test workspace
         env:
           # Fail rather than skip when the second filesystem is missing: a silent
-          # skip would leave the cross-device staging path untested. Linux stages
-          # from `/dev/shm`; the macOS step above supplies the RAM disk.
+          # skip would leave the cross-device staging path untested. The second
+          # filesystem must differ from the sandbox directory: Linux stages from
+          # `/dev/shm`; the macOS step above supplies the RAM disk.
           MSB_TEST_REQUIRE_CROSS_DEVICE_TESTS: "1"
         run: cargo +stable test --workspace --exclude microsandbox-agentd
 

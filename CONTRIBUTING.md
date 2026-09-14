@@ -19,7 +19,7 @@ Please read and follow our [code of conduct](./CODE_OF_CONDUCT.md). We want micr
 
 ## Development Setup
 
-Follow [DEVELOPMENT.md](./DEVELOPMENT.md) to install prerequisites, build the project, run tests, and understand the release workflow.
+Follow [DEVELOPMENT.md](./DEVELOPMENT.md) to install prerequisites, build the project, run tests, and understand the release workflow. For the project's domain language, see [CONTEXT.md](./CONTEXT.md); for accepted design decisions and their rationale, see [`docs/adr/`](./docs/adr).
 
 ## Pull Requests
 
