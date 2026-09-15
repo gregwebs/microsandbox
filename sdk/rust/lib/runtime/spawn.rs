@@ -2248,6 +2248,7 @@ enum FileMountStagingMode {
     ForceCopyWorkerGate,
 }
 
+#[cfg(unix)]
 impl FileMountStagingMode {
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     fn forces_device_mismatch(self) -> bool {
