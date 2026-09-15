@@ -1479,7 +1479,7 @@ fn attempted_parent(path: &Path) -> PathBuf {
 fn open_parent_openat2(
     base: &SearchDir,
     parent_components: &[Component],
-    path: &Path,
+    _path: &Path,
 ) -> io::Result<Option<SearchDir>> {
     let mut rel = PathBuf::new();
     for component in parent_components {
@@ -1632,6 +1632,9 @@ fn fstat(fd: RawFd) -> io::Result<libc::stat> {
 }
 
 /// Extract the [`LeafKind`] from a raw `st_mode`.
+// The `S_IF*` constants are `u32` on Linux but a narrower `mode_t` on Darwin,
+// so the casts are required on macOS even though they are no-ops on Linux.
+#[allow(clippy::unnecessary_cast)]
 fn kind_from_mode(mode: u32) -> LeafKind {
     let kind = mode & (libc::S_IFMT as u32);
     if kind == libc::S_IFREG as u32 {
@@ -1764,7 +1767,7 @@ fn parent_allows_foreign_root_swap(fd: RawFd) -> io::Result<bool> {
 /// a permission-synthesizing filesystem or a foreign-owned decoy without
 /// changing the real directory; production passes the real stat values.
 fn validate_pinned_stage(
-    fd: RawFd,
+    _fd: RawFd,
     stat: &libc::stat,
     observed_mode: u32,
     observed_uid: Option<libc::uid_t>,
@@ -1800,7 +1803,7 @@ fn validate_pinned_stage(
         // well as any entry that could let a principal change this directory's
         // own permissions or ownership. A per-entry ACL query failure is
         // reported as an error and handled fail-closed by the caller.
-        match acl_has_foreign_grant(fd, stat_uid(stat)) {
+        match acl_has_foreign_grant(_fd, stat_uid(stat)) {
             Ok(false) => {}
             Ok(true) => {
                 return Err(io::Error::new(
@@ -2139,6 +2142,9 @@ struct ParsedControl {
 /// present. This is a private seam so tests can exercise the truncation and
 /// malformed-header refusal semantics with synthetic buffers, without
 /// manufacturing the kernel's own unreported truncation descriptors.
+// `msg_controllen` is `usize` on Linux but `u32` on Darwin, so the casts are
+// required on macOS even though they are no-ops on Linux.
+#[allow(clippy::unnecessary_cast)]
 fn parse_control_descriptors(msg: &libc::msghdr) -> ParsedControl {
     let mut descriptors: Vec<OwnedFd> = Vec::new();
     let mut malformed = false;
@@ -2241,6 +2247,9 @@ fn cmsg_align(len: usize) -> usize {
 ///
 /// `libc` exposes `CMSG_NXTHDR` on Darwin but not on Linux, so this mirrors the
 /// macro with the platform's control-message alignment.
+// `msg_controllen`/`cmsg_len` are `usize` on Linux but `u32` on Darwin, so the
+// casts are required on macOS even though they are no-ops on Linux.
+#[allow(clippy::unnecessary_cast)]
 fn next_cmsg(msg: &libc::msghdr, cmsg: *const libc::cmsghdr) -> *mut libc::cmsghdr {
     let base = msg.msg_control as usize;
     let end = base + msg.msg_controllen as usize;
