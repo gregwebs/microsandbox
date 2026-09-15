@@ -1,0 +1,28 @@
+---
+title: "Week of September 14, 2026"
+description: "File bind mounts follow the same symlink policy as directory binds."
+icon: "shield-halved"
+---
+
+## Breaking changes
+
+**File bind mounts follow the same symlink policy as directory bind mounts.**
+
+A host *file* whose path traverses a symlink in any component is now refused at create time, with
+the same `follow_root_symlinks(true)` / `follow-root-symlinks` opt-in that directory binds already
+use. Previously macOS silently mounted the symlink's target and Linux staged the symlink itself,
+which broke guest init or resolved to an unrelated *guest* path. On macOS `/tmp` and `/var` are
+symlinks, so a file mount under either now needs the opt-in — the same requirement your directory
+mounts under those paths already had.
+
+```rust
+sandbox.volume("/etc/app/settings.toml", |mount| {
+    mount.bind("/home/me/settings.toml").follow_root_symlinks(true)
+})
+```
+
+```bash
+msb run -v /home/me/settings.toml:/etc/app/settings.toml:follow-root-symlinks debian:13-slim
+```
+
+Directory bind mounts, named volumes, and non-file sources are unchanged. This applies to file bind mounts on Linux and macOS; Windows file binds are unchanged and get no no-follow enforcement.

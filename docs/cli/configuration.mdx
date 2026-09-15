@@ -196,7 +196,7 @@ init:
 
 ### Mounts
 
-A string mount is a config-relative bind mount using the same `SOURCE:TARGET[:OPTIONS]` option grammar as a bind passed to `-v/--volume`. Options include `ro`, `rw`, `noexec`, `nosuid`, `nodev`, `follow-root-symlinks`, `stat-virt=strict|relaxed|off`, `host-perms=private|mirror`, `quota=<size>`, and paired `uid=<N>,gid=<N>`:
+A string mount is a config-relative bind mount using the same `SOURCE:TARGET[:OPTIONS]` option grammar as a bind passed to `-v/--volume`. Options include `ro`, `rw`, `noexec`, `nosuid`, `nodev`, `follow-root-symlinks`, `stat-virt=strict|relaxed|off`, `host-perms=private|mirror`, `quota=<size>`, and paired `uid=<N>,gid=<N>`. `follow-root-symlinks` applies to a single-file source as well as a directory: on Linux and macOS a host file whose path traverses a symlink is refused at create time by default, unless `follow-root-symlinks` is set, while Windows file binds get no no-follow enforcement.
 
 ```yaml
 mounts:

@@ -14,7 +14,7 @@ use std::os::fd::{FromRawFd, OwnedFd};
 #[cfg(unix)]
 use std::os::unix::ffi::OsStrExt;
 #[cfg(unix)]
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
 #[cfg(windows)]
 use std::os::windows::fs::OpenOptionsExt;
 #[cfg(windows)]
@@ -56,6 +56,10 @@ use windows_sys::Win32::System::Threading::{
     CREATE_BREAKAWAY_FROM_JOB, CREATE_NEW_PROCESS_GROUP, DETACHED_PROCESS,
 };
 
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+use microsandbox_filesystem::nofollow::{CleanupOutcome, CopyError, CopySourceError, StageError};
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+use microsandbox_filesystem::nofollow::{CopyFaults, LinkFaults, StageOverrides};
 use microsandbox_image::{Digest, GlobalCache};
 use microsandbox_metrics::{MetricsRegistry, ReserveSlot, SlotReservation};
 use microsandbox_protocol::{
@@ -383,7 +387,7 @@ pub async fn spawn_sandbox(
     // Stage file bind mounts: each file gets its own isolated directory so
     // that virtio-fs (which requires directories) can share it without
     // exposing adjacent files on the host.
-    let (staged_file_mounts, file_mounts_staging) = stage_file_mounts(config).await?;
+    let (staged_file_mounts, file_mounts_staging) = stage_file_mounts(config, &sandbox_dir).await?;
     let named_volumes = resolve_named_volumes(local, config).await?;
     let disk_locks = lock_disk_mounts(config, &named_volumes)?;
     let metrics_reservation = if config.effective_metrics_interval().is_some() {
@@ -2135,17 +2139,373 @@ async fn terminate_startup_process(
     child.wait().await.ok()
 }
 
-/// Scan `config.spec.mounts` for file bind mounts and stage each file in its own
-/// isolated directory inside an ephemeral [`TempDir`].
+/// Test-only handoff that lets the executor-progress test hold a
+/// `spawn_blocking` staging worker at the gated copy while it checks that the
+/// current-thread runtime keeps running tasks. If the copy ran inline on the
+/// runtime thread, the heartbeat would stall and the test would fail.
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+mod copy_worker_gate {
+    use std::sync::{Condvar, Mutex};
+
+    /// Set while the blocking worker is held at the gate.
+    static BLOCKED: Mutex<bool> = Mutex::new(false);
+    /// Notified by the test to release the worker.
+    static RELEASE: Condvar = Condvar::new();
+
+    /// Called from the blocking worker: announce that it reached the gated copy,
+    /// then wait until the test releases it.
+    pub(super) fn wait() {
+        let mut blocked = BLOCKED.lock().unwrap();
+        *blocked = true;
+        RELEASE.notify_all();
+        while *blocked {
+            blocked = RELEASE.wait(blocked).unwrap();
+        }
+    }
+
+    /// True while a worker is held at the gate.
+    pub(super) fn blocked() -> bool {
+        *BLOCKED.lock().unwrap()
+    }
+
+    /// Release a held worker.
+    pub(super) fn release() {
+        *BLOCKED.lock().unwrap() = false;
+        RELEASE.notify_all();
+    }
+}
+
+/// Test seam for the file-mount staging destination decision. `Automatic` uses
+/// the real filesystem identity; the forced variants override only the
+/// equality result so the cross-device branches can be exercised without a
+/// second filesystem. Setup (metadata) failures still surface as errors.
+#[cfg(unix)]
+#[derive(Clone, Copy)]
+enum FileMountStagingMode {
+    Automatic,
+    #[cfg(test)]
+    ForceDeviceMismatch,
+    #[cfg(test)]
+    ForceDeviceMismatchAndRejectSourceParentStage,
+    /// Substitute this errno for the `linkat` result, to exercise the
+    /// mode-dependent link-failure handling without a privileged fixture.
+    #[cfg(test)]
+    ForceLinkErrno(i32),
+    /// Replace the source after fstatat classification, before linkat.
+    #[cfg(test)]
+    ForceLeafSwapBeforeLink,
+    /// Force the pinned source-parent stage descriptor to observe `m`, so the
+    /// D5 gate's skipped and applied branches are distinguishable on an
+    /// ordinary filesystem.
+    #[cfg(test)]
+    ForceSourceParentStageMode(u32),
+    /// Force the D5 parent-writability gate true on a parent that is not
+    /// group/other-writable.
+    #[cfg(test)]
+    ForceSourceParentForeignWritable,
+    /// Force the first sandbox-dir `linkat` to return `EXDEV`, so the writable
+    /// source-parent retry is exercised deterministically.
+    #[cfg(test)]
+    ForceFirstLinkExdev,
+    /// Simulate a hostile foreign-owned `0700` directory at the first anchor: the
+    /// pinned descriptor is observed as owned by another uid, so the D5
+    /// ownership check must reject it.
+    #[cfg(test)]
+    ForceSourceParentStageSwap,
+    /// After the first anchor, rename the stage root and plant a same-name decoy;
+    /// population must stay on the held descriptor.
+    #[cfg(test)]
+    ForceStageSwapAfterAnchor,
+    /// Rename the resolved source parent and plant a decoy tree; `mkdirat`/`linkat`
+    /// must stay under the held parent.
+    #[cfg(test)]
+    ForceAncestorRedirect,
+    /// Force the staged-entry verification `fstatat` to fail with `EIO`.
+    #[cfg(test)]
+    ForceVerifyStatError,
+    /// Force a post-link identity mismatch, then a cleanup `unlinkat` failure.
+    #[cfg(test)]
+    ForceVerificationUnlinkError,
+    /// Force the lazy-copy source open to fail with `EACCES`.
+    #[cfg(test)]
+    ForceCopyOpenError,
+    /// Force the lazy-copy source `fstat` to fail with `EIO`.
+    #[cfg(test)]
+    ForceCopyStatError,
+    /// Report the lazy-copy source as no longer regular.
+    #[cfg(test)]
+    ForceCopyNonRegular,
+    /// Report the lazy-copy source as an identity change.
+    #[cfg(test)]
+    ForceCopyChanged,
+    /// Fail the second mount after the first has been staged, so the unwind
+    /// contract is exercised deterministically.
+    #[cfg(test)]
+    FailSecondMount,
+    /// Hold the blocking copy worker at a gate, so an executor-progress test can
+    /// prove the copy runs off the runtime thread.
+    #[cfg(test)]
+    ForceCopyWorkerGate,
+}
+
+#[cfg(unix)]
+impl FileMountStagingMode {
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn forces_device_mismatch(self) -> bool {
+        match self {
+            FileMountStagingMode::Automatic => false,
+            // The source-parent-stage overrides imply the writable cross-device
+            // path, since they only apply to a source-parent stage. The copy
+            // hooks imply the cross-device readonly path, which copies directly.
+            #[cfg(test)]
+            FileMountStagingMode::ForceDeviceMismatch
+            | FileMountStagingMode::ForceDeviceMismatchAndRejectSourceParentStage
+            | FileMountStagingMode::ForceSourceParentStageMode(_)
+            | FileMountStagingMode::ForceSourceParentForeignWritable
+            | FileMountStagingMode::ForceSourceParentStageSwap
+            | FileMountStagingMode::ForceStageSwapAfterAnchor
+            | FileMountStagingMode::ForceAncestorRedirect
+            | FileMountStagingMode::ForceCopyOpenError
+            | FileMountStagingMode::ForceCopyStatError
+            | FileMountStagingMode::ForceCopyNonRegular
+            | FileMountStagingMode::ForceCopyChanged
+            | FileMountStagingMode::ForceCopyWorkerGate => true,
+            #[cfg(test)]
+            _ => false,
+        }
+    }
+}
+
+/// One bind mount that passed the file-mount gate, with its host path already
+/// resolved to a no-follow parent descriptor plus leaf.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[derive(Debug)]
+struct FileMountCandidate {
+    /// The path as the user wrote it. Under `follow_root_symlinks` this differs
+    /// from `source.path()`; error messages name this one.
+    requested: PathBuf,
+    /// The classified, no-follow source.
+    source: microsandbox_filesystem::nofollow::NoFollowFile,
+    /// The guest path the mount is published at.
+    guest: String,
+    /// Whether the mount is readonly.
+    readonly: bool,
+}
+
+/// The guest-path map a staging call returns: guest path to
+/// `(canonical stage directory, staged filename, tag)`.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+type StagedFileMounts = HashMap<String, (PathBuf, String, String)>;
+
+/// One bind mount admitted by the file-mount gate, before resolution. Owns the
+/// values the original `filter_map` produced and introduces no policy on
+/// `is_file() == false` mounts.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[derive(Debug)]
+struct SelectedFileMount {
+    requested: PathBuf,
+    guest: String,
+    readonly: bool,
+    follow_root_symlinks: bool,
+}
+
+/// A file-mount stage root this process owns for the sandbox process lifetime.
+#[derive(Debug)]
+pub(crate) enum FileMountStageOwner {
+    /// A source-parent stage pinned by held descriptors.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    SourceParent(microsandbox_filesystem::nofollow::SourceParentStage),
+    /// A `TempDir`-owned stage. Only constructed on non-Linux/macOS targets;
+    /// retained on all platforms so the handle plumbing and its tests share one
+    /// type.
+    #[allow(dead_code)]
+    Temp(TempDir),
+}
+
+impl FileMountStageOwner {
+    /// Release ownership without deleting the stage, so the detached VM process
+    /// can keep reading it.
+    pub(crate) fn detach(self) {
+        match self {
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
+            Self::SourceParent(stage) => stage.keep(),
+            Self::Temp(dir) => {
+                let _ = dir.keep();
+            }
+        }
+    }
+
+    /// The stage root path, for diagnostics and tests.
+    #[allow(dead_code)]
+    pub(crate) fn path(&self) -> &Path {
+        match self {
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
+            Self::SourceParent(stage) => stage.path(),
+            Self::Temp(dir) => dir.path(),
+        }
+    }
+}
+
+/// The requested/resolved paths and guest path a staging error names.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+struct MountContext<'a> {
+    requested: &'a Path,
+    resolved: &'a Path,
+    guest: &'a str,
+    readonly: bool,
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+impl MountContext<'_> {
+    fn host(&self) -> String {
+        if self.requested == self.resolved {
+            self.requested.display().to_string()
+        } else {
+            format!(
+                "{} (resolved to {})",
+                self.requested.display(),
+                self.resolved.display()
+            )
+        }
+    }
+}
+
+/// Stage every file bind mount for one sandbox and return the guest-path map
+/// plus the stage roots the caller must retain.
 ///
-/// Returns a map from guest path to `(file_mount_dir, filename, tag)` for
-/// each staged file, plus the `TempDir` handle that must be kept alive for
-/// the VM's lifetime.
+/// `sandbox_dir` is the backend-specific directory of the sandbox being
+/// started (`<home>/sandboxes/<name>`). The Unix implementation stages into
+/// `<sandbox_dir>/file-mounts` and resets it on every spawn. Callers must own
+/// the sandbox lifecycle namespace and have established that the previous
+/// generation is dead before calling; the lifecycle guard covers this on Unix.
+/// The non-Unix implementation preserves the legacy system-temp staging and
+/// ignores `sandbox_dir`.
 async fn stage_file_mounts(
     config: &SandboxConfig,
-) -> MicrosandboxResult<(HashMap<String, (PathBuf, String, String)>, Option<TempDir>)> {
-    // Collect file bind mounts first so we can skip TempDir creation when
-    // there are none.
+    sandbox_dir: &Path,
+) -> MicrosandboxResult<(
+    HashMap<String, (PathBuf, String, String)>,
+    Vec<FileMountStageOwner>,
+)> {
+    #[cfg(unix)]
+    {
+        stage_file_mounts_with_mode(config, sandbox_dir, FileMountStagingMode::Automatic).await
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = sandbox_dir; // No metadata, cleanup, creation or path validation here.
+        stage_file_mounts_legacy(config).await
+    }
+}
+
+/// Unix file-mount staging: choose the stage root per mount by filesystem
+/// identity, before any tag directory is created.
+///
+/// Same-device mounts hard-link into the private sandbox-dir stage; a readonly
+/// cross-device mount copies into it; a writable cross-device mount hard-links
+/// in a source-parent stage beside its source so guest writes reach it.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+async fn stage_file_mounts_with_mode(
+    config: &SandboxConfig,
+    sandbox_dir: &Path,
+    mode: FileMountStagingMode,
+) -> MicrosandboxResult<(
+    HashMap<String, (PathBuf, String, String)>,
+    Vec<FileMountStageOwner>,
+)> {
+    stage_file_mounts_with_after_gate_hook(config, sandbox_dir, mode, || {}).await
+}
+
+/// [`stage_file_mounts_with_mode`] with a `cfg(test)` hook that runs after the
+/// following-stat gate has admitted its mounts and before canonicalize/resolve.
+///
+/// Production passes a no-op. The hook exists so a test can revoke search or
+/// break a live opt-in symlink *after* `host.is_file()` has already returned
+/// true, which is the only way to reach the post-gate classification branches
+/// through the real entry point rather than by calling the classifier directly.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+async fn stage_file_mounts_with_after_gate_hook<F>(
+    config: &SandboxConfig,
+    sandbox_dir: &Path,
+    mode: FileMountStagingMode,
+    after_gate: F,
+) -> MicrosandboxResult<(
+    HashMap<String, (PathBuf, String, String)>,
+    Vec<FileMountStageOwner>,
+)>
+where
+    F: FnOnce() + Send + 'static,
+{
+    let stage_root = sandbox_dir.join("file-mounts");
+
+    // Reset the previous generation's stage before identifying this one, even
+    // when this spawn has no file mounts, so a restart never mixes generations.
+    clear_sandbox_file_mount_stage(&stage_root).await?;
+
+    // Phase 1A: the original following-stat filter, collected completely in
+    // original order. This expression is the one at `:2205` before this change
+    // and must not be rewritten: the behaviour-preservation argument for every
+    // `is_file() == false` mount rests on it. Writing it as an `fstatat`, a
+    // `symlink_metadata`, or a reuse of the resolver's own result silently
+    // widens the change to directories, fifos and unresolvable paths.
+    let mut selected: Vec<SelectedFileMount> = Vec::new();
+    for mount in &config.spec.mounts {
+        if let VolumeMount::Bind {
+            host,
+            guest,
+            options,
+            follow_root_symlinks,
+            ..
+        } = mount
+            && host.is_file()
+        {
+            selected.push(SelectedFileMount {
+                requested: host.clone(),
+                guest: guest.clone(),
+                readonly: options.readonly,
+                follow_root_symlinks: *follow_root_symlinks,
+            });
+        }
+    }
+    if selected.is_empty() {
+        return Ok((HashMap::new(), Vec::new()));
+    }
+
+    let stage_root_owned = stage_root.clone();
+    tokio::task::spawn_blocking(move || {
+        // Production passes a no-op; tests inject the post-gate break here.
+        after_gate();
+        let candidates = classify_file_mounts(selected)?;
+        if candidates.is_empty() {
+            return Ok((HashMap::new(), Vec::new()));
+        }
+        stage_candidates(candidates, &stage_root_owned, mode)
+    })
+    .await
+    .map_err(|join_error| {
+        crate::MicrosandboxError::InvalidConfig(format!(
+            "file mount staging task failed: {join_error}"
+        ))
+    })?
+}
+
+/// Unix file-mount staging for other Unix targets: the pre-existing
+/// implementation, retained byte-for-byte.
+#[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
+async fn stage_file_mounts_with_mode(
+    config: &SandboxConfig,
+    sandbox_dir: &Path,
+    mode: FileMountStagingMode,
+) -> MicrosandboxResult<(
+    HashMap<String, (PathBuf, String, String)>,
+    Vec<FileMountStageOwner>,
+)> {
+    let stage_root = sandbox_dir.join("file-mounts");
+
+    // Reset the previous generation's stage before identifying this one, even
+    // when this spawn has no file mounts, so a restart never mixes generations.
+    clear_sandbox_file_mount_stage(&stage_root).await?;
+
     let file_mounts: Vec<_> = config
         .spec
         .mounts
@@ -2160,90 +2520,1233 @@ async fn stage_file_mounts(
             _ => None,
         })
         .collect();
-
     if file_mounts.is_empty() {
-        return Ok((HashMap::new(), None));
+        return Ok((HashMap::new(), Vec::new()));
     }
 
-    let tempdir = tempfile::tempdir()?;
-    let mut staged = HashMap::new();
+    // Create the sandbox-dir stage privately (mode `0700`): it holds hard links
+    // to possibly private source files. It is not a `TempDir`: it persists
+    // beyond handle drop until the next spawn of this name or `rm`.
+    let mut builder = std::fs::DirBuilder::new();
+    builder.mode(0o700);
+    match builder.create(&stage_root) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(error) => {
+            return Err(crate::MicrosandboxError::InvalidConfig(format!(
+                "failed to create file mount staging directory {}: {error}",
+                stage_root.display()
+            )));
+        }
+    }
+    restrict_stage_root_to_owner(&stage_root).map_err(|error| {
+        crate::MicrosandboxError::InvalidConfig(format!(
+            "failed to restrict file mount staging {} to its owner: {error}",
+            stage_root.display()
+        ))
+    })?;
 
+    let stage_dev = file_mount_device_id(&stage_root).map_err(|error| {
+        crate::MicrosandboxError::InvalidConfig(format!(
+            "failed to stat file mount staging directory {}: {error}",
+            stage_root.display()
+        ))
+    })?;
+
+    let mut staging: Vec<TempDir> = Vec::new();
+    let mut staged = HashMap::new();
     for (host, guest, readonly) in file_mounts {
-        // Generate a random tag to avoid collisions.
         let id: u32 = rand::rng().random();
         let tag = format!("fm_{id:08x}");
-
-        let file_mount_dir = tempdir.path().join(&tag);
-        tokio::fs::create_dir_all(&file_mount_dir).await?;
-
-        // Canonicalize the staging directory so the mount root is symlink-free
-        // (the system temp dir often sits under a symlinked prefix, e.g. macOS
-        // `/var` -> `/private/var`). This resolves the one benign system symlink
-        // here in the trusted host context, so the mount stays under the default
-        // no-follow root protection instead of needing an exemption.
-        let file_mount_dir = tokio::fs::canonicalize(&file_mount_dir).await?;
-
         let filename_os = host.file_name().ok_or_else(|| {
             crate::MicrosandboxError::InvalidConfig(format!(
                 "file mount has no filename: {}",
                 host.display()
             ))
         })?;
+        let filename = filename_os
+            .to_str()
+            .ok_or_else(|| {
+                crate::MicrosandboxError::InvalidConfig(format!(
+                    "file mount filename is not valid UTF-8: {}",
+                    host.display()
+                ))
+            })?
+            .to_owned();
 
-        let filename = filename_os.to_str().ok_or_else(|| {
+        let source_dev = file_mount_device_id(host).map_err(|error| {
             crate::MicrosandboxError::InvalidConfig(format!(
-                "file mount filename is not valid UTF-8: {}",
+                "failed to stat file mount source {}: {error}",
                 host.display()
             ))
         })?;
+        let same_device = match mode {
+            FileMountStagingMode::Automatic => source_dev == stage_dev,
+            #[cfg(test)]
+            FileMountStagingMode::ForceDeviceMismatch
+            | FileMountStagingMode::ForceDeviceMismatchAndRejectSourceParentStage => false,
+        };
 
-        let target = file_mount_dir.join(filename);
+        let stage_dir = if same_device {
+            // Same filesystem: hard link into the sandbox-dir stage. This keeps
+            // inode identity, so even a readonly mount is the source file
+            // rather than a snapshot.
+            let dir = create_file_mount_stage_dir(&stage_root, &tag).await?;
+            let target = dir.join(&filename);
+            tokio::fs::hard_link(host, &target).await.map_err(|error| {
+                crate::MicrosandboxError::InvalidConfig(format!(
+                    "failed to hard link file mount {} to {}: {error}",
+                    host.display(),
+                    target.display()
+                ))
+            })?;
+            dir
+        } else if readonly {
+            // Cross-device readonly: copy into the sandbox-dir stage. A hard
+            // link cannot cross filesystems, and a readonly mount needs no
+            // writeback, so an isolated copy is correct.
+            let dir = create_file_mount_stage_dir(&stage_root, &tag).await?;
+            let target = dir.join(&filename);
+            tokio::fs::copy(host, &target).await.map_err(|error| {
+                crate::MicrosandboxError::InvalidConfig(format!(
+                    "failed to copy file mount {} to {}: {error}",
+                    host.display(),
+                    target.display()
+                ))
+            })?;
+            dir
+        } else {
+            // Cross-device writable: preserve inode identity by hard-linking in
+            // a stage beside the source, which must be on the source's own
+            // filesystem. Copying would lose guest writes.
+            //
+            // `parent()` is `Some("")` for a bare relative path such as
+            // `foo.txt`, which is not a directory to stage in.
+            let parent = host
+                .parent()
+                .filter(|parent| !parent.as_os_str().is_empty())
+                .ok_or_else(|| {
+                    crate::MicrosandboxError::InvalidConfig(format!(
+                        "file mount has no parent directory: {}",
+                        host.display()
+                    ))
+                })?;
+            let local = match mode {
+                #[cfg(test)]
+                FileMountStagingMode::ForceDeviceMismatchAndRejectSourceParentStage => {
+                    Err(std::io::Error::new(
+                        std::io::ErrorKind::PermissionDenied,
+                        "forced unwritable source parent for file mount staging",
+                    ))
+                }
+                _ => tempfile::Builder::new()
+                    .prefix(".microsandbox-file-mount-")
+                    .tempdir_in(parent),
+            }
+            .map_err(|error| {
+                crate::MicrosandboxError::InvalidConfig(format!(
+                    "cannot stage writable file mount {} across a filesystem boundary: the \
+                     staging directory must live beside the source in {}, which must be \
+                     writable so guest writes reach the host file: {error}",
+                    host.display(),
+                    parent.display()
+                ))
+            })?;
+            // The stage root holds a hard link to a possibly private source
+            // file, so keep it owner-only instead of inheriting the umask.
+            restrict_stage_root_to_owner(local.path()).map_err(|error| {
+                crate::MicrosandboxError::InvalidConfig(format!(
+                    "failed to restrict file mount staging {} to its owner: {error}",
+                    local.path().display()
+                ))
+            })?;
+            let dir = create_file_mount_stage_dir(local.path(), &tag).await?;
+            let target = dir.join(&filename);
+            tokio::fs::hard_link(host, &target).await?;
+            staging.push(local);
+            dir
+        };
+        let file_mount_dir = tokio::fs::canonicalize(&stage_dir).await?;
+        staged.insert(guest.clone(), (file_mount_dir, filename, tag));
+    }
+    let owners = staging.into_iter().map(FileMountStageOwner::Temp).collect();
+    Ok((staged, owners))
+}
 
-        // Hard-link preserves the same inode — writes in the guest propagate
-        // to the host and vice-versa. Falls back to copy for cross-filesystem
-        // mounts (different device IDs).
-        match tokio::fs::hard_link(host, &target).await {
-            Ok(()) => {
-                tracing::debug!(
-                    host = %host.display(),
-                    file_mount_dir = %target.display(),
-                    "file mount: hard-linked"
-                );
+/// Create the private `<tag>` directory for one file mount under `stage_root`
+/// and return it. Naming the directory in the error lets a caller attribute a
+/// creation failure to the mount being staged.
+#[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
+async fn create_file_mount_stage_dir(stage_root: &Path, tag: &str) -> MicrosandboxResult<PathBuf> {
+    let dir = stage_root.join(tag);
+    tokio::fs::create_dir(&dir).await.map_err(|error| {
+        crate::MicrosandboxError::InvalidConfig(format!(
+            "failed to create file mount staging directory {}: {error}",
+            dir.display()
+        ))
+    })?;
+    Ok(dir)
+}
+
+//--------------------------------------------------------------------------------------------------
+// Functions: Helpers (no-follow file-mount staging)
+//--------------------------------------------------------------------------------------------------
+
+/// Classify every bind mount in `config` into file-mount candidates, applying
+/// the no-follow policy to exactly the mounts that are file mounts today.
+///
+/// **Stage A — the gate.** A `VolumeMount::Bind` reaches this function only when
+/// the unchanged `host.is_file()` filter admitted it. Everything else keeps the
+/// directory-bind path with no inspection and no rejection.
+///
+/// **Stage B — the policy.** `follow_root_symlinks` canonicalizes the path
+/// first; then the path is resolved following no symlink in any component,
+/// preserving `..` with the descriptor stack, and the leaf is classified through
+/// the parent descriptor.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn classify_file_mounts(
+    selected: Vec<SelectedFileMount>,
+) -> MicrosandboxResult<Vec<FileMountCandidate>> {
+    use microsandbox_filesystem::nofollow::{NoFollowError, NoFollowPath};
+
+    let mut candidates = Vec::with_capacity(selected.len());
+    for item in selected {
+        let resolved = if item.follow_root_symlinks {
+            std::fs::canonicalize(&item.requested).map_err(|error| {
+                crate::MicrosandboxError::InvalidConfig(format!(
+                    "file mount source {} has follow-root-symlinks set but could not be \
+                     resolved: {error}.",
+                    item.requested.display()
+                ))
+            })?
+        } else {
+            item.requested.clone()
+        };
+        let context = MountContext {
+            requested: &item.requested,
+            resolved: &resolved,
+            guest: &item.guest,
+            readonly: item.readonly,
+        };
+        let source = NoFollowPath::resolve(&resolved)
+            .and_then(NoFollowPath::classify_regular)
+            .map_err(|error| match error {
+                NoFollowError::Symlink { component } => {
+                    if item.follow_root_symlinks {
+                        symlink_reappeared_error(&context, &component)
+                    } else if component == resolved {
+                        symlink_leaf_error(&context)
+                    } else {
+                        symlink_ancestor_error(&context, &component)
+                    }
+                }
+                NoFollowError::NonRegular { .. } => {
+                    crate::MicrosandboxError::InvalidConfig(format!(
+                        "file mount source {} changed while it was being classified: it is no \
+                         longer a regular file. Spawn refused.",
+                        context.host()
+                    ))
+                }
+                NoFollowError::Unresolved { component, source } => {
+                    crate::MicrosandboxError::InvalidConfig(format!(
+                        "file mount source {} cannot be resolved at {}: {source}.",
+                        context.host(),
+                        component.display()
+                    ))
+                }
+                NoFollowError::Unsupported { path, reason } => {
+                    crate::MicrosandboxError::InvalidConfig(format!(
+                        "file mount source {} cannot be resolved: {reason}.",
+                        path.display()
+                    ))
+                }
+            })?;
+        candidates.push(FileMountCandidate {
+            requested: item.requested,
+            source,
+            guest: item.guest,
+            readonly: item.readonly,
+        });
+    }
+    Ok(candidates)
+}
+
+/// The shared tail of both symlink-refusal messages, so the two opt-in
+/// spellings cannot drift apart.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+const FILE_MOUNT_SYMLINK_TAIL: &str = "mount paths are resolved following no symlink by default, \
+     so a symlink cannot redirect the mount. Opt in with .follow_root_symlinks(true) in the SDK, or \
+     the `follow-root-symlinks` option on a CLI mount";
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn symlink_ancestor_error(
+    context: &MountContext<'_>,
+    component: &Path,
+) -> crate::MicrosandboxError {
+    crate::MicrosandboxError::InvalidConfig(format!(
+        "file mount source {} resolves through a symlink at {}: {FILE_MOUNT_SYMLINK_TAIL} \
+         (-v {}:{}:follow-root-symlinks).",
+        context.host(),
+        component.display(),
+        context.requested.display(),
+        context.guest
+    ))
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn symlink_leaf_error(context: &MountContext<'_>) -> crate::MicrosandboxError {
+    crate::MicrosandboxError::InvalidConfig(format!(
+        "file mount source {} is a symlink: {FILE_MOUNT_SYMLINK_TAIL} \
+         (-v {}:{}:follow-root-symlinks).",
+        context.host(),
+        context.requested.display(),
+        context.guest
+    ))
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn symlink_reappeared_error(
+    context: &MountContext<'_>,
+    component: &Path,
+) -> crate::MicrosandboxError {
+    crate::MicrosandboxError::InvalidConfig(format!(
+        "file mount source {} changed while it was being resolved: a symlink appeared at {} after \
+         the path was canonicalized. Spawn refused.",
+        context.host(),
+        component.display()
+    ))
+}
+
+/// Create the private sandbox-dir stage root (`0700`), tolerating an existing
+/// directory and resetting its mode.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn create_stage_root(stage_root: &Path) -> MicrosandboxResult<()> {
+    let mut builder = std::fs::DirBuilder::new();
+    builder.mode(0o700);
+    match builder.create(stage_root) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(error) => {
+            return Err(crate::MicrosandboxError::InvalidConfig(format!(
+                "failed to create file mount staging directory {}: {error}",
+                stage_root.display()
+            )));
+        }
+    }
+    restrict_stage_root_to_owner(stage_root).map_err(|error| {
+        crate::MicrosandboxError::InvalidConfig(format!(
+            "failed to restrict file mount staging {} to its owner: {error}",
+            stage_root.display()
+        ))
+    })
+}
+
+/// Stage every candidate into the sandbox-dir or a source-parent stage.
+///
+/// On any error, every source-parent owner created so far is explicitly closed
+/// before the error is returned, so a partially staged spawn does not leak
+/// source-owned descriptors.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn stage_candidates(
+    candidates: Vec<FileMountCandidate>,
+    stage_root: &Path,
+    mode: FileMountStagingMode,
+) -> MicrosandboxResult<(StagedFileMounts, Vec<FileMountStageOwner>)> {
+    use microsandbox_filesystem::nofollow::NoFollowDir;
+
+    create_stage_root(stage_root)?;
+    let stage_dev = file_mount_device_id(stage_root).map_err(|error| {
+        crate::MicrosandboxError::InvalidConfig(format!(
+            "failed to stat file mount staging directory {}: {error}",
+            stage_root.display()
+        ))
+    })?;
+    let stage_root_dir = NoFollowDir::open(stage_root).map_err(|error| {
+        crate::MicrosandboxError::InvalidConfig(format!(
+            "failed to open file mount staging directory {}: {error}",
+            stage_root.display()
+        ))
+    })?;
+
+    let mut owners: Vec<FileMountStageOwner> = Vec::new();
+    let mut staged: HashMap<String, (PathBuf, String, String)> = HashMap::new();
+    for (index, candidate) in candidates.iter().enumerate() {
+        if let Err(error) = stage_one(
+            index,
+            candidate,
+            &stage_root_dir,
+            stage_dev,
+            mode,
+            &mut owners,
+            &mut staged,
+        ) {
+            // Close every source-parent owner created so far, and report each
+            // retained object/cause in the returned error, not only via tracing.
+            let mut retained_cleanup: Vec<String> = Vec::new();
+            for owner in owners.drain(..) {
+                match owner {
+                    FileMountStageOwner::SourceParent(stage) => {
+                        if let Err(cleanup) = stage.close() {
+                            tracing::warn!(
+                                error = %cleanup,
+                                "failed to clean up source-parent file-mount stage after a staging error"
+                            );
+                            retained_cleanup.push(cleanup.to_string());
+                        }
+                    }
+                    FileMountStageOwner::Temp(dir) => drop(dir),
+                }
+            }
+            // Earlier sandbox-dir entries are not removed by this unwind; they are
+            // cleared by the next spawn, so name them rather than promising global
+            // emptiness.
+            if !staged.is_empty() {
+                retained_cleanup.push(format!(
+                    "Earlier sandbox-dir stages may remain under {}; they are cleared by the \
+                     next spawn or rm.",
+                    stage_root.display()
+                ));
+            }
+            return Err(append_retained_cleanup(error, &retained_cleanup));
+        }
+    }
+    Ok((staged, owners))
+}
+
+/// Append the cleanup failures/notes retained by the explicit unwind to the
+/// returned error, so a caller never learns of a retained stage only from logs.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn append_retained_cleanup(
+    error: crate::MicrosandboxError,
+    retained: &[String],
+) -> crate::MicrosandboxError {
+    if retained.is_empty() {
+        return error;
+    }
+    match error {
+        crate::MicrosandboxError::InvalidConfig(message) => {
+            crate::MicrosandboxError::InvalidConfig(format!(
+                "{message} Retention notes: {}",
+                retained.join(" ")
+            ))
+        }
+        other => other,
+    }
+}
+
+/// Stage one candidate and publish it into `staged`.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[allow(clippy::too_many_arguments)]
+fn stage_one(
+    index: usize,
+    candidate: &FileMountCandidate,
+    stage_root_dir: &microsandbox_filesystem::nofollow::NoFollowDir,
+    stage_dev: u64,
+    mode: FileMountStagingMode,
+    owners: &mut Vec<FileMountStageOwner>,
+    staged: &mut HashMap<String, (PathBuf, String, String)>,
+) -> MicrosandboxResult<()> {
+    // Fail the second mount after the first has already been staged, so the
+    // unwind contract (first sandbox entry retained, first source-parent owner
+    // closed) is exercised deterministically rather than by a filesystem race.
+    #[cfg(test)]
+    if index == 1 && matches!(mode, FileMountStagingMode::FailSecondMount) {
+        return Err(crate::MicrosandboxError::InvalidConfig(format!(
+            "failed to stage file mount {}: injected second-mount failure",
+            candidate.requested.display()
+        )));
+    }
+    let _ = index;
+    let requested = &candidate.requested;
+    let resolved = candidate.source.path();
+    let context = MountContext {
+        requested,
+        resolved,
+        guest: &candidate.guest,
+        readonly: candidate.readonly,
+    };
+    let filename_os = requested.file_name().ok_or_else(|| {
+        crate::MicrosandboxError::InvalidConfig(format!(
+            "file mount has no filename: {}",
+            requested.display()
+        ))
+    })?;
+    let filename = filename_os
+        .to_str()
+        .ok_or_else(|| {
+            crate::MicrosandboxError::InvalidConfig(format!(
+                "file mount filename is not valid UTF-8: {}",
+                requested.display()
+            ))
+        })?
+        .to_owned();
+    let id: u32 = rand::rng().random();
+    let tag = format!("fm_{id:08x}");
+    let source = &candidate.source;
+
+    let same_device = if mode.forces_device_mismatch() {
+        false
+    } else {
+        source.device() == stage_dev
+    };
+
+    if same_device {
+        let tag_dir = stage_root_dir
+            .create_subdir(OsStr::new(&tag), 0o700)
+            .map_err(|error| sandbox_tag_creation_error(&context, error))?;
+        match inject_link_result(source, &tag_dir, filename_os, mode, true) {
+            Ok(()) => publish(
+                staged,
+                &context,
+                &filename,
+                &tag,
+                tag_dir.path(),
+                tag_dir.identity(),
+                None,
+            ),
+            Err(StageError::SourceChanged { cleanup }) => {
+                Err(source_changed_error(&context, tag_dir.path(), cleanup))
+            }
+            Err(StageError::Unverifiable {
+                source: error,
+                cleanup,
+            }) => Err(unverifiable_error(&context, tag_dir.path(), error, cleanup)),
+            Err(StageError::Link(_)) if context.readonly => {
+                inject_copy_result(source, &tag_dir, filename_os, mode)
+                    .map_err(|error| copy_error(&context, tag_dir.path(), error))?;
+                publish(
+                    staged,
+                    &context,
+                    &filename,
+                    &tag,
+                    tag_dir.path(),
+                    tag_dir.identity(),
+                    None,
+                )
+            }
+            Err(StageError::Link(error)) if is_cross_device(&error) => {
+                stage_root_dir
+                    .remove_child(OsStr::new(&tag))
+                    .map_err(|remove_error| {
+                        crate::MicrosandboxError::InvalidConfig(format!(
+                            "failed to remove empty sandbox file mount stage {}: {remove_error}",
+                            tag_dir.path().display()
+                        ))
+                    })?;
+                stage_beside_source(source, &context, &tag, filename_os, mode, owners, staged)
+            }
+            Err(StageError::Link(error)) => Err(link_error(&context, tag_dir.path(), error)),
+        }
+    } else if context.readonly {
+        let tag_dir = stage_root_dir
+            .create_subdir(OsStr::new(&tag), 0o700)
+            .map_err(|error| sandbox_tag_creation_error(&context, error))?;
+        // Test hook: hold the blocking worker here so an executor-progress test
+        // can prove the copy runs off the runtime thread.
+        #[cfg(test)]
+        if matches!(mode, FileMountStagingMode::ForceCopyWorkerGate) {
+            copy_worker_gate::wait();
+        }
+        inject_copy_result(source, &tag_dir, filename_os, mode)
+            .map_err(|error| copy_error(&context, tag_dir.path(), error))?;
+        publish(
+            staged,
+            &context,
+            &filename,
+            &tag,
+            tag_dir.path(),
+            tag_dir.identity(),
+            None,
+        )
+    } else {
+        stage_beside_source(source, &context, &tag, filename_os, mode, owners, staged)
+    }
+}
+
+/// Stage a writable mount in a source-parent stage beside the resolved source
+/// and link the leaf into its tag directory.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[allow(clippy::too_many_arguments)]
+fn stage_beside_source(
+    source: &microsandbox_filesystem::nofollow::NoFollowFile,
+    context: &MountContext<'_>,
+    tag: &str,
+    filename_os: &OsStr,
+    mode: FileMountStagingMode,
+    owners: &mut Vec<FileMountStageOwner>,
+    staged: &mut HashMap<String, (PathBuf, String, String)>,
+) -> MicrosandboxResult<()> {
+    // A bare relative source such as `foo.txt` has no parent directory to stage
+    // in; this keeps the pre-existing requested-path eligibility error.
+    let has_requested_parent = context
+        .requested
+        .parent()
+        .is_some_and(|parent| !parent.as_os_str().is_empty());
+    if !has_requested_parent {
+        return Err(crate::MicrosandboxError::InvalidConfig(format!(
+            "file mount has no parent directory: {}",
+            context.requested.display()
+        )));
+    }
+    #[cfg(test)]
+    if matches!(
+        mode,
+        FileMountStagingMode::ForceDeviceMismatchAndRejectSourceParentStage
+    ) {
+        return Err(crate::MicrosandboxError::InvalidConfig(format!(
+            "cannot stage writable file mount {} across a filesystem boundary: the staging \
+             directory must live beside the source in {}, which must be writable so guest writes \
+             reach the host file: forced unwritable source parent for file mount staging",
+            context.host(),
+            context
+                .requested
+                .parent()
+                .map(|parent| parent.display().to_string())
+                .unwrap_or_default()
+        )));
+    }
+
+    let stage = create_stage_beside(source, mode)
+        .map_err(|error| source_parent_stage_creation_error(context, error))?;
+    owners.push(FileMountStageOwner::SourceParent(stage));
+    let index = owners.len() - 1;
+    let stage_ref = match &mut owners[index] {
+        FileMountStageOwner::SourceParent(stage) => stage,
+        FileMountStageOwner::Temp(_) => unreachable!("source-parent owner was just pushed"),
+    };
+    #[cfg(test)]
+    let root_path = stage_ref.path().to_path_buf();
+    stage_ref
+        .create_tag(OsStr::new(tag))
+        .map_err(|error| source_parent_stage_creation_error(context, error))?;
+    // Test hook: after the root swap or ancestor redirect, complete the
+    // replacement tree with the exact expected `fm_*` tag and a decoy leaf, so
+    // `canonicalize` succeeds as a fixture precondition and the refusal is
+    // attributable to the held-identity comparison rather than a missing path.
+    #[cfg(test)]
+    if matches!(
+        mode,
+        FileMountStagingMode::ForceStageSwapAfterAnchor
+            | FileMountStagingMode::ForceAncestorRedirect
+    ) {
+        let decoy_tag = root_path.join(tag);
+        if std::fs::create_dir_all(&decoy_tag).is_ok() {
+            let _ = std::fs::write(decoy_tag.join(filename_os), b"decoy-leaf");
+        }
+    }
+    let target = stage_ref.dir().path().to_path_buf();
+    let tag_identity = stage_ref.dir().identity();
+    let root_identity = stage_ref.identity();
+    match inject_link_result(source, stage_ref.dir(), filename_os, mode, false) {
+        Ok(()) => {
+            stage_ref.set_leaf(filename_os);
+            publish(
+                staged,
+                context,
+                &filename_os.to_string_lossy(),
+                tag,
+                &target,
+                tag_identity,
+                Some(root_identity),
+            )
+        }
+        Err(StageError::SourceChanged { cleanup }) => {
+            Err(source_changed_error(context, &target, cleanup))
+        }
+        Err(StageError::Unverifiable {
+            source: error,
+            cleanup,
+        }) => Err(unverifiable_error(context, &target, error, cleanup)),
+        Err(StageError::Link(error)) => Err(link_error(context, &target, error)),
+    }
+}
+
+/// Create a source-parent stage, honouring the test-mode overrides.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn create_stage_beside(
+    source: &microsandbox_filesystem::nofollow::NoFollowFile,
+    mode: FileMountStagingMode,
+) -> Result<
+    microsandbox_filesystem::nofollow::SourceParentStage,
+    microsandbox_filesystem::nofollow::StageCreateError,
+> {
+    #[cfg(test)]
+    match mode {
+        FileMountStagingMode::ForceSourceParentStageMode(observed) => {
+            return source.create_stage_beside_with_override(StageOverrides {
+                mode: Some(observed),
+                ..StageOverrides::default()
+            });
+        }
+        FileMountStagingMode::ForceSourceParentForeignWritable => {
+            return source.create_stage_beside_with_override(StageOverrides {
+                force_foreign_writable: true,
+                ..StageOverrides::default()
+            });
+        }
+        FileMountStagingMode::ForceSourceParentStageSwap => {
+            // A foreign-owned directory cannot be created without privilege, so
+            // the pinned descriptor is observed as uid 0 while the real directory
+            // stays caller-owned 0700. This drives exactly the ownership check a
+            // real decoy would trip.
+            return source.create_stage_beside_with_override(StageOverrides {
+                uid: Some(0),
+                force_foreign_writable: true,
+                ..StageOverrides::default()
+            });
+        }
+        FileMountStagingMode::ForceStageSwapAfterAnchor => {
+            return source.create_stage_beside_with_override(StageOverrides {
+                swap_after_anchor: true,
+                ..StageOverrides::default()
+            });
+        }
+        FileMountStagingMode::ForceAncestorRedirect => {
+            return source.create_stage_beside_with_override(StageOverrides {
+                redirect_ancestor: true,
+                ..StageOverrides::default()
+            });
+        }
+        _ => {}
+    }
+    let _ = mode;
+    source.create_stage_beside()
+}
+
+/// Swap the classified source leaf in place, so the next `linkat` observes a
+/// different inode than classification did.
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+fn swap_source_leaf_for_test(source: &microsandbox_filesystem::nofollow::NoFollowFile) {
+    if let Some(parent) = source.path().parent() {
+        let decoy = parent.join(format!(".msb-decoy-{}", std::process::id()));
+        if std::fs::write(&decoy, b"decoy").is_ok() {
+            let _ = std::fs::rename(&decoy, source.path());
+        }
+    }
+}
+
+/// Link the classified source into `dir`, honouring the test-mode injections.
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+fn inject_link_result(
+    source: &microsandbox_filesystem::nofollow::NoFollowFile,
+    dir: &microsandbox_filesystem::nofollow::NoFollowDir,
+    name: &OsStr,
+    mode: FileMountStagingMode,
+    sandbox_first_attempt: bool,
+) -> Result<(), StageError> {
+    let mut faults = LinkFaults::default();
+    match mode {
+        FileMountStagingMode::ForceLinkErrno(errno) => {
+            return Err(StageError::Link(std::io::Error::from_raw_os_error(errno)));
+        }
+        FileMountStagingMode::ForceFirstLinkExdev if sandbox_first_attempt => {
+            return Err(StageError::Link(std::io::Error::from_raw_os_error(
+                libc::EXDEV,
+            )));
+        }
+        FileMountStagingMode::ForceLeafSwapBeforeLink => swap_source_leaf_for_test(source),
+        FileMountStagingMode::ForceVerifyStatError => faults.verify_stat_errno = Some(libc::EIO),
+        FileMountStagingMode::ForceVerificationUnlinkError => {
+            swap_source_leaf_for_test(source);
+            faults.unlink_errno = Some(libc::EACCES);
+        }
+        _ => {}
+    }
+    source.link_into_with_faults(dir, name, faults)
+}
+
+/// Link the classified source into `dir`.
+#[cfg(all(not(test), any(target_os = "linux", target_os = "macos")))]
+fn inject_link_result(
+    source: &microsandbox_filesystem::nofollow::NoFollowFile,
+    dir: &microsandbox_filesystem::nofollow::NoFollowDir,
+    name: &OsStr,
+    _mode: FileMountStagingMode,
+    _sandbox_first_attempt: bool,
+) -> Result<(), StageError> {
+    source.link_into(dir, name)
+}
+
+/// Copy the classified source into `dir`, honouring the test-mode injections.
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+fn inject_copy_result(
+    source: &microsandbox_filesystem::nofollow::NoFollowFile,
+    dir: &microsandbox_filesystem::nofollow::NoFollowDir,
+    name: &OsStr,
+    mode: FileMountStagingMode,
+) -> Result<(), CopyError> {
+    let faults = match mode {
+        FileMountStagingMode::ForceCopyOpenError => CopyFaults {
+            open_errno: Some(libc::EACCES),
+            ..CopyFaults::default()
+        },
+        FileMountStagingMode::ForceCopyStatError => CopyFaults {
+            stat_errno: Some(libc::EIO),
+            ..CopyFaults::default()
+        },
+        FileMountStagingMode::ForceCopyNonRegular => CopyFaults {
+            non_regular: true,
+            ..CopyFaults::default()
+        },
+        FileMountStagingMode::ForceCopyChanged => CopyFaults {
+            changed: true,
+            ..CopyFaults::default()
+        },
+        _ => CopyFaults::default(),
+    };
+    source.copy_into_with_faults(dir, name, faults)
+}
+
+/// Copy the classified source into `dir`.
+#[cfg(all(not(test), any(target_os = "linux", target_os = "macos")))]
+fn inject_copy_result(
+    source: &microsandbox_filesystem::nofollow::NoFollowFile,
+    dir: &microsandbox_filesystem::nofollow::NoFollowDir,
+    name: &OsStr,
+    _mode: FileMountStagingMode,
+) -> Result<(), CopyError> {
+    source.copy_into(dir, name)
+}
+
+/// Stat a path's `(dev, ino)` identity, following symlinks.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn path_identity(path: &Path) -> std::io::Result<microsandbox_filesystem::nofollow::StageIdentity> {
+    use std::os::unix::fs::MetadataExt;
+
+    let meta = std::fs::metadata(path)?;
+    Ok(microsandbox_filesystem::nofollow::StageIdentity {
+        dev: meta.dev(),
+        ino: meta.ino(),
+    })
+}
+
+/// Canonicalize the tag directory, verify it still resolves to the pinned
+/// tag/root descriptors, and insert the staged map tuple.
+///
+/// `canonicalize` alone is not an identity check: a complete replacement tree
+/// containing the exact expected `fm_*` tag canonicalizes successfully. The
+/// held `(dev, ino)` comparisons are what refuse a substituted stage. This is a
+/// consistency check, not a closure of the later path-to-VMM window.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn publish(
+    staged: &mut HashMap<String, (PathBuf, String, String)>,
+    context: &MountContext<'_>,
+    filename: &str,
+    tag: &str,
+    tag_path: &Path,
+    held_tag: microsandbox_filesystem::nofollow::StageIdentity,
+    held_root: Option<microsandbox_filesystem::nofollow::StageIdentity>,
+) -> MicrosandboxResult<()> {
+    let file_mount_dir = std::fs::canonicalize(tag_path).map_err(|error| {
+        crate::MicrosandboxError::InvalidConfig(format!(
+            "failed to canonicalize file mount staging {}: {error}",
+            tag_path.display()
+        ))
+    })?;
+    let found_tag = path_identity(&file_mount_dir).map_err(|error| {
+        crate::MicrosandboxError::InvalidConfig(format!(
+            "failed to stat canonical file mount staging {}: {error}",
+            file_mount_dir.display()
+        ))
+    })?;
+    if found_tag != held_tag {
+        return Err(crate::MicrosandboxError::InvalidConfig(format!(
+            "file mount staging {} no longer matches the pinned tag directory (expected dev={}, \
+             ino={}; found dev={}, ino={}). Spawn refused.",
+            tag_path.display(),
+            held_tag.dev,
+            held_tag.ino,
+            found_tag.dev,
+            found_tag.ino
+        )));
+    }
+    if let Some(held_root) = held_root {
+        let parent = file_mount_dir.parent().ok_or_else(|| {
+            crate::MicrosandboxError::InvalidConfig(format!(
+                "canonical file mount staging {} has no parent directory",
+                file_mount_dir.display()
+            ))
+        })?;
+        let found_root = path_identity(parent).map_err(|error| {
+            crate::MicrosandboxError::InvalidConfig(format!(
+                "failed to stat file mount staging root {}: {error}",
+                parent.display()
+            ))
+        })?;
+        if found_root != held_root {
+            return Err(crate::MicrosandboxError::InvalidConfig(format!(
+                "file mount staging root {} no longer matches the pinned stage root (expected \
+                 dev={}, ino={}; found dev={}, ino={}). Spawn refused.",
+                parent.display(),
+                held_root.dev,
+                held_root.ino,
+                found_root.dev,
+                found_root.ino
+            )));
+        }
+    }
+    staged.insert(
+        context.guest.to_string(),
+        (file_mount_dir, filename.to_string(), tag.to_string()),
+    );
+    Ok(())
+}
+
+/// Render the `[5c]` cleanup suffix for a staging error.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn cleanup_suffix(cleanup: CleanupOutcome) -> String {
+    match cleanup {
+        CleanupOutcome::Removed => " The attempted entry was removed.".to_string(),
+        CleanupOutcome::Retained {
+            target,
+            source,
+            stage,
+            identity,
+        } => {
+            format!(
+                " Could not remove {}: {source}. Stage retained at last-known path {} (dev={}, ino={}).",
+                target.display(),
+                stage.display(),
+                identity.dev,
+                identity.ino
+            )
+        }
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn source_changed_error(
+    context: &MountContext<'_>,
+    target: &Path,
+    cleanup: CleanupOutcome,
+) -> crate::MicrosandboxError {
+    crate::MicrosandboxError::InvalidConfig(format!(
+        "file mount source {} changed while it was being staged: the entry linked into {} does not \
+         match the classified source identity or regular kind. Spawn refused.{}",
+        context.host(),
+        target.display(),
+        cleanup_suffix(cleanup)
+    ))
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn unverifiable_error(
+    context: &MountContext<'_>,
+    target: &Path,
+    error: std::io::Error,
+    cleanup: CleanupOutcome,
+) -> crate::MicrosandboxError {
+    crate::MicrosandboxError::InvalidConfig(format!(
+        "could not verify staged file mount {} at {}: {error}. Spawn refused.{}",
+        context.host(),
+        target.display(),
+        cleanup_suffix(cleanup)
+    ))
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn link_error(
+    context: &MountContext<'_>,
+    target: &Path,
+    error: std::io::Error,
+) -> crate::MicrosandboxError {
+    let base = format!(
+        "failed to hard link file mount {} for guest path {} to {}: {error}. A writable file mount \
+         must keep the host inode, so it cannot fall back to a copy.",
+        context.host(),
+        context.guest,
+        target.display()
+    );
+    if error.raw_os_error() == Some(libc::EPERM) {
+        crate::MicrosandboxError::InvalidConfig(format!(
+            "{base} On Linux fs.protected_hardlinks=1 refuses a hard link to a file you neither own \
+             nor can both read and write: mount it readonly, or change the file's ownership."
+        ))
+    } else {
+        crate::MicrosandboxError::InvalidConfig(base)
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn copy_error(
+    context: &MountContext<'_>,
+    target: &Path,
+    error: CopyError,
+) -> crate::MicrosandboxError {
+    match error {
+        CopyError::Source(CopySourceError::NonRegular) => {
+            crate::MicrosandboxError::InvalidConfig(format!(
+                "file mount source {} is no longer regular when opened for copying. Spawn refused.",
+                context.host()
+            ))
+        }
+        CopyError::Source(CopySourceError::Changed) => {
+            crate::MicrosandboxError::InvalidConfig(format!(
+                "file mount source {} changed before copying: opened identity differs from \
+                 classification. Spawn refused.",
+                context.host()
+            ))
+        }
+        CopyError::Source(CopySourceError::Open(error)) => {
+            copy_operation_error(context, target, "open source for copy", error, None)
+        }
+        CopyError::Source(CopySourceError::Stat(error)) => {
+            copy_operation_error(context, target, "fstat copy source", error, None)
+        }
+        CopyError::Operation {
+            operation,
+            source,
+            cleanup,
+        } => copy_operation_error(context, target, operation, source, cleanup),
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn copy_operation_error(
+    context: &MountContext<'_>,
+    target: &Path,
+    operation: &str,
+    error: std::io::Error,
+    cleanup: Option<CleanupOutcome>,
+) -> crate::MicrosandboxError {
+    let mut message = format!(
+        "failed to copy file mount {} for guest path {} to {}: {operation}: {error}. Spawn refused.",
+        context.host(),
+        context.guest,
+        target.display()
+    );
+    if let Some(cleanup) = cleanup {
+        message.push_str(&cleanup_suffix(cleanup));
+    }
+    crate::MicrosandboxError::InvalidConfig(message)
+}
+
+/// A tag-creation failure inside the sandbox-dir stage root.
+///
+/// This is the same-device hard-link path and the cross-device readonly copy
+/// path; it is not a source-parent staging failure, so it must not claim to be
+/// one.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn sandbox_tag_creation_error(
+    context: &MountContext<'_>,
+    error: microsandbox_filesystem::nofollow::StageCreateError,
+) -> crate::MicrosandboxError {
+    crate::MicrosandboxError::InvalidConfig(format!(
+        "failed to create file mount staging directory for {}: {error}",
+        context.host()
+    ))
+}
+
+/// A source-parent stage creation or tag-acquisition failure.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn source_parent_stage_creation_error(
+    context: &MountContext<'_>,
+    error: microsandbox_filesystem::nofollow::StageCreateError,
+) -> crate::MicrosandboxError {
+    crate::MicrosandboxError::InvalidConfig(format!(
+        "cannot stage writable file mount {} across a filesystem boundary: the staging directory \
+         must live beside the source, which must be writable so guest writes reach the host file: \
+         {error}",
+        context.host()
+    ))
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn is_cross_device(error: &std::io::Error) -> bool {
+    error.raw_os_error() == Some(libc::EXDEV) || error.kind() == std::io::ErrorKind::CrossesDevices
+}
+
+/// Legacy non-Unix file-mount staging: eager system-temp root, then link, then
+/// `EXDEV` routing. Preserved unchanged for Windows and other non-Unix targets;
+/// this is not new platform support and does not use the sandbox directory.
+#[cfg(not(unix))]
+async fn stage_file_mounts_legacy(
+    config: &SandboxConfig,
+) -> MicrosandboxResult<(
+    HashMap<String, (PathBuf, String, String)>,
+    Vec<FileMountStageOwner>,
+)> {
+    let file_mounts: Vec<_> = config
+        .spec
+        .mounts
+        .iter()
+        .filter_map(|m| match m {
+            VolumeMount::Bind {
+                host,
+                guest,
+                options,
+                ..
+            } if host.is_file() => Some((host, guest, options.readonly)),
+            _ => None,
+        })
+        .collect();
+    if file_mounts.is_empty() {
+        return Ok((HashMap::new(), Vec::new()));
+    }
+
+    // The system staging root is created eagerly: the hard-link fast path needs a
+    // directory in the system temp dir to link into, and readonly cross-device
+    // mounts copy into it. A writable cross-device mount abandons its (empty)
+    // system-temp directory and stages in a second root beside its source.
+    let tempdir = tempfile::tempdir()?;
+    let mut staging = vec![FileMountStageOwner::Temp(tempdir)];
+    let mut staged = HashMap::new();
+    for (host, guest, readonly) in file_mounts {
+        let id: u32 = rand::rng().random();
+        let tag = format!("fm_{id:08x}");
+        let filename_os = host.file_name().ok_or_else(|| {
+            crate::MicrosandboxError::InvalidConfig(format!(
+                "file mount has no filename: {}",
+                host.display()
+            ))
+        })?;
+        let filename = filename_os
+            .to_str()
+            .ok_or_else(|| {
+                crate::MicrosandboxError::InvalidConfig(format!(
+                    "file mount filename is not valid UTF-8: {}",
+                    host.display()
+                ))
+            })?
+            .to_owned();
+
+        let mut file_mount_dir = staging[0].path().join(&tag);
+        tokio::fs::create_dir_all(&file_mount_dir).await?;
+        let mut target = file_mount_dir.join(&filename);
+        let initial_link = tokio::fs::hard_link(host, &target).await;
+        match initial_link {
+            Ok(()) => {}
+            Err(e) if is_cross_device_link_error(&e) && readonly => {
+                tokio::fs::copy(host, &target).await?;
             }
             Err(e) if is_cross_device_link_error(&e) => {
-                if !readonly {
-                    tracing::warn!(
-                        host = %host.display(),
-                        file_mount_dir = %target.display(),
-                        "file mount: cross-filesystem, falling back to copy \
-                         (guest writes will NOT propagate to host)"
-                    );
-                } else {
-                    tracing::debug!(
-                        host = %host.display(),
-                        file_mount_dir = %target.display(),
-                        "file mount: cross-filesystem, copying (read-only)"
-                    );
-                }
-                tokio::fs::copy(host, &target).await?;
+                // A writable mount must retain inode identity. Stage beside the
+                // source instead of copying, otherwise guest writes are lost.
+                //
+                // `parent()` is `Some("")` for a bare relative path such as
+                // `foo.txt`, which is not a directory to stage in.
+                let parent = host
+                    .parent()
+                    .filter(|parent| !parent.as_os_str().is_empty())
+                    .ok_or_else(|| {
+                        crate::MicrosandboxError::InvalidConfig(format!(
+                            "file mount has no parent directory: {}",
+                            host.display()
+                        ))
+                    })?;
+                let local = tempfile::Builder::new()
+                    .prefix(".microsandbox-file-mount-")
+                    .tempdir_in(parent)
+                    .map_err(|error| {
+                        crate::MicrosandboxError::InvalidConfig(format!(
+                            "cannot stage writable file mount {} across a filesystem boundary: the \
+                             staging directory must live beside the source in {}, which must be \
+                             writable so guest writes reach the host file: {error}",
+                            host.display(),
+                            parent.display()
+                        ))
+                    })?;
+                // The stage root holds a hard link to a possibly private source
+                // file, so keep it owner-only instead of inheriting the umask.
+                restrict_stage_root_to_owner(local.path()).map_err(|error| {
+                    crate::MicrosandboxError::InvalidConfig(format!(
+                        "failed to restrict file mount staging {} to its owner: {error}",
+                        local.path().display()
+                    ))
+                })?;
+                file_mount_dir = local.path().join(&tag);
+                tokio::fs::create_dir(&file_mount_dir).await?;
+                target = file_mount_dir.join(&filename);
+                tokio::fs::hard_link(host, &target).await?;
+                staging.push(FileMountStageOwner::Temp(local));
             }
             Err(e) => return Err(e.into()),
         }
-
-        staged.insert(guest.clone(), (file_mount_dir, filename.to_string(), tag));
+        let file_mount_dir = tokio::fs::canonicalize(&file_mount_dir).await?;
+        staged.insert(guest.clone(), (file_mount_dir, filename, tag));
     }
+    Ok((staged, staging))
+}
 
-    Ok((staged, Some(tempdir)))
+/// Remove the exact sandbox-dir file-mount stage before a spawn reuses it.
+///
+/// A missing root is normal. The root is inspected with `symlink_metadata` so a
+/// preexisting symlink is removed rather than traversed. A real directory is
+/// removed recursively; a symlink or a stray regular file at exactly this
+/// runtime-owned path is removed (only the link or file itself, never a
+/// target); any other artifact type is a fatal error rather than something
+/// cleared.
+#[cfg(unix)]
+async fn clear_sandbox_file_mount_stage(stage_root: &Path) -> MicrosandboxResult<()> {
+    let metadata = match tokio::fs::symlink_metadata(stage_root).await {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => {
+            return Err(crate::MicrosandboxError::InvalidConfig(format!(
+                "failed to inspect file mount staging directory {}: {error}",
+                stage_root.display()
+            )));
+        }
+    };
+
+    let file_type = metadata.file_type();
+    if file_type.is_dir() {
+        tokio::fs::remove_dir_all(stage_root)
+            .await
+            .map_err(|error| {
+                crate::MicrosandboxError::InvalidConfig(format!(
+                    "failed to clear file mount staging directory {}: {error}",
+                    stage_root.display()
+                ))
+            })
+    } else if file_type.is_symlink() || file_type.is_file() {
+        tokio::fs::remove_file(stage_root).await.map_err(|error| {
+            crate::MicrosandboxError::InvalidConfig(format!(
+                "failed to clear file mount staging directory {}: {error}",
+                stage_root.display()
+            ))
+        })
+    } else {
+        Err(crate::MicrosandboxError::InvalidConfig(format!(
+            "refusing to clear unexpected file mount staging artifact at {}",
+            stage_root.display()
+        )))
+    }
+}
+
+/// Return the filesystem device id holding `path`, following symlinks so the
+/// identity is that of the resolved file.
+///
+/// On Linux/macOS this now has a single caller: the sandbox-dir stage root,
+/// which microsandbox owns and creates itself. Per-mount device identity comes
+/// from the classified source's held-parent `fstatat` (`NoFollowFile::device`),
+/// never from this helper.
+#[cfg(unix)]
+fn file_mount_device_id(path: &Path) -> std::io::Result<u64> {
+    Ok(std::fs::metadata(path)?.dev())
+}
+
+/// Restrict a staging root to its owner (mode `0700`).
+///
+/// A sandbox-dir or source-parent stage holds a hard link to a possibly private
+/// source file, so it must not be listable or traversable by other local users
+/// no matter what the process umask is.
+#[cfg(unix)]
+fn restrict_stage_root_to_owner(path: &Path) -> std::io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))
+}
+
+#[cfg(not(unix))]
+fn restrict_stage_root_to_owner(_path: &Path) -> std::io::Result<()> {
+    Ok(())
 }
 
 /// Return whether a host hard-link failed because the target is on another device.
+#[cfg(not(unix))]
 fn is_cross_device_link_error(error: &std::io::Error) -> bool {
     error.kind() == std::io::ErrorKind::CrossesDevices || is_platform_cross_device_link_error(error)
-}
-
-#[cfg(unix)]
-fn is_platform_cross_device_link_error(error: &std::io::Error) -> bool {
-    error.raw_os_error() == Some(libc::EXDEV)
 }
 
 #[cfg(windows)]
@@ -2885,7 +4388,15 @@ mod tests {
     use std::ffi::{OsStr, OsString};
     #[cfg(target_os = "linux")]
     use std::num::NonZero;
+    #[cfg(unix)]
+    use std::os::unix::fs::MetadataExt;
     use std::path::{Path, PathBuf};
+
+    /// Fully-qualified name of the child-process probe used by the no-system-temp
+    /// tests; passed to the test binary via `--exact`.
+    #[cfg(unix)]
+    const CHILD_PROBE_TEST: &str =
+        "runtime::spawn::tests::stage_file_mounts_child_probe_stages_without_system_temp";
 
     use microsandbox_protocol::{
         bootstrap::{BootstrapBlockRoot, BootstrapEnvVar, BootstrapMountFlags},
@@ -4939,6 +6450,1390 @@ mod tests {
         assert!(format!("{err}").contains("must not contain '='"));
     }
 
+    /// The checkout's cargo `target` directory, for staging fixtures.
+    ///
+    /// Fixtures under `target/` share the checkout's filesystem (never the
+    /// ambient system temp, which may be tmpfs, so the cross-device tests keep
+    /// comparing against the checkout), and `target/` is already gitignored via
+    /// `**/target/`, so an interrupted or aborted run cannot leave untracked
+    /// litter in the tracked tree. The workspace root is found from the runtime
+    /// `CARGO_MANIFEST_DIR`; the compile-time path is only a fallback for a test
+    /// binary run outside Cargo.
+    #[cfg(unix)]
+    fn staging_fixture_dir() -> PathBuf {
+        let manifest_dir = std::env::var_os("CARGO_MANIFEST_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from(env!("CARGO_MANIFEST_DIR")));
+        let workspace_root = manifest_dir
+            .ancestors()
+            .find(|dir| {
+                std::fs::read_to_string(dir.join("Cargo.toml"))
+                    .is_ok_and(|manifest| manifest.lines().any(|line| line.trim() == "[workspace]"))
+            })
+            .unwrap_or(manifest_dir.as_path());
+        let target = workspace_root.join("target");
+        std::fs::create_dir_all(&target).unwrap();
+        target
+    }
+
+    /// A staging fixture root under the checkout's `target/`. Sandbox and source
+    /// directories are its subdirectories, so they share one device.
+    #[cfg(unix)]
+    fn staging_fixture_root() -> tempfile::TempDir {
+        tempfile::Builder::new()
+            .prefix("msb-staging-fixture-")
+            .tempdir_in(staging_fixture_dir())
+            .unwrap()
+    }
+
+    /// Create a sandbox directory that a staging call owns, separate from the
+    /// source directories, under one fixture root. Returns the root (kept alive
+    /// for the test) and the sandbox directory path.
+    #[cfg(unix)]
+    fn staging_sandbox_dir() -> (tempfile::TempDir, PathBuf) {
+        let root = staging_fixture_root();
+        let sandbox = root.path().join("sandbox");
+        std::fs::create_dir_all(&sandbox).unwrap();
+        // Return the canonical sandbox path so it compares equal to the
+        // canonicalized stage paths the staging code produces (macOS temp paths
+        // under `/var` resolve to `/private/var`).
+        let sandbox = std::fs::canonicalize(&sandbox).unwrap();
+        (root, sandbox)
+    }
+
+    /// A source directory under a fixture root, sibling to the sandbox
+    /// directory so the two share a device.
+    #[cfg(unix)]
+    fn same_device_source_dir(root: &Path) -> PathBuf {
+        let sources = root.join("sources");
+        std::fs::create_dir_all(&sources).unwrap();
+        std::fs::canonicalize(&sources).unwrap()
+    }
+
+    async fn file_mounts_config(mounts: &[(&Path, &str, bool)]) -> SandboxConfig {
+        let mut builder = SandboxBuilder::new("test").image("/tmp/rootfs");
+        for (host, guest, readonly) in mounts {
+            builder = builder.volume(*guest, |mount| {
+                let mount = mount.bind(*host);
+                if *readonly { mount.readonly() } else { mount }
+            });
+        }
+        builder.build().await.unwrap()
+    }
+
+    async fn file_mount_config(host: &Path, guest: &str, readonly: bool) -> SandboxConfig {
+        file_mounts_config(&[(host, guest, readonly)]).await
+    }
+
+    /// The canonical sandbox-dir stage path. Staged mount directories are
+    /// canonicalized, so the expected root must be too (macOS temp paths under
+    /// `/var` resolve to `/private/var`). The sandbox directory always exists by
+    /// the time this is called.
+    #[cfg(unix)]
+    fn sandbox_stage_root(sandbox_dir: &Path) -> PathBuf {
+        std::fs::canonicalize(sandbox_dir)
+            .unwrap_or_else(|error| {
+                panic!("sandbox dir {} missing: {error}", sandbox_dir.display())
+            })
+            .join("file-mounts")
+    }
+
+    /// A `msb`-named sandbox directory with a pre-staged marker and a source
+    /// file inside the fixture root, for the Windows legacy-preservation tests.
+    ///
+    /// The source lives under the fixture's own `root` rather than the
+    /// process-global system temp dir, so two tests in this binary get distinct
+    /// source paths and cannot race; dropping `root` removes the source.
+    #[cfg(windows)]
+    fn windows_staging_fixture() -> (tempfile::TempDir, PathBuf, PathBuf) {
+        let root = tempdir().unwrap();
+        let sandbox = root.path().join("sandbox");
+        let stage_root = sandbox.join("file-mounts");
+        std::fs::create_dir_all(&stage_root).unwrap();
+        std::fs::write(stage_root.join("stale-sentinel"), b"old").unwrap();
+        let source = root.path().join("msb-staging-source.txt");
+        std::fs::write(&source, b"source").unwrap();
+        (root, sandbox, source)
+    }
+
+    /// The legacy classifier still recognizes the OS cross-device error and the
+    /// portable `CrossesDevices` kind.
+    #[cfg(windows)]
+    #[test]
+    fn windows_cross_device_link_classifier_matches_raw_17_and_kind() {
+        assert!(super::is_cross_device_link_error(
+            &std::io::Error::from_raw_os_error(17)
+        ));
+        assert!(super::is_cross_device_link_error(&std::io::Error::new(
+            std::io::ErrorKind::CrossesDevices,
+            "kind"
+        )));
+        assert!(!super::is_cross_device_link_error(
+            &std::io::Error::from_raw_os_error(2)
+        ));
+        assert!(!super::is_cross_device_link_error(&std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "other"
+        )));
+    }
+
+    /// The non-Unix dispatcher preserves the legacy behavior: it stages into a
+    /// system-temp root, never under the sandbox directory, and leaves the
+    /// sandbox directory (and any stale `file-mounts` content) untouched.
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn windows_dispatcher_stages_in_system_temp_and_ignores_sandbox_dir() {
+        let (root, sandbox, source) = windows_staging_fixture();
+        let config = file_mount_config(&source, "/guest/source.txt", false).await;
+
+        let (staged, staging) = super::stage_file_mounts(&config, &sandbox).await.unwrap();
+        let (mount_dir, filename, _) = staged.get("/guest/source.txt").unwrap();
+
+        let system_temp = std::fs::canonicalize(std::env::temp_dir()).unwrap();
+        assert!(
+            mount_dir.starts_with(&system_temp),
+            "the legacy path must stage in the system temp dir: {}",
+            mount_dir.display()
+        );
+        assert!(
+            !mount_dir.starts_with(sandbox.join("file-mounts")),
+            "the legacy path must not use the sandbox directory"
+        );
+        assert!(
+            sandbox.join("file-mounts").join("stale-sentinel").exists(),
+            "the legacy path must not clear the sandbox directory"
+        );
+        assert_eq!(std::fs::metadata(&source).unwrap().len(), 6);
+        assert_eq!(std::fs::read(mount_dir.join(filename)).unwrap(), b"source");
+        assert_eq!(staging.len(), 1, "one system-temp root per staging call");
+        drop(root);
+    }
+
+    /// Two legacy staging calls with the same sandbox argument return independent
+    /// system-temp roots; dropping one leaves the other's files intact.
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn windows_legacy_staging_roots_are_independent() {
+        let (root, sandbox, source) = windows_staging_fixture();
+        let config = file_mount_config(&source, "/guest/source.txt", false).await;
+
+        let (_, first_staging) = super::stage_file_mounts(&config, &sandbox).await.unwrap();
+        let (_, second_staging) = super::stage_file_mounts(&config, &sandbox).await.unwrap();
+        let first_root = first_staging[0].path().to_path_buf();
+        let second_root = second_staging[0].path().to_path_buf();
+        assert_ne!(first_root, second_root);
+
+        drop(windows_probe_handle(first_staging, "windows-legacy-first"));
+        assert!(
+            !first_root.exists(),
+            "dropping one token must remove only its own root"
+        );
+        assert!(second_root.exists());
+        drop(windows_probe_handle(
+            second_staging,
+            "windows-legacy-second",
+        ));
+        assert!(!second_root.exists());
+        drop(root);
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn stage_file_mounts_hard_links_same_filesystem_source() {
+        let (root, sandbox) = staging_sandbox_dir();
+        let source = same_device_source_dir(root.path()).join("source.txt");
+        std::fs::write(&source, b"source").unwrap();
+        let config = file_mount_config(&source, "/guest/source.txt", false).await;
+
+        let (staged, staging) = super::stage_file_mounts(&config, &sandbox).await.unwrap();
+        let (mount_dir, filename, _) = staged.get("/guest/source.txt").unwrap();
+        let staged_file = mount_dir.join(filename);
+
+        assert!(
+            staging.is_empty(),
+            "a same-device mount stages in the sandbox directory, not a temporary root"
+        );
+        assert!(
+            mount_dir.starts_with(sandbox_stage_root(&sandbox)),
+            "same-device stage must be under the sandbox dir: {}",
+            mount_dir.display()
+        );
+        assert_eq!(std::fs::read(&staged_file).unwrap(), b"source");
+        assert_eq!(
+            std::fs::metadata(&source).unwrap().ino(),
+            std::fs::metadata(&staged_file).unwrap().ino(),
+            "ordinary same-device file mounts must hard-link the source"
+        );
+    }
+
+    /// A same-device stage is a live hard link, not a snapshot: a readonly mount
+    /// reflects later source edits, and a write through a writable mount reaches
+    /// the source. This is the host-side behavior the VM e2e depends on for the
+    /// common single-filesystem layout.
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn stage_file_mounts_same_device_links_are_live() {
+        let (root, sandbox) = staging_sandbox_dir();
+        let sources = same_device_source_dir(root.path());
+
+        // Readonly same device is a link, so editing the source after staging is
+        // visible through the staged file (readonly is not a frozen copy).
+        let readonly = sources.join("readonly.txt");
+        std::fs::write(&readonly, b"before").unwrap();
+        let config = file_mount_config(&readonly, "/guest/readonly.txt", true).await;
+        let (staged, _) = super::stage_file_mounts(&config, &sandbox).await.unwrap();
+        let (dir, name, _) = staged.get("/guest/readonly.txt").unwrap();
+        std::fs::write(&readonly, b"after").unwrap();
+        assert_eq!(
+            std::fs::read(dir.join(name)).unwrap(),
+            b"after",
+            "a same-device readonly mount is a link, so later source edits are visible"
+        );
+
+        // Writable same device preserves inode identity, so a write through the
+        // staged path reaches the source file.
+        let writable = sources.join("writable.txt");
+        std::fs::write(&writable, b"before").unwrap();
+        let config = file_mount_config(&writable, "/guest/writable.txt", false).await;
+        let (staged, _) = super::stage_file_mounts(&config, &sandbox).await.unwrap();
+        let (dir, name, _) = staged.get("/guest/writable.txt").unwrap();
+        std::fs::write(dir.join(name), b"guest write").unwrap();
+        assert_eq!(
+            std::fs::read(&writable).unwrap(),
+            b"guest write",
+            "a same-device writable mount writes through to the source"
+        );
+    }
+
+    /// A same-device readonly mount is still a hard link (not a snapshot), and
+    /// its stage survives the staging token being dropped: the sandbox-dir
+    /// stage is not a `TempDir`.
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn stage_file_mounts_same_device_readonly_links_and_persists() {
+        let (root, sandbox) = staging_sandbox_dir();
+        let source = same_device_source_dir(root.path()).join("readonly.txt");
+        std::fs::write(&source, b"before").unwrap();
+        let config = file_mount_config(&source, "/guest/readonly.txt", true).await;
+
+        let (staged, staging) = super::stage_file_mounts(&config, &sandbox).await.unwrap();
+        let (mount_dir, filename, _) = staged.get("/guest/readonly.txt").unwrap();
+        let staged_file = mount_dir.join(filename);
+
+        assert!(staging.is_empty());
+        assert!(mount_dir.starts_with(sandbox_stage_root(&sandbox)));
+        assert_eq!(
+            std::fs::metadata(&source).unwrap().ino(),
+            std::fs::metadata(&staged_file).unwrap().ino(),
+            "a same-device readonly mount is a link, not a snapshot"
+        );
+
+        let stage_root = sandbox_stage_root(&sandbox);
+        drop(staging);
+        assert!(
+            mount_dir.exists() && stage_root.exists(),
+            "the sandbox-dir stage must persist after the staging token is dropped: {}",
+            stage_root.display()
+        );
+        assert_eq!(file_mode(&stage_root), 0o700);
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn stage_file_mounts_forced_device_mismatch_copies_readonly_source() {
+        let (root, sandbox) = staging_sandbox_dir();
+        let source = same_device_source_dir(root.path()).join("readonly.txt");
+        std::fs::write(&source, b"before").unwrap();
+        let config = file_mount_config(&source, "/guest/readonly.txt", true).await;
+
+        let (staged, staging) = super::stage_file_mounts_with_mode(
+            &config,
+            &sandbox,
+            super::FileMountStagingMode::ForceDeviceMismatch,
+        )
+        .await
+        .unwrap();
+        let (mount_dir, filename, _) = staged.get("/guest/readonly.txt").unwrap();
+        let staged_file = mount_dir.join(filename);
+        std::fs::write(&source, b"after").unwrap();
+
+        assert!(
+            staging.is_empty(),
+            "a readonly copy needs no temporary root"
+        );
+        assert!(
+            mount_dir.starts_with(sandbox_stage_root(&sandbox)),
+            "a readonly cross-device copy stays in the sandbox dir: {}",
+            mount_dir.display()
+        );
+        assert_eq!(std::fs::read(&staged_file).unwrap(), b"before");
+        assert_eq!(
+            std::fs::metadata(&staged_file).unwrap().nlink(),
+            1,
+            "a readonly cross-device copy must not share the source inode"
+        );
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn stage_file_mounts_forced_device_mismatch_hard_links_writable_source_parent() {
+        let (root, sandbox) = staging_sandbox_dir();
+        let source_dir = same_device_source_dir(root.path());
+        let source = source_dir.join("writable.txt");
+        std::fs::write(&source, b"before").unwrap();
+        let config = file_mount_config(&source, "/guest/writable.txt", false).await;
+
+        let (staged, staging) = super::stage_file_mounts_with_mode(
+            &config,
+            &sandbox,
+            super::FileMountStagingMode::ForceDeviceMismatch,
+        )
+        .await
+        .unwrap();
+        let (mount_dir, filename, _) = staged.get("/guest/writable.txt").unwrap();
+        let staged_file = mount_dir.join(filename);
+        std::fs::write(&staged_file, b"guest write").unwrap();
+
+        assert_eq!(
+            staging.len(),
+            1,
+            "one source-parent stage per writable cross-device mount"
+        );
+        assert!(
+            mount_dir.starts_with(std::fs::canonicalize(&source_dir).unwrap()),
+            "a writable cross-device stage must live beside its source"
+        );
+        assert!(
+            !mount_dir.starts_with(sandbox_stage_root(&sandbox)),
+            "a writable cross-device mount must not use the sandbox-dir stage"
+        );
+        assert_eq!(std::fs::read(&source).unwrap(), b"guest write");
+        assert_eq!(
+            std::fs::metadata(&source).unwrap().ino(),
+            std::fs::metadata(&staged_file).unwrap().ino(),
+            "writable cross-device staging must preserve writeback through a hard link"
+        );
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn stage_file_mounts_retains_every_writable_device_mismatch_staging_directory() {
+        let (root, sandbox) = staging_sandbox_dir();
+        let sources = same_device_source_dir(root.path());
+        let first_parent = sources.join("first");
+        let second_parent = sources.join("second");
+        std::fs::create_dir_all(&first_parent).unwrap();
+        std::fs::create_dir_all(&second_parent).unwrap();
+        let first = first_parent.join("first.txt");
+        let second = second_parent.join("second.txt");
+        std::fs::write(&first, b"first").unwrap();
+        std::fs::write(&second, b"second").unwrap();
+        let config = file_mounts_config(&[
+            (&first, "/guest/first.txt", false),
+            (&second, "/guest/second.txt", false),
+        ])
+        .await;
+
+        let (staged, staging) = super::stage_file_mounts_with_mode(
+            &config,
+            &sandbox,
+            super::FileMountStagingMode::ForceDeviceMismatch,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(staging.len(), 2, "one source-parent stage per file");
+        for (source, guest) in [(&first, "/guest/first.txt"), (&second, "/guest/second.txt")] {
+            let (mount_dir, filename, _) = staged.get(guest).unwrap();
+            let staged_file = mount_dir.join(filename);
+            assert!(staged_file.exists());
+            assert_eq!(
+                std::fs::metadata(source).unwrap().ino(),
+                std::fs::metadata(&staged_file).unwrap().ino()
+            );
+        }
+        assert!(
+            directory_entries(&sandbox_stage_root(&sandbox)).is_empty(),
+            "a writable cross-device mount must create no tag in the sandbox-dir stage"
+        );
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn stage_file_mounts_forced_device_mismatch_fails_when_source_parent_is_unwritable() {
+        let (root, sandbox) = staging_sandbox_dir();
+        let source = same_device_source_dir(root.path()).join("source.txt");
+        std::fs::write(&source, b"source").unwrap();
+        let config = file_mount_config(&source, "/guest/source.txt", false).await;
+
+        let rendered = super::stage_file_mounts_with_mode(
+            &config,
+            &sandbox,
+            super::FileMountStagingMode::ForceDeviceMismatchAndRejectSourceParentStage,
+        )
+        .await
+        .expect_err("writable cross-device staging must not fall back to a copy")
+        .to_string();
+        assert!(
+            rendered.contains(&source.display().to_string()),
+            "the error must name the mount that could not be staged: {rendered}"
+        );
+        assert!(
+            rendered.contains("writable"),
+            "the error must explain what the caller can change: {rendered}"
+        );
+    }
+
+    /// A sole writable cross-device mount creates no `<tag>` directory under the
+    /// sandbox-dir stage, and a stale sandbox-dir stage is cleared first.
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn stage_file_mounts_sole_writable_mismatch_leaves_no_sandbox_tag() {
+        let (root, sandbox) = staging_sandbox_dir();
+        let stage_root = sandbox_stage_root(&sandbox);
+        std::fs::create_dir_all(&stage_root).unwrap();
+        std::fs::write(stage_root.join("stale-sentinel"), b"old").unwrap();
+        let source = same_device_source_dir(root.path()).join("writable.txt");
+        std::fs::write(&source, b"before").unwrap();
+        let config = file_mount_config(&source, "/guest/writable.txt", false).await;
+
+        let (staged, staging) = super::stage_file_mounts_with_mode(
+            &config,
+            &sandbox,
+            super::FileMountStagingMode::ForceDeviceMismatch,
+        )
+        .await
+        .unwrap();
+        let (mount_dir, filename, _) = staged.get("/guest/writable.txt").unwrap();
+        std::fs::write(mount_dir.join(filename), b"guest").unwrap();
+
+        assert_eq!(std::fs::read(&source).unwrap(), b"guest");
+        assert_eq!(staging.len(), 1);
+        assert!(
+            !stage_root.join("stale-sentinel").exists(),
+            "the previous sandbox-dir stage must be cleared"
+        );
+        assert!(
+            directory_entries(&stage_root).is_empty(),
+            "a sole writable cross-device mount must create no tag in the sandbox-dir stage: {:?}",
+            directory_entries(&stage_root)
+        );
+    }
+
+    /// Mixed same-device and cross-device mounts place each stage exactly where
+    /// its device decision says, expose exactly the selected filename, and leave
+    /// the source files' siblings unshared.
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn stage_file_mounts_places_each_mount_by_device_decision() {
+        let (root, sandbox) = staging_sandbox_dir();
+        let sources = same_device_source_dir(root.path());
+        let same_device = sources.join("same.txt");
+        let readonly_mismatch = sources.join("readonly.txt");
+        let writable_mismatch = sources.join("writable.txt");
+        std::fs::write(&same_device, b"same").unwrap();
+        std::fs::write(&readonly_mismatch, b"ro").unwrap();
+        std::fs::write(&writable_mismatch, b"rw").unwrap();
+        std::fs::write(sources.join("sibling-sentinel"), b"private").unwrap();
+
+        // Same-device mount routed by identity (Automatic).
+        let same_config = file_mount_config(&same_device, "/guest/same.txt", false).await;
+        let (staged, _) = super::stage_file_mounts(&same_config, &sandbox)
+            .await
+            .unwrap();
+        let (same_dir, same_name, _) = staged.get("/guest/same.txt").unwrap();
+        assert!(same_dir.starts_with(sandbox_stage_root(&sandbox)));
+        assert_eq!(directory_entries(same_dir), vec![same_name.clone()]);
+
+        // Forced-mismatch mounts: readonly copies into the sandbox dir, writable
+        // stages beside its source.
+        let mismatch_config = file_mounts_config(&[
+            (&readonly_mismatch, "/guest/readonly.txt", true),
+            (&writable_mismatch, "/guest/writable.txt", false),
+        ])
+        .await;
+        let (staged, staging) = super::stage_file_mounts_with_mode(
+            &mismatch_config,
+            &sandbox,
+            super::FileMountStagingMode::ForceDeviceMismatch,
+        )
+        .await
+        .unwrap();
+        assert_eq!(staging.len(), 1, "only the writable mismatch needs a root");
+        let (ro_dir, ro_name, _) = staged.get("/guest/readonly.txt").unwrap();
+        assert!(ro_dir.starts_with(sandbox_stage_root(&sandbox)));
+        assert_eq!(directory_entries(ro_dir), vec![ro_name.clone()]);
+        let (rw_dir, rw_name, _) = staged.get("/guest/writable.txt").unwrap();
+        assert!(rw_dir.starts_with(std::fs::canonicalize(&sources).unwrap()));
+        assert_eq!(directory_entries(rw_dir), vec![rw_name.clone()]);
+    }
+
+    /// Respawning the same sandbox name clears the previous sandbox-dir stage,
+    /// including when the new spawn has no file mounts.
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn stage_file_mounts_respawn_clears_previous_sandbox_stage() {
+        let (root, sandbox) = staging_sandbox_dir();
+        let sources = same_device_source_dir(root.path());
+        let first = sources.join("first.txt");
+        std::fs::write(&first, b"first").unwrap();
+        let config = file_mount_config(&first, "/guest/first.txt", false).await;
+        let (staged, _) = super::stage_file_mounts(&config, &sandbox).await.unwrap();
+        let (first_dir, _, _) = staged.get("/guest/first.txt").unwrap();
+        assert!(first_dir.exists());
+
+        let second = sources.join("second.txt");
+        std::fs::write(&second, b"second").unwrap();
+        let second_config = file_mount_config(&second, "/guest/second.txt", false).await;
+        let (staged, _) = super::stage_file_mounts(&second_config, &sandbox)
+            .await
+            .unwrap();
+        let (second_dir, second_name, _) = staged.get("/guest/second.txt").unwrap();
+        assert!(
+            !first_dir.exists(),
+            "the previous generation's stage directory must be cleared"
+        );
+        assert_eq!(
+            std::fs::read(second_dir.join(second_name)).unwrap(),
+            b"second"
+        );
+
+        // A restart that drops all file mounts removes the root entirely.
+        let directory = sources.join("adir");
+        std::fs::create_dir_all(&directory).unwrap();
+        let directory_config = file_mounts_config(&[(&directory, "/guest/dir", false)]).await;
+        let (staged, staging) = super::stage_file_mounts(&directory_config, &sandbox)
+            .await
+            .unwrap();
+        assert!(staged.is_empty());
+        assert!(staging.is_empty());
+        assert!(
+            !sandbox_stage_root(&sandbox).exists(),
+            "a spawn with no file mounts must clear and not recreate the sandbox-dir stage"
+        );
+    }
+
+    /// The sandbox-dir stage root is owner-only (`0700`), holds only its tag
+    /// directories, and a stale symlink root is removed rather than followed.
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn stage_file_mounts_sandbox_stage_root_is_private() {
+        let (root, sandbox) = staging_sandbox_dir();
+        let source = same_device_source_dir(root.path()).join("source.txt");
+        std::fs::write(&source, b"source").unwrap();
+        let config = file_mount_config(&source, "/guest/source.txt", false).await;
+
+        let (staged, _) = super::stage_file_mounts(&config, &sandbox).await.unwrap();
+        let (mount_dir, filename, tag) = staged.get("/guest/source.txt").unwrap();
+        let stage_root = sandbox_stage_root(&sandbox);
+        assert_eq!(
+            file_mode(&stage_root),
+            0o700,
+            "stage root must not be world-accessible"
+        );
+        assert_eq!(directory_entries(&stage_root), vec![tag.clone()]);
+        assert_eq!(directory_entries(mount_dir), vec![filename.clone()]);
+
+        // A permissive stale root must be reset back to 0700 by the next spawn.
+        set_mode(&stage_root, 0o777);
+        let (_, _) = super::stage_file_mounts(&config, &sandbox).await.unwrap();
+        assert_eq!(file_mode(&stage_root), 0o700);
+    }
+
+    /// A `file-mounts` root that is a symlink is removed as a link, leaving the
+    /// directory it points at untouched.
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn stage_file_mounts_clear_removes_symlink_root_not_its_target() {
+        let (root, sandbox) = staging_sandbox_dir();
+        let outside = root.path().join("outside");
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(outside.join("keep"), b"keep").unwrap();
+        std::fs::create_dir_all(&sandbox).unwrap();
+        std::os::unix::fs::symlink(&outside, sandbox_stage_root(&sandbox)).unwrap();
+
+        let source = same_device_source_dir(root.path()).join("source.txt");
+        std::fs::write(&source, b"source").unwrap();
+        let config = file_mount_config(&source, "/guest/source.txt", false).await;
+        let (_staged, _) = super::stage_file_mounts(&config, &sandbox).await.unwrap();
+
+        assert!(
+            outside.join("keep").exists(),
+            "clearing must not follow a root symlink into its target"
+        );
+        let stage_root = sandbox_stage_root(&sandbox);
+        assert!(
+            stage_root.is_dir(),
+            "a fresh private root replaces the symlink"
+        );
+        assert!(!stage_root.is_symlink());
+    }
+
+    /// An unexpected non-directory root artifact is a fatal error, before any
+    /// staging happens.
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn stage_file_mounts_clear_rejects_unexpected_root_artifact() {
+        let (root, sandbox) = staging_sandbox_dir();
+        std::fs::create_dir_all(&sandbox).unwrap();
+        // A fifo is neither a file, directory, nor symlink.
+        let fifo = sandbox_stage_root(&sandbox);
+        let status = std::process::Command::new("mkfifo")
+            .arg(&fifo)
+            .status()
+            .unwrap();
+        assert!(status.success());
+
+        let source = same_device_source_dir(root.path()).join("source.txt");
+        std::fs::write(&source, b"source").unwrap();
+        let config = file_mount_config(&source, "/guest/source.txt", false).await;
+        let result = super::stage_file_mounts(&config, &sandbox).await;
+        assert!(
+            result.is_err(),
+            "an unexpected root artifact must be fatal, not cleared"
+        );
+    }
+
+    /// A source directory on a filesystem other than the sandbox directory, if
+    /// this host has a writable one.
+    ///
+    /// Cross-device staging is only reachable when the source and the
+    /// sandbox-dir stage really differ in `st_dev`, so a host without a second
+    /// filesystem cannot cover the branch. The situation is reported instead of
+    /// silently passing, and CI overrides it:
+    ///
+    /// - `MSB_TEST_CROSS_DEVICE_DIR` names the directory to stage from (the macOS
+    ///   job points it at the RAM disk it creates; Linux auto-discovers `/dev/shm`).
+    /// - `MSB_TEST_REQUIRE_CROSS_DEVICE_TESTS` turns the missing-precondition case
+    ///   into a failure, so a job that is supposed to run these tests cannot quietly
+    ///   stop running them.
+    #[cfg(unix)]
+    fn cross_device_source_dir(sandbox_dir: &Path) -> Option<tempfile::TempDir> {
+        // Required mode must not escape via an early `?` on setup inspection:
+        // a sandbox directory that cannot be inspected is a hard error.
+        let sandbox_dir = match std::fs::canonicalize(sandbox_dir) {
+            Ok(dir) => dir,
+            Err(error) => panic!(
+                "cross-device tests could not inspect the sandbox directory {}: {error}",
+                sandbox_dir.display()
+            ),
+        };
+        let sandbox_dev = std::fs::metadata(&sandbox_dir)
+            .unwrap_or_else(|error| {
+                panic!(
+                    "cross-device tests could not stat the sandbox directory {}: {error}",
+                    sandbox_dir.display()
+                )
+            })
+            .dev();
+        let required = std::env::var_os("MSB_TEST_REQUIRE_CROSS_DEVICE_TESTS").is_some();
+
+        let explicit = std::env::var_os("MSB_TEST_CROSS_DEVICE_DIR").map(PathBuf::from);
+        let candidates: Vec<PathBuf> = match &explicit {
+            Some(explicit) => vec![explicit.clone()],
+            None => {
+                let mut candidates: Vec<PathBuf> =
+                    ["/dev/shm", "/run"].iter().map(PathBuf::from).collect();
+                // macOS: any mounted volume (a RAM disk or a disk image both work).
+                // Entries for the boot volume resolve to the same device and are
+                // filtered out below.
+                if let Ok(entries) = std::fs::read_dir("/Volumes") {
+                    candidates.extend(entries.flatten().map(|entry| entry.path()));
+                }
+                candidates
+            }
+        };
+
+        let mut rejected: Vec<String> = Vec::new();
+        let found = candidates.iter().find_map(|candidate| {
+            // Canonicalize first: on a distribution where `/dev/shm` is a
+            // symlink to `/run/shm`, `tempdir_in` would return a path that
+            // traverses a symlink and every cross-device file mount would now be
+            // refused by the no-follow policy.
+            let candidate = match std::fs::canonicalize(candidate) {
+                Ok(candidate) => candidate,
+                Err(error) => {
+                    rejected.push(format!("{}: {error}", candidate.display()));
+                    return None;
+                }
+            };
+            let candidate_dev = match std::fs::metadata(&candidate) {
+                Ok(metadata) => metadata.dev(),
+                Err(error) => {
+                    rejected.push(format!("{}: {error}", candidate.display()));
+                    return None;
+                }
+            };
+            if candidate_dev == sandbox_dev {
+                rejected.push(format!(
+                    "{}: same device as the sandbox ({sandbox_dev})",
+                    candidate.display()
+                ));
+                return None;
+            }
+            match tempfile::Builder::new()
+                .prefix("microsandbox-cross-device-")
+                .tempdir_in(&candidate)
+            {
+                Ok(dir) => Some(dir),
+                Err(error) => {
+                    rejected.push(format!("{}: not writable: {error}", candidate.display()));
+                    None
+                }
+            }
+        });
+        if let Some(dir) = &found {
+            // Validate the allocated fixture's device too, not just the guessed path.
+            let actual_dev = std::fs::metadata(dir.path()).unwrap().dev();
+            assert_ne!(
+                actual_dev,
+                sandbox_dev,
+                "allocated cross-device source fixture {} is on the sandbox's device {sandbox_dev}",
+                dir.path().display()
+            );
+        }
+        if found.is_none() {
+            let message = format!(
+                "cross-device staging tests need a writable directory on a filesystem other than \
+                 the sandbox directory ({}, device {sandbox_dev}): none of {candidates:?} qualifies \
+                 (rejected: {rejected:?})",
+                sandbox_dir.display()
+            );
+            if required {
+                panic!("MSB_TEST_REQUIRE_CROSS_DEVICE_TESTS is set but {message}");
+            }
+            eprintln!("SKIP: {message}");
+        }
+        found
+    }
+
+    #[cfg(unix)]
+    fn file_mode(path: &Path) -> u32 {
+        use std::os::unix::fs::PermissionsExt;
+
+        std::fs::metadata(path).unwrap().permissions().mode() & 0o7777
+    }
+
+    #[cfg(unix)]
+    fn running_as_root() -> bool {
+        // SAFETY: `geteuid` has no preconditions and cannot fail.
+        unsafe { libc::geteuid() == 0 }
+    }
+
+    #[cfg(unix)]
+    fn set_mode(path: &Path, mode: u32) {
+        use std::os::unix::fs::PermissionsExt;
+
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap();
+    }
+
+    #[cfg(unix)]
+    fn directory_entries(path: &Path) -> Vec<String> {
+        let mut entries: Vec<String> = std::fs::read_dir(path)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        entries.sort();
+        entries
+    }
+
+    #[cfg(unix)]
+    fn assert_no_staging_residue(path: &Path) {
+        let residue: Vec<String> = directory_entries(path)
+            .into_iter()
+            .filter(|entry| entry.starts_with(".microsandbox-file-mount-"))
+            .collect();
+        assert!(
+            residue.is_empty(),
+            "staging residue left in {}: {residue:?}",
+            path.display()
+        );
+    }
+
+    #[cfg(unix)]
+    fn probe_handle(
+        staging: Vec<super::FileMountStageOwner>,
+        label: &str,
+    ) -> crate::runtime::ProcessHandle {
+        let child = tokio::process::Command::new("true").spawn().unwrap();
+        let pid = child.id().unwrap();
+        crate::runtime::ProcessHandle::new(
+            pid,
+            label.to_string(),
+            child,
+            staging,
+            Vec::new(),
+            None,
+            None,
+        )
+    }
+
+    /// Like [`probe_handle`], but with the non-Unix `ProcessHandle::new` shape:
+    /// on Windows the parent-watchdog argument is replaced by a job-object one,
+    /// so both it and the metrics reservation are supplied explicitly.
+    #[cfg(windows)]
+    fn windows_probe_handle(
+        staging: Vec<super::FileMountStageOwner>,
+        label: &str,
+    ) -> crate::runtime::ProcessHandle {
+        let child = tokio::process::Command::new("cmd")
+            .arg("/C")
+            .arg("exit 0")
+            .spawn()
+            .unwrap();
+        let pid = child.id().unwrap();
+        crate::runtime::ProcessHandle::new(
+            pid,
+            label.to_string(),
+            child,
+            staging,
+            Vec::new(),
+            None,
+            None,
+        )
+    }
+
+    /// The forced modes above override the equality decision; this drives the
+    /// real cross-device branch with filesystems that genuinely differ in
+    /// `st_dev`, which is the only check that validates the identity classifier
+    /// against the OS instead of a hand-built decision.
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn stage_file_mounts_real_cross_device_keeps_writable_inode_identity() {
+        let (root, sandbox) = staging_sandbox_dir();
+        let Some(source_dir) = cross_device_source_dir(&sandbox) else {
+            drop(root);
+            return;
+        };
+        let source = source_dir.path().join("writable.txt");
+        std::fs::write(&source, b"before").unwrap();
+        assert_ne!(
+            std::fs::metadata(&source).unwrap().dev(),
+            std::fs::metadata(sandbox_stage_root(&sandbox))
+                .map(|metadata| metadata.dev())
+                .unwrap_or_else(|_| std::fs::metadata(&sandbox).unwrap().dev()),
+            "the source must really be on a different device from the sandbox dir"
+        );
+
+        let config = file_mount_config(&source, "/guest/writable.txt", false).await;
+        let (staged, staging) = super::stage_file_mounts(&config, &sandbox).await.unwrap();
+        let (mount_dir, filename, _) = staged.get("/guest/writable.txt").unwrap();
+        let staged_file = mount_dir.join(filename);
+
+        assert_eq!(
+            staging.len(),
+            1,
+            "one source-parent stage per writable mount"
+        );
+        assert_eq!(
+            std::fs::metadata(&source).unwrap().dev(),
+            std::fs::metadata(&staged_file).unwrap().dev(),
+            "a writable cross-device stage must live on the source's filesystem"
+        );
+        assert_eq!(
+            std::fs::metadata(&source).unwrap().ino(),
+            std::fs::metadata(&staged_file).unwrap().ino(),
+            "a writable cross-device mount must keep inode identity"
+        );
+        std::fs::write(&staged_file, b"guest write").unwrap();
+        assert_eq!(std::fs::read(&source).unwrap(), b"guest write");
+
+        // The stage survives until the handle that owns it goes away, and then it is
+        // gone from the user's own directory.
+        let stage_root = mount_dir.parent().unwrap().to_path_buf();
+        assert!(stage_root.exists());
+        drop(staging);
+        assert!(
+            !stage_root.exists(),
+            "dropping the staging handle must remove {}",
+            stage_root.display()
+        );
+        assert_no_staging_residue(source_dir.path());
+    }
+
+    /// A readonly cross-device mount must become an isolated copy under the
+    /// sandbox directory: no link to the host source, frozen content.
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn stage_file_mounts_real_cross_device_copies_readonly_into_sandbox_stage() {
+        let (root, sandbox) = staging_sandbox_dir();
+        let Some(source_dir) = cross_device_source_dir(&sandbox) else {
+            drop(root);
+            return;
+        };
+        let source = source_dir.path().join("readonly.txt");
+        std::fs::write(&source, b"before").unwrap();
+        assert_ne!(
+            std::fs::metadata(&source).unwrap().dev(),
+            std::fs::metadata(&sandbox).unwrap().dev(),
+            "the source must really be on a different device from the sandbox dir"
+        );
+
+        let config = file_mount_config(&source, "/guest/readonly.txt", true).await;
+        let (staged, staging) = super::stage_file_mounts(&config, &sandbox).await.unwrap();
+        let (mount_dir, filename, _) = staged.get("/guest/readonly.txt").unwrap();
+        let staged_file = mount_dir.join(filename);
+
+        assert!(
+            staging.is_empty(),
+            "a readonly copy needs no temporary root"
+        );
+        assert!(
+            mount_dir.starts_with(sandbox_stage_root(&sandbox)),
+            "readonly cross-device copies belong under the sandbox dir: {}",
+            mount_dir.display()
+        );
+        std::fs::write(&source, b"after").unwrap();
+        assert_eq!(std::fs::read(&staged_file).unwrap(), b"before");
+        assert_eq!(
+            std::fs::metadata(&staged_file).unwrap().nlink(),
+            1,
+            "the readonly copy must not share the source inode"
+        );
+        assert_no_staging_residue(source_dir.path());
+    }
+
+    /// A readonly mount and a writable mount of a second-device directory:
+    /// exactly one source-parent stage, each with the right identity and
+    /// placement.
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn stage_file_mounts_real_cross_device_mixes_readonly_and_writable() {
+        let (root, sandbox) = staging_sandbox_dir();
+        let Some(source_dir) = cross_device_source_dir(&sandbox) else {
+            drop(root);
+            return;
+        };
+        let writable = source_dir.path().join("writable.txt");
+        let readonly = source_dir.path().join("readonly.txt");
+        std::fs::write(&writable, b"w").unwrap();
+        std::fs::write(&readonly, b"r").unwrap();
+        let config = file_mounts_config(&[
+            (&writable, "/guest/writable.txt", false),
+            (&readonly, "/guest/readonly.txt", true),
+        ])
+        .await;
+
+        let (staged, staging) = super::stage_file_mounts(&config, &sandbox).await.unwrap();
+        assert_eq!(
+            staging.len(),
+            1,
+            "only the writable cross-device mount needs a source-parent root"
+        );
+
+        let (writable_dir, writable_name, _) = staged.get("/guest/writable.txt").unwrap();
+        let writable_staged = writable_dir.join(writable_name);
+        std::fs::write(&writable_staged, b"guest").unwrap();
+        assert_eq!(std::fs::read(&writable).unwrap(), b"guest");
+        assert!(writable_dir.starts_with(std::fs::canonicalize(source_dir.path()).unwrap()));
+
+        let (readonly_dir, readonly_name, _) = staged.get("/guest/readonly.txt").unwrap();
+        let readonly_staged = readonly_dir.join(readonly_name);
+        assert!(
+            readonly_dir.starts_with(sandbox_stage_root(&sandbox)),
+            "a readonly cross-device copy stays under the sandbox dir"
+        );
+        std::fs::write(&readonly, b"changed").unwrap();
+        assert_eq!(std::fs::read(&readonly_staged).unwrap(), b"r");
+        assert_ne!(
+            std::fs::metadata(&readonly).unwrap().ino(),
+            std::fs::metadata(&readonly_staged).unwrap().ino()
+        );
+
+        drop(staging);
+        assert_no_staging_residue(source_dir.path());
+    }
+
+    /// The source-parent stage is created inside the user's own directory, so it
+    /// must be owner-only (mode `0700`) and hold nothing but the mount's own
+    /// directory. The sandbox-dir stage is likewise private.
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn stage_file_mounts_real_cross_device_stage_root_is_owner_only() {
+        let (root, sandbox) = staging_sandbox_dir();
+        let Some(source_dir) = cross_device_source_dir(&sandbox) else {
+            drop(root);
+            return;
+        };
+        // A same-device mount proves the sandbox-dir stage mode.
+        let same = same_device_source_dir(root.path()).join("same.txt");
+        std::fs::write(&same, b"same").unwrap();
+        let same_config = file_mount_config(&same, "/guest/same.txt", false).await;
+        let (_, _) = super::stage_file_mounts(&same_config, &sandbox)
+            .await
+            .unwrap();
+        assert_eq!(file_mode(&sandbox_stage_root(&sandbox)), 0o700);
+
+        let source = source_dir.path().join("writable.txt");
+        std::fs::write(&source, b"before").unwrap();
+        let config = file_mount_config(&source, "/guest/writable.txt", false).await;
+
+        let (staged, _staging) = super::stage_file_mounts(&config, &sandbox).await.unwrap();
+        let (mount_dir, filename, _) = staged.get("/guest/writable.txt").unwrap();
+        let stage_root = mount_dir.parent().unwrap();
+
+        assert_eq!(
+            file_mode(stage_root),
+            0o700,
+            "the per-source stage must not be world-traversable"
+        );
+        assert_eq!(
+            stage_root.parent().unwrap(),
+            std::fs::canonicalize(source_dir.path()).unwrap(),
+            "the stage must live beside the source"
+        );
+        assert!(
+            stage_root
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .starts_with(".microsandbox-file-mount-"),
+            "the stage name is user-visible: {}",
+            stage_root.display()
+        );
+        let entries = directory_entries(stage_root);
+        assert_eq!(
+            entries,
+            vec![
+                mount_dir
+                    .file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .into_owned()
+            ],
+            "the stage holds only its own mount directory"
+        );
+        assert_eq!(
+            file_mode(&mount_dir.join(filename)),
+            file_mode(&source),
+            "the staged link must keep the source's mode"
+        );
+    }
+
+    /// The source-parent stage can only be dropped while the VM runs, so an
+    /// attached handle must drop it and a detached (`disarm`ed) handle must keep
+    /// it for the VM that is still reading through it. The sandbox-dir stage is
+    /// not owned by the handle and is unaffected either way.
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn stage_file_mounts_real_cross_device_stages_follow_the_handle_lifetime() {
+        let (root, sandbox) = staging_sandbox_dir();
+        let Some(source_dir) = cross_device_source_dir(&sandbox) else {
+            drop(root);
+            return;
+        };
+        let source = source_dir.path().join("writable.txt");
+        std::fs::write(&source, b"before").unwrap();
+        let config = file_mount_config(&source, "/guest/writable.txt", false).await;
+
+        let (_, staging) = super::stage_file_mounts(&config, &sandbox).await.unwrap();
+        drop(probe_handle(staging, "cross-device-attached"));
+        assert_eq!(
+            directory_entries(source_dir.path()),
+            vec!["writable.txt".to_string()],
+            "an attached VM must not leave a stage inside the source directory"
+        );
+
+        let (_, staging) = super::stage_file_mounts(&config, &sandbox).await.unwrap();
+        let mut detached = probe_handle(staging, "cross-device-detached");
+        detached.disarm();
+        drop(detached);
+        // Note: `disarm` keeps the stage for the detached VM, and nothing removes it
+        // once that VM exits - a residue the SDK does not clean up today. This
+        // asserts the current contract so a change to it is deliberate.
+        assert!(
+            directory_entries(source_dir.path())
+                .iter()
+                .any(|entry| entry.starts_with(".microsandbox-file-mount-")),
+            "a detached VM must keep reading its stage"
+        );
+    }
+
+    /// Staging failures must be actionable (the caller cannot tell which mount
+    /// broke from a bare `io::Error`) and must not leave earlier source-parent
+    /// stages behind.
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn stage_file_mounts_real_unwritable_source_parent_names_the_mount() {
+        if running_as_root() {
+            eprintln!("SKIP: as root, mode 0500 does not deny directory writes");
+            return;
+        }
+        let (root, sandbox) = staging_sandbox_dir();
+        let Some(source_dir) = cross_device_source_dir(&sandbox) else {
+            drop(root);
+            return;
+        };
+        let source = source_dir.path().join("writable.txt");
+        std::fs::write(&source, b"before").unwrap();
+        let config = file_mount_config(&source, "/guest/writable.txt", false).await;
+
+        set_mode(source_dir.path(), 0o500);
+        let result = super::stage_file_mounts(&config, &sandbox).await;
+        // Restore first: a panic here would otherwise poison the TempDir cleanup.
+        set_mode(source_dir.path(), 0o700);
+
+        let rendered = result
+            .expect_err("an unwritable source parent cannot stage a writable mount")
+            .to_string();
+        assert!(
+            rendered.contains(&source.display().to_string()),
+            "the error must name the mount that could not be staged: {rendered}"
+        );
+        assert!(
+            rendered.contains("writable"),
+            "the error must explain what the caller can change: {rendered}"
+        );
+        assert_no_staging_residue(source_dir.path());
+    }
+
+    /// A failure on a later mount must not leave the earlier mount's source-parent
+    /// stage inside the user's directory. The sandbox-dir stage may retain private
+    /// remnants until retry or `rm`.
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn stage_file_mounts_failure_on_a_later_mount_drops_earlier_stages() {
+        if running_as_root() {
+            eprintln!("SKIP: as root, mode 0500 does not deny directory writes");
+            return;
+        }
+        let (root, sandbox) = staging_sandbox_dir();
+        let Some(source_dir) = cross_device_source_dir(&sandbox) else {
+            drop(root);
+            return;
+        };
+        let staged_parent = source_dir.path().join("staged");
+        let broken_parent = source_dir.path().join("broken");
+        std::fs::create_dir(&staged_parent).unwrap();
+        std::fs::create_dir(&broken_parent).unwrap();
+        let first = staged_parent.join("first.txt");
+        let second = broken_parent.join("second.txt");
+        std::fs::write(&first, b"first").unwrap();
+        std::fs::write(&second, b"second").unwrap();
+        let config = file_mounts_config(&[
+            (&first, "/guest/first.txt", false),
+            (&second, "/guest/second.txt", false),
+        ])
+        .await;
+
+        set_mode(&broken_parent, 0o500);
+        let result = super::stage_file_mounts(&config, &sandbox).await;
+        set_mode(&broken_parent, 0o700);
+
+        assert!(
+            result.is_err(),
+            "the second mount cannot be staged, so the whole spawn must fail"
+        );
+        assert_no_staging_residue(&staged_parent);
+    }
+
+    /// Two mounts of one host file must not share a virtiofs tag or a stage
+    /// directory, and both must still reach the same inode.
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn stage_file_mounts_stages_every_mount_of_the_same_source() {
+        let (root, sandbox) = staging_sandbox_dir();
+        let source = same_device_source_dir(root.path()).join("shared.txt");
+        std::fs::write(&source, b"shared").unwrap();
+        let config = file_mounts_config(&[
+            (&source, "/guest/a.txt", false),
+            (&source, "/guest/b.txt", false),
+        ])
+        .await;
+
+        let (staged, staging) = super::stage_file_mounts(&config, &sandbox).await.unwrap();
+        assert!(staging.is_empty());
+
+        let (first_dir, first_name, _) = staged.get("/guest/a.txt").unwrap();
+        let (second_dir, second_name, _) = staged.get("/guest/b.txt").unwrap();
+        assert_ne!(first_dir, second_dir);
+        for (dir, name) in [(first_dir, first_name), (second_dir, second_name)] {
+            assert_eq!(
+                std::fs::metadata(&source).unwrap().ino(),
+                std::fs::metadata(dir.join(name)).unwrap().ino()
+            );
+        }
+    }
+
+    /// A config without file mounts must not create any staging root at all, and
+    /// must leave an existing sandbox-dir stage cleared.
+    #[tokio::test]
+    async fn stage_file_mounts_creates_nothing_without_file_mounts() {
+        let (root, sandbox) = {
+            let root = tempdir().unwrap();
+            let sandbox = root.path().join("sandbox");
+            std::fs::create_dir_all(&sandbox).unwrap();
+            (root, sandbox)
+        };
+        #[cfg(unix)]
+        {
+            let stage_root = sandbox_stage_root(&sandbox);
+            std::fs::create_dir_all(&stage_root).unwrap();
+            std::fs::write(stage_root.join("stale"), b"old").unwrap();
+        }
+        let directory = root.path().join("adir");
+        std::fs::create_dir_all(&directory).unwrap();
+        let config = file_mounts_config(&[(&directory, "/guest/directory", false)]).await;
+
+        let (staged, staging) = super::stage_file_mounts(&config, &sandbox).await.unwrap();
+        assert!(staged.is_empty());
+        assert!(
+            staging.is_empty(),
+            "a directory mount is not a file mount and needs no staging root"
+        );
+        #[cfg(unix)]
+        assert!(
+            !sandbox_stage_root(&sandbox).exists(),
+            "a config without file mounts must clear and not recreate the sandbox-dir stage"
+        );
+    }
+
+    /// The child-process probe used by the no-system-temp tests below. It reads
+    /// explicit fixture paths from env vars and never calls the process-wide
+    /// `tempdir()`, so the parent can point `TMPDIR`/`TMP`/`TEMP` at a location
+    /// that must stay unused (missing or empty).
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn stage_file_mounts_child_probe_stages_without_system_temp() {
+        let (Ok(sandbox), Ok(source_same), Ok(source_readonly), Ok(source_writable)) = (
+            std::env::var("MSB_TEST_STAGING_SANDBOX"),
+            std::env::var("MSB_TEST_STAGING_SOURCE_SAME"),
+            std::env::var("MSB_TEST_STAGING_SOURCE_READONLY"),
+            std::env::var("MSB_TEST_STAGING_SOURCE_WRITABLE"),
+        ) else {
+            return; // Not invoked as the probe child.
+        };
+        let sandbox = PathBuf::from(sandbox);
+        let sandbox = std::fs::canonicalize(&sandbox).unwrap();
+        let stage_root = sandbox_stage_root(&sandbox);
+
+        // Same device (real identity): the mount hard-links into the sandbox-dir
+        // stage and owns no temporary root.
+        let same_config =
+            file_mount_config(Path::new(&source_same), "/guest/same.txt", false).await;
+        let (staged, staging) = super::stage_file_mounts(&same_config, &sandbox)
+            .await
+            .expect("same-device staging must not depend on the system temp dir");
+        let (dir, name, _) = staged.get("/guest/same.txt").unwrap();
+        assert!(
+            dir.starts_with(&stage_root),
+            "same-device mount must stage in the sandbox dir: {}",
+            dir.display()
+        );
+        assert_eq!(std::fs::read(dir.join(name)).unwrap(), b"content");
+        assert!(staging.is_empty());
+
+        // Cross-device (forced): the readonly mount copies into the sandbox-dir
+        // stage; the writable mount hard-links beside its source.
+        let mismatch_config = file_mounts_config(&[
+            (Path::new(&source_readonly), "/guest/readonly.txt", true),
+            (Path::new(&source_writable), "/guest/writable.txt", false),
+        ])
+        .await;
+        let (staged, staging) = super::stage_file_mounts_with_mode(
+            &mismatch_config,
+            &sandbox,
+            super::FileMountStagingMode::ForceDeviceMismatch,
+        )
+        .await
+        .expect("cross-device staging must not depend on the system temp dir");
+        let (dir, name, _) = staged.get("/guest/readonly.txt").unwrap();
+        assert!(
+            dir.starts_with(&stage_root),
+            "readonly mismatch must stage in the sandbox dir: {}",
+            dir.display()
+        );
+        assert_eq!(std::fs::read(dir.join(name)).unwrap(), b"content");
+        let (dir, name, _) = staged.get("/guest/writable.txt").unwrap();
+        assert!(
+            !dir.starts_with(&stage_root),
+            "a writable mismatch must not stage in the sandbox dir"
+        );
+        assert_eq!(std::fs::read(dir.join(name)).unwrap(), b"content");
+        assert_eq!(staging.len(), 1, "only the writable mismatch owns a root");
+        let _ = std::fs::remove_dir_all(&sandbox);
+    }
+
+    /// Staging must not depend on the system temp dir. A child process runs the
+    /// probe above with `TMPDIR`/`TMP`/`TEMP` pointed at a missing path; the
+    /// staging succeeds and the missing path stays missing.
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn stage_file_mounts_ignores_missing_system_temp_dir() {
+        let (root, sandbox) = staging_sandbox_dir();
+        let sources = same_device_source_dir(root.path());
+        let source_same = sources.join("same.txt");
+        let source_readonly = sources.join("readonly.txt");
+        let source_writable = sources.join("writable.txt");
+        for source in [&source_same, &source_readonly, &source_writable] {
+            std::fs::write(source, b"content").unwrap();
+        }
+        let missing = root.path().join("no-such-temp-dir");
+
+        let child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", CHILD_PROBE_TEST, "--nocapture"])
+            .env("MSB_TEST_STAGING_SANDBOX", &sandbox)
+            .env("MSB_TEST_STAGING_SOURCE_SAME", &source_same)
+            .env("MSB_TEST_STAGING_SOURCE_READONLY", &source_readonly)
+            .env("MSB_TEST_STAGING_SOURCE_WRITABLE", &source_writable)
+            .env("TMPDIR", &missing)
+            .env("TMP", &missing)
+            .env("TEMP", &missing)
+            .output()
+            .unwrap();
+        assert!(
+            child.status.success(),
+            "probe child failed: stdout={} stderr={}",
+            String::from_utf8_lossy(&child.stdout),
+            String::from_utf8_lossy(&child.stderr)
+        );
+        assert!(
+            !missing.exists(),
+            "staging must not create or probe the system temp dir: {}",
+            missing.display()
+        );
+    }
+
+    /// As above, but the system temp dir exists and is empty: staging must leave
+    /// it empty instead of writing anything there.
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn stage_file_mounts_leaves_empty_system_temp_dir_empty() {
+        let (root, sandbox) = staging_sandbox_dir();
+        let sources = same_device_source_dir(root.path());
+        let source_same = sources.join("same.txt");
+        let source_readonly = sources.join("readonly.txt");
+        let source_writable = sources.join("writable.txt");
+        for source in [&source_same, &source_readonly, &source_writable] {
+            std::fs::write(source, b"content").unwrap();
+        }
+        let sentinel_temp = root.path().join("empty-temp-dir");
+        std::fs::create_dir_all(&sentinel_temp).unwrap();
+
+        let child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", CHILD_PROBE_TEST, "--nocapture"])
+            .env("MSB_TEST_STAGING_SANDBOX", &sandbox)
+            .env("MSB_TEST_STAGING_SOURCE_SAME", &source_same)
+            .env("MSB_TEST_STAGING_SOURCE_READONLY", &source_readonly)
+            .env("MSB_TEST_STAGING_SOURCE_WRITABLE", &source_writable)
+            .env("TMPDIR", &sentinel_temp)
+            .env("TMP", &sentinel_temp)
+            .env("TEMP", &sentinel_temp)
+            .output()
+            .unwrap();
+        assert!(
+            child.status.success(),
+            "probe child failed: stdout={} stderr={}",
+            String::from_utf8_lossy(&child.stdout),
+            String::from_utf8_lossy(&child.stderr)
+        );
+        assert_eq!(
+            directory_entries(&sentinel_temp),
+            Vec::<String>::new(),
+            "staging must leave the system temp dir empty"
+        );
+    }
+
     #[test]
     fn block_writeback_policy_resolves_by_platform() {
         #[cfg(target_os = "linux")]
@@ -5114,5 +8009,1385 @@ mod tests {
                 (Some(1024 * 1024 * 1024), Some(512 * 1024 * 1024))
             );
         }
+    }
+
+    //----------------------------------------------------------------------------------------------
+    // issue #24: no-follow file binds
+    //----------------------------------------------------------------------------------------------
+
+    /// Like [`file_mount_config`], but opts in to following root symlinks.
+    #[cfg(unix)]
+    async fn file_mount_config_following(
+        host: &Path,
+        guest: &str,
+        readonly: bool,
+    ) -> SandboxConfig {
+        let mut builder = SandboxBuilder::new("test").image("/tmp/rootfs");
+        builder = builder.volume(guest, |mount| {
+            let mount = mount.bind(host).follow_root_symlinks(true);
+            if readonly { mount.readonly() } else { mount }
+        });
+        builder.build().await.unwrap()
+    }
+
+    #[cfg(unix)]
+    fn symlink_fixture(root: &Path, name: &str) -> (PathBuf, PathBuf) {
+        let sources = same_device_source_dir(root);
+        let real = sources.join("real.txt");
+        std::fs::write(&real, b"before").unwrap();
+        let link = sources.join(name);
+        std::os::unix::fs::symlink("real.txt", &link).unwrap();
+        (real, link)
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn stage_file_mounts_rejects_a_symlinked_leaf_by_default() {
+        let (root, sandbox) = staging_sandbox_dir();
+        let (_real, link) = symlink_fixture(root.path(), "link.txt");
+        let config = file_mount_config(&link, "/guest/link.txt", false).await;
+
+        let rendered = super::stage_file_mounts(&config, &sandbox)
+            .await
+            .expect_err("a symlinked file source is refused by default")
+            .to_string();
+        assert!(
+            rendered.contains(&link.display().to_string()),
+            "the error must name the source: {rendered}"
+        );
+        assert!(
+            rendered.contains(".follow_root_symlinks(true)"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("follow-root-symlinks"), "{rendered}");
+        assert!(
+            !sandbox_stage_root(&sandbox).exists(),
+            "a rejected mount must not create the sandbox-dir stage"
+        );
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn stage_file_mounts_rejects_a_symlinked_ancestor_by_default() {
+        let (root, sandbox) = staging_sandbox_dir();
+        let sources = same_device_source_dir(root.path());
+        let real_dir = sources.join("realdir");
+        std::fs::create_dir(&real_dir).unwrap();
+        std::fs::write(real_dir.join("f.txt"), b"x").unwrap();
+        let link_dir = sources.join("linkdir");
+        std::os::unix::fs::symlink("realdir", &link_dir).unwrap();
+        let host = link_dir.join("f.txt");
+        let config = file_mount_config(&host, "/guest/f.txt", false).await;
+
+        let rendered = super::stage_file_mounts(&config, &sandbox)
+            .await
+            .expect_err("a symlinked ancestor is refused by default")
+            .to_string();
+        assert!(
+            rendered.contains(&link_dir.display().to_string()),
+            "the error must name the ancestor: {rendered}"
+        );
+        assert!(rendered.contains("follow-root-symlinks"), "{rendered}");
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn stage_file_mounts_follows_root_symlinks_when_opted_in() {
+        let (root, sandbox) = staging_sandbox_dir();
+        let (real, link) = symlink_fixture(root.path(), "link.txt");
+        let config = file_mount_config_following(&link, "/guest/link.txt", false).await;
+
+        let (staged, _) = super::stage_file_mounts(&config, &sandbox).await.unwrap();
+        let (mount_dir, filename, _) = staged.get("/guest/link.txt").unwrap();
+        assert_eq!(
+            filename, "link.txt",
+            "the staged basename remains the requested name"
+        );
+        assert_eq!(
+            std::fs::metadata(&real).unwrap().ino(),
+            std::fs::metadata(mount_dir.join(filename)).unwrap().ino()
+        );
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn stage_file_mounts_opt_in_writable_symlink_writes_through() {
+        let (root, sandbox) = staging_sandbox_dir();
+        let (real, link) = symlink_fixture(root.path(), "link.txt");
+        let config = file_mount_config_following(&link, "/guest/link.txt", false).await;
+        let (staged, _) = super::stage_file_mounts(&config, &sandbox).await.unwrap();
+        let (mount_dir, filename, _) = staged.get("/guest/link.txt").unwrap();
+        std::fs::write(mount_dir.join(filename), b"written through").unwrap();
+        assert_eq!(std::fs::read(&real).unwrap(), b"written through");
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn stage_file_mounts_opt_in_absolute_symlink_stages_the_host_target() {
+        let (root, sandbox) = staging_sandbox_dir();
+        let sources = same_device_source_dir(root.path());
+        let real = sources.join("real.txt");
+        std::fs::write(&real, b"absolute").unwrap();
+        let link = sources.join("abs.txt");
+        // An absolute symlink target: on Linux `link(2)` would stage the link
+        // itself, and the guest would resolve it against the guest root.
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let config = file_mount_config_following(&link, "/guest/abs.txt", false).await;
+        let (staged, _) = super::stage_file_mounts(&config, &sandbox).await.unwrap();
+        let (mount_dir, filename, _) = staged.get("/guest/abs.txt").unwrap();
+        let staged_file = mount_dir.join(filename);
+        assert_eq!(
+            std::fs::metadata(&real).unwrap().ino(),
+            std::fs::metadata(&staged_file).unwrap().ino()
+        );
+        assert!(
+            !std::fs::symlink_metadata(&staged_file)
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "the staged entry must be the target file, never a symlink"
+        );
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn stage_file_mounts_detects_a_source_swapped_during_staging() {
+        let (root, sandbox) = staging_sandbox_dir();
+        let source = same_device_source_dir(root.path()).join("source.txt");
+        std::fs::write(&source, b"source").unwrap();
+        let config = file_mount_config(&source, "/guest/source.txt", false).await;
+
+        let rendered = super::stage_file_mounts_with_mode(
+            &config,
+            &sandbox,
+            super::FileMountStagingMode::ForceLeafSwapBeforeLink,
+        )
+        .await
+        .expect_err("a leaf swap must be detected")
+        .to_string();
+        assert!(
+            rendered.contains(&source.display().to_string()),
+            "the error must name the mount: {rendered}"
+        );
+        assert!(
+            rendered.contains("changed while it was being staged"),
+            "{rendered}"
+        );
+        assert_eq!(
+            std::fs::metadata(&source).unwrap().nlink(),
+            1,
+            "the attempted entry is removed and the decoy is not linked twice"
+        );
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn stage_file_mounts_readonly_falls_back_to_a_copy_on_link_failure() {
+        let (root, sandbox) = staging_sandbox_dir();
+        let source = same_device_source_dir(root.path()).join("readonly.txt");
+        std::fs::write(&source, b"payload").unwrap();
+        set_mode(&source, 0o640);
+        let config = file_mount_config(&source, "/guest/readonly.txt", true).await;
+
+        let (staged, _) = super::stage_file_mounts_with_mode(
+            &config,
+            &sandbox,
+            super::FileMountStagingMode::ForceLinkErrno(libc::EPERM),
+        )
+        .await
+        .unwrap();
+        let (mount_dir, filename, _) = staged.get("/guest/readonly.txt").unwrap();
+        let staged_file = mount_dir.join(filename);
+        assert_eq!(std::fs::read(&staged_file).unwrap(), b"payload");
+        assert_eq!(std::fs::metadata(&staged_file).unwrap().nlink(), 1);
+        assert_eq!(
+            file_mode(&staged_file) & 0o7777,
+            0o640,
+            "the copy must preserve the source mode, not inherit the umask"
+        );
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn stage_file_mounts_readonly_fallback_copy_is_a_snapshot_not_a_live_link() {
+        let (root, sandbox) = staging_sandbox_dir();
+        let source = same_device_source_dir(root.path()).join("snapshot.txt");
+        std::fs::write(&source, b"before").unwrap();
+        let config = file_mount_config(&source, "/guest/snapshot.txt", true).await;
+        let (staged, _) = super::stage_file_mounts_with_mode(
+            &config,
+            &sandbox,
+            super::FileMountStagingMode::ForceLinkErrno(libc::EPERM),
+        )
+        .await
+        .unwrap();
+        let (mount_dir, filename, _) = staged.get("/guest/snapshot.txt").unwrap();
+        // A linked (non-fallback) readonly mount is live; the fallback copy is
+        // a snapshot, so later source edits are not visible.
+        std::fs::write(&source, b"after").unwrap();
+        assert_eq!(std::fs::read(mount_dir.join(filename)).unwrap(), b"before");
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn stage_file_mounts_writable_link_failure_names_protected_hardlinks() {
+        let (root, sandbox) = staging_sandbox_dir();
+        let source = same_device_source_dir(root.path()).join("writable.txt");
+        std::fs::write(&source, b"x").unwrap();
+        let config = file_mount_config(&source, "/guest/writable.txt", false).await;
+
+        let rendered = super::stage_file_mounts_with_mode(
+            &config,
+            &sandbox,
+            super::FileMountStagingMode::ForceLinkErrno(libc::EPERM),
+        )
+        .await
+        .expect_err("a writable link failure must not fall back to a copy")
+        .to_string();
+        assert!(
+            rendered.contains(&source.display().to_string()),
+            "{rendered}"
+        );
+        assert!(rendered.contains("/guest/writable.txt"), "{rendered}");
+        assert!(rendered.contains("protected_hardlinks"), "{rendered}");
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn stage_file_mounts_writable_link_failure_other_errno_omits_protected_hardlinks() {
+        let (root, sandbox) = staging_sandbox_dir();
+        let source = same_device_source_dir(root.path()).join("writable.txt");
+        std::fs::write(&source, b"x").unwrap();
+        let config = file_mount_config(&source, "/guest/writable.txt", false).await;
+
+        let rendered = super::stage_file_mounts_with_mode(
+            &config,
+            &sandbox,
+            super::FileMountStagingMode::ForceLinkErrno(libc::EACCES),
+        )
+        .await
+        .expect_err("a writable link failure is an error")
+        .to_string();
+        assert!(
+            rendered.contains(&source.display().to_string()),
+            "{rendered}"
+        );
+        assert!(
+            !rendered.contains("protected_hardlinks"),
+            "a non-EPERM errno must not mention protected_hardlinks: {rendered}"
+        );
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn stage_file_mounts_missing_source_is_left_to_the_directory_bind() {
+        let (_root, sandbox) = staging_sandbox_dir();
+        let missing = PathBuf::from("/definitely/not/here/settings.toml");
+        let config = file_mount_config(&missing, "/guest/settings.toml", false).await;
+        let (staged, staging) = super::stage_file_mounts(&config, &sandbox).await.unwrap();
+        assert!(staged.is_empty());
+        assert!(staging.is_empty());
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn stage_file_mounts_symlinked_directory_source_is_left_to_the_directory_bind() {
+        let (root, sandbox) = staging_sandbox_dir();
+        let sources = same_device_source_dir(root.path());
+        let real_dir = sources.join("realdir");
+        std::fs::create_dir(&real_dir).unwrap();
+        let link_dir = sources.join("linkdir");
+        std::os::unix::fs::symlink("realdir", &link_dir).unwrap();
+        let config = file_mount_config(&link_dir, "/guest/dir", false).await;
+        let (staged, staging) = super::stage_file_mounts(&config, &sandbox).await.unwrap();
+        assert!(
+            staged.is_empty(),
+            "the SDK must not reject a symlinked directory"
+        );
+        assert!(staging.is_empty());
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn stage_file_mounts_fifo_source_is_left_to_the_directory_bind() {
+        let (root, sandbox) = staging_sandbox_dir();
+        let sources = same_device_source_dir(root.path());
+        let fifo = sources.join("pipe");
+        let status = std::process::Command::new("mkfifo")
+            .arg(&fifo)
+            .status()
+            .unwrap();
+        assert!(status.success());
+        let config = file_mount_config(&fifo, "/guest/pipe", false).await;
+        let (staged, staging) = super::stage_file_mounts(&config, &sandbox)
+            .await
+            .expect("a fifo source must not error or hang");
+        assert!(staged.is_empty());
+        assert!(staging.is_empty());
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn stage_file_mounts_symlinked_source_rejection_survives_no_other_mounts() {
+        let (root, sandbox) = staging_sandbox_dir();
+        let (_real, link) = symlink_fixture(root.path(), "only.txt");
+        let config = file_mount_config(&link, "/guest/only.txt", false).await;
+        assert!(super::stage_file_mounts(&config, &sandbox).await.is_err());
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn stage_file_mounts_preserves_parent_dir_components() {
+        let (root, sandbox) = staging_sandbox_dir();
+        let sources = same_device_source_dir(root.path());
+        let file = sources.join("f.txt");
+        std::fs::write(&file, b"x").unwrap();
+        let host = sources.join("..").join("sources").join("f.txt");
+        let config = file_mount_config(&host, "/guest/f.txt", false).await;
+        let (staged, _) = super::stage_file_mounts(&config, &sandbox).await.unwrap();
+        let (mount_dir, filename, _) = staged.get("/guest/f.txt").unwrap();
+        assert_eq!(
+            std::fs::metadata(&file).unwrap().ino(),
+            std::fs::metadata(mount_dir.join(filename)).unwrap().ino()
+        );
+        // A `..` after a missing component must not cancel lexically.
+        let missing = sources.join("nope").join("..").join("f.txt");
+        let config = file_mount_config(&missing, "/guest/f2.txt", false).await;
+        let (staged, _) = super::stage_file_mounts(&config, &sandbox).await.unwrap();
+        assert!(
+            staged.is_empty(),
+            "a missing component before `..` must fail the gate"
+        );
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn stage_file_mounts_preserves_search_only_ancestors() {
+        let (root, sandbox) = staging_sandbox_dir();
+        let sources = same_device_source_dir(root.path());
+        let search_only = sources.join("search-only");
+        std::fs::create_dir(&search_only).unwrap();
+        let file = search_only.join("f.txt");
+        std::fs::write(&file, b"search").unwrap();
+        set_mode(&search_only, 0o111);
+        // Prove the ancestor is genuinely not readable.
+        assert!(microsandbox_filesystem::nofollow::NoFollowDir::open(&search_only).is_err());
+        let config = file_mount_config(&file, "/guest/f.txt", false).await;
+        let result = super::stage_file_mounts(&config, &sandbox).await;
+        let (staged, _) = match result {
+            Ok(value) => value,
+            Err(error) => {
+                set_mode(&search_only, 0o700);
+                panic!("a search-only ancestor must stage successfully: {error}");
+            }
+        };
+        let (mount_dir, filename, _) = staged.get("/guest/f.txt").unwrap();
+        assert_eq!(
+            std::fs::metadata(&file).unwrap().ino(),
+            std::fs::metadata(mount_dir.join(filename)).unwrap().ino()
+        );
+        set_mode(&search_only, 0o700);
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn stage_file_mounts_genuine_no_search_stays_directory_routing() {
+        let (root, sandbox) = staging_sandbox_dir();
+        let sources = same_device_source_dir(root.path());
+        let denied = sources.join("denied");
+        std::fs::create_dir(&denied).unwrap();
+        let file = denied.join("f.txt");
+        std::fs::write(&file, b"x").unwrap();
+        set_mode(&denied, 0o600);
+        let config = file_mount_config(&file, "/guest/f.txt", false).await;
+        let result = super::stage_file_mounts(&config, &sandbox).await;
+        set_mode(&denied, 0o700);
+        let (staged, _) = result.unwrap();
+        assert!(
+            staged.is_empty(),
+            "an unsearchable source fails the gate and keeps directory-bind routing"
+        );
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn stage_file_mounts_opt_in_cross_device_writable_stages_beside_resolved_file() {
+        let (root, sandbox) = staging_sandbox_dir();
+        let (real, link) = symlink_fixture(root.path(), "link.txt");
+        let config = file_mount_config_following(&link, "/guest/link.txt", false).await;
+        let (staged, staging) = super::stage_file_mounts_with_mode(
+            &config,
+            &sandbox,
+            super::FileMountStagingMode::ForceDeviceMismatch,
+        )
+        .await
+        .unwrap();
+        let (mount_dir, filename, _) = staged.get("/guest/link.txt").unwrap();
+        assert_eq!(staging.len(), 1);
+        assert!(
+            mount_dir.starts_with(std::fs::canonicalize(real.parent().unwrap()).unwrap()),
+            "the source-parent stage must be beside the resolved file: {}",
+            mount_dir.display()
+        );
+        assert_eq!(
+            std::fs::metadata(&real).unwrap().ino(),
+            std::fs::metadata(mount_dir.join(filename)).unwrap().ino()
+        );
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn stage_file_mounts_owned_unreadable_sources_remain_linkable() {
+        let (root, sandbox) = staging_sandbox_dir();
+        let source = same_device_source_dir(root.path()).join("owned.txt");
+        std::fs::write(&source, b"x").unwrap();
+        set_mode(&source, 0o200);
+        // A read-only open must fail for a 0200 source.
+        assert!(std::fs::File::open(&source).is_err());
+
+        let config = file_mount_config(&source, "/guest/owned.txt", false).await;
+        let (staged, _) = super::stage_file_mounts(&config, &sandbox).await.unwrap();
+        let (mount_dir, filename, _) = staged.get("/guest/owned.txt").unwrap();
+        assert!(file_mode(&source) & 0o7777 == 0o200);
+        assert_eq!(
+            std::fs::metadata(&source).unwrap().ino(),
+            std::fs::metadata(mount_dir.join(filename)).unwrap().ino(),
+            "an owned write-only source must still hard-link"
+        );
+        set_mode(&source, 0o600);
+    }
+
+    /// `#21`/`#24` — an owned `0000` or `0200` source must stage on the same
+    /// device for both a readonly and a writable mount, keeping inode identity
+    /// (no readable open is required).
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn stage_file_mounts_owned_mode_matrix_keeps_inode_identity() {
+        for mode in [0o000, 0o200] {
+            for readonly in [true, false] {
+                let (root, sandbox) = staging_sandbox_dir();
+                let source = same_device_source_dir(root.path())
+                    .join(format!("owned-{mode:04o}-{readonly}.txt"));
+                std::fs::write(&source, b"payload").unwrap();
+                set_mode(&source, mode);
+                let config = file_mount_config(&source, "/guest/owned.txt", readonly).await;
+                let (staged, _) = super::stage_file_mounts(&config, &sandbox)
+                    .await
+                    .unwrap_or_else(|error| panic!("mode {mode:04o} readonly={readonly}: {error}"));
+                let (mount_dir, filename, _) = staged.get("/guest/owned.txt").unwrap();
+                assert_eq!(
+                    std::fs::metadata(&source).unwrap().ino(),
+                    std::fs::metadata(mount_dir.join(filename)).unwrap().ino(),
+                    "mode {mode:04o} readonly={readonly} must hard-link, not copy"
+                );
+                set_mode(&source, 0o600);
+            }
+        }
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn stage_file_mounts_writable_exdev_retries_beside_the_source_once() {
+        let (root, sandbox) = staging_sandbox_dir();
+        let sources = same_device_source_dir(root.path());
+        let source = sources.join("writable.txt");
+        std::fs::write(&source, b"before").unwrap();
+        let config = file_mount_config(&source, "/guest/writable.txt", false).await;
+
+        let (staged, staging) = super::stage_file_mounts_with_mode(
+            &config,
+            &sandbox,
+            super::FileMountStagingMode::ForceFirstLinkExdev,
+        )
+        .await
+        .unwrap();
+        let (mount_dir, filename, _) = staged.get("/guest/writable.txt").unwrap();
+        assert_eq!(staging.len(), 1, "the retry uses one source-parent stage");
+        assert!(
+            mount_dir.starts_with(std::fs::canonicalize(&sources).unwrap()),
+            "the retry stages beside the source: {}",
+            mount_dir.display()
+        );
+        std::fs::write(mount_dir.join(filename), b"guest").unwrap();
+        assert_eq!(std::fs::read(&source).unwrap(), b"guest");
+        assert!(
+            directory_entries(&sandbox_stage_root(&sandbox)).is_empty(),
+            "the abandoned empty sandbox tag must be withdrawn"
+        );
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn stage_file_mounts_parent_writability_gate_skipped_permits_staging() {
+        let (root, sandbox) = staging_sandbox_dir();
+        let sources = same_device_source_dir(root.path());
+        let source = sources.join("source.txt");
+        std::fs::write(&source, b"x").unwrap();
+        set_mode(&sources, 0o700);
+        let config = file_mount_config(&source, "/guest/source.txt", false).await;
+        let (staged, staging) = super::stage_file_mounts_with_mode(
+            &config,
+            &sandbox,
+            super::FileMountStagingMode::ForceSourceParentStageMode(0o755),
+        )
+        .await
+        .expect("the gate is skipped on a non-foreign-writable parent");
+        assert_eq!(staging.len(), 1);
+        let (mount_dir, filename, _) = staged.get("/guest/source.txt").unwrap();
+        assert_eq!(
+            std::fs::metadata(&source).unwrap().ino(),
+            std::fs::metadata(mount_dir.join(filename)).unwrap().ino()
+        );
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn stage_file_mounts_parent_writability_gate_applied_fails_closed() {
+        let (root, sandbox) = staging_sandbox_dir();
+        let sources = same_device_source_dir(root.path());
+        let source = sources.join("source.txt");
+        std::fs::write(&source, b"x").unwrap();
+        set_mode(&sources, 0o777);
+        let config = file_mount_config(&source, "/guest/source.txt", false).await;
+        let result = super::stage_file_mounts_with_mode(
+            &config,
+            &sandbox,
+            super::FileMountStagingMode::ForceSourceParentStageMode(0o755),
+        )
+        .await;
+        set_mode(&sources, 0o700);
+        let rendered = result
+            .expect_err("the applied gate must fail closed on a synthesized non-0700 mode")
+            .to_string();
+        assert!(
+            rendered.contains(&source.display().to_string()),
+            "the error must name the mount: {rendered}"
+        );
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn stage_file_mounts_parent_writability_gate_forced_foreign_writable() {
+        // Force the gate applied even though the caller-owned parent is not
+        // group/other-writable; the pinned directory is a genuine `0700`, so the
+        // strict check passes and staging succeeds.
+        let (root, sandbox) = staging_sandbox_dir();
+        let sources = same_device_source_dir(root.path());
+        let source = sources.join("source.txt");
+        std::fs::write(&source, b"x").unwrap();
+        set_mode(&sources, 0o700);
+        let config = file_mount_config(&source, "/guest/source.txt", false).await;
+        let (staged, staging) = super::stage_file_mounts_with_mode(
+            &config,
+            &sandbox,
+            super::FileMountStagingMode::ForceSourceParentForeignWritable,
+        )
+        .await
+        .expect("a genuine 0700 pinned directory passes the applied gate");
+        assert_eq!(staging.len(), 1);
+        let (mount_dir, filename, _) = staged.get("/guest/source.txt").unwrap();
+        assert_eq!(
+            std::fs::metadata(&source).unwrap().ino(),
+            std::fs::metadata(mount_dir.join(filename)).unwrap().ino()
+        );
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn stage_file_mounts_false_gate_clears_stale_stage_without_policy() {
+        let (root, sandbox) = staging_sandbox_dir();
+        let stage_root = sandbox_stage_root(&sandbox);
+        std::fs::create_dir_all(&stage_root).unwrap();
+        std::fs::write(stage_root.join("stale"), b"old").unwrap();
+        let directory = same_device_source_dir(root.path()).join("adir");
+        std::fs::create_dir(&directory).unwrap();
+        let config = file_mount_config(&directory, "/guest/dir", false).await;
+        let (staged, staging) = super::stage_file_mounts(&config, &sandbox).await.unwrap();
+        assert!(staged.is_empty());
+        assert!(staging.is_empty());
+        assert!(
+            !stage_root.exists(),
+            "the stale stage is cleared even when no file mount is admitted"
+        );
+    }
+
+    // Stage-B mappings tested directly against the classifier, bypassing the
+    // following-stat gate so the post-gate branches are reachable.
+
+    #[cfg(unix)]
+    fn selected(host: &Path, guest: &str, follow: bool) -> super::SelectedFileMount {
+        super::SelectedFileMount {
+            requested: host.to_path_buf(),
+            guest: guest.to_string(),
+            readonly: false,
+            follow_root_symlinks: follow,
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn classify_file_mounts_reports_opt_in_canonicalize_failure() {
+        let dir = staging_fixture_root();
+        let link = dir.path().join("dangling.txt");
+        std::os::unix::fs::symlink("missing-target", &link).unwrap();
+        let error = super::classify_file_mounts(vec![selected(&link, "/guest/x", true)])
+            .expect_err("a dangling opt-in source cannot be canonicalized")
+            .to_string();
+        assert!(
+            error.contains("follow-root-symlinks set but could not be resolved"),
+            "{error}"
+        );
+        assert!(error.contains(&link.display().to_string()), "{error}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn classify_file_mounts_reports_nonregular_leaf() {
+        let dir = staging_fixture_root();
+        let sub = dir.path().join("subdir");
+        std::fs::create_dir(&sub).unwrap();
+        let error = super::classify_file_mounts(vec![selected(&sub, "/guest/x", false)])
+            .expect_err("a non-regular leaf is a post-gate change")
+            .to_string();
+        assert!(error.contains("no longer a regular file"), "{error}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn classify_file_mounts_reports_post_gate_permission_denial() {
+        let dir = staging_fixture_root();
+        let denied = dir.path().join("denied");
+        std::fs::create_dir(&denied).unwrap();
+        let file = denied.join("f.txt");
+        std::fs::write(&file, b"x").unwrap();
+        set_mode(&denied, 0o600);
+        let result = super::classify_file_mounts(vec![selected(&file, "/guest/x", false)]);
+        set_mode(&denied, 0o700);
+        let error = result
+            .expect_err("a post-gate revocation fails closed")
+            .to_string();
+        assert!(error.contains("cannot be resolved"), "{error}");
+        assert!(error.contains(&denied.display().to_string()), "{error}");
+    }
+    /// The literal non-owner `0711` search-only regression, using the privileged
+    /// CI fixture. Skips with a printed reason when `MSB_TEST_SEARCH_ONLY_DIR`
+    /// is unset (local runs); in CI the fixture is required.
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn stage_file_mounts_preserves_literal_0711_search_only_ancestor() {
+        let Some(root) = std::env::var_os("MSB_TEST_SEARCH_ONLY_DIR").map(PathBuf::from) else {
+            eprintln!(
+                "skipping literal-0711 search-only test: MSB_TEST_SEARCH_ONLY_DIR is not set \
+                 (CI sets it)"
+            );
+            return;
+        };
+        let meta = std::fs::metadata(&root).expect("MSB_TEST_SEARCH_ONLY_DIR must exist");
+        use std::os::unix::fs::PermissionsExt as _;
+        let euid = unsafe { libc::geteuid() };
+        assert_ne!(
+            meta.uid(),
+            euid,
+            "the fixture root must be owned by another uid"
+        );
+        assert_eq!(
+            meta.permissions().mode() & 0o7777,
+            0o711,
+            "the fixture root must be 0711"
+        );
+        assert!(
+            std::fs::File::open(&root).is_err(),
+            "an 0711 root must not be readable"
+        );
+        let source = root.join("source.txt");
+        assert!(source.is_file(), "the fixture source must exist");
+
+        let (_root_guard, sandbox) = staging_sandbox_dir();
+        if std::fs::metadata(&source).unwrap().dev() != std::fs::metadata(&sandbox).unwrap().dev() {
+            eprintln!(
+                "partial literal-0711 coverage: source and sandbox are on different devices, so \
+                 only the copy path is exercised"
+            );
+        }
+        let config = file_mount_config(&source, "/guest/source.txt", true).await;
+        let staged = super::stage_file_mounts(&config, &sandbox)
+            .await
+            .expect("a search-only 0711 ancestor must stage successfully")
+            .0;
+        let (mount_dir, filename, _) = staged.get("/guest/source.txt").unwrap();
+        assert_eq!(
+            std::fs::read(mount_dir.join(filename)).unwrap(),
+            std::fs::read(&source).unwrap()
+        );
+    }
+
+    //----------------------------------------------------------------------------------------------
+    // issue #24: source-parent race, verification, cleanup, copy faults
+    //----------------------------------------------------------------------------------------------
+
+    /// `#[18(a)]` — the D5 gate applied, with the pinned source-parent
+    /// descriptor observed as owned by another uid: the ownership check must
+    /// reject it, leave the created directory untouched, and link nothing.
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn stage_file_mounts_source_parent_stage_rejects_a_foreign_owned_decoy() {
+        let (root, sandbox) = staging_sandbox_dir();
+        let sources = same_device_source_dir(root.path());
+        let source = sources.join("source.txt");
+        std::fs::write(&source, b"secret").unwrap();
+        let config = file_mount_config(&source, "/guest/source.txt", false).await;
+
+        let rendered = super::stage_file_mounts_with_mode(
+            &config,
+            &sandbox,
+            super::FileMountStagingMode::ForceSourceParentStageSwap,
+        )
+        .await
+        .expect_err("a foreign-owned pinned stage must be rejected")
+        .to_string();
+        assert!(
+            rendered.contains(&source.display().to_string()),
+            "the error must name the mount: {rendered}"
+        );
+        assert!(
+            rendered.contains("owned by uid"),
+            "the ownership check, not the mode check, must fire: {rendered}"
+        );
+
+        // The rejected directory is retained for the operator and untouched:
+        // nothing was linked into it.
+        let retained: Vec<String> = directory_entries(&sources)
+            .into_iter()
+            .filter(|entry| entry.starts_with(".microsandbox-file-mount-"))
+            .collect();
+        assert_eq!(
+            retained.len(),
+            1,
+            "the created directory is retained, not adopted: {retained:?}"
+        );
+        assert!(
+            directory_entries(&sources.join(&retained[0])).is_empty(),
+            "no staged entry may reach a rejected decoy"
+        );
+        assert_eq!(std::fs::metadata(&source).unwrap().nlink(), 1);
+    }
+
+    /// `#[18(b)]` — the same-name stage-root replacement AFTER the first anchor.
+    /// Population must stay on the held descriptor, so the decoy never receives
+    /// the staged entry. The replacement tree contains the exact expected
+    /// `fm_*` tag (plus a decoy leaf), so `canonicalize` succeeds and the
+    /// refusal is attributable to the held-identity comparison (S1).
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn stage_file_mounts_stage_swap_after_anchor_does_not_reach_the_decoy() {
+        let (root, sandbox) = staging_sandbox_dir();
+        let sources = same_device_source_dir(root.path());
+        let source = sources.join("source.txt");
+        std::fs::write(&source, b"secret").unwrap();
+        let config = file_mount_config(&source, "/guest/source.txt", false).await;
+
+        let result = super::stage_file_mounts_with_mode(
+            &config,
+            &sandbox,
+            super::FileMountStagingMode::ForceStageSwapAfterAnchor,
+        )
+        .await;
+
+        // The hook renamed the real stage root to `<name>.msb-held` and planted
+        // a decoy at the original name; the test hook completed the decoy tree
+        // with the exact `fm_*` tag and a decoy leaf.
+        let entries: Vec<PathBuf> = directory_entries(&sources)
+            .into_iter()
+            .map(|entry| sources.join(entry))
+            .filter(|path| {
+                path.file_name().is_some_and(|name| {
+                    name.to_string_lossy()
+                        .starts_with(".microsandbox-file-mount-")
+                })
+            })
+            .collect();
+        let decoy = entries
+            .iter()
+            .find(|path| path.join("decoy-sentinel").exists());
+        let decoy = decoy.expect("the same-name decoy must exist");
+        let decoy_tags: Vec<String> = directory_entries(decoy)
+            .into_iter()
+            .filter(|entry| entry.starts_with("fm_"))
+            .collect();
+        assert_eq!(
+            decoy_tags.len(),
+            1,
+            "the replacement tree must contain the exact expected tag: {:?}",
+            directory_entries(decoy)
+        );
+        assert_eq!(
+            std::fs::read(decoy.join(&decoy_tags[0]).join("source.txt")).unwrap(),
+            b"decoy-leaf",
+            "no real population may reach the decoy"
+        );
+        let held = entries.iter().find(|path| path != &decoy);
+        assert!(held.is_some(), "the held original root must also remain");
+
+        let rendered = result
+            .expect_err("publication must refuse rather than redirect population")
+            .to_string();
+        assert!(
+            rendered.contains("no longer matches the pinned tag"),
+            "the held-identity comparison, not canonicalize, must fire: {rendered}"
+        );
+        assert!(
+            rendered.contains("Retention notes") && rendered.contains("replacement"),
+            "the renamed original root must be reported as retained: {rendered}"
+        );
+    }
+
+    /// `#[18(c)]` — the source parent is renamed and a decoy tree planted at its
+    /// old name before `mkdirat`. Staging must stay under the held parent, so
+    /// the decoy tree is untouched and the real (renamed) parent has no residue.
+    /// The replacement tree contains the exact expected `fm_*` tag (plus a decoy
+    /// leaf), so `canonicalize` succeeds and the refusal is attributable to the
+    /// held-identity comparison (S1).
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn stage_file_mounts_ancestor_redirect_keeps_staging_under_the_held_parent() {
+        let (root, sandbox) = staging_sandbox_dir();
+        let sources = same_device_source_dir(root.path());
+        let source = sources.join("source.txt");
+        std::fs::write(&source, b"secret").unwrap();
+        let source_ino = std::fs::metadata(&source).unwrap().ino();
+        let config = file_mount_config(&source, "/guest/source.txt", false).await;
+
+        let result = super::stage_file_mounts_with_mode(
+            &config,
+            &sandbox,
+            super::FileMountStagingMode::ForceAncestorRedirect,
+        )
+        .await;
+
+        let redirected = sources.with_file_name(format!(
+            "{}.msb-redirected",
+            sources.file_name().unwrap().to_string_lossy()
+        ));
+        // The decoy tree at the original parent name holds its own `decoy.txt`
+        // plus the planted complete stage tree (with the expected `fm_*` tag).
+        let entries = directory_entries(&sources);
+        assert!(entries.contains(&"decoy.txt".to_string()), "{entries:?}");
+        let decoy_root = entries
+            .iter()
+            .find(|entry| entry.starts_with(".microsandbox-file-mount-"))
+            .map(|entry| sources.join(entry))
+            .expect("the planted decoy stage root must exist");
+        let decoy_tags: Vec<String> = directory_entries(&decoy_root)
+            .into_iter()
+            .filter(|entry| entry.starts_with("fm_"))
+            .collect();
+        assert_eq!(decoy_tags.len(), 1, "{:?}", directory_entries(&decoy_root));
+        assert_eq!(
+            std::fs::read(decoy_root.join(&decoy_tags[0]).join("source.txt")).unwrap(),
+            b"decoy-leaf",
+            "no real population may reach the decoy"
+        );
+        assert_eq!(
+            std::fs::metadata(redirected.join("source.txt"))
+                .unwrap()
+                .ino(),
+            source_ino,
+            "the real source moved with the renamed held parent"
+        );
+        assert_no_staging_residue(&redirected);
+
+        let rendered = result
+            .expect_err("publication refuses on the redirected path")
+            .to_string();
+        assert!(
+            rendered.contains("no longer matches the pinned tag"),
+            "the held-identity comparison, not canonicalize, must fire: {rendered}"
+        );
+    }
+
+    /// `#22` — a failed staged-entry verification is reported as unverifiable,
+    /// not as a mismatch, and the attempted entry is removed.
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn stage_file_mounts_verification_failure_is_reported_distinctly() {
+        let (root, sandbox) = staging_sandbox_dir();
+        let source = same_device_source_dir(root.path()).join("source.txt");
+        std::fs::write(&source, b"payload").unwrap();
+        let config = file_mount_config(&source, "/guest/source.txt", false).await;
+
+        let rendered = super::stage_file_mounts_with_mode(
+            &config,
+            &sandbox,
+            super::FileMountStagingMode::ForceVerifyStatError,
+        )
+        .await
+        .expect_err("a verification failure refuses the spawn")
+        .to_string();
+        assert!(
+            rendered.contains("could not verify staged file mount"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains(&source.display().to_string()),
+            "{rendered}"
+        );
+        assert!(rendered.contains("was removed"), "{rendered}");
+        assert!(
+            !rendered.contains("changed while it was being staged"),
+            "a verification error must not be reported as a mismatch: {rendered}"
+        );
+        assert_eq!(std::fs::metadata(&source).unwrap().nlink(), 1);
+    }
+
+    /// `#22` — a detected mismatch whose cleanup `unlinkat` fails reports the
+    /// retained entry with the stage's last-known path and identity.
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn stage_file_mounts_retained_verification_failure_names_the_stage_identity() {
+        let (root, sandbox) = staging_sandbox_dir();
+        let source = same_device_source_dir(root.path()).join("source.txt");
+        std::fs::write(&source, b"payload").unwrap();
+        let config = file_mount_config(&source, "/guest/source.txt", false).await;
+
+        let rendered = super::stage_file_mounts_with_mode(
+            &config,
+            &sandbox,
+            super::FileMountStagingMode::ForceVerificationUnlinkError,
+        )
+        .await
+        .expect_err("a retained entry still refuses the spawn")
+        .to_string();
+        assert!(
+            rendered.contains("changed while it was being staged"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("Could not remove"), "{rendered}");
+        assert!(
+            rendered.contains("Stage retained at last-known path"),
+            "the [5c] retained text must name the stage path: {rendered}"
+        );
+        assert!(
+            rendered.contains("(dev=") && rendered.contains("ino="),
+            "{rendered}"
+        );
+
+        // The failed cleanup left the attempted entry for the operator.
+        let stage_root = sandbox_stage_root(&sandbox);
+        let tags = directory_entries(&stage_root);
+        assert_eq!(tags.len(), 1, "the attempted tag must remain: {tags:?}");
+        assert_eq!(
+            directory_entries(&stage_root.join(&tags[0])),
+            vec!["source.txt".to_string()],
+            "the attempted entry is retained"
+        );
+    }
+
+    /// `#22` — a failure on the second mount keeps the first sandbox-dir stage
+    /// (no global emptiness).
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn stage_file_mounts_second_mount_failure_keeps_the_first_sandbox_stage() {
+        let (root, sandbox) = staging_sandbox_dir();
+        let sources = same_device_source_dir(root.path());
+        let first = sources.join("first.txt");
+        let second = sources.join("second.txt");
+        std::fs::write(&first, b"first").unwrap();
+        std::fs::write(&second, b"second").unwrap();
+        let config = file_mounts_config(&[
+            (&first, "/guest/first.txt", false),
+            (&second, "/guest/second.txt", false),
+        ])
+        .await;
+
+        let rendered = super::stage_file_mounts_with_mode(
+            &config,
+            &sandbox,
+            super::FileMountStagingMode::FailSecondMount,
+        )
+        .await
+        .expect_err("the injected second-mount failure must fail the spawn")
+        .to_string();
+        assert!(
+            rendered.contains(&second.display().to_string()),
+            "{rendered}"
+        );
+
+        let stage_root = sandbox_stage_root(&sandbox);
+        let tags = directory_entries(&stage_root);
+        assert_eq!(
+            tags.len(),
+            1,
+            "the first sandbox-dir mount must remain: {tags:?}"
+        );
+        assert_eq!(
+            std::fs::metadata(stage_root.join(&tags[0]).join("first.txt"))
+                .unwrap()
+                .ino(),
+            std::fs::metadata(&first).unwrap().ino()
+        );
+    }
+
+    /// `#22` — a failure on the second mount explicitly closes the first
+    /// source-parent owner, leaving no staging residue in the user's tree.
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn stage_file_mounts_second_mount_failure_closes_the_first_source_parent_stage() {
+        if running_as_root() {
+            eprintln!("SKIP: as root, mode 0500 does not deny directory writes");
+            return;
+        }
+        let (root, sandbox) = staging_sandbox_dir();
+        let sources = same_device_source_dir(root.path());
+        let first = sources.join("first.txt");
+        let broken = sources.join("broken");
+        std::fs::create_dir(&broken).unwrap();
+        let second = broken.join("second.txt");
+        std::fs::write(&first, b"first").unwrap();
+        std::fs::write(&second, b"second").unwrap();
+        let config = file_mounts_config(&[
+            (&first, "/guest/first.txt", false),
+            (&second, "/guest/second.txt", false),
+        ])
+        .await;
+
+        set_mode(&broken, 0o500);
+        let result = super::stage_file_mounts_with_mode(
+            &config,
+            &sandbox,
+            super::FileMountStagingMode::ForceDeviceMismatch,
+        )
+        .await;
+        set_mode(&broken, 0o700);
+        assert!(result.is_err(), "the second mount cannot be staged");
+        assert_no_staging_residue(&sources);
+    }
+
+    /// `#26` — lazy-copy source failures map to the `[9]`/`[9a]`/`[9b]`
+    /// families and never silently fall back to directory routing.
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn stage_file_mounts_copy_source_faults_map_to_copy_failures() {
+        let (root, sandbox) = staging_sandbox_dir();
+        let source = same_device_source_dir(root.path()).join("readonly.txt");
+        std::fs::write(&source, b"payload").unwrap();
+        let config = file_mount_config(&source, "/guest/readonly.txt", true).await;
+
+        let cases = [
+            (
+                super::FileMountStagingMode::ForceCopyOpenError,
+                "open source for copy",
+            ),
+            (
+                super::FileMountStagingMode::ForceCopyStatError,
+                "fstat copy source",
+            ),
+        ];
+        for (mode, operation) in cases {
+            let rendered = super::stage_file_mounts_with_mode(&config, &sandbox, mode)
+                .await
+                .expect_err("the copy source fault must refuse the spawn")
+                .to_string();
+            assert!(rendered.contains("failed to copy"), "{rendered}");
+            assert!(rendered.contains(operation), "{rendered}");
+            assert!(!rendered.contains("cannot stage writable"), "{rendered}");
+        }
+
+        let rendered = super::stage_file_mounts_with_mode(
+            &config,
+            &sandbox,
+            super::FileMountStagingMode::ForceCopyNonRegular,
+        )
+        .await
+        .expect_err("a non-regular copy source refuses the spawn")
+        .to_string();
+        assert!(
+            rendered.contains("no longer regular when opened for copying"),
+            "{rendered}"
+        );
+
+        let rendered = super::stage_file_mounts_with_mode(
+            &config,
+            &sandbox,
+            super::FileMountStagingMode::ForceCopyChanged,
+        )
+        .await
+        .expect_err("an identity change refuses the spawn")
+        .to_string();
+        assert!(rendered.contains("changed before copying"), "{rendered}");
+    }
+
+    /// `#25` — the copy runs on a blocking worker: the current-thread runtime
+    /// keeps running other tasks while the worker is held at the copy gate.
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn stage_file_mounts_copy_runs_off_the_runtime_thread() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+        let (root, sandbox) = staging_sandbox_dir();
+        let source = same_device_source_dir(root.path()).join("readonly.txt");
+        std::fs::write(&source, b"payload").unwrap();
+        let config = file_mount_config(&source, "/guest/readonly.txt", true).await;
+
+        let heartbeat = Arc::new(AtomicUsize::new(0));
+        let stop = Arc::new(AtomicBool::new(false));
+        {
+            let heartbeat = heartbeat.clone();
+            let stop = stop.clone();
+            tokio::spawn(async move {
+                while !stop.load(Ordering::Relaxed) {
+                    heartbeat.fetch_add(1, Ordering::Relaxed);
+                    tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+                }
+            });
+        }
+
+        let staging = tokio::spawn(async move {
+            super::stage_file_mounts_with_mode(
+                &config,
+                &sandbox,
+                super::FileMountStagingMode::ForceCopyWorkerGate,
+            )
+            .await
+        });
+
+        // Wait until the blocking worker is held at the gate (bounded, so a
+        // regression fails instead of hanging).
+        let mut waited = 0u32;
+        while !super::copy_worker_gate::blocked() {
+            assert!(waited < 5_000, "the copy worker never reached the gate");
+            waited += 1;
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        }
+        let before = heartbeat.load(Ordering::Relaxed);
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let after = heartbeat.load(Ordering::Relaxed);
+        super::copy_worker_gate::release();
+
+        let staged = staging.await.unwrap().unwrap().0;
+        stop.store(true, Ordering::Relaxed);
+        assert!(
+            after > before,
+            "the runtime must keep running tasks while the copy worker is held: {before} -> {after}"
+        );
+        let (dir, name, _) = staged.get("/guest/readonly.txt").unwrap();
+        assert_eq!(std::fs::read(dir.join(name)).unwrap(), b"payload");
+    }
+
+    /// `#16` post-gate partner — search revoked after `host.is_file()` admitted
+    /// the mount fails closed through the real entry point.
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn stage_file_mounts_after_gate_revocation_fails_closed() {
+        let (root, sandbox) = staging_sandbox_dir();
+        let sources = same_device_source_dir(root.path());
+        let denied = sources.join("denied");
+        std::fs::create_dir(&denied).unwrap();
+        let file = denied.join("f.txt");
+        std::fs::write(&file, b"x").unwrap();
+        let config = file_mount_config(&file, "/guest/f.txt", false).await;
+
+        let denied_for_hook = denied.clone();
+        let result = super::stage_file_mounts_with_after_gate_hook(
+            &config,
+            &sandbox,
+            super::FileMountStagingMode::Automatic,
+            move || set_mode(&denied_for_hook, 0o600),
+        )
+        .await;
+        set_mode(&denied, 0o700);
+
+        let rendered = result
+            .expect_err("a post-gate revocation must fail closed")
+            .to_string();
+        assert!(rendered.contains("cannot be resolved"), "{rendered}");
+        assert!(
+            rendered.contains(&denied.display().to_string()),
+            "{rendered}"
+        );
+        assert!(
+            !sandbox_stage_root(&sandbox).exists(),
+            "classification precedes stage creation"
+        );
+    }
+
+    /// `#17` — an opt-in canonicalize failure is an error, reached by breaking a
+    /// live symlink *after* the gate returned true.
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn stage_file_mounts_opt_in_canonicalize_failure_is_an_error() {
+        let (root, sandbox) = staging_sandbox_dir();
+        let (real, link) = symlink_fixture(root.path(), "link.txt");
+        let config = file_mount_config_following(&link, "/guest/link.txt", false).await;
+
+        let real_for_hook = real.clone();
+        let result = super::stage_file_mounts_with_after_gate_hook(
+            &config,
+            &sandbox,
+            super::FileMountStagingMode::Automatic,
+            move || {
+                let _ = std::fs::remove_file(&real_for_hook);
+            },
+        )
+        .await;
+
+        let rendered = result
+            .expect_err("a canonicalize failure under the opt-in is an error")
+            .to_string();
+        assert!(
+            rendered.contains("follow-root-symlinks set but could not be resolved"),
+            "{rendered}"
+        );
+        assert!(rendered.contains(&link.display().to_string()), "{rendered}");
+    }
+
+    /// `§6.3` — a real Linux `protected_hardlinks=1` fixture. Skips with a
+    /// printed reason whenever a precondition is absent, never fails.
+    #[tokio::test]
+    #[cfg(target_os = "linux")]
+    async fn stage_file_mounts_readonly_root_owned_source_on_protected_hardlinks() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let protected = std::fs::read_to_string("/proc/sys/fs/protected_hardlinks")
+            .map(|value| value.trim() == "1")
+            .unwrap_or(false);
+        if !protected {
+            eprintln!("SKIP protected_hardlinks test: /proc/sys/fs/protected_hardlinks is not 1");
+            return;
+        }
+        if running_as_root() {
+            eprintln!("SKIP protected_hardlinks test: running as root");
+            return;
+        }
+        let (root, sandbox) = staging_sandbox_dir();
+        let sandbox_dev = std::fs::metadata(&sandbox).unwrap().dev();
+        let mut tried: Vec<String> = Vec::new();
+        let candidate = ["/etc/hosts", "/etc/os-release"].iter().find_map(|path| {
+            let canonical = match std::fs::canonicalize(path) {
+                Ok(path) => path,
+                Err(error) => {
+                    tried.push(format!("{path}: {error}"));
+                    return None;
+                }
+            };
+            let meta = match std::fs::metadata(&canonical) {
+                Ok(meta) => meta,
+                Err(error) => {
+                    tried.push(format!("{path}: {error}"));
+                    return None;
+                }
+            };
+            if !meta.is_file()
+                || meta.dev() != sandbox_dev
+                || meta.uid() != 0
+                || meta.permissions().mode() & 0o022 != 0
+            {
+                tried.push(format!(
+                    "{path}: dev={} uid={} mode={:o}",
+                    meta.dev(),
+                    meta.uid(),
+                    meta.permissions().mode() & 0o7777
+                ));
+                return None;
+            }
+            Some(canonical)
+        });
+        let Some(source) = candidate else {
+            eprintln!(
+                "SKIP protected_hardlinks test: no root-owned, not-group/other-writable file \
+                 on the sandbox device (tried {tried:?})"
+            );
+            return;
+        };
+
+        // Prove a real hard link into the stage device is refused, accounting for
+        // ACLs and capabilities.
+        let probe_dir = root.path().join("protected-hardlinks-probe");
+        std::fs::create_dir_all(&probe_dir).unwrap();
+        let probe = probe_dir.join("probe");
+        let refused = std::fs::hard_link(&source, &probe).is_err();
+        let _ = std::fs::remove_dir_all(&probe_dir);
+        if !refused {
+            eprintln!(
+                "SKIP protected_hardlinks test: a probe hard link to {} unexpectedly succeeded",
+                source.display()
+            );
+            return;
+        }
+        let read_source = std::fs::read(&source).unwrap();
+
+        // Readonly: the refused link falls back to an isolated copy.
+        let config = file_mount_config(&source, "/guest/hosts", true).await;
+        let (staged, _) = super::stage_file_mounts(&config, &sandbox)
+            .await
+            .expect("a readonly root-owned source must fall back to a copy");
+        let (mount_dir, filename, _) = staged.get("/guest/hosts").unwrap();
+        let staged_file = mount_dir.join(filename);
+        assert_eq!(std::fs::read(&staged_file).unwrap(), read_source);
+        assert_eq!(std::fs::metadata(&staged_file).unwrap().nlink(), 1);
+
+        // Writable: the refused link is a hard error naming protected_hardlinks.
+        let config = file_mount_config(&source, "/guest/hosts-rw", false).await;
+        let rendered = super::stage_file_mounts(&config, &sandbox)
+            .await
+            .expect_err("a writable root-owned source cannot hard-link")
+            .to_string();
+        assert!(rendered.contains("protected_hardlinks"), "{rendered}");
+    }
+
+    /// S1 — publication refuses a replacement tree that contains the exact
+    /// expected `fm_*` tag but no leaf, so `canonicalize` succeeds as a fixture
+    /// precondition and only the held-identity comparison rejects it.
+    #[test]
+    #[cfg(unix)]
+    fn publish_rejects_a_tag_only_replacement() {
+        use microsandbox_filesystem::nofollow::NoFollowDir;
+
+        let dir = staging_fixture_root();
+        let held_root_path = dir.path().join("held-root");
+        std::fs::create_dir(&held_root_path).unwrap();
+        let held_root = NoFollowDir::open(&held_root_path).unwrap();
+        let tag = held_root
+            .create_subdir(std::ffi::OsStr::new("fm_00000001"), 0o700)
+            .unwrap();
+        let tag_identity = tag.identity();
+        let root_identity = held_root.identity();
+
+        // A replacement tree containing only the expected tag name (no leaf).
+        let replacement = dir.path().join("replacement");
+        std::fs::create_dir(&replacement).unwrap();
+        std::fs::create_dir(replacement.join("fm_00000001")).unwrap();
+        let replacement_tag = replacement.join("fm_00000001");
+        assert!(
+            std::fs::canonicalize(&replacement_tag).is_ok(),
+            "the fixture precondition is that canonicalize succeeds"
+        );
+
+        let mut staged = std::collections::HashMap::new();
+        let requested = dir.path().join("source.txt");
+        let resolved = requested.clone();
+        let context = super::MountContext {
+            requested: &requested,
+            resolved: &resolved,
+            guest: "/guest/source.txt",
+            readonly: false,
+        };
+        let error = super::publish(
+            &mut staged,
+            &context,
+            "source.txt",
+            "fm_00000001",
+            &replacement_tag,
+            tag_identity,
+            Some(root_identity),
+        )
+        .expect_err("a tag-only replacement must be rejected by identity");
+        assert!(staged.is_empty(), "nothing may be published");
+        assert!(
+            error
+                .to_string()
+                .contains("no longer matches the pinned tag"),
+            "{error}"
+        );
     }
 }

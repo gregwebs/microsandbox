@@ -632,6 +632,32 @@ pub(crate) fn open_beneath(
     unsafe { libc::openat(dirfd, name, flags | libc::O_CLOEXEC) }
 }
 
+/// Open a file relative to a directory with Linux `openat2` containment,
+/// preserving the bare errno and **never** falling back to a following
+/// `openat`.
+///
+/// This is deliberately a separate entry point from [`open_beneath`]: the
+/// runtime root policy keeps its existing `ENOSYS` fallback byte-for-byte, while
+/// the file resolver in [`crate::nofollow`] selects its own no-follow component
+/// walk when this returns `ENOSYS`.
+#[cfg(target_os = "linux")]
+pub(crate) fn open_beneath_strict(dirfd: RawFd, name: *const libc::c_char, flags: i32) -> RawFd {
+    let how = OpenHow {
+        flags: (flags | libc::O_CLOEXEC) as u64,
+        mode: 0,
+        resolve: OPENAT2_RESOLVE_FLAGS,
+    };
+    unsafe {
+        libc::syscall(
+            SYS_OPENAT2,
+            dirfd,
+            name,
+            &how as *const OpenHow,
+            std::mem::size_of::<OpenHow>(),
+        ) as i32
+    }
+}
+
 #[cfg(target_os = "linux")]
 pub(crate) fn sanitize_linux_open_flags(flags: i32) -> i32 {
     (flags & libc::O_ACCMODE) | (flags & LINUX_OPEN_FLAG_MASK)

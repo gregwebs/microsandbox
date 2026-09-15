@@ -1875,10 +1875,30 @@ mod tests {
         fs::create_dir_all(sandbox_dir.join("runtime/scripts")).unwrap();
         fs::write(sandbox_dir.join("runtime/scripts/start.sh"), b"echo hi").unwrap();
         fs::create_dir_all(sandbox_dir.join("rw")).unwrap();
+        // A real file-mount subtree whose hard link points at an external source.
+        #[cfg(unix)]
+        let source_sentinel = {
+            let sources = temp.path().join("sources");
+            fs::create_dir_all(&sources).unwrap();
+            let source = sources.join("mounted.txt");
+            fs::write(&source, b"source bytes").unwrap();
+            let stage = sandbox_dir.join("file-mounts/fm_00000000");
+            fs::create_dir_all(&stage).unwrap();
+            fs::hard_link(&source, stage.join("mounted.txt")).unwrap();
+            source
+        };
 
         remove_dir_if_exists(&sandbox_dir).unwrap();
 
         assert!(!sandbox_dir.exists());
+        #[cfg(unix)]
+        {
+            assert!(
+                source_sentinel.exists(),
+                "removing the sandbox must not follow a file-mount hard link to its source"
+            );
+            assert_eq!(fs::read(&source_sentinel).unwrap(), b"source bytes");
+        }
     }
 
     #[test]

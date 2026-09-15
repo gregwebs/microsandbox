@@ -1252,14 +1252,14 @@ Builder for configuring a sandbox volume mount.
 fn bind(self, host: impl Into<PathBuf>) -> Self
 ```
 
-Bind mount a host directory into the guest. Changes in the guest are reflected on the host and vice versa. The host path must be valid UTF-8 and must not contain `,`, `:`, or `;`.
+Bind mount a host directory into the guest. Changes in the guest are reflected on the host and vice versa. The host path must be valid UTF-8 and must not contain `,`, `:`, or `;`. A host *file* may also be bound; file binds are staged, and on the local backend on Unix the stage location and lifetime are described in [File bind-mount storage](/sandboxes/volumes#file-bind-mount-storage).
 
 <p className="msb-label">Parameters</p>
 
 <div className="msb-params">
   <div className="msb-param">
     <div className="msb-param-key"><code>host</code><span className="msb-type">impl Into&lt;PathBuf&gt;</span></div>
-    <div className="msb-param-desc">Directory path on the host.</div>
+    <div className="msb-param-desc">Host path of a directory or file to bind.</div>
   </div>
 </div>
 
@@ -1393,7 +1393,7 @@ Set the inner filesystem type for a [`.disk()`](#mb-disk) mount, for example `"e
 fn readonly(self) -> Self
 ```
 
-Prevent writes to this mount. Enforced both at the host (virtiofs server rejects writes) and in the guest (the kernel returns `EROFS`).
+Prevent writes to this mount. Enforced both at the host (virtiofs server rejects writes) and in the guest (the kernel returns `EROFS`). A readonly *file* bind is not a snapshot: on the local backend on Unix a same-filesystem file is hard-linked, and only a cross-filesystem file is copied. See [File bind-mount storage](/sandboxes/volumes#file-bind-mount-storage).
 
 #### <span className="msb-recv">mount.</span><span className="msb-hn">noexec()</span>
 

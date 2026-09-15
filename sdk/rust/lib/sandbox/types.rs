@@ -345,8 +345,11 @@ impl MountBuilder {
     /// By default the host path is resolved following no symlink in any
     /// component, so a symlink planted at or under the mount root cannot
     /// redirect the mount. Pass `true` to opt out when the host path
-    /// legitimately traverses a symlink. Valid only for bind and named-directory
-    /// mounts.
+    /// legitimately traverses a symlink. On Linux and macOS this governs
+    /// **file** binds as well as bind and named-directory mounts: a host *file*
+    /// whose path traverses a symlink in any component is refused at create time
+    /// unless this is set. On Windows, and on other Unix targets that keep the
+    /// legacy staging path, file binds get no no-follow enforcement.
     pub fn follow_root_symlinks(mut self, follow: bool) -> Self {
         self.follow_root_symlinks = follow;
         self

@@ -89,6 +89,11 @@ tar.workspace = true
 
 [dev-dependencies]
 ipnetwork.workspace = true
+# Enables the filesystem crate's `test-internals` fault-injection seams for the
+# SDK's `#[cfg(test)]` tests. Dev-dependencies are not built for normal or
+# release builds, so the seams never ship in the SDK's API (resolver v3 keeps
+# dev-dependency features out of the normal dependency graph).
+microsandbox-filesystem = { workspace = true, features = ["test-internals"] }
 microsandbox-network.workspace = true
 rcgen.workspace = true
 tempfile.workspace = true
