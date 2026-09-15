@@ -1058,11 +1058,13 @@ impl SourceParentStage {
     ///
     /// Only recorded leaf names and the tag/root names are removed. The root
     /// name is removed only when its held-parent stat still matches the pinned
-    /// identity **and** the source parent is not writable by another principal;
-    /// a renamed or replaced directory is reported rather than deleted, and a
-    /// root in a foreign-swappable parent is retained because its identity
-    /// cannot be tied to a removal. No recursive walk, and no unconditional
-    /// claim that a replacement was preserved.
+    /// identity **and** a read of the held parent descriptor shows no other
+    /// principal could rename entries (mode, sticky, and, on Darwin, extended
+    /// ACL rights). A same-name replacement, a renamed original, or a parent
+    /// whose safety could not be determined is retained and reported rather
+    /// than deleted. No recursive walk, and no unconditional claim that a
+    /// replacement was preserved: conservative retention is normal possible
+    /// behaviour, not a guarantee that an empty root is removed.
     pub fn close(mut self) -> Result<(), StageCleanupError> {
         let armed = self.armed;
         self.armed = false;
@@ -1074,10 +1076,12 @@ impl SourceParentStage {
     ///
     /// Leaf removal and directory removal both go through held descriptors. A
     /// tag/root name is removed only when the directory it now names is still
-    /// the pinned object. A same-name replacement is preserved and reported, as
-    /// is a renamed original we can no longer unlink by its old name; a root
-    /// whose parent is foreign-swappable is retained and reported instead of
-    /// removed, because a stat match cannot be tied to the later `unlinkat`.
+    /// the pinned object and the held parent is not swappable by another
+    /// principal. A same-name replacement is preserved and reported, as is a
+    /// renamed original we can no longer unlink by its old name; a root whose
+    /// parent is foreign-swappable — or whose safety could not be determined —
+    /// is retained and reported instead of removed, because a stat match cannot
+    /// be tied to the later `unlinkat`.
     fn cleanup_owned(&mut self) -> Result<(), StageCleanupError> {
         let mut retained = Vec::new();
         if let (Some(tag), Some(leaf)) = (&self.tag, &self.leaf) {
@@ -1125,9 +1129,12 @@ impl SourceParentStage {
         }
         // The root's name lives in the source parent. A stat match proves which
         // object was there, not which object `unlinkat` would remove a moment
-        // later, so first ask whether another principal could swap it.
-        let parent_allows_swap =
-            fstat(self.parent.raw()).map(|stat| parent_allows_foreign_root_swap(&stat));
+        // later, so first ask whether another principal could swap it. The
+        // decision reads the **held parent descriptor** so a Darwin extended ACL
+        // is included; a stat or ACL read failure is not proof of safety, so it
+        // is reported as an inability to determine rather than as an observed
+        // permission fact.
+        let parent_allows_swap = parent_allows_foreign_root_swap(self.parent.raw());
         match stat_at(self.parent.raw(), &self.name) {
             Ok(stat)
                 if stat_dev(&stat) == self.identity.dev && stat_ino(&stat) == self.identity.ino =>
@@ -1137,26 +1144,49 @@ impl SourceParentStage {
                 #[cfg(any(test, feature = "test-internals"))]
                 swap_root_before_removal_for_test(&self.parent, self.root.path());
 
-                if parent_allows_swap.unwrap_or(true) {
-                    // A foreign-swappable parent cannot tie the checked identity
-                    // to the removal, so retain and report rather than risk
-                    // deleting a same-name replacement.
-                    retained.push((
-                        self.root.path().to_path_buf(),
-                        self.identity,
-                        io::Error::other(
-                            "source parent is writable by another principal; the stage root was retained because its identity cannot be tied to a removal",
-                        ),
-                    ));
-                } else {
-                    let ret = unsafe {
-                        libc::unlinkat(self.parent.raw(), self.name.as_ptr(), libc::AT_REMOVEDIR)
-                    };
-                    if ret < 0 {
-                        let error = io::Error::last_os_error();
-                        if error.raw_os_error() != Some(libc::ENOENT) {
-                            retained.push((self.root.path().to_path_buf(), self.identity, error));
+                match parent_allows_swap {
+                    Ok(false) => {
+                        let ret = unsafe {
+                            libc::unlinkat(
+                                self.parent.raw(),
+                                self.name.as_ptr(),
+                                libc::AT_REMOVEDIR,
+                            )
+                        };
+                        if ret < 0 {
+                            let error = io::Error::last_os_error();
+                            if error.raw_os_error() != Some(libc::ENOENT) {
+                                retained.push((
+                                    self.root.path().to_path_buf(),
+                                    self.identity,
+                                    error,
+                                ));
+                            }
                         }
+                    }
+                    Ok(true) => {
+                        // A foreign-swappable parent cannot tie the checked
+                        // identity to the removal, so retain and report rather
+                        // than risk deleting a same-name replacement.
+                        retained.push((
+                            self.root.path().to_path_buf(),
+                            self.identity,
+                            io::Error::other(
+                                "source parent is writable by another principal; the stage root was retained because its identity cannot be tied to a removal",
+                            ),
+                        ));
+                    }
+                    Err(error) => {
+                        // The safety of removal could not be determined (stat or
+                        // ACL read failed); retain and say so rather than claim
+                        // an observed permission fact.
+                        retained.push((
+                            self.root.path().to_path_buf(),
+                            self.identity,
+                            io::Error::other(format!(
+                                "could not determine whether the source parent is writable by another principal; the stage root was retained rather than risk removing a replacement: {error}"
+                            )),
+                        ));
                     }
                 }
             }
@@ -1231,6 +1261,12 @@ impl SearchDir {
 //--------------------------------------------------------------------------------------------------
 
 impl Drop for SourceParentStage {
+    /// Best-effort cleanup of an armed stage. This is **normal possible**
+    /// cleanup, not a guarantee of removal: a conservative decision (a
+    /// foreign-swappable parent, an undeterminable parent, or a replaced or
+    /// renamed root) retains the root and only logs the retention, so a stage
+    /// can legitimately survive a drop. Callers that need the retention
+    /// reported should call [`SourceParentStage::close`].
     fn drop(&mut self) {
         if self.armed {
             self.armed = false;
@@ -1682,21 +1718,41 @@ fn identity_from_stat(stat: &libc::stat) -> StageIdentity {
 /// as non-mitigating because applying the strict check is free, but the cost of
 /// a false positive here is leaking a stage directory. In a sticky directory a
 /// non-owner cannot rename the caller's freshly created entry, so the
-/// check/unlink race is unreachable and removal is safe. Root is outside the
+/// check/unlink race is unreachable **unless** a Darwin extended ACL grants the
+/// principal an overriding right: XNU's `vnode_authorize_delete` gives node
+/// `DELETE` and parent `DELETE_CHILD` ACEs priority over the sticky restriction,
+/// a same-parent `renameatx_np(RENAME_SWAP)` needs only `DELETE_CHILD` on the
+/// parent, and a foreign governance grant can widen access after the check. The
+/// sticky exception therefore applies only when the parent carries no foreign
+/// ACL grant of a swap, delete, search, or governance right. Root is outside the
 /// threat model: it can remove the entry regardless, so a root-owned parent is
 /// only counted when it is group/other-writable without the sticky bit.
-fn parent_allows_foreign_root_swap(stat: &libc::stat) -> bool {
+///
+/// Read from the **held parent descriptor** so the ACL snapshot belongs to the
+/// directory the removal will use. A failed `fstat` or ACL read is returned as
+/// an error; the caller treats that as unsafe and retains.
+fn parent_allows_foreign_root_swap(fd: RawFd) -> io::Result<bool> {
+    let stat = fstat(fd)?;
     let euid = unsafe { libc::geteuid() };
-    let owner = stat_uid(stat);
-    let mode = stat_mode(stat) & 0o7777;
+    let owner = stat_uid(&stat);
+    let mode = stat_mode(&stat) & 0o7777;
     let sticky = mode & 0o1000 != 0;
     // A foreign non-root owner can rename entries regardless of the mode (and
     // can clear a sticky bit it set itself).
     if owner != euid && owner != 0 {
-        return true;
+        return Ok(true);
+    }
+    #[cfg(target_os = "macos")]
+    {
+        // A foreign ACL grant of a create/rename/delete/search or governance
+        // right makes the parent swappable even when the mode says otherwise,
+        // and overrides the sticky carve-out below. Fail closed on a read error.
+        if acl_grants_foreign_swap(fd, owner)? {
+            return Ok(true);
+        }
     }
     // Group/other write without the sticky bit lets any other principal rename.
-    (mode & 0o022) != 0 && !sticky
+    Ok((mode & 0o022) != 0 && !sticky)
 }
 
 /// Validate the pinned stage descriptor when the D5 gate applies.
@@ -2021,13 +2077,14 @@ fn child_send(sock: RawFd, fd_to_send: RawFd, status: i32) {
 
 /// Receive a status word plus an optional descriptor over `sock` (parent side).
 ///
-/// The status word and the control message are validated independently, but
-/// **every descriptor the kernel delivered is adopted into an owned guard before
-/// any of those checks run**, so no refusal path can leak it: a successful
-/// `recvmsg` has already installed the descriptors, and the kernel closes only
-/// the ones it could not fit, never the ones it placed in the returned buffer.
-/// On success the message must match the protocol exactly: status `0` carries
-/// exactly one descriptor, a nonzero status carries none.
+/// The status word and the control message are validated independently by
+/// [`validate_recv_message`]. On success the message must match the protocol
+/// exactly: status `0` carries exactly one descriptor, a nonzero status carries
+/// none.
+///
+/// The trusted creation child ([`child_send`]) sends **at most one** descriptor,
+/// which always fits the fixed control buffer, so normal traffic never truncates.
+/// Only malformed excess traffic can overflow the buffer and set `MSG_CTRUNC`.
 fn parent_recv(sock: RawFd) -> io::Result<(Option<OwnedFd>, i32)> {
     let mut status_bytes = [0u8; 4];
     let mut iov = libc::iovec {
@@ -2053,16 +2110,35 @@ fn parent_recv(sock: RawFd) -> io::Result<(Option<OwnedFd>, i32)> {
         break ret as usize;
     };
 
-    // Adopt every delivered descriptor before checking protocol status. A
-    // successful `recvmsg` has already installed these; the kernel closes only
-    // the descriptors it could not fit (`MSG_CTRUNC`), never the ones it placed
-    // in the returned control buffer, so a message we refuse must close them
-    // itself. `delivered` drops (and thus closes) them on every early return.
-    let mut delivered: Vec<OwnedFd> = Vec::new();
+    validate_recv_message(&msg, received_len, status_bytes)
+}
+
+/// The descriptors and malformed-control flag parsed out of a received
+/// `msghdr`'s control buffer.
+struct ParsedControl {
+    /// Every descriptor the kernel placed in the buffer, adopted as owned guards
+    /// so a refusal drops (and closes) them.
+    descriptors: Vec<OwnedFd>,
+    /// A control message with an unexpected offset, level, type, or length.
+    malformed: bool,
+}
+
+/// Parse the control buffer of `msg`, adopting each descriptor into an owned
+/// guard **before** any status/length validation, so every refusal path reclaims
+/// the descriptors the kernel installed.
+///
+/// The copy of each descriptor payload is bounded by the bytes actually present
+/// in the buffer (`msg_controllen`) rather than the *declared* `cmsg_len`, which
+/// a kernel-truncated copy keeps even though fewer bytes (and `MSG_CTRUNC`) are
+/// present. This is a private seam so tests can exercise the truncation and
+/// malformed-header refusal semantics with synthetic buffers, without
+/// manufacturing the kernel's own unreported truncation descriptors.
+fn parse_control_descriptors(msg: &libc::msghdr) -> ParsedControl {
+    let mut descriptors: Vec<OwnedFd> = Vec::new();
     let mut malformed = false;
     if msg.msg_controllen > 0 {
         let control_base = msg.msg_control as usize;
-        let mut cmsg = unsafe { libc::CMSG_FIRSTHDR(&msg) };
+        let mut cmsg = unsafe { libc::CMSG_FIRSTHDR(msg) };
         while !cmsg.is_null() {
             let cmsg_len = unsafe { (*cmsg).cmsg_len as usize };
             let level = unsafe { (*cmsg).cmsg_level };
@@ -2077,9 +2153,6 @@ fn parent_recv(sock: RawFd) -> io::Result<(Option<OwnedFd>, i32)> {
                 malformed = true;
                 break;
             }
-            // `cmsg_len` keeps the *declared* length even when the kernel
-            // truncated the copy (it sets `MSG_CTRUNC`), so it must never be
-            // trusted past the bytes actually present in the buffer.
             let declared_data = cmsg_len - header;
             let available_data = (msg.msg_controllen as usize - offset).saturating_sub(header);
             let data_len = declared_data.min(available_data);
@@ -2093,13 +2166,35 @@ fn parent_recv(sock: RawFd) -> io::Result<(Option<OwnedFd>, i32)> {
                     );
                 }
                 if raw >= 0 {
-                    delivered.push(unsafe { OwnedFd::from_raw_fd(raw) });
+                    descriptors.push(unsafe { OwnedFd::from_raw_fd(raw) });
                 }
             }
-            cmsg = next_cmsg(&msg, cmsg);
+            cmsg = next_cmsg(msg, cmsg);
         }
     }
+    ParsedControl {
+        descriptors,
+        malformed,
+    }
+}
 
+/// Validate one received creation-child message: a 4-byte status word and the
+/// control buffer in `msg`.
+///
+/// The descriptors in `msg` are adopted into owned guards by
+/// [`parse_control_descriptors`] before the status, truncation, and count checks,
+/// so every refusal drops them and reclaims them. The kernel reports only the
+/// descriptors that fit the control buffer, so a message we refuse must close
+/// the reported ones itself; an unreported overflow is a malformed-sender
+/// artifact that the trusted one-descriptor [`child_send`] cannot produce. On
+/// success the message must match the protocol exactly: status `0` carries
+/// exactly one descriptor, a nonzero status carries none.
+fn validate_recv_message(
+    msg: &libc::msghdr,
+    received_len: usize,
+    status_bytes: [u8; 4],
+) -> io::Result<(Option<OwnedFd>, i32)> {
+    let mut parsed = parse_control_descriptors(msg);
     if received_len != status_bytes.len() {
         return Err(io::Error::other("creation child sent a short status word"));
     }
@@ -2108,7 +2203,7 @@ fn parent_recv(sock: RawFd) -> io::Result<(Option<OwnedFd>, i32)> {
             "creation child ancillary data was truncated",
         ));
     }
-    if malformed {
+    if parsed.malformed {
         return Err(io::Error::other(
             "creation child sent a malformed control message",
         ));
@@ -2117,12 +2212,12 @@ fn parent_recv(sock: RawFd) -> io::Result<(Option<OwnedFd>, i32)> {
     // Exactly one descriptor on success (status `0`), none on failure; any other
     // count is a protocol violation.
     let expected = usize::from(status == 0);
-    if delivered.len() != expected {
+    if parsed.descriptors.len() != expected {
         return Err(io::Error::other(
             "creation child sent an unexpected number of descriptors",
         ));
     }
-    Ok((delivered.pop(), status))
+    Ok((parsed.descriptors.pop(), status))
 }
 
 /// Control-message alignment: Darwin aligns to 4 (`__DARWIN_ALIGN32`), other
@@ -2374,6 +2469,23 @@ fn acl_grants_foreign_write(fd: RawFd, owner_uid: libc::uid_t) -> io::Result<boo
     }))
 }
 
+/// Cleanup-swap predicate: any grant whose qualifier is not the caller that
+/// could let another principal create, rename, delete, or search this directory,
+/// or later change the directory's own permissions/ownership to widen access.
+///
+/// Stricter than [`acl_grants_foreign_write`]: it also counts a foreign
+/// `search`/`execute` right, and it gates the sticky carve-out in
+/// [`parent_allows_foreign_root_swap`] because XNU lets a parent `DELETE_CHILD`
+/// ACE override a sticky deny.
+#[cfg(target_os = "macos")]
+fn acl_grants_foreign_swap(fd: RawFd, owner_uid: libc::uid_t) -> io::Result<bool> {
+    let grants = acl_allow_grants(fd, owner_uid)?;
+    Ok(grants.iter().any(|grant| {
+        grant.foreign
+            && (grant.mask & (darwin_acl::ACL_SWAP_BITS | darwin_acl::ACL_GOVERNANCE_BITS)) != 0
+    }))
+}
+
 /// Pinned-stage-privacy predicate: reject **any** non-caller granting entry, and
 /// any entry that grants a right to change the directory's own permissions or
 /// ownership (which could widen access later). An owning-group grant is a
@@ -2400,6 +2512,10 @@ mod darwin_acl {
     /// delete-child, so any grant that could let another principal create,
     /// rename or remove an entry counts.
     pub(super) const ACL_WRITE_BITS: u64 = (1 << 2) | (1 << 4) | (1 << 5) | (1 << 6);
+    /// Swap/removal rights: the parent-write bits plus search/execute. A foreign
+    /// grant of any of these can let another principal swap or remove an entry
+    /// here, or traverse the directory to reach it.
+    pub(super) const ACL_SWAP_BITS: u64 = ACL_WRITE_BITS | (1 << 3);
     /// Rights that let a principal change the object's own permissions or
     /// ownership (`ACL_WRITE_SECURITY`, `ACL_CHANGE_OWNER`).
     pub(super) const ACL_GOVERNANCE_BITS: u64 = (1 << 12) | (1 << 13);
@@ -3319,6 +3435,103 @@ mod tests {
         );
     }
 
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn close_retains_the_root_when_an_acl_only_0755_parent_permits_a_swap() {
+        // A caller-owned, non-sticky `0755` parent has no mode write bits, so a
+        // mode-only check calls removal safe. A foreign extended-ACL grant of the
+        // parent-only swap rights (`delete_child,search`) — which need not be
+        // inherited onto the private `0700` root — lets another principal perform
+        // a same-parent `renameatx_np(RENAME_SWAP)` after the identity stat, so
+        // cleanup must treat the ACL and retain.
+        let dir = fixture();
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
+        let source = dir.path().join("source.txt");
+        std::fs::write(&source, b"payload").unwrap();
+        let file = NoFollowPath::resolve(&source)
+            .unwrap()
+            .classify_regular()
+            .unwrap();
+        set_acl(dir.path(), "everyone allow delete_child,search");
+        let stage = file.create_stage_beside().unwrap();
+        let root_path = stage.path().to_path_buf();
+        let swapped = root_path.with_extension("msb-swapped");
+        SWAP_ROOT_BEFORE_REMOVAL.with(|flag| flag.set(true));
+        let error = stage
+            .close()
+            .expect_err("a foreign ACL grant on the parent must retain the root");
+        SWAP_ROOT_BEFORE_REMOVAL.with(|flag| flag.set(false));
+        clear_acl(dir.path());
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(
+            root_path.exists(),
+            "the same-name replacement must not be removed"
+        );
+        assert!(
+            swapped.exists(),
+            "the renamed original root must be retained under the decoy name"
+        );
+        assert!(
+            error.to_string().contains("cannot be tied to a removal"),
+            "retention must be reported truthfully: {error}"
+        );
+        let message = error.to_string();
+        assert!(
+            message.contains("dev=") && message.contains("ino="),
+            "the retained original's identity must reach the caller: {message}"
+        );
+        let _ = std::fs::remove_dir_all(&swapped);
+        let _ = std::fs::remove_dir_all(&root_path);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn close_retains_the_root_when_a_foreign_delete_child_acl_overrides_sticky() {
+        // A sticky `1777` parent normally makes removal safe (a non-owner cannot
+        // rename the caller's fresh entry). XNU's `vnode_authorize_delete` gives a
+        // parent `DELETE_CHILD` ACE priority over the sticky deny, so a foreign
+        // grant of it reopens the swap for a same-parent `RENAME_SWAP`; cleanup
+        // must retain rather than treat the sticky bit as mitigating.
+        let dir = fixture();
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o1777)).unwrap();
+        let source = dir.path().join("source.txt");
+        std::fs::write(&source, b"payload").unwrap();
+        let file = NoFollowPath::resolve(&source)
+            .unwrap()
+            .classify_regular()
+            .unwrap();
+        set_acl(dir.path(), "everyone allow delete_child");
+        let stage = file.create_stage_beside().unwrap();
+        let root_path = stage.path().to_path_buf();
+        let swapped = root_path.with_extension("msb-swapped");
+        SWAP_ROOT_BEFORE_REMOVAL.with(|flag| flag.set(true));
+        let error = stage
+            .close()
+            .expect_err("a foreign DELETE_CHILD grant overrides the sticky carve-out");
+        SWAP_ROOT_BEFORE_REMOVAL.with(|flag| flag.set(false));
+        clear_acl(dir.path());
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(
+            root_path.exists(),
+            "the same-name replacement must not be removed"
+        );
+        assert!(
+            swapped.exists(),
+            "the renamed original root must be retained under the decoy name"
+        );
+        assert!(
+            error.to_string().contains("cannot be tied to a removal"),
+            "retention must be reported truthfully: {error}"
+        );
+        let message = error.to_string();
+        assert!(
+            message.contains("dev=") && message.contains("ino="),
+            "the retained original's identity must reach the caller: {message}"
+        );
+        let _ = std::fs::remove_dir_all(&swapped);
+        let _ = std::fs::remove_dir_all(&root_path);
+    }
+
     #[test]
     fn create_dir_reports_a_directory_left_by_a_post_mkdir_failure() {
         let dir = fixture();
@@ -3419,9 +3632,9 @@ mod tests {
         rest: [u8; 256],
     }
 
-    /// Send a status word plus zero or more descriptors as one `SCM_RIGHTS`
+    /// Send `status` bytes plus zero or more descriptors as one `SCM_RIGHTS`
     /// control message.
-    fn send_status_with_fds(sock: RawFd, status: [u8; 4], fds: &[RawFd]) {
+    fn send_status_bytes_with_fds(sock: RawFd, status: &[u8], fds: &[RawFd]) {
         let mut iov = libc::iovec {
             iov_base: status.as_ptr() as *mut libc::c_void,
             iov_len: status.len(),
@@ -3451,6 +3664,55 @@ mod tests {
         }
         let ret = unsafe { libc::sendmsg(sock, &msg, 0) };
         assert!(ret >= 0, "sendmsg failed: {}", io::Error::last_os_error());
+    }
+
+    /// Send a four-byte status word plus zero or more descriptors.
+    fn send_status_with_fds(sock: RawFd, status: [u8; 4], fds: &[RawFd]) {
+        send_status_bytes_with_fds(sock, &status, fds);
+    }
+
+    /// A synthetic received ancillary buffer, so parser-seam tests can model a
+    /// kernel-truncated or malformed control message without sending (and thus
+    /// installing) the kernel's own unreported excess descriptors.
+    #[repr(C)]
+    struct SyntheticControl {
+        cmsg: libc::cmsghdr,
+        data: [u8; 64],
+    }
+
+    /// Build a synthetic received `msghdr` over `control` holding the first
+    /// `present_data` bytes of `fds` and declaring `declared_data` bytes of
+    /// payload in `cmsg_len`. When `declared_data > present_data` the buffer
+    /// models a kernel-truncated copy: the declared length is intact but fewer
+    /// bytes are present.
+    fn synthetic_control_msg(
+        control: &mut SyntheticControl,
+        fds: &[RawFd],
+        declared_data: usize,
+        present_data: usize,
+        level: libc::c_int,
+        kind: libc::c_int,
+        flags: libc::c_int,
+    ) -> libc::msghdr {
+        let header = unsafe { libc::CMSG_LEN(0) } as usize;
+        assert!(present_data <= control.data.len());
+        assert!(present_data <= std::mem::size_of_val(fds));
+        control.cmsg = unsafe { std::mem::zeroed() };
+        control.cmsg.cmsg_len = (header + declared_data) as _;
+        control.cmsg.cmsg_level = level;
+        control.cmsg.cmsg_type = kind;
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                fds.as_ptr() as *const u8,
+                libc::CMSG_DATA(&control.cmsg),
+                present_data,
+            );
+        }
+        let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
+        msg.msg_control = (&mut control.cmsg as *mut libc::cmsghdr).cast();
+        msg.msg_controllen = (header + present_data) as _;
+        msg.msg_flags = flags;
+        msg
     }
 
     #[test]
@@ -3506,6 +3768,10 @@ mod tests {
 
     #[test]
     fn parent_recv_rejects_extra_descriptors() {
+        // The trusted creation child sends at most one descriptor, so a receiver
+        // exchange sized for the bounded sender never truncates. Surplus but
+        // **untruncated** rights (here two, which fit the buffer) must still be
+        // refused; truncation refusal is covered by the parser seam.
         let (a, b) = socket_pair();
         let fds = [
             unsafe { libc::open(c"/dev/null".as_ptr(), libc::O_RDONLY) },
@@ -3546,25 +3812,50 @@ mod tests {
     }
 
     #[test]
-    fn parent_recv_rejects_truncated_ancillary_data() {
+    fn parse_control_descriptors_rejects_a_malformed_control_message() {
+        // A wrong `cmsg_level` must be flagged before the payload is
+        // interpreted. The synthetic buffer holds no descriptor bytes, so no
+        // kernel-backed descriptor is installed by this test.
+        let mut control: SyntheticControl = unsafe { std::mem::zeroed() };
+        let msg = synthetic_control_msg(
+            &mut control,
+            &[],
+            0,
+            0,
+            /* level */ 0,
+            libc::SCM_RIGHTS,
+            0,
+        );
+        let parsed = parse_control_descriptors(&msg);
+        assert!(
+            parsed.malformed,
+            "a wrong-level control message must be flagged malformed"
+        );
+        assert!(parsed.descriptors.is_empty());
+    }
+
+    #[test]
+    fn parent_recv_rejects_surplus_untruncated_descriptors() {
+        // The trusted creation child sends at most one descriptor, so a receiver
+        // exchange sized for the bounded sender never truncates; surplus but
+        // **untruncated** rights (here two, which fit the buffer) must still be
+        // refused. Truncation refusal is covered by the parser seam.
         let (a, b) = socket_pair();
-        let fds: Vec<RawFd> = (0..32)
-            .map(|_| unsafe { libc::open(c"/dev/null".as_ptr(), libc::O_RDONLY) })
-            .collect();
+        let fds = [
+            unsafe { libc::open(c"/dev/null".as_ptr(), libc::O_RDONLY) },
+            unsafe { libc::open(c"/dev/null".as_ptr(), libc::O_RDONLY) },
+        ];
         assert!(fds.iter().all(|fd| *fd >= 0));
-        // The child-side buffer holds 32 descriptors, but the receiver's
-        // `ControlBuffer` fits only about 16, so the kernel truncates the copy
-        // and still delivers the descriptors that fit.
         send_status_with_fds(b, [0, 0, 0, 0], &fds);
         let result = parent_recv(a);
-        for fd in &fds {
-            unsafe { libc::close(*fd) };
+        for fd in fds {
+            unsafe { libc::close(fd) };
         }
         unsafe {
             libc::close(a);
             libc::close(b);
         }
-        assert!(result.is_err(), "truncated ancillary data must be rejected");
+        assert!(result.is_err(), "surplus descriptors must be refused");
     }
 
     #[test]
@@ -3589,22 +3880,29 @@ mod tests {
         }
         let baseline = open_fd_count();
 
-        // Short status word: no descriptor is delivered.
+        // Real socket exchange: short status word **with** a descriptor. The
+        // status is refused, but the already-installed descriptor must still be
+        // reclaimed (this is the regression the previous short-status test, which
+        // sent no rights, could not catch).
         {
             let (a, b) = socket_pair();
-            assert_eq!(
-                unsafe { libc::write(b, b"x".as_ptr() as *const libc::c_void, 1) },
-                1
-            );
+            let sent = unsafe { libc::open(c"/dev/null".as_ptr(), libc::O_RDONLY) };
+            assert!(sent >= 0);
+            send_status_bytes_with_fds(b, b"x", &[sent]);
             assert!(parent_recv(a).is_err());
             unsafe {
+                libc::close(sent);
                 libc::close(a);
                 libc::close(b);
             }
         }
-        assert_eq!(open_fd_count(), baseline, "short-status receive leaked");
+        assert_eq!(
+            open_fd_count(),
+            baseline,
+            "short-status-with-rights receive leaked"
+        );
 
-        // Success status with no descriptor.
+        // Real socket exchange: success status with no descriptor.
         {
             let (a, b) = socket_pair();
             send_status_with_fds(b, [0, 0, 0, 0], &[]);
@@ -3620,7 +3918,8 @@ mod tests {
             "missing-descriptor receive leaked"
         );
 
-        // Success status with two descriptors: both must be reclaimed.
+        // Real socket exchange: success status with two descriptors; both must
+        // be reclaimed.
         {
             let (a, b) = socket_pair();
             let extra = [
@@ -3639,7 +3938,7 @@ mod tests {
         }
         assert_eq!(open_fd_count(), baseline, "extra-descriptor receive leaked");
 
-        // Failure status that still delivered a descriptor.
+        // Real socket exchange: failure status that still delivered a descriptor.
         {
             let (a, b) = socket_pair();
             let sent = unsafe { libc::open(c"/dev/null".as_ptr(), libc::O_RDONLY) };
@@ -3657,37 +3956,90 @@ mod tests {
             "failure-status descriptor leaked"
         );
 
-        // Truncated control message: macOS installs **all** sent descriptors but
-        // only reports the ones that fit in the control buffer, so the ones that
-        // fit must all be reclaimed here; only the kernel's own beyond-buffer
-        // installment (which no userspace can name) may remain.
+        // Parser seam: a truncated copy. The buffer declares two descriptors but
+        // contains only one, exactly as the kernel leaves a copy when it sets
+        // `MSG_CTRUNC`. The seam must adopt the one descriptor present and the
+        // truncation check must refuse the message, closing it. The descriptor is
+        // a real open descriptor so the count is exact; no unreported descriptor
+        // is manufactured.
         {
-            let (a, b) = socket_pair();
-            let fds: Vec<RawFd> = (0..32)
-                .map(|_| unsafe { libc::open(c"/dev/null".as_ptr(), libc::O_RDONLY) })
-                .collect();
-            let reported_fds = (std::mem::size_of::<ControlBuffer>()
-                - unsafe { libc::CMSG_LEN(0) } as usize)
-                / std::mem::size_of::<RawFd>();
-            assert!(
-                fds.len() > reported_fds,
-                "the truncation case must exceed the control buffer"
+            let fd = unsafe { libc::open(c"/dev/null".as_ptr(), libc::O_RDONLY) };
+            assert!(fd >= 0);
+            let one = std::mem::size_of::<RawFd>();
+            let mut control: SyntheticControl = unsafe { std::mem::zeroed() };
+            let msg = synthetic_control_msg(
+                &mut control,
+                &[fd],
+                /* declared */ 2 * one,
+                /* present */ one,
+                libc::SOL_SOCKET,
+                libc::SCM_RIGHTS,
+                libc::MSG_CTRUNC,
             );
-            send_status_with_fds(b, [0, 0, 0, 0], &fds);
-            assert!(parent_recv(a).is_err());
-            for fd in &fds {
-                unsafe { libc::close(*fd) };
-            }
-            unsafe {
-                libc::close(a);
-                libc::close(b);
-            }
-            let kernel_only = fds.len() - reported_fds;
             assert!(
-                open_fd_count() <= baseline + kernel_only,
-                "the reported descriptors of a truncated message must be reclaimed"
+                validate_recv_message(&msg, 4, [0, 0, 0, 0]).is_err(),
+                "a truncated control message must be refused"
+            );
+            assert_eq!(
+                unsafe { libc::fcntl(fd, libc::F_GETFD) },
+                -1,
+                "the descriptor present in a truncated copy must be reclaimed"
             );
         }
+        assert_eq!(open_fd_count(), baseline, "truncated-copy receive leaked");
+
+        // Parser seam: a short status carrying a descriptor must still reclaim
+        // it.
+        {
+            let fd = unsafe { libc::open(c"/dev/null".as_ptr(), libc::O_RDONLY) };
+            assert!(fd >= 0);
+            let one = std::mem::size_of::<RawFd>();
+            let mut control: SyntheticControl = unsafe { std::mem::zeroed() };
+            let msg = synthetic_control_msg(
+                &mut control,
+                &[fd],
+                one,
+                one,
+                libc::SOL_SOCKET,
+                libc::SCM_RIGHTS,
+                0,
+            );
+            assert!(validate_recv_message(&msg, 1, [0, 0, 0, 0]).is_err());
+            assert_eq!(unsafe { libc::fcntl(fd, libc::F_GETFD) }, -1);
+        }
+        assert_eq!(
+            open_fd_count(),
+            baseline,
+            "parser-seam short-status receive leaked"
+        );
+
+        // Parser seam: a well-formed success carrying exactly one descriptor is
+        // accepted and the returned guard owns it (dropped here).
+        {
+            let fd = unsafe { libc::open(c"/dev/null".as_ptr(), libc::O_RDONLY) };
+            assert!(fd >= 0);
+            let one = std::mem::size_of::<RawFd>();
+            let mut control: SyntheticControl = unsafe { std::mem::zeroed() };
+            let msg = synthetic_control_msg(
+                &mut control,
+                &[fd],
+                one,
+                one,
+                libc::SOL_SOCKET,
+                libc::SCM_RIGHTS,
+                0,
+            );
+            let (owned, status) = validate_recv_message(&msg, 4, [0, 0, 0, 0])
+                .expect("a one-descriptor success is well formed");
+            assert_eq!(status, 0);
+            assert!(owned.is_some());
+            drop(owned);
+        }
+        assert_eq!(
+            open_fd_count(),
+            baseline,
+            "parser-seam success receive leaked"
+        );
     }
 
     #[test]
