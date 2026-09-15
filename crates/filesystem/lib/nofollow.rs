@@ -1715,18 +1715,21 @@ fn identity_from_stat(stat: &libc::stat) -> StageIdentity {
 ///
 /// This predicate is deliberately **tighter** than the D5 gate
 /// ([`fd_is_foreign_writable`]): the gate conservatively treats the sticky bit
-/// as non-mitigating because applying the strict check is free, but the cost of
-/// a false positive here is leaking a stage directory. In a sticky directory a
-/// non-owner cannot rename the caller's freshly created entry, so the
-/// check/unlink race is unreachable **unless** a Darwin extended ACL grants the
-/// principal an overriding right: XNU's `vnode_authorize_delete` gives node
-/// `DELETE` and parent `DELETE_CHILD` ACEs priority over the sticky restriction,
-/// a same-parent `renameatx_np(RENAME_SWAP)` needs only `DELETE_CHILD` on the
-/// parent, and a foreign governance grant can widen access after the check. The
-/// sticky exception therefore applies only when the parent carries no foreign
-/// ACL grant of a swap, delete, search, or governance right. Root is outside the
-/// threat model: it can remove the entry regardless, so a root-owned parent is
-/// only counted when it is group/other-writable without the sticky bit.
+/// as non-mitigating, whereas the cost of a false positive here is leaking a
+/// stage directory. In a sticky directory a non-owner cannot rename the caller's
+/// freshly created entry, so the check/unlink race is unreachable **unless** a
+/// Darwin extended ACL grants the principal an overriding right: XNU's
+/// `vnode_authorize_delete` gives node `DELETE` and parent `DELETE_CHILD` ACEs
+/// priority over the sticky restriction, and a same-parent
+/// `renameatx_np(RENAME_SWAP)` additionally needs parent `ADD_SUBDIRECTORY` plus
+/// search/traversal to reach the entry, so a foreign `DELETE_CHILD` grant is a
+/// relevant bit rather than the whole requirement. A foreign governance grant can
+/// also widen access after the check. The sticky exception therefore applies only
+/// when the parent carries no foreign ACL grant of a swap, delete, search, or
+/// governance right. Root is outside the threat model: it can remove the entry
+/// regardless, so a root-owned parent is only counted when it is
+/// group/other-writable without the sticky bit, or carries a relevant foreign
+/// ACL grant.
 ///
 /// Read from the **held parent descriptor** so the ACL snapshot belongs to the
 /// directory the removal will use. A failed `fstat` or ACL read is returned as
@@ -2116,16 +2119,19 @@ fn parent_recv(sock: RawFd) -> io::Result<(Option<OwnedFd>, i32)> {
 /// The descriptors and malformed-control flag parsed out of a received
 /// `msghdr`'s control buffer.
 struct ParsedControl {
-    /// Every descriptor the kernel placed in the buffer, adopted as owned guards
-    /// so a refusal drops (and closes) them.
+    /// The descriptors reported in the buffer's `SCM_RIGHTS` payloads, adopted as
+    /// owned guards so a refusal drops (and closes) them.
     descriptors: Vec<OwnedFd>,
     /// A control message with an unexpected offset, level, type, or length.
     malformed: bool,
 }
 
-/// Parse the control buffer of `msg`, adopting each descriptor into an owned
-/// guard **before** any status/length validation, so every refusal path reclaims
-/// the descriptors the kernel installed.
+/// Parse the control buffer of `msg`, adopting each **reported** `SCM_RIGHTS`
+/// descriptor into an owned guard **before** any status/length validation, so
+/// every refusal path reclaims the descriptors the kernel reported on this
+/// bounded private exchange. It cannot recover a descriptor Darwin dropped on
+/// its own unreported overflow past `msg_controllen`; production callers size the
+/// buffer for the single-descriptor sender, so that overflow is not reachable.
 ///
 /// The copy of each descriptor payload is bounded by the bytes actually present
 /// in the buffer (`msg_controllen`) rather than the *declared* `cmsg_len`, which
@@ -2355,10 +2361,11 @@ struct ForeignAclGrant {
     /// group contains other uids), so a grant whose qualifier is the owning gid
     /// is treated as foreign. This is deliberately conservative: the parent
     /// predicate then applies the strict check, and the pinned-root predicate
-    /// rejects, and neither can be wrong in the unsafe direction because the
-    /// stage we create is `0700`. On a filesystem with real permissions a
-    /// false-positive gate costs nothing — validation only fails when the stage
-    /// *we* created is not caller-private, and we created it `0700`.
+    /// rejects; neither can be wrong in the unsafe direction because the stage we
+    /// create is `0700`. This is not a no-cost false positive: an inherited
+    /// foreign ACL can coexist with `0700` and make validation refuse, and the
+    /// query itself costs a system call, but erring toward refusal is the safe
+    /// direction for the privacy guarantee.
     foreign: bool,
     /// The entry's permission mask.
     mask: u64,
@@ -3439,11 +3446,15 @@ mod tests {
     #[test]
     fn close_retains_the_root_when_an_acl_only_0755_parent_permits_a_swap() {
         // A caller-owned, non-sticky `0755` parent has no mode write bits, so a
-        // mode-only check calls removal safe. A foreign extended-ACL grant of the
-        // parent-only swap rights (`delete_child,search`) — which need not be
-        // inherited onto the private `0700` root — lets another principal perform
-        // a same-parent `renameatx_np(RENAME_SWAP)` after the identity stat, so
-        // cleanup must treat the ACL and retain.
+        // mode-only check calls removal safe. The fixture grants a foreign
+        // extended-ACL `delete_child,search` right, which need not be inherited
+        // onto the private `0700` root. A same-parent `renameatx_np(RENAME_SWAP)`
+        // needs `DELETE_CHILD` together with parent `ADD_SUBDIRECTORY` and
+        // search/traversal, so this exact grant is not by itself a complete
+        // foreign-swap authorization; the `SWAP_ROOT_BEFORE_REMOVAL` hook performs
+        // an ordinary caller rename, making this a deterministic policy test that
+        // cleanup refuses when a relevant foreign ACL bit is present, not a
+        // demonstration that this ACL authorizes a foreign swap.
         let dir = fixture();
         std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
         let source = dir.path().join("source.txt");
@@ -3489,8 +3500,8 @@ mod tests {
     fn close_retains_the_root_when_a_foreign_delete_child_acl_overrides_sticky() {
         // A sticky `1777` parent normally makes removal safe (a non-owner cannot
         // rename the caller's fresh entry). XNU's `vnode_authorize_delete` gives a
-        // parent `DELETE_CHILD` ACE priority over the sticky deny, so a foreign
-        // grant of it reopens the swap for a same-parent `RENAME_SWAP`; cleanup
+        // parent `DELETE_CHILD` ACE priority over the sticky deny, so a relevant
+        // foreign ACL bit reopens the swap for a same-parent `RENAME_SWAP`; cleanup
         // must retain rather than treat the sticky bit as mitigating.
         let dir = fixture();
         std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o1777)).unwrap();

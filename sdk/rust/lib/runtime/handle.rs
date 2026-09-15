@@ -63,9 +63,12 @@ pub struct ProcessHandle {
     /// Temporary file-mount stage roots this handle owns: source-parent roots
     /// on Unix, and both the system root and any source-parent roots on
     /// Windows/non-Unix. Dropped when the process handle is dropped, which
-    /// auto-removes the staged files. Unix sandbox-dir stages
-    /// (`<sandbox_dir>/file-mounts`) are not owned here; they survive drop and
-    /// disarm until the next spawn of the same name or `rm`.
+    /// best-effort-removes the staged files through `SourceParentStage` cleanup;
+    /// cleanup conservatively retains a root it cannot tie to a removal (for
+    /// example a replaced or renamed entry, or a parent that lets another
+    /// principal rename entries) and only logs that retention. Unix sandbox-dir
+    /// stages (`<sandbox_dir>/file-mounts`) are not owned here; they survive drop
+    /// and disarm until the next spawn of the same name or `rm`.
     _file_mounts_staging: Vec<crate::runtime::spawn::FileMountStageOwner>,
 
     /// Open disk-image lock files. Kept for the process lifetime so disk
