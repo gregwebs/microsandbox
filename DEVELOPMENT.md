@@ -105,8 +105,9 @@ order:
    it did so. Requires the `prebuilt` feature; ignored without it, where the
    checkout's own build is the only supported source.
 2. `build/agentd` — this checkout's own build. It must not be older than
-   `crates/agentd` or `crates/protocol`; otherwise the build fails and asks for
-   `just build-agentd`.
+   `crates/agentd` or `crates/protocol`; otherwise the build fails and names both
+   ways to produce it: `just build-agentd`, or the host cross-build of
+   `crates/agentd` where `just` and Docker are unavailable.
 3. The release artifact for the workspace version — downloaded **only when the
    build has no guest source tree at all** (a published crate rather than a
    checkout), announced with a `cargo:warning`. A checkout never falls back to it:
