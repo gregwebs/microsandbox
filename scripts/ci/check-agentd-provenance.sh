@@ -91,18 +91,23 @@ restore_artifact() {
   fi
 }
 
+# Assert that a build fails, and that its message names everything the developer
+# needs. The check comes first and every argument after it is a required
+# substring of the same failure output, so one run can assert a whole remedy.
 expect_failure() {
-  local description="$1" expected="$2"
+  local description="$1" check="$2"
   shift 2
-  local output=""
+  local output="" expected=""
 
-  if output="$("$@" 2>&1)"; then
+  if output="$("$check" 2>&1)"; then
     fail "$description: the build succeeded, but it must not"
   fi
-  if ! grep -qF -- "$expected" <<<"$output"; then
-    printf '%s\n' "$output" >&2
-    fail "$description: the failure does not mention: $expected"
-  fi
+  for expected in "$@"; do
+    if ! grep -qF -- "$expected" <<<"$output"; then
+      printf '%s\n' "$output" >&2
+      fail "$description: the failure does not mention: $expected"
+    fi
+  done
   echo "ok: $description"
 }
 
@@ -140,17 +145,21 @@ expect_success "fresh build/agentd is embedded with prebuilt enabled" check_preb
 mark_sources_newer_than_artifact
 expect_failure \
   "a stale build/agentd fails instead of being embedded with prebuilt enabled" \
-  "is older than crates/agentd or crates/protocol source" \
-  check_prebuilt
+  check_prebuilt \
+  "is older than crates/agentd or crates/protocol source"
 
 # A checkout can always rebuild the guest agent, so it must never substitute the
-# released artifact for a missing local one.
+# released artifact for a missing local one. Both ways to produce it are named:
+# the vendored recipe needs `just` and, on macOS, Docker, so a host that has
+# neither needs the cross-build to be in the message too.
 mark_artifact_newer_than_sources
 remove_artifact
 expect_failure \
   "a missing build/agentd in a checkout fails instead of downloading the release" \
+  check_prebuilt \
   "will not download a released guest" \
-  check_prebuilt
+  "just build-agentd" \
+  "cargo build --release --manifest-path crates/agentd/Cargo.toml"
 
 # An explicit artifact is the caller's choice, and says so.
 expect_success_mentioning \
@@ -173,14 +182,14 @@ restore_artifact
 mark_sources_newer_than_artifact
 expect_failure \
   "a stale build/agentd fails without the prebuilt feature" \
-  "is older than crates/agentd or crates/protocol source" \
-  check_without_prebuilt
+  check_without_prebuilt \
+  "is older than crates/agentd or crates/protocol source"
 
 mark_artifact_newer_than_sources
 remove_artifact
 expect_failure \
   "MSB_AGENTD_PATH stays ignored without the prebuilt feature" \
-  "binary not found at" \
-  check_without_prebuilt_explicit
+  check_without_prebuilt_explicit \
+  "binary not found at"
 
 echo "agentd provenance: OK"

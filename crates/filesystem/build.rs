@@ -14,7 +14,14 @@ fn main() {
     println!("cargo:rerun-if-changed=../agentd");
     println!("cargo:rerun-if-changed=../protocol");
 
-    let workspace_root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
+    // `<workspace_root>/crates/filesystem` -> `<workspace_root>`. Taking ancestors
+    // rather than joining `../..` keeps `..` out of the paths the build prints:
+    // the messages below hand the reader commands to copy and run.
+    let workspace_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .and_then(Path::parent)
+        .expect("CARGO_MANIFEST_DIR is <workspace_root>/crates/filesystem")
+        .to_path_buf();
     let out_dir = PathBuf::from(std::env::var("OUT_DIR").unwrap());
 
     build_agentd(&workspace_root, &out_dir);
@@ -71,7 +78,10 @@ fn build_agentd(workspace_root: &Path, out_dir: &Path) {
         // substitute a released artifact for a missing local one: the guest agent
         // is embedded in the host binary, so that would silently ship a payload
         // built from a different revision of this tree (upstream's, for a fork).
-        panic!("{}", missing_local_agentd_message(&local, sources));
+        panic!(
+            "{}",
+            missing_local_agentd_message(&local, workspace_root, sources)
+        );
     }
 
     #[cfg(feature = "prebuilt")]
@@ -112,15 +122,25 @@ fn guest_agentd_sources(workspace_root: &Path) -> Option<GuestAgentdSources> {
     })
 }
 
-fn missing_local_agentd_message(local: &Path, sources: &GuestAgentdSources) -> String {
+fn missing_local_agentd_message(
+    local: &Path,
+    workspace_root: &Path,
+    sources: &GuestAgentdSources,
+) -> String {
     format!(
-        "{AGENTD_BINARY} binary not found at `{}`.\n\
-         This is a source checkout ({} exists), so it will not download a released guest\n\
-         agent: that would embed a guest payload built from a different revision of this tree.\n\
-         Run `just build-agentd` (or `just build-deps`) to build it, or point\n\
-         MSB_AGENTD_PATH at an agentd binary that belongs to this build.",
+        r#"{AGENTD_BINARY} binary not found at `{}`.
+This is a source checkout ({} exists), so it will not download a released guest
+agent: that would embed a guest payload built from a different revision of this tree.
+Build it from this workspace root, `{}`, either way:
+    just build-agentd
+or, without just and Docker (a Linux host with musl-tools):
+    rustup target add x86_64-unknown-linux-musl
+    cargo build --release --manifest-path crates/agentd/Cargo.toml --target x86_64-unknown-linux-musl
+    cp target/x86_64-unknown-linux-musl/release/agentd build/{AGENTD_BINARY}
+Or point MSB_AGENTD_PATH at an agentd binary that belongs to this build."#,
         local.display(),
-        sources.agentd.display()
+        sources.agentd.display(),
+        workspace_root.display()
     )
 }
 
