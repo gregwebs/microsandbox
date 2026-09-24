@@ -6048,7 +6048,6 @@ mod capability_probe_tests {
 #[cfg(all(test, unix))]
 mod launch_lifecycle_tests {
     use std::os::unix::fs::PermissionsExt;
-    use std::sync::Mutex;
     use std::time::Duration;
 
     use super::*;
@@ -6056,8 +6055,9 @@ mod launch_lifecycle_tests {
 
     /// `MSB_PATH`/`MSB_LIBKRUNFW_PATH` are process-global, so the stub-binary
     /// lifecycle tests serialize on this lock. Each test uses its own temp home,
-    /// so it also gets its own metrics-registry shared-memory object.
-    static ENV_LOCK: Mutex<()> = Mutex::new(());
+    /// so it also gets its own metrics-registry shared-memory object. A tokio
+    /// mutex is held across the test's await points.
+    static ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
     /// Restores `MSB_PATH`/`MSB_LIBKRUNFW_PATH` when dropped.
     struct EnvRestore {
@@ -6080,11 +6080,11 @@ mod launch_lifecycle_tests {
         }
     }
 
-    fn point_at_stub(
+    async fn point_at_stub(
         msb: &Path,
         libkrunfw: &Path,
-    ) -> (std::sync::MutexGuard<'static, ()>, EnvRestore) {
-        let lock = ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+    ) -> (tokio::sync::MutexGuard<'static, ()>, EnvRestore) {
+        let lock = ENV_LOCK.lock().await;
         let restore = EnvRestore {
             msb: std::env::var_os("MSB_PATH"),
             libkrunfw: std::env::var_os("MSB_LIBKRUNFW_PATH"),
@@ -6200,7 +6200,7 @@ mod launch_lifecycle_tests {
             &format!("echo $$ > '{}'\nexec sleep 60", pid_path.display()),
         );
         let libkrunfw = dummy_libkrunfw(temp.path());
-        let (_lock, _restore) = point_at_stub(&stub, &libkrunfw);
+        let (_lock, _restore) = point_at_stub(&stub, &libkrunfw).await;
 
         let (local, config) = build_backend_and_config(temp.path(), "lifecycle-cancel").await;
 
@@ -6248,7 +6248,7 @@ mod launch_lifecycle_tests {
         let stub = temp.path().join("msb-not-executable");
         std::fs::write(&stub, b"#!/bin/sh\nexit 0\n").unwrap();
         let libkrunfw = dummy_libkrunfw(temp.path());
-        let (_lock, _restore) = point_at_stub(&stub, &libkrunfw);
+        let (_lock, _restore) = point_at_stub(&stub, &libkrunfw).await;
 
         let (local, config) = build_backend_and_config(temp.path(), "lifecycle-fail").await;
         let result = spawn_sandbox(&local, &config, 1, SpawnMode::Attached, None, None).await;
@@ -6270,7 +6270,7 @@ mod launch_lifecycle_tests {
             "printf '{\"pid\": %s}\\n' \"$$\"\nexec sleep 60",
         );
         let libkrunfw = dummy_libkrunfw(temp.path());
-        let (_lock, _restore) = point_at_stub(&stub, &libkrunfw);
+        let (_lock, _restore) = point_at_stub(&stub, &libkrunfw).await;
 
         let (local, config) = build_backend_and_config(temp.path(), "lifecycle-ok").await;
         let (handle, _agent_sock) =
