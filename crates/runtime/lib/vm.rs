@@ -371,6 +371,11 @@ pub struct VmConfig {
     #[cfg(feature = "net")]
     pub network: microsandbox_network::config::NetworkConfig,
 
+    /// Launch-only resolved header-credential values for this boot.
+    #[cfg(feature = "net")]
+    pub resolved_header_credentials:
+        Vec<microsandbox_network::secrets::credential::ResolvedHeaderCredential>,
+
     /// Host-runtime isolation profile enforced by the network backend.
     #[cfg(feature = "net")]
     pub deployment_profile: microsandbox_types::DeploymentProfile,
@@ -1857,6 +1862,24 @@ fn build_vm(
 
     // Network.
     #[cfg(feature = "net")]
+    {
+        // Validate the launch-only resolved credentials against the durable
+        // definitions independently of the builder and of `network.enabled`, so
+        // a credential-bearing config can never boot without interception.
+        microsandbox_network::secrets::credential::validate_resolved_header_credentials(
+            &vm.network.secrets.header_credentials,
+            &vm.resolved_header_credentials,
+        )
+        .map_err(|err| RuntimeError::Custom(format!("invalid header credentials: {err}")))?;
+        if !vm.network.secrets.header_credentials.is_empty()
+            && (!vm.network.enabled || !vm.network.tls.enabled)
+        {
+            return Err(RuntimeError::Custom(
+                "header credentials require networking and TLS interception".to_string(),
+            ));
+        }
+    }
+    #[cfg(feature = "net")]
     if vm.network.enabled {
         let _ = rustls::crypto::ring::default_provider().install_default();
         vm.network
@@ -1865,12 +1888,14 @@ fn build_vm(
             .map_err(|err| RuntimeError::Custom(format!("invalid network secrets: {err}")))?;
         let rate_limiters = to_krun_network_rate_limiters(&vm.network);
 
-        let mut network = microsandbox_network::network::SmoltcpNetwork::new_with_profile(
-            vm.network.clone(),
-            vm.sandbox_slot,
-            vm.deployment_profile,
-        )
-        .map_err(|err| RuntimeError::Custom(format!("initialize network: {err}")))?;
+        let mut network =
+            microsandbox_network::network::SmoltcpNetwork::new_with_profile_and_credentials(
+                vm.network.clone(),
+                vm.sandbox_slot,
+                vm.deployment_profile,
+                vm.resolved_header_credentials.clone(),
+            )
+            .map_err(|err| RuntimeError::Custom(format!("initialize network: {err}")))?;
         network_termination_handle = Some(network.termination_handle());
         network_metrics_handle = Some(network.metrics_handle());
         // Only sandboxes that booted with secrets can be live-reconfigured:

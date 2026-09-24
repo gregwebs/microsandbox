@@ -1316,11 +1316,16 @@ impl SandboxBuilder {
                         .as_local()
                         .ok_or_else(|| MicrosandboxError::local_only(Operation::SandboxCreate))?;
                     local
-                        .create_sandbox(backend.clone(), config, mode, Some(sender))
+                        .create_sandbox(backend.clone(), config, mode, Some(sender), None)
                         .await
                 }
                 crate::backend::BackendKind::Cloud => {
                     drop(sender);
+                    if crate::sandbox::config::has_header_credentials(&config) {
+                        return Err(MicrosandboxError::HeaderCredential(
+                            crate::HeaderCredentialError::UnsupportedBackend,
+                        ));
+                    }
                     if detached {
                         backend
                             .sandboxes()
@@ -1361,11 +1366,17 @@ impl SandboxBuilder {
                             config,
                             crate::runtime::SpawnMode::Detached,
                             Some(sender),
+                            None,
                         )
                         .await
                 }
                 crate::backend::BackendKind::Cloud => {
                     drop(sender);
+                    if crate::sandbox::config::has_header_credentials(&config) {
+                        return Err(MicrosandboxError::HeaderCredential(
+                            crate::HeaderCredentialError::UnsupportedBackend,
+                        ));
+                    }
                     backend
                         .sandboxes()
                         .create_detached(backend.clone(), config)

@@ -81,7 +81,33 @@ impl LocalBackend {
         mut config: SandboxConfig,
         mode: SpawnMode,
         progress: Option<PullProgressSender>,
+        resolver: Option<Arc<dyn crate::CredentialResolver>>,
     ) -> MicrosandboxResult<Sandbox> {
+        // Origin-scoped header credentials are local-only, non-Windows, and
+        // require a per-launch resolver. Refuse before any database mutation,
+        // image pull, or value lookup so a refused launch leaves no state.
+        if crate::sandbox::config::has_header_credentials(&config) {
+            #[cfg(windows)]
+            {
+                return Err(crate::MicrosandboxError::HeaderCredential(
+                    crate::HeaderCredentialError::UnsupportedPlatform,
+                ));
+            }
+            #[cfg(not(windows))]
+            {
+                if resolver.is_none() {
+                    return Err(crate::MicrosandboxError::HeaderCredential(
+                        crate::HeaderCredentialError::MissingResolver {
+                            credential_index: 0,
+                        },
+                    ));
+                }
+                let msb_path = self.config().resolve_msb_path()?;
+                crate::runtime::spawn::ensure_header_credential_launch_capability(&msb_path)
+                    .await?;
+            }
+        }
+
         tracing::debug!(
             sandbox = %config.spec.name,
             image = ?config.spec.image,
@@ -373,7 +399,7 @@ impl LocalBackend {
         // Spawn the sandbox process and create the bridge. On failure, mark the sandbox
         // as stopped so it doesn't appear as a phantom "Running" entry.
         let (local_state, returned_config) = match self
-            .create_sandbox_inner(config, sandbox_id, mode, None)
+            .create_sandbox_inner(config, sandbox_id, mode, None, resolver)
             .await
         {
             Ok(pair) => pair,
@@ -472,9 +498,10 @@ impl LocalBackend {
         sandbox_id: i32,
         mode: SpawnMode,
         lifecycle_guard: Option<microsandbox_runtime::ipc::SandboxLifecycleGuard>,
+        resolver: Option<Arc<dyn crate::CredentialResolver>>,
     ) -> MicrosandboxResult<(crate::backend::SandboxLocalState, SandboxConfig)> {
         let (mut handle, agent_sock_path) =
-            spawn_sandbox(self, &config, sandbox_id, mode, lifecycle_guard).await?;
+            spawn_sandbox(self, &config, sandbox_id, mode, lifecycle_guard, resolver).await?;
         let log_dir = self.sandboxes_dir().join(&config.spec.name).join("logs");
 
         // Wait for the relay socket to become available.
@@ -1476,7 +1503,7 @@ mod tests {
         ];
 
         let err = match backend
-            .create_sandbox(backend_trait, config, SpawnMode::Attached, None)
+            .create_sandbox(backend_trait, config, SpawnMode::Attached, None, None)
             .await
         {
             Ok(_) => panic!("expected invalid direct-config mounts to be rejected"),
@@ -1503,7 +1530,7 @@ mod tests {
         config.spec.runtime.hostname = Some("y".repeat(MAX_HOSTNAME_BYTES + 1));
 
         let err = match backend
-            .create_sandbox(backend.clone(), config, SpawnMode::Attached, None)
+            .create_sandbox(backend.clone(), config, SpawnMode::Attached, None, None)
             .await
         {
             Ok(_) => panic!("invalid hostname should fail before sandbox creation"),

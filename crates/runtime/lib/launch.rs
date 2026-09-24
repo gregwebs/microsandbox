@@ -18,6 +18,8 @@ use microsandbox_types::TransparentHugePagePolicy;
 
 #[cfg(feature = "net")]
 use microsandbox_network::config::NetworkConfig;
+#[cfg(feature = "net")]
+use microsandbox_network::secrets::credential::ResolvedHeaderCredential;
 
 use crate::vm::{MetricsSlotHandoff, StartupCommand};
 
@@ -115,6 +117,15 @@ pub struct LaunchConfig {
     /// Network configuration. Present only when the `net` feature is on.
     #[cfg(feature = "net")]
     pub network: Option<NetworkConfig>,
+
+    /// Launch-only resolved header-credential values.
+    ///
+    /// Built by the SDK from the durable `header_credentials` definitions and
+    /// transmitted only here, on the private config fd. Never persisted and
+    /// never part of a durable `SandboxConfig`.
+    #[cfg(feature = "net")]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub resolved_header_credentials: Vec<ResolvedHeaderCredential>,
 
     /// Host-runtime isolation profile enforced by backend implementations.
     #[cfg(feature = "net")]

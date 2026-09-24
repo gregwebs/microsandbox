@@ -7,6 +7,8 @@
 
 #[cfg(windows)]
 use std::fmt::Write as _;
+#[cfg(windows)]
+use std::io::{Seek, SeekFrom, Write as IoWrite};
 #[cfg(unix)]
 use std::os::fd::AsRawFd;
 #[cfg(unix)]
@@ -23,10 +25,12 @@ use std::{
     collections::{BTreeMap, BTreeSet, HashMap},
     ffi::{OsStr, OsString},
     fs::File,
-    io::{Seek, SeekFrom, Write as IoWrite},
     path::{Path, PathBuf},
     process::Stdio,
+    sync::Arc,
 };
+
+use zeroize::Zeroizing;
 
 #[cfg(windows)]
 use rand::Rng;
@@ -260,6 +264,50 @@ impl Drop for StdioInheritGuard {
 // Functions
 //--------------------------------------------------------------------------------------------------
 
+/// Verify the installed `msb` binary advertises header-credential launch support.
+///
+/// Runs a lightweight, no-VM-boot probe against the exact binary the SDK is
+/// about to spawn and requires the fixed `header-credential-launch-v1` token on
+/// stdout with a zero exit status. An older binary lacks the subcommand, so
+/// `clap` exits non-zero and the probe fails closed. The probe is repeated just
+/// before resolution at spawn time; a same-uid adversary that swaps the binary
+/// between the two probes is out of scope (see the issue's threat model).
+pub(crate) async fn ensure_header_credential_launch_capability(
+    msb_path: &Path,
+) -> MicrosandboxResult<()> {
+    let output = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        tokio::process::Command::new(msb_path)
+            .arg("__capabilities")
+            .stdin(std::process::Stdio::null())
+            .output(),
+    )
+    .await
+    .map_err(|_| {
+        crate::MicrosandboxError::HeaderCredential(crate::HeaderCredentialError::RuntimeProbeFailed)
+    })?
+    .map_err(|_| {
+        crate::MicrosandboxError::HeaderCredential(crate::HeaderCredentialError::RuntimeProbeFailed)
+    })?;
+
+    if !output.status.success() {
+        return Err(crate::MicrosandboxError::HeaderCredential(
+            crate::HeaderCredentialError::RuntimeCapabilityMissing,
+        ));
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    if stdout
+        .lines()
+        .any(|line| line.trim() == microsandbox_types::HEADER_CREDENTIAL_LAUNCH_CAPABILITY)
+    {
+        Ok(())
+    } else {
+        Err(crate::MicrosandboxError::HeaderCredential(
+            crate::HeaderCredentialError::RuntimeCapabilityMissing,
+        ))
+    }
+}
+
 /// Spawn the sandbox process for a sandbox.
 ///
 /// Returns a [`ProcessHandle`] and the path to the agent relay socket.
@@ -276,6 +324,7 @@ pub async fn spawn_sandbox(
     sandbox_id: i32,
     mode: SpawnMode,
     lifecycle_guard: Option<microsandbox_runtime::ipc::SandboxLifecycleGuard>,
+    resolver: Option<Arc<dyn crate::CredentialResolver>>,
 ) -> MicrosandboxResult<(ProcessHandle, PathBuf)> {
     // Reference-model secrets store only a host-side source reference in the
     // durable config; resolve the actual values now so they travel to the
@@ -285,6 +334,8 @@ pub async fn spawn_sandbox(
     let resolved_config = crate::sandbox::config::resolve_config_secret_sources(config)?;
     #[cfg(feature = "net")]
     let config = resolved_config.as_ref().unwrap_or(config);
+    #[cfg(not(feature = "net"))]
+    let _ = &resolver;
 
     // libkrunfw is process-level (one dylib per process address space). The
     // resolver consults MSB_LIBKRUNFW_PATH env, then SDK_LIBKRUNFW_PATH static,
@@ -292,6 +343,25 @@ pub async fn spawn_sandbox(
     let global = local.config();
     let msb_path = global.resolve_msb_path()?;
     let libkrunfw_path = global.resolve_libkrunfw_path()?;
+
+    // Origin-scoped header credentials are refused on Windows, and on every
+    // platform the installed binary must advertise the launch capability
+    // before any value is looked up. These gates repeat the create-time checks
+    // defensively, immediately before the resolver is invoked.
+    #[cfg(windows)]
+    if crate::sandbox::config::has_header_credentials(config) {
+        return Err(crate::MicrosandboxError::HeaderCredential(
+            crate::HeaderCredentialError::UnsupportedPlatform,
+        ));
+    }
+    #[cfg(all(unix, feature = "net"))]
+    if crate::sandbox::config::has_header_credentials(config) {
+        ensure_header_credential_launch_capability(&msb_path).await?;
+    }
+    #[cfg(feature = "net")]
+    let resolved_header_credentials =
+        crate::sandbox::config::resolve_header_credentials(config, resolver.as_deref())?;
+
     #[cfg(windows)]
     crate::setup::verify_windows_host_prerequisites()?;
     tracing::debug!(
@@ -486,16 +556,23 @@ pub async fn spawn_sandbox(
     launch.block_writeback_limit_bytes = writeback_limit_bytes;
     launch.block_writeback_pool_bytes = writeback_pool_bytes;
 
+    // The resolved credential values travel only on the private config fd; the
+    // durable config on argv and in the database keeps only the reference.
+    #[cfg(feature = "net")]
+    {
+        launch.resolved_header_credentials = resolved_header_credentials;
+    }
+
     #[cfg(unix)]
-    let config_file = match write_launch_config_fd(&launch) {
-        Ok(file) => file,
+    let config_handoff = match create_config_handoff(&launch) {
+        Ok(handoff) => handoff,
         Err(err) => {
             release_metrics_reservation(config, metrics_reservation.as_ref());
             return Err(err);
         }
     };
     #[cfg(unix)]
-    let config_raw_fd = config_file.as_raw_fd();
+    let config_raw_fd = config_handoff.child_fd().as_raw_fd();
     #[cfg(unix)]
     {
         visible.push(OsString::from("--config-fd"));
@@ -643,6 +720,17 @@ pub async fn spawn_sandbox(
         }
     };
     tracing::debug!(pid = _pid, sandbox = %config.spec.name, "spawn_sandbox: process started");
+
+    // Complete the private config handoff. For the macOS/other-Unix pipe this
+    // writes the launch JSON and closes the write end so the child's
+    // read-to-end terminates; a short/failed write kills the child rather than
+    // leaving it waiting for a config that never arrives.
+    #[cfg(unix)]
+    if let Err(err) = config_handoff.finish().await {
+        let _ = child.start_kill();
+        release_metrics_reservation(config, metrics_reservation.as_ref());
+        return Err(err);
+    }
 
     #[cfg(windows)]
     if let Some(job) = &child_job
@@ -1063,19 +1151,169 @@ fn create_pipe() -> MicrosandboxResult<Pipe> {
     Ok(Pipe { read_fd, write_fd })
 }
 
-/// Serialize the [`LaunchConfig`] as JSON into an anonymous temp file, rewound
-/// to offset 0. The file is unlinked on creation, so there is no path to clean
-/// up or race on; it is `dup2`'d onto
-/// [`CONFIG_FD`](microsandbox_runtime::vm::CONFIG_FD) for the child to read.
+/// Serialize the [`LaunchConfig`] as JSON into an anonymous, memory-backed
+/// object for the child to read to EOF on
+/// [`CONFIG_FD`](microsandbox_runtime::vm::CONFIG_FD).
+///
+/// Linux uses a `memfd_create` anonymous memory file (written and rewound
+/// before spawn). macOS and other Unix use an anonymous pipe: the parent writes
+/// the JSON *after* `spawn` (see [`ConfigHandoff::finish`]) and then closes the
+/// write end, so a config larger than the pipe buffer cannot deadlock. No
+/// filesystem-backed temporary file carries the plaintext, and there is no
+/// fallback to one.
 #[cfg(unix)]
-fn write_launch_config_fd(launch: &LaunchConfig) -> MicrosandboxResult<std::fs::File> {
-    let mut file = tempfile::tempfile()?;
-    let json = serde_json::to_vec(launch)
-        .map_err(|e| crate::MicrosandboxError::Runtime(format!("serialize launch config: {e}")))?;
-    file.write_all(&json)?;
-    file.flush()?;
-    file.seek(SeekFrom::Start(0))?;
-    Ok(file)
+struct ConfigHandoff {
+    read_fd: OwnedFd,
+    after_spawn: AfterSpawn,
+}
+
+#[cfg(unix)]
+enum AfterSpawn {
+    /// The object was written and rewound before spawn (Linux memfd).
+    Written,
+    /// The parent writes these bytes after spawn, then closes the write end to
+    /// produce EOF for the child's read-to-end.
+    Pipe {
+        write_fd: OwnedFd,
+        bytes: Zeroizing<Vec<u8>>,
+    },
+}
+
+#[cfg(unix)]
+impl ConfigHandoff {
+    /// The inherited fd that is `dup2`'d onto the child's config fd.
+    fn child_fd(&self) -> &OwnedFd {
+        &self.read_fd
+    }
+
+    /// Complete the handoff after the child has been spawned.
+    ///
+    /// For the pipe case this writes the JSON from the *same* future (no
+    /// background thread) and closes the write end, producing EOF for the
+    /// child's read-to-end. The write loop must not block the Tokio reactor.
+    async fn finish(mut self) -> MicrosandboxResult<()> {
+        match std::mem::replace(&mut self.after_spawn, AfterSpawn::Written) {
+            AfterSpawn::Written => Ok(()),
+            AfterSpawn::Pipe { write_fd, bytes } => write_all_nonblocking(write_fd, &bytes).await,
+        }
+    }
+}
+
+/// Build the private, memory-backed launch-config handoff.
+#[cfg(unix)]
+fn create_config_handoff(launch: &LaunchConfig) -> MicrosandboxResult<ConfigHandoff> {
+    let bytes =
+        Zeroizing::new(serde_json::to_vec(launch).map_err(|e| {
+            crate::MicrosandboxError::Runtime(format!("serialize launch config: {e}"))
+        })?);
+
+    #[cfg(target_os = "linux")]
+    {
+        let fd = unsafe { libc::memfd_create(c"msb-launch-config".as_ptr(), libc::MFD_CLOEXEC) };
+        if fd < 0 {
+            return Err(std::io::Error::last_os_error().into());
+        }
+        let read_fd = unsafe { OwnedFd::from_raw_fd(fd) };
+        write_all_blocking(&read_fd, &bytes)?;
+        if unsafe { libc::lseek(read_fd.as_raw_fd(), 0, libc::SEEK_SET) } < 0 {
+            return Err(std::io::Error::last_os_error().into());
+        }
+        Ok(ConfigHandoff {
+            read_fd,
+            after_spawn: AfterSpawn::Written,
+        })
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    {
+        let Pipe { read_fd, write_fd } = create_pipe()?;
+        set_nonblocking(&write_fd)?;
+        Ok(ConfigHandoff {
+            read_fd,
+            after_spawn: AfterSpawn::Pipe { write_fd, bytes },
+        })
+    }
+}
+
+/// Write every byte of `bytes` to `fd`, retrying on `EINTR` (Linux pre-spawn).
+#[cfg(target_os = "linux")]
+fn write_all_blocking(fd: &OwnedFd, bytes: &[u8]) -> MicrosandboxResult<()> {
+    let mut offset = 0usize;
+    while offset < bytes.len() {
+        let written = unsafe {
+            libc::write(
+                fd.as_raw_fd(),
+                bytes[offset..].as_ptr() as *const libc::c_void,
+                bytes.len() - offset,
+            )
+        };
+        if written < 0 {
+            let err = std::io::Error::last_os_error();
+            if err.kind() == std::io::ErrorKind::Interrupted {
+                continue;
+            }
+            return Err(err.into());
+        }
+        if written == 0 {
+            return Err(crate::MicrosandboxError::Runtime(
+                "config fd write returned zero bytes".into(),
+            ));
+        }
+        offset += written as usize;
+    }
+    Ok(())
+}
+
+/// Set `O_NONBLOCK` on `fd`.
+#[cfg(all(unix, not(target_os = "linux")))]
+fn set_nonblocking(fd: &OwnedFd) -> MicrosandboxResult<()> {
+    let flags = unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_GETFL) };
+    if flags < 0 {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    if unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0 {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    Ok(())
+}
+
+/// Write every byte of `bytes` on a nonblocking pipe write end without blocking
+/// the Tokio reactor, retrying on `EAGAIN`/`EINTR`.
+#[cfg(unix)]
+async fn write_all_nonblocking(write_fd: OwnedFd, bytes: &[u8]) -> MicrosandboxResult<()> {
+    use tokio::io::unix::AsyncFd;
+
+    let async_fd = AsyncFd::new(write_fd)?;
+    let mut offset = 0usize;
+    while offset < bytes.len() {
+        let mut guard = async_fd.writable().await?;
+        match guard.try_io(|inner| {
+            let written = unsafe {
+                libc::write(
+                    inner.as_raw_fd(),
+                    bytes[offset..].as_ptr() as *const libc::c_void,
+                    bytes.len() - offset,
+                )
+            };
+            if written < 0 {
+                Err(std::io::Error::last_os_error())
+            } else {
+                Ok(written as usize)
+            }
+        }) {
+            Ok(Ok(0)) => {
+                return Err(crate::MicrosandboxError::Runtime(
+                    "config fd write returned zero bytes".into(),
+                ));
+            }
+            Ok(Ok(written)) => offset += written,
+            Ok(Err(err)) if err.kind() == std::io::ErrorKind::Interrupted => continue,
+            Ok(Err(err)) => return Err(err.into()),
+            Err(_would_block) => continue,
+        }
+    }
+    // Dropping `async_fd` closes the write end, producing EOF for the child.
+    Ok(())
 }
 
 /// Serialize the [`LaunchConfig`] as JSON to a short-lived named file for Windows.
@@ -5114,5 +5352,61 @@ mod tests {
                 (Some(1024 * 1024 * 1024), Some(512 * 1024 * 1024))
             );
         }
+    }
+}
+
+//--------------------------------------------------------------------------------------------------
+// Tests: Config Handoff
+//--------------------------------------------------------------------------------------------------
+
+#[cfg(all(test, unix))]
+mod config_handoff_tests {
+    use std::io::Read;
+
+    use super::*;
+
+    #[cfg(not(target_os = "linux"))]
+    #[tokio::test]
+    async fn config_handoff_pipe_is_anon_fifo_and_delivers_all_bytes() {
+        let mut launch = LaunchConfig::default();
+        // Make the payload comfortably larger than a typical 64 KiB pipe buffer
+        // so the post-spawn write loop must wait for the reader to drain it.
+        launch.exec_args = (0..40_000).map(|i| format!("arg-{i:08}")).collect();
+
+        let handoff = create_config_handoff(&launch).unwrap();
+        let read_fd = handoff.child_fd().as_raw_fd();
+
+        // The object is an anonymous pipe (unlinked FIFO), not a filesystem file.
+        let mut stat: libc::stat = unsafe { std::mem::zeroed() };
+        assert_eq!(unsafe { libc::fstat(read_fd, &mut stat) }, 0);
+        assert_eq!(stat.st_mode & libc::S_IFMT, libc::S_IFIFO);
+
+        let reader_fd = unsafe { libc::dup(read_fd) };
+        assert!(reader_fd >= 0);
+        let reader = tokio::task::spawn_blocking(move || {
+            let mut file = unsafe { std::fs::File::from_raw_fd(reader_fd) };
+            let mut buf = Vec::new();
+            file.read_to_end(&mut buf).unwrap();
+            buf
+        });
+
+        handoff.finish().await.unwrap();
+
+        let bytes = reader.await.unwrap();
+        assert_eq!(bytes, serde_json::to_vec(&launch).unwrap());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn config_handoff_memfd_is_memory_backed() {
+        let launch = LaunchConfig::default();
+        let handoff = create_config_handoff(&launch).unwrap();
+        let fd = handoff.child_fd().as_raw_fd();
+
+        let mut stat: libc::stat = unsafe { std::mem::zeroed() };
+        assert_eq!(unsafe { libc::fstat(fd, &mut stat) }, 0);
+        assert_eq!(stat.st_mode & libc::S_IFMT, libc::S_IFREG);
+
+        handoff.finish().await.unwrap();
     }
 }

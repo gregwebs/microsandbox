@@ -3895,6 +3895,43 @@ mod tests {
     }
 
     #[test]
+    fn header_credential_grammar_fixture() {
+        let raw = include_str!("fixtures/header_credential_grammar.json");
+        let fixture: serde_json::Value = serde_json::from_str(raw).unwrap();
+
+        for entry in fixture["accept"].as_array().unwrap() {
+            let credential: DurableHeaderCredential = serde_json::from_value(entry.clone())
+                .unwrap_or_else(|e| panic!("accept entry failed to parse: {e}"));
+            assert!(
+                config_with(vec![credential]).validate().is_ok(),
+                "expected accept entry to validate: {entry}"
+            );
+        }
+
+        for entry in fixture["reject"].as_array().unwrap() {
+            let text = entry.to_string();
+            let mut entry = entry.clone();
+            if let Some(object) = entry.as_object_mut() {
+                object.remove("_why");
+            }
+            let credential: DurableHeaderCredential = serde_json::from_value(entry)
+                .unwrap_or_else(|e| panic!("reject entry failed to parse: {e}"));
+            assert!(
+                config_with(vec![credential]).validate().is_err(),
+                "expected reject entry to fail validation: {text}"
+            );
+        }
+
+        for raw_entry in fixture["serde_reject"].as_array().unwrap() {
+            let text = raw_entry.as_str().unwrap();
+            assert!(
+                serde_json::from_str::<DurableHeaderCredential>(text).is_err(),
+                "expected serde to reject: {text}"
+            );
+        }
+    }
+
+    #[test]
     fn header_credential_debug_redacts_caller_metadata() {
         let sentinel = "SENTINEL-abc123";
         let mut credential = header_credential();

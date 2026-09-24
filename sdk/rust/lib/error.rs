@@ -41,6 +41,10 @@ pub enum MicrosandboxError {
     #[error("invalid config: {0}")]
     InvalidConfig(String),
 
+    /// An origin-scoped header-credential launch was refused.
+    #[error(transparent)]
+    HeaderCredential(#[from] HeaderCredentialError),
+
     /// The sandbox's effective entrypoint and CMD do not provide an executable default command.
     #[error(
         "sandbox has no default command; configure an entrypoint or cmd, or execute a literal command"
@@ -398,6 +402,57 @@ pub enum UnsupportedReason {
     NotAvailable(String),
 }
 
+/// A refusal to launch a sandbox that carries origin-scoped header credentials.
+///
+/// Messages carry fixed labels and numeric indices only; never a credential
+/// reference, value, or any caller-controlled string.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum HeaderCredentialError {
+    /// A credential-bearing config was created without a `CredentialResolver`.
+    #[error(
+        "header credential #{credential_index} requires a resolver; create the sandbox with Sandbox::create_with_pull_progress_and_resolver"
+    )]
+    MissingResolver {
+        /// Index of the first credential without a resolver.
+        credential_index: usize,
+    },
+
+    /// The resolver failed for one credential.
+    #[error("header credential #{credential_index} could not be resolved")]
+    ResolveFailed {
+        /// Index of the credential that failed to resolve.
+        credential_index: usize,
+    },
+
+    /// The resolved list did not match the durable definitions.
+    #[error("resolved header credentials do not match the configured definitions")]
+    ResolutionMismatch,
+
+    /// Header credentials are not supported on this platform (Windows).
+    #[error("header credentials are not supported on this platform")]
+    UnsupportedPlatform,
+
+    /// Header credentials cannot be dispatched to this backend (cloud).
+    #[error("header credentials are not supported by this backend")]
+    UnsupportedBackend,
+
+    /// The installed `msb` binary lacks the header-credential launch capability.
+    #[error(
+        "the installed msb binary does not support header credentials; install a runtime that reports header-credential-launch-v1"
+    )]
+    RuntimeCapabilityMissing,
+
+    /// The installed `msb` binary could not be probed for launch capabilities.
+    #[error("the installed msb binary could not be probed for launch capabilities")]
+    RuntimeProbeFailed,
+
+    /// A stopped reference-backed sandbox cannot be restarted by name.
+    #[error(
+        "this sandbox has header credentials and cannot be restarted by name; recreate it with a resolver"
+    )]
+    RestartRequiresResolver,
+}
+
 //--------------------------------------------------------------------------------------------------
 // Methods
 //--------------------------------------------------------------------------------------------------
@@ -503,7 +558,6 @@ impl MicrosandboxError {
     pub fn unsupported(op: Operation, reason: UnsupportedReason) -> MicrosandboxError {
         MicrosandboxError::Unsupported { op, reason }
     }
-
     /// [`Unsupported`](Self::Unsupported) for operations only a local backend honors.
     pub fn local_only(op: Operation) -> MicrosandboxError {
         Self::unsupported(op, UnsupportedReason::LocalOnly)

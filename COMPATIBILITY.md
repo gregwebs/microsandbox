@@ -142,6 +142,8 @@ Sources: [`crates/runtime/lib/launch.rs`](crates/runtime/lib/launch.rs), [`crate
 
 This protocol has no explicit version envelope. Treat additions as optional and consider adding explicit version or capability negotiation before allowing independently versioned launchers and runtimes.
 
+Origin-scoped header credentials add an optional `resolved_header_credentials` field to the launch JSON. Because an older runtime silently ignores unknown additive fields (which would boot the sandbox and forward uninjected traffic), the SDK does not rely on the gitlink pin: it probes the installed `msb` for the fixed `header-credential-launch-v1` token (hidden `msb __capabilities` subcommand) before a credential-bearing create and again immediately before the resolver runs, and refuses when the token is absent. The config FD itself was changed from a filesystem-backed (unlinked) temporary file to a memory-backed object — Linux `memfd_create`, macOS/other Unix an anonymous pipe — with no fallback to a file; the child still reads to EOF without seeking, so this is not an observable wire change.
+
 ## 6. Database, Configuration, and Migration History
 
 The SQLite database under `MSB_HOME` is a durable protocol between releases. Host and runtime processes must also agree on WAL, busy timeout, foreign-key, synchronous, and writer settings.

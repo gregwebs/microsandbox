@@ -600,6 +600,56 @@ impl SandboxConfig {
     }
 }
 
+/// Whether a durable config authorizes any origin-scoped header credential.
+pub(crate) fn has_header_credentials(config: &SandboxConfig) -> bool {
+    config
+        .spec
+        .network
+        .secrets
+        .as_ref()
+        .is_some_and(|secrets| !secrets.header_credentials.is_empty())
+}
+
+/// Resolve origin-scoped header-credential references into launch-only values.
+///
+/// Called in the embedding process before `fork`. The returned values are moved
+/// onto the private launch config and never returned to a durable config. An
+/// error carries only a numeric index and a fixed kind.
+#[cfg(feature = "net")]
+pub(crate) fn resolve_header_credentials(
+    config: &SandboxConfig,
+    resolver: Option<&dyn crate::CredentialResolver>,
+) -> crate::MicrosandboxResult<
+    Vec<microsandbox_network::secrets::credential::ResolvedHeaderCredential>,
+> {
+    use microsandbox_network::secrets::credential::ResolvedHeaderCredential;
+
+    let Some(secrets) = config.spec.network.secrets.as_ref() else {
+        return Ok(Vec::new());
+    };
+    if secrets.header_credentials.is_empty() {
+        return Ok(Vec::new());
+    }
+    let resolver = resolver.ok_or(crate::MicrosandboxError::HeaderCredential(
+        crate::HeaderCredentialError::MissingResolver {
+            credential_index: 0,
+        },
+    ))?;
+
+    let mut resolved = Vec::with_capacity(secrets.header_credentials.len());
+    for (index, definition) in secrets.header_credentials.iter().enumerate() {
+        let value = resolver.resolve(&definition.reference).map_err(|_| {
+            crate::MicrosandboxError::HeaderCredential(
+                crate::HeaderCredentialError::ResolveFailed {
+                    credential_index: index,
+                },
+            )
+        })?;
+        resolved.push(ResolvedHeaderCredential::from_definition(definition, value));
+    }
+    Ok(resolved)
+}
+
 /// Resolve reference-model secret entries (host-side `source` references) into
 /// concrete values for this spawn.
 ///
@@ -724,6 +774,8 @@ impl Default for SandboxConfig {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(feature = "net")]
+    use super::resolve_header_credentials;
     use super::{SandboxConfig, merge_env};
     use crate::sandbox::{
         HandoffInit, MountOptions, NamedVolumeMode, RootDisk, RootfsSource, StatVirtualization,
@@ -1965,5 +2017,100 @@ mod tests {
             }
             mount => panic!("expected tmpfs mount, got {mount:?}"),
         }
+    }
+
+    #[cfg(feature = "net")]
+    #[test]
+    fn resolve_header_credentials_requires_a_resolver_and_keeps_the_value_off_durable_config() {
+        use microsandbox_network::config::NetworkBuilder;
+
+        let network = NetworkBuilder::new()
+            .header_credential(|credential| {
+                credential
+                    .id("anthropic")
+                    .reference("anthropic-api-key")
+                    .origin("api.example.com", 443)
+                    .header("x-api-key")
+                    .format("%s")
+            })
+            .build()
+            .expect("credential-bearing network config should build");
+
+        let mut config = SandboxConfig::default();
+        config.set_local_network_config(network).unwrap();
+
+        // The durable config carries the reference but never a value.
+        let durable = serde_json::to_string(&config).unwrap();
+        assert!(durable.contains("header_credentials"), "{durable}");
+        assert!(!durable.contains("value"), "{durable}");
+
+        // No resolver is a typed refusal that names the first index.
+        let err = resolve_header_credentials(&config, None).unwrap_err();
+        assert!(matches!(
+            err,
+            crate::MicrosandboxError::HeaderCredential(
+                crate::HeaderCredentialError::MissingResolver {
+                    credential_index: 0
+                }
+            )
+        ));
+
+        struct FixedResolver;
+        impl crate::CredentialResolver for FixedResolver {
+            fn resolve(
+                &self,
+                _reference: &str,
+            ) -> Result<zeroize::Zeroizing<String>, crate::CredentialResolveError> {
+                Ok(zeroize::Zeroizing::new("sk-secret".into()))
+            }
+        }
+
+        let resolved = resolve_header_credentials(&config, Some(&FixedResolver)).unwrap();
+        assert_eq!(resolved.len(), 1);
+        assert_eq!(resolved[0].value.as_str(), "sk-secret");
+        // The launch-only wire form does carry the value.
+        let wire = serde_json::to_string(&resolved).unwrap();
+        assert!(wire.contains("sk-secret"), "{wire}");
+    }
+
+    #[cfg(feature = "net")]
+    #[test]
+    fn resolve_header_credentials_maps_resolver_error_to_index_only() {
+        use microsandbox_network::config::NetworkBuilder;
+
+        let network = NetworkBuilder::new()
+            .header_credential(|credential| {
+                credential
+                    .id("a")
+                    .reference("ref-a")
+                    .origin("api.example.com", 443)
+                    .header("x-api-key")
+                    .format("%s")
+            })
+            .build()
+            .unwrap();
+        let mut config = SandboxConfig::default();
+        config.set_local_network_config(network).unwrap();
+
+        struct FailingResolver;
+        impl crate::CredentialResolver for FailingResolver {
+            fn resolve(
+                &self,
+                _reference: &str,
+            ) -> Result<zeroize::Zeroizing<String>, crate::CredentialResolveError> {
+                Err(crate::CredentialResolveError::not_found())
+            }
+        }
+
+        let err = resolve_header_credentials(&config, Some(&FailingResolver)).unwrap_err();
+        assert!(matches!(
+            err,
+            crate::MicrosandboxError::HeaderCredential(
+                crate::HeaderCredentialError::ResolveFailed {
+                    credential_index: 0
+                }
+            )
+        ));
+        assert!(!err.to_string().contains("ref-a"), "{err}");
     }
 }

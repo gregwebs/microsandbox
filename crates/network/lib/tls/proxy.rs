@@ -343,6 +343,7 @@ pub(crate) async fn intercept_relay(
         // IP-literal CONNECT authorities retain the existing DNS-pin check.
         SecretsHandler::new_tls_intercepted(&secrets, sni_name, guest_dst.ip(), &shared)
     }
+    .with_header_credentials(tls_state.header_credentials().to_vec())
     .with_guest_dst(guest_dst);
     let mut request_stream =
         open_authorized_request_stream(&extensions, guest_dst, sni_name, via_connect);

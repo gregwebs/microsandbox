@@ -15,6 +15,7 @@ use tokio_rustls::TlsConnector;
 
 use super::ca::CertAuthority;
 use super::certgen::{self, DomainCert, DomainCertError};
+use crate::secrets::credential::ResolvedHeaderCredential;
 use crate::secrets::handle::SecretsHandle;
 use microsandbox_types::TlsConfig;
 
@@ -40,6 +41,11 @@ pub struct TlsState {
     /// Live-swappable secrets configuration for placeholder substitution.
     /// Loaded per connection so live secret updates apply to future traffic.
     pub secrets: SecretsHandle,
+    /// Immutable origin-scoped header credentials resolved for this boot.
+    ///
+    /// Fixed for the sandbox's lifetime: rotation requires a new launch with a
+    /// new resolver. Shared with the secret handler per connection.
+    header_credentials: Arc<[ResolvedHeaderCredential]>,
     /// Pre-computed lowercased bypass patterns for efficient matching.
     bypass_patterns: Vec<DomainPattern>,
     /// Whether fail-closed request interception is active for this engine
@@ -175,9 +181,24 @@ impl TlsState {
             scoped_upstream_connectors,
             config,
             secrets,
+            header_credentials: Vec::new().into(),
             bypass_patterns,
             intercept_active,
         })
+    }
+
+    /// Attach the immutable resolved header credentials for this boot.
+    ///
+    /// The default (empty) list is used by every constructor that does not
+    /// deliver a launch-only resolved list.
+    pub fn with_header_credentials(mut self, credentials: Vec<ResolvedHeaderCredential>) -> Self {
+        self.header_credentials = credentials.into();
+        self
+    }
+
+    /// The immutable resolved header credentials for this boot.
+    pub fn header_credentials(&self) -> Arc<[ResolvedHeaderCredential]> {
+        self.header_credentials.clone()
     }
 
     /// Get or generate a certificate for the given domain.

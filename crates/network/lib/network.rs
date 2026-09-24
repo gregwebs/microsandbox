@@ -31,6 +31,7 @@ use crate::netstack::{
 };
 use crate::policy::{NetworkPolicy, NetworkProfile};
 use crate::ports::publisher::PortCommand;
+use crate::secrets::credential::{ResolvedHeaderCredential, validate_resolved_header_credentials};
 use crate::secrets::handle::SecretsHandle;
 use crate::tls::state::{TlsState, TlsStateError};
 
@@ -122,6 +123,41 @@ pub enum NetworkInitError {
     /// A stored network rate limiter has neither direction configured.
     #[error("invalid network rate limiter: at least one of egress or ingress is required")]
     EmptyNetworkRateLimiter,
+
+    /// A stored secret configuration failed validation.
+    #[error("invalid network secret configuration: {source}")]
+    InvalidSecretConfig {
+        /// Underlying validation error.
+        #[source]
+        source: microsandbox_types::SecretConfigError,
+    },
+
+    /// Header credentials were configured while networking is disabled.
+    #[error("header credentials require networking to be enabled")]
+    HeaderCredentialRequiresNetwork,
+
+    /// Header credentials were configured without TLS interception.
+    #[error("header credentials require TLS interception")]
+    HeaderCredentialRequiresTls,
+}
+
+/// Validate the launch-only resolved credentials against the durable
+/// definitions and require TLS + networking for a credential-bearing config.
+fn validate_launch_header_credentials(
+    config: &NetworkConfig,
+    resolved: &[ResolvedHeaderCredential],
+) -> Result<(), NetworkInitError> {
+    validate_resolved_header_credentials(&config.secrets.header_credentials, resolved)
+        .map_err(|source| NetworkInitError::InvalidSecretConfig { source })?;
+    if !config.secrets.header_credentials.is_empty() {
+        if !config.enabled {
+            return Err(NetworkInitError::HeaderCredentialRequiresNetwork);
+        }
+        if !config.tls.enabled {
+            return Err(NetworkInitError::HeaderCredentialRequiresTls);
+        }
+    }
+    Ok(())
 }
 
 /// Handle for installing host-side termination behavior into the network stack.
@@ -204,6 +240,32 @@ impl SmoltcpNetwork {
             extensions,
             host_has_ipv4_route(),
             host_has_ipv6_route(),
+            Vec::new(),
+        )
+    }
+
+    /// Create the network backend with resolved header credentials for this
+    /// launch.
+    ///
+    /// The resolved list is the launch-only wire value that was carried on the
+    /// private config FD; it must match the durable definitions in
+    /// `config.secrets.header_credentials` one-to-one. Every other constructor
+    /// passes an empty list and therefore refuses a config that declares header
+    /// credentials without resolved values.
+    pub fn new_with_profile_and_credentials(
+        config: NetworkConfig,
+        slot: u64,
+        deployment_profile: DeploymentProfile,
+        resolved_header_credentials: Vec<ResolvedHeaderCredential>,
+    ) -> Result<Self, NetworkInitError> {
+        Self::new_with_profile_and_routes(
+            config,
+            slot,
+            deployment_profile,
+            NetworkExtensions::default(),
+            host_has_ipv4_route(),
+            host_has_ipv6_route(),
+            resolved_header_credentials,
         )
     }
 
@@ -221,6 +283,7 @@ impl SmoltcpNetwork {
             NetworkExtensions::default(),
             host_has_ipv4,
             host_has_ipv6,
+            Vec::new(),
         )
     }
 
@@ -231,6 +294,7 @@ impl SmoltcpNetwork {
         extensions: NetworkExtensions,
         host_has_ipv4: bool,
         host_has_ipv6: bool,
+        resolved_header_credentials: Vec<ResolvedHeaderCredential>,
     ) -> Result<Self, NetworkInitError> {
         assert!(
             slot <= MAX_SLOT,
@@ -313,13 +377,24 @@ impl SmoltcpNetwork {
         let backend = SmoltcpBackend::new(shared.clone());
         let extensions = install_intercept_extension(extensions, &config.intercept);
 
+        // A stored config bypasses the builder, so validate the durable secret
+        // grammar and the launch-only resolved list here, independently.
+        config
+            .secrets
+            .validate()
+            .map_err(|source| NetworkInitError::InvalidSecretConfig { source })?;
+        validate_launch_header_credentials(&config, &resolved_header_credentials)?;
+
         let secrets = SecretsHandle::new(config.secrets.clone());
         let tls_state = if config.tls.enabled {
-            Some(Arc::new(TlsState::new(
-                config.tls.clone(),
-                secrets.clone(),
-                config.intercept.is_active(),
-            )?))
+            Some(Arc::new(
+                TlsState::new(
+                    config.tls.clone(),
+                    secrets.clone(),
+                    config.intercept.is_active(),
+                )?
+                .with_header_credentials(resolved_header_credentials),
+            ))
         } else {
             None
         };
