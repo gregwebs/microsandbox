@@ -311,7 +311,13 @@ impl NetworkBuilder {
     ///
     /// A credential-bearing config can only be injected through TLS
     /// interception, so this enables TLS; [`NetworkBuilder::build`] fails
-    /// closed if TLS or networking is explicitly disabled.
+    /// closed if TLS or networking is explicitly disabled. Interception is
+    /// decided **per port**, so [`NetworkBuilder::build`] also fails closed
+    /// when the credential's origin port is not among
+    /// [`TlsConfig::intercepted_ports`] (default `[443]`) — that port must be
+    /// added explicitly, e.g. `.tls(|t| t.intercepted_ports(vec![8443]))`.
+    /// Ports are never added automatically, because doing so would intercept
+    /// unrelated traffic on them.
     ///
     /// ```ignore
     /// .header_credential(|c| c
@@ -492,6 +498,16 @@ impl NetworkBuilder {
             }
             if !self.config.tls.enabled {
                 return Err(BuildError::HeaderCredentialRequiresTls);
+            }
+            // Interception is per-port, and `.intercepted_ports` can be set
+            // after `.header_credential`, so check the assembled config here
+            // rather than inside `header_credential`.
+            if let Some((credential_id, port)) = self.config.first_unintercepted_header_credential()
+            {
+                return Err(BuildError::HeaderCredentialPortNotIntercepted {
+                    credential_id: credential_id.to_owned(),
+                    port,
+                });
             }
         }
         self.config.secrets.validate()?;
@@ -1388,6 +1404,103 @@ mod tests {
             .build()
             .unwrap_err();
         assert!(matches!(err, BuildError::HeaderCredentialRequiresNetwork));
+    }
+
+    /// Helper: a canonical credential for `origin_port`, fully specified.
+    fn credential_at(
+        origin_port: u16,
+    ) -> impl FnOnce(HeaderCredentialBuilder) -> HeaderCredentialBuilder {
+        move |c| {
+            c.id("anthropic")
+                .reference("anthropic-api-key")
+                .origin("api.anthropic.com", origin_port)
+                .header("x-api-key")
+                .format("%s")
+        }
+    }
+
+    /// A credential scoped to a port that is not TLS-intercepted is rejected:
+    /// interception is per-port, so the credential could never be injected.
+    #[test]
+    fn header_credential_for_an_unintercepted_port_is_rejected() {
+        let err = NetworkBuilder::new()
+            .header_credential(credential_at(8443))
+            .build()
+            .unwrap_err();
+
+        assert!(
+            matches!(
+                err,
+                BuildError::HeaderCredentialPortNotIntercepted {
+                    ref credential_id,
+                    port: 8443,
+                } if credential_id == "anthropic"
+            ),
+            "got {err:?}"
+        );
+        // The diagnostic must name the offending port, say to add it to the
+        // intercepted ports, and explain that interception is per-port.
+        let rendered = err.to_string();
+        assert!(rendered.contains("8443"), "{rendered}");
+        assert!(rendered.contains("intercepted ports"), "{rendered}");
+        assert!(rendered.contains("per-port"), "{rendered}");
+    }
+
+    /// The same credential is accepted once its port is intercepted, and
+    /// `.intercepted_ports` may be set *after* `.header_credential` (which is
+    /// why the check lives in `build`, not in `header_credential`).
+    #[test]
+    fn header_credential_is_accepted_once_its_port_is_intercepted() {
+        let cfg = NetworkBuilder::new()
+            .header_credential(credential_at(8443))
+            .tls(|t| t.intercepted_ports(vec![8443]))
+            .build()
+            .unwrap();
+
+        assert_eq!(cfg.tls.intercepted_ports, vec![8443]);
+        assert_eq!(cfg.secrets.header_credentials.len(), 1);
+    }
+
+    /// A 443 credential is accepted under the default intercepted ports.
+    #[test]
+    fn header_credential_on_the_default_port_is_accepted() {
+        let cfg = NetworkBuilder::new()
+            .header_credential(credential_at(443))
+            .build()
+            .unwrap();
+
+        assert_eq!(cfg.tls.intercepted_ports, vec![443]);
+        assert_eq!(cfg.secrets.header_credentials.len(), 1);
+    }
+
+    /// Explicitly emptying the intercepted-port list rejects a credential even
+    /// on 443: the default is only a default, and a non-intercepted port is a
+    /// non-intercepted port.
+    #[test]
+    fn header_credential_on_443_is_rejected_when_interception_is_emptied() {
+        let err = NetworkBuilder::new()
+            .header_credential(credential_at(443))
+            .tls(|t| t.intercepted_ports(vec![]))
+            .build()
+            .unwrap_err();
+
+        assert!(matches!(
+            err,
+            BuildError::HeaderCredentialPortNotIntercepted { port: 443, .. }
+        ));
+    }
+
+    /// A credential-free config is unaffected by the interception check, even
+    /// with interception enabled and no ports listed.
+    #[test]
+    fn credential_free_config_is_unaffected_by_the_interception_check() {
+        let cfg = NetworkBuilder::new()
+            .tls(|t| t.enabled(true).intercepted_ports(vec![]))
+            .build()
+            .unwrap();
+
+        assert!(cfg.secrets.header_credentials.is_empty());
+        assert!(cfg.tls.intercepted_ports.is_empty());
     }
 
     #[test]

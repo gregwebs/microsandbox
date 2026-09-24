@@ -139,10 +139,23 @@ pub enum NetworkInitError {
     /// Header credentials were configured without TLS interception.
     #[error("header credentials require TLS interception")]
     HeaderCredentialRequiresTls,
+
+    /// A header credential targets an origin port that is not TLS-intercepted,
+    /// so the credential could never be injected.
+    #[error(
+        "header credential `{credential_id}` targets port {port}, which is not TLS-intercepted; add {port} to the TLS intercepted ports (tls.intercepted_ports) because interception is per-port, not per-host"
+    )]
+    HeaderCredentialPortNotIntercepted {
+        /// Non-secret diagnostic `id` of the offending credential.
+        credential_id: String,
+        /// The origin port that is not intercepted.
+        port: u16,
+    },
 }
 
 /// Validate the launch-only resolved credentials against the durable
-/// definitions and require TLS + networking for a credential-bearing config.
+/// definitions and require TLS + networking and per-port interception for a
+/// credential-bearing config.
 fn validate_launch_header_credentials(
     config: &NetworkConfig,
     resolved: &[ResolvedHeaderCredential],
@@ -155,6 +168,15 @@ fn validate_launch_header_credentials(
         }
         if !config.tls.enabled {
             return Err(NetworkInitError::HeaderCredentialRequiresTls);
+        }
+        // A stored config bypasses `NetworkBuilder::build`, so enforce the
+        // per-port interception invariant here too; interception is decided
+        // purely by port, so a mis-scoped credential would never be injected.
+        if let Some((credential_id, port)) = config.first_unintercepted_header_credential() {
+            return Err(NetworkInitError::HeaderCredentialPortNotIntercepted {
+                credential_id: credential_id.to_owned(),
+                port,
+            });
         }
     }
     Ok(())
@@ -1219,5 +1241,89 @@ mod tests {
                 source: RateLimitConfigError::EmptyLimiter,
             }
         ));
+    }
+
+    /// A canonical credential definition for `origin_port`, paired with its
+    /// matching resolved value, ready to feed the engine's config-level
+    /// validation (which requires a 1:1 definition/resolution mapping).
+    fn credential_definition_and_resolution(
+        origin_port: u16,
+    ) -> (
+        microsandbox_types::DurableHeaderCredential,
+        ResolvedHeaderCredential,
+    ) {
+        let definition = microsandbox_types::DurableHeaderCredential {
+            id: "anthropic".into(),
+            reference: "anthropic-api-key".into(),
+            origin: microsandbox_types::HttpsOrigin {
+                host: "api.anthropic.com".into(),
+                port: origin_port,
+            },
+            header: "x-api-key".into(),
+            format: "%s".into(),
+        };
+        let resolved = ResolvedHeaderCredential::from_definition(
+            &definition,
+            zeroize::Zeroizing::new("sk-secret".to_owned()),
+        );
+        (definition, resolved)
+    }
+
+    /// A stored config bypasses `NetworkBuilder::build`, so the engine must
+    /// re-validate the per-port interception invariant itself: a credential
+    /// scoped to an un-intercepted port fails network creation.
+    #[test]
+    fn new_with_credentials_rejects_a_credential_for_an_unintercepted_port() {
+        let (definition, resolved) = credential_definition_and_resolution(443);
+        let mut config = NetworkConfig::default();
+        config.tls.enabled = true;
+        config.tls.intercepted_ports = vec![8443];
+        config.secrets.header_credentials.push(definition);
+
+        let err = match SmoltcpNetwork::new_with_profile_and_credentials(
+            config,
+            0,
+            DeploymentProfile::SingleTenant,
+            vec![resolved],
+        ) {
+            Ok(_) => panic!("a credential for an un-intercepted port should fail"),
+            Err(err) => err,
+        };
+
+        assert!(
+            matches!(
+                err,
+                NetworkInitError::HeaderCredentialPortNotIntercepted {
+                    ref credential_id,
+                    port: 443,
+                } if credential_id == "anthropic"
+            ),
+            "got {err:?}"
+        );
+    }
+
+    /// The same config is accepted once the credential's port is intercepted.
+    /// Exercised through the private validator the engine calls so no TLS CA is
+    /// needed.
+    #[test]
+    fn validate_launch_header_credentials_accepts_an_intercepted_port() {
+        let (definition, resolved) = credential_definition_and_resolution(8443);
+        let mut config = NetworkConfig::default();
+        config.tls.enabled = true;
+        config.tls.intercepted_ports = vec![8443];
+        config.secrets.header_credentials.push(definition);
+
+        assert!(validate_launch_header_credentials(&config, &[resolved]).is_ok());
+    }
+
+    /// Negative control: with no credentials the interceptor list is irrelevant,
+    /// so an empty list does not fail validation.
+    #[test]
+    fn validate_launch_header_credentials_skips_the_port_check_without_credentials() {
+        let mut config = NetworkConfig::default();
+        config.tls.enabled = true;
+        config.tls.intercepted_ports = vec![];
+
+        assert!(validate_launch_header_credentials(&config, &[]).is_ok());
     }
 }

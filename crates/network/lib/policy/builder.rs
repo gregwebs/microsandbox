@@ -116,6 +116,18 @@ pub enum BuildError {
         field: &'static str,
     },
 
+    /// A header credential targets an origin port that is not TLS-intercepted,
+    /// so the credential could never be injected.
+    #[error(
+        "header credential `{credential_id}` targets port {port}, which is not TLS-intercepted; add {port} to the TLS intercepted ports (tls.intercepted_ports) because interception is per-port, not per-host"
+    )]
+    HeaderCredentialPortNotIntercepted {
+        /// Non-secret diagnostic `id` of the offending credential.
+        credential_id: String,
+        /// The origin port that is not intercepted.
+        port: u16,
+    },
+
     /// `.domain(&str)` or `.domain_suffix(&str)` received a value that
     /// doesn't parse as a [`DomainName`].
     #[error("rule #{rule_index}: invalid domain `{raw}`: {source}")]
