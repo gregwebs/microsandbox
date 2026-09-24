@@ -10,8 +10,8 @@ use std::net::{IpAddr, SocketAddr};
 
 use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
 use httlib_hpack::{Decoder as HpackDecoder, Encoder as HpackEncoder};
+use microsandbox_types::SecretString;
 use percent_encoding::percent_decode;
-use zeroize::Zeroizing;
 
 use super::config::{
     HostPattern, MAX_SECRET_PLACEHOLDER_BYTES, SecretEntry, SecretSource, SecretsConfig,
@@ -186,7 +186,7 @@ type Http2Headers = Vec<(Vec<u8>, Vec<u8>)>;
 
 /// Header fields to set on a request, as `(name, rendered value)`. The
 /// rendered value is zeroized on drop.
-type CredentialFields = Vec<(String, Zeroizing<String>)>;
+type CredentialFields = Vec<(String, SecretString)>;
 
 /// Current chunked-body parser phase.
 #[derive(Debug, Clone, Default)]
@@ -1567,9 +1567,19 @@ impl SecretsHandler {
         let mut fields = Vec::new();
         for credential in &self.header_credentials {
             if self.credential_authorized(credential, request) {
-                // An unsafe or over-long rendered value blocks the connection
-                // rather than forwarding an uninjected request.
-                let rendered = credential.render().ok_or(ViolationAction::Block)?;
+                // An empty, unsafe, or over-long rendered value blocks the
+                // connection rather than forwarding an uninjected request. The
+                // failure reason is surfaced (value-free) with the non-secret
+                // credential id so an operator can distinguish the cases; the
+                // value itself is never logged.
+                let rendered = credential.render().map_err(|error| {
+                    tracing::warn!(
+                        credential_id = %credential.id,
+                        error = %error,
+                        "header credential could not be rendered; blocking request"
+                    );
+                    ViolationAction::Block
+                })?;
                 fields.push((credential.header.clone(), rendered));
             }
         }
@@ -2084,7 +2094,7 @@ impl Http2State {
         if let Some(fields) = credential_fields {
             for (name, value) in fields {
                 headers.retain(|(field_name, _)| !field_name.eq_ignore_ascii_case(name.as_bytes()));
-                headers.push((name.into_bytes(), value.as_bytes().to_vec()));
+                headers.push((name.into_bytes(), value.expose_secret().as_bytes().to_vec()));
             }
             enforce_http2_header_limits(&headers)?;
         }
@@ -2913,7 +2923,7 @@ fn check_credential_http1_grammar(
 /// every other byte of the request head exactly.
 fn set_credential_fields_in_head(
     head: &[u8],
-    fields: &[(String, Zeroizing<String>)],
+    fields: &[(String, SecretString)],
 ) -> Result<Vec<u8>, ViolationAction> {
     let Some(stripped) = head.strip_suffix(b"\r\n\r\n") else {
         return Err(ViolationAction::Block);
@@ -2950,7 +2960,7 @@ fn set_credential_fields_in_head(
     for (name, value) in fields {
         output.extend_from_slice(name.as_bytes());
         output.extend_from_slice(b": ");
-        output.extend_from_slice(value.as_bytes());
+        output.extend_from_slice(value.expose_secret().as_bytes());
         output.extend_from_slice(b"\r\n");
     }
     output.extend_from_slice(b"\r\n");
@@ -6951,9 +6961,9 @@ mod tests {
 
         let value = "a".repeat(8 * 1024);
         let mut first = first;
-        first.value = Zeroizing::new(value.clone());
+        first.value = SecretString::new(value.clone());
         let mut second = second;
-        second.value = Zeroizing::new(value);
+        second.value = SecretString::new(value);
 
         let prefix = "GET /v1 HTTP/1.1\r\nHost: api.example.com\r\n";
         // Leaves room for one rendered field but not two.

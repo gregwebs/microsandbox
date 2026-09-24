@@ -2150,6 +2150,61 @@ pub struct DurableHeaderCredential {
     pub format: String,
 }
 
+/// A plaintext string that wipes itself on drop and redacts itself in [`Debug`].
+///
+/// This is the launch-wire value type for resolved header credentials: the
+/// plaintext is reachable only through [`SecretString::expose_secret`], so every
+/// read is greppable, and there is deliberately no `Display` and no `Deref`/
+/// `DerefMut` implementation. The redaction is a property of the type, so a
+/// containing struct cannot forget to redact it. `Debug` prints `[REDACTED]`.
+///
+/// Serialization is transparent (`#[serde(transparent)]`): on the private
+/// launch-config fd a `SecretString` is exactly a JSON string, byte-identical to
+/// the previous `Zeroizing<String>` representation.
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct SecretString(Zeroizing<String>);
+
+impl SecretString {
+    /// Wrap `value`, taking ownership so the plaintext is wiped on drop.
+    pub fn new(value: impl Into<String>) -> Self {
+        Self(Zeroizing::new(value.into()))
+    }
+
+    /// Borrow the plaintext.
+    ///
+    /// Deliberately named so that every read of a secret is easy to audit by
+    /// grepping for `expose_secret`.
+    pub fn expose_secret(&self) -> &str {
+        self.0.as_str()
+    }
+}
+
+impl From<String> for SecretString {
+    fn from(value: String) -> Self {
+        Self::new(value)
+    }
+}
+
+impl From<&str> for SecretString {
+    fn from(value: &str) -> Self {
+        Self::new(value)
+    }
+}
+
+impl From<Zeroizing<String>> for SecretString {
+    fn from(value: Zeroizing<String>) -> Self {
+        Self(value)
+    }
+}
+
+// The whole point of the newtype: redaction cannot be forgotten by a caller.
+impl fmt::Debug for SecretString {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("[REDACTED]")
+    }
+}
+
 /// A single secret entry.
 ///
 /// `value` is the sensitive material — it never enters the sandbox and is
@@ -3956,5 +4011,53 @@ mod tests {
             !nested.contains("SENTINEL"),
             "nested Debug leaked: {nested}"
         );
+    }
+
+    #[test]
+    fn secret_string_debug_is_redacted() {
+        let secret = SecretString::new("SENTINEL-sk-live-42".to_string());
+        let rendered = format!("{secret:?}");
+        assert_eq!(rendered, "[REDACTED]");
+        assert!(
+            !rendered.contains("SENTINEL"),
+            "Debug leaked the value: {rendered}"
+        );
+    }
+
+    #[test]
+    fn secret_string_reads_only_through_the_accessor() {
+        let secret = SecretString::new("sk-live-42".to_string());
+        assert_eq!(secret.expose_secret(), "sk-live-42");
+    }
+
+    #[test]
+    fn secret_string_serde_round_trips_as_a_plain_string() {
+        let secret = SecretString::new("sk-live-42".to_string());
+        let json = serde_json::to_string(&secret).unwrap();
+        assert_eq!(json, "\"sk-live-42\"");
+        let back: SecretString = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.expose_secret(), "sk-live-42");
+    }
+
+    /// The wire form must stay byte-identical to the previous
+    /// `Zeroizing<String>` representation, so `#[serde(transparent)]` is
+    /// load-bearing: a struct whose only field is a `SecretString` serializes
+    /// exactly like the same struct with a `Zeroizing<String>` field.
+    #[test]
+    fn secret_string_json_bytes_match_the_previous_representation() {
+        #[derive(Serialize)]
+        struct With(Zeroizing<String>);
+        #[derive(Serialize)]
+        struct WithSecret(SecretString);
+
+        let raw = With(Zeroizing::new("sk-live-42".to_string()));
+        let wrapped = WithSecret(SecretString::new("sk-live-42"));
+        assert_eq!(
+            serde_json::to_vec(&raw).unwrap(),
+            serde_json::to_vec(&wrapped).unwrap()
+        );
+        // A newtype struct over a transparent wrapper is a plain JSON string,
+        // exactly as `Zeroizing<String>` was.
+        assert_eq!(serde_json::to_vec(&wrapped).unwrap(), br#""sk-live-42""#);
     }
 }

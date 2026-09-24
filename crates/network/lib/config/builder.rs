@@ -326,9 +326,16 @@ impl NetworkBuilder {
         mut self,
         f: impl FnOnce(HeaderCredentialBuilder) -> HeaderCredentialBuilder,
     ) -> Self {
-        let credential = f(HeaderCredentialBuilder::new()).build();
-        self.config.tls.enabled = true;
-        self.config.secrets.header_credentials.push(credential);
+        // Like the other nested builders, a missing required field is pushed as
+        // a `BuildError` and surfaced by `NetworkBuilder::build`; the config is
+        // left untouched (no TLS enable, no credential) on failure.
+        match f(HeaderCredentialBuilder::new()).build() {
+            Ok(credential) => {
+                self.config.tls.enabled = true;
+                self.config.secrets.header_credentials.push(credential);
+            }
+            Err(err) => self.errors.push(err),
+        }
         self
     }
 
@@ -931,29 +938,28 @@ impl HeaderCredentialBuilder {
 
     /// Consume the builder and return the credential.
     ///
-    /// # Panics
-    /// Panics if any required field (`id`, `reference`, `origin`, `header`,
-    /// `format`) was not set, matching [`SecretBuilder`]'s contract. Real
-    /// checking is [`SecretsConfig::validate`](microsandbox_types::SecretsConfig::validate).
-    pub fn build(self) -> DurableHeaderCredential {
-        DurableHeaderCredential {
-            id: self.id.expect("HeaderCredentialBuilder: .id() is required"),
-            reference: self
-                .reference
-                .expect("HeaderCredentialBuilder: .reference() is required"),
+    /// Returns [`BuildError::HeaderCredentialFieldMissing`] naming the first
+    /// required field (`id`, `reference`, `origin`, `header`, `format`) that was
+    /// not set, so a caller — including [`NetworkBuilder::header_credential`] —
+    /// surfaces a typed error instead of panicking. Real value-grammar checking
+    /// is [`SecretsConfig::validate`](microsandbox_types::SecretsConfig::validate).
+    pub fn build(self) -> Result<DurableHeaderCredential, BuildError> {
+        let miss = |field| BuildError::HeaderCredentialFieldMissing { field };
+        let id = self.id.ok_or_else(|| miss("id"))?;
+        let reference = self.reference.ok_or_else(|| miss("reference"))?;
+        let origin_host = self.origin_host.ok_or_else(|| miss("origin"))?;
+        let header = self.header.ok_or_else(|| miss("header"))?;
+        let format = self.format.ok_or_else(|| miss("format"))?;
+        Ok(DurableHeaderCredential {
+            id,
+            reference,
             origin: HttpsOrigin {
-                host: self
-                    .origin_host
-                    .expect("HeaderCredentialBuilder: .origin() is required"),
+                host: origin_host,
                 port: self.origin_port,
             },
-            header: self
-                .header
-                .expect("HeaderCredentialBuilder: .header() is required"),
-            format: self
-                .format
-                .expect("HeaderCredentialBuilder: .format() is required"),
-        }
+            header,
+            format,
+        })
     }
 }
 
@@ -1275,6 +1281,82 @@ mod tests {
         assert!(with_credential.tls.enabled);
         assert!(with_credential.secrets.secrets.is_empty());
         assert_eq!(with_credential.secrets.header_credentials.len(), 1);
+    }
+
+    /// A missing required field is a typed `BuildError`, not a panic. This is
+    /// the exact code path that used to `expect()` (and panic) per field.
+    #[test]
+    fn header_credential_builder_reports_a_missing_field_instead_of_panicking() {
+        let err = HeaderCredentialBuilder::new()
+            .id("anthropic")
+            .build()
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            BuildError::HeaderCredentialFieldMissing { field: "reference" }
+        ));
+    }
+
+    /// `NetworkBuilder::build` surfaces the missing field as a `BuildError`
+    /// rather than panicking inside `header_credential`, for every required
+    /// field.
+    #[test]
+    fn network_builder_surfaces_a_missing_header_credential_field() {
+        let cases: [(&str, fn(HeaderCredentialBuilder) -> HeaderCredentialBuilder); 5] = [
+            ("id", |c| {
+                c.reference("r")
+                    .origin("api.anthropic.com", 443)
+                    .header("x-api-key")
+                    .format("%s")
+            }),
+            ("reference", |c| {
+                c.id("anthropic")
+                    .origin("api.anthropic.com", 443)
+                    .header("x-api-key")
+                    .format("%s")
+            }),
+            ("origin", |c| {
+                c.id("anthropic")
+                    .reference("r")
+                    .header("x-api-key")
+                    .format("%s")
+            }),
+            ("header", |c| {
+                c.id("anthropic")
+                    .reference("r")
+                    .origin("api.anthropic.com", 443)
+                    .format("%s")
+            }),
+            ("format", |c| {
+                c.id("anthropic")
+                    .reference("r")
+                    .origin("api.anthropic.com", 443)
+                    .header("x-api-key")
+            }),
+        ];
+        for (field, configure) in cases {
+            let err = NetworkBuilder::new()
+                .header_credential(configure)
+                .build()
+                .unwrap_err();
+            assert!(
+                matches!(err, BuildError::HeaderCredentialFieldMissing { field: f } if f == field),
+                "expected missing `{field}`, got {err:?}"
+            );
+        }
+    }
+
+    /// A failed `header_credential` must not mutate the config: no TLS enable
+    /// and no credential are applied, only the accumulated error.
+    #[test]
+    fn failed_header_credential_does_not_mutate_the_config() {
+        let builder = NetworkBuilder::new().header_credential(|c| c.id("anthropic"));
+        assert!(
+            !builder.config.tls.enabled,
+            "TLS must not be enabled when the credential is invalid"
+        );
+        assert!(builder.config.secrets.header_credentials.is_empty());
+        assert_eq!(builder.errors.len(), 1);
     }
 
     #[test]

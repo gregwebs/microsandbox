@@ -2542,7 +2542,7 @@ mod tests {
         let resolved =
             crate::sandbox::config::resolve_header_credentials(&updated, Some(&CanaryResolver))
                 .unwrap();
-        assert_eq!(resolved[0].value.as_str(), CANARY);
+        assert_eq!(resolved[0].value.expose_secret(), CANARY);
 
         let model = sandbox_entity::ActiveModel {
             name: Set(updated.spec.name.clone()),

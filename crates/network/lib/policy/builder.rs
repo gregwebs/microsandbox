@@ -107,6 +107,15 @@ pub enum BuildError {
     #[error("header credentials require TLS interception; enable tls in the network config")]
     HeaderCredentialRequiresTls,
 
+    /// A header-credential builder was built without a required field.
+    #[error(
+        "header credential: {field} is required; call .{field}() before building the credential"
+    )]
+    HeaderCredentialFieldMissing {
+        /// Name of the required field that was not set.
+        field: &'static str,
+    },
+
     /// `.domain(&str)` or `.domain_suffix(&str)` received a value that
     /// doesn't parse as a [`DomainName`].
     #[error("rule #{rule_index}: invalid domain `{raw}`: {source}")]

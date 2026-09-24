@@ -2067,7 +2067,7 @@ mod tests {
 
         let resolved = resolve_header_credentials(&config, Some(&FixedResolver)).unwrap();
         assert_eq!(resolved.len(), 1);
-        assert_eq!(resolved[0].value.as_str(), "sk-secret");
+        assert_eq!(resolved[0].value.expose_secret(), "sk-secret");
         // The launch-only wire form does carry the value.
         let wire = serde_json::to_string(&resolved).unwrap();
         assert!(wire.contains("sk-secret"), "{wire}");

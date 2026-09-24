@@ -2246,7 +2246,7 @@ mod tests {
             crate::sandbox::config::resolve_header_credentials(&config, Some(&CanaryResolver))
                 .unwrap();
         assert_eq!(resolved.len(), 1);
-        assert_eq!(resolved[0].value.as_str(), RESOLVED_VALUE_CANARY);
+        assert_eq!(resolved[0].value.expose_secret(), RESOLVED_VALUE_CANARY);
 
         // Arbitrary durable serialization keeps the reference only.
         let json = serde_json::to_string(&config).unwrap();
