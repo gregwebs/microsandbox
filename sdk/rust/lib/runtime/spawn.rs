@@ -261,17 +261,40 @@ impl Drop for StdioInheritGuard {
 }
 
 //--------------------------------------------------------------------------------------------------
+// Constants
+//--------------------------------------------------------------------------------------------------
+
+/// Bound for the private config handoff plus the child's startup line.
+///
+/// A child that never drains the launch-config pipe, or that exits without
+/// reporting startup, must not leave the launcher waiting forever with a live
+/// VM process behind it.
+const STARTUP_HANDOFF_BUDGET: std::time::Duration = std::time::Duration::from_secs(30);
+
+//--------------------------------------------------------------------------------------------------
 // Functions
 //--------------------------------------------------------------------------------------------------
 
 /// Verify the installed `msb` binary advertises header-credential launch support.
 ///
 /// Runs a lightweight, no-VM-boot probe against the exact binary the SDK is
-/// about to spawn and requires the fixed `header-credential-launch-v1` token on
-/// stdout with a zero exit status. An older binary lacks the subcommand, so
-/// `clap` exits non-zero and the probe fails closed. The probe is repeated just
-/// before resolution at spawn time; a same-uid adversary that swaps the binary
-/// between the two probes is out of scope (see the issue's threat model).
+/// about to spawn and requires the fixed `header-credential-launch-v1` token as
+/// the *complete* stdout of a zero-exit run. An older binary lacks the
+/// subcommand, so `clap` exits non-zero and the probe fails closed; a binary
+/// that prints anything else (including a supported token among other lines)
+/// is refused as a broken protocol rather than parsed generously.
+///
+/// # Threat model
+///
+/// This is a **compatibility** guard, not an atomic anti-tampering check. It is
+/// called before the local DB record is written and again immediately before
+/// the launch config is resolved, but it does not compare file identity between
+/// the probe and the subsequent exec, so a *same-UID* adversary that replaces
+/// the resolved `msb` between the two probes is not detected. That adversary is
+/// outside this project's stated threat model (the host OS and other same-UID
+/// processes are trusted; the guest cannot read host memory or FDs). Closing
+/// that window would require `fexecve`-style pinning of one opened file or a
+/// signed-binary digest policy, which this change does not claim.
 pub(crate) async fn ensure_header_credential_launch_capability(
     msb_path: &Path,
 ) -> MicrosandboxResult<()> {
@@ -295,16 +318,71 @@ pub(crate) async fn ensure_header_credential_launch_capability(
             crate::HeaderCredentialError::RuntimeCapabilityMissing,
         ));
     }
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    if stdout
-        .lines()
-        .any(|line| line.trim() == microsandbox_types::HEADER_CREDENTIAL_LAUNCH_CAPABILITY)
+    // Exact protocol: stdout is the capability token and nothing else. Any
+    // other content means an unknown or malformed binary, not a capability.
+    let stdout = std::str::from_utf8(&output.stdout).map_err(|_| {
+        crate::MicrosandboxError::HeaderCredential(crate::HeaderCredentialError::RuntimeProbeFailed)
+    })?;
+    if stdout.trim_end_matches(['\r', '\n'])
+        == microsandbox_types::HEADER_CREDENTIAL_LAUNCH_CAPABILITY
     {
         Ok(())
     } else {
         Err(crate::MicrosandboxError::HeaderCredential(
             crate::HeaderCredentialError::RuntimeCapabilityMissing,
         ))
+    }
+}
+
+/// Owns the freshly-spawned sandbox child until startup succeeds.
+///
+/// Dropping the launcher future (task cancellation) or returning early during
+/// the private config handoff and startup wait must not leave an unreported VM
+/// process behind, so the guard kills the child on drop. [`Self::disarm`]
+/// transfers ownership to the returned [`ProcessHandle`] on success; this is
+/// deliberately explicit instead of `Command::kill_on_drop(true)`, which cannot
+/// be disarmed and would kill a live (including detached) sandbox when the
+/// process handle is later dropped.
+///
+/// [`ProcessHandle`]: crate::runtime::handle::ProcessHandle
+struct StartupChildGuard {
+    child: Option<tokio::process::Child>,
+}
+
+impl StartupChildGuard {
+    fn new(child: tokio::process::Child) -> Self {
+        Self { child: Some(child) }
+    }
+
+    /// Give up responsibility for the child after a successful startup.
+    fn disarm(mut self) -> tokio::process::Child {
+        self.child
+            .take()
+            .expect("startup child guard already disarmed")
+    }
+}
+
+impl std::ops::Deref for StartupChildGuard {
+    type Target = tokio::process::Child;
+
+    fn deref(&self) -> &Self::Target {
+        self.child.as_ref().expect("startup child guard disarmed")
+    }
+}
+
+impl std::ops::DerefMut for StartupChildGuard {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.child.as_mut().expect("startup child guard disarmed")
+    }
+}
+
+impl Drop for StartupChildGuard {
+    fn drop(&mut self) {
+        if let Some(mut child) = self.child.take()
+            && let Err(error) = child.start_kill()
+        {
+            tracing::debug!(error = %error, "failed to kill sandbox child during startup teardown");
+        }
     }
 }
 
@@ -702,7 +780,7 @@ pub async fn spawn_sandbox(
         };
 
         match cmd.spawn() {
-            Ok(child) => child,
+            Ok(child) => StartupChildGuard::new(child),
             Err(err) => {
                 release_metrics_reservation(config, metrics_reservation.as_ref());
                 return Err(err.into());
@@ -721,17 +799,6 @@ pub async fn spawn_sandbox(
     };
     tracing::debug!(pid = _pid, sandbox = %config.spec.name, "spawn_sandbox: process started");
 
-    // Complete the private config handoff. For the macOS/other-Unix pipe this
-    // writes the launch JSON and closes the write end so the child's
-    // read-to-end terminates; a short/failed write kills the child rather than
-    // leaving it waiting for a config that never arrives.
-    #[cfg(unix)]
-    if let Err(err) = config_handoff.finish().await {
-        let _ = child.start_kill();
-        release_metrics_reservation(config, metrics_reservation.as_ref());
-        return Err(err);
-    }
-
     #[cfg(windows)]
     if let Some(job) = &child_job
         && let Err(err) = job.assign_pid(_pid)
@@ -743,24 +810,30 @@ pub async fn spawn_sandbox(
         )));
     }
 
-    let line = match tokio::time::timeout(
-        std::time::Duration::from_secs(30),
-        read_startup_line(&mut child, startup_pipe),
+    // Complete the private config handoff *and* read the startup line under one
+    // bounded budget. For the macOS/other-Unix pipe this writes the launch JSON
+    // and closes the write end so the child's read-to-end terminates; a child
+    // that never drains the pipe must refuse rather than hang the launcher, and
+    // a short/failed write kills the child rather than leaving it waiting for a
+    // config that never arrives.
+    #[cfg(unix)]
+    let startup_result = finish_config_handoff_and_read_startup(
+        config_handoff,
+        &mut child,
+        startup_pipe,
+        STARTUP_HANDOFF_BUDGET,
     )
-    .await
-    {
-        Ok(Ok(line)) => line,
-        Ok(Err(err)) => {
+    .await;
+    #[cfg(windows)]
+    let startup_result =
+        read_startup_line_bounded(&mut child, startup_pipe, STARTUP_HANDOFF_BUDGET).await;
+
+    let line = match startup_result {
+        Ok(line) => line,
+        Err(err) => {
             terminate_startup_process(&mut child).await;
             release_metrics_reservation(config, metrics_reservation.as_ref());
             return Err(err);
-        }
-        Err(_) => {
-            terminate_startup_process(&mut child).await;
-            release_metrics_reservation(config, metrics_reservation.as_ref());
-            return Err(crate::MicrosandboxError::Runtime(
-                "sandbox startup timeout: no JSON received within 30 seconds".into(),
-            ));
         }
     };
 
@@ -795,6 +868,10 @@ pub async fn spawn_sandbox(
         agent_sock = %agent_sock_path.display(),
         "spawn_sandbox: startup JSON received"
     );
+
+    // Startup completed: hand the live child to the process handle. Dropping
+    // the guard after this point must not kill the sandbox.
+    let child = child.disarm();
 
     #[cfg(unix)]
     let handle = ProcessHandle::new(
@@ -1314,6 +1391,50 @@ async fn write_all_nonblocking(write_fd: OwnedFd, bytes: &[u8]) -> MicrosandboxR
     }
     // Dropping `async_fd` closes the write end, producing EOF for the child.
     Ok(())
+}
+
+/// Complete the private config handoff and read the startup line under one
+/// bounded budget.
+///
+/// Returns the timeout error (rather than waiting forever) when a spawned child
+/// never drains the launch-config pipe or never reports startup.
+#[cfg(unix)]
+async fn finish_config_handoff_and_read_startup(
+    handoff: ConfigHandoff,
+    child: &mut tokio::process::Child,
+    startup_pipe: Option<Pipe>,
+    budget: std::time::Duration,
+) -> MicrosandboxResult<String> {
+    match tokio::time::timeout(budget, async {
+        handoff.finish().await?;
+        read_startup_line(child, startup_pipe).await
+    })
+    .await
+    {
+        Ok(result) => result,
+        Err(_) => Err(crate::MicrosandboxError::Runtime(
+            "sandbox startup timeout: private config handoff or startup JSON did not complete \
+             within the startup budget"
+                .into(),
+        )),
+    }
+}
+
+/// Read the child's startup line under a bounded budget (Windows has no
+/// config-handoff step, only startup-file handoff).
+#[cfg(windows)]
+async fn read_startup_line_bounded(
+    child: &mut tokio::process::Child,
+    startup_pipe: Option<StartupPipe>,
+    budget: std::time::Duration,
+) -> MicrosandboxResult<String> {
+    match tokio::time::timeout(budget, read_startup_line(child, startup_pipe)).await {
+        Ok(result) => result,
+        Err(_) => Err(crate::MicrosandboxError::Runtime(
+            "sandbox startup timeout: startup JSON did not complete within the startup budget"
+                .into(),
+        )),
+    }
 }
 
 /// Serialize the [`LaunchConfig`] as JSON to a short-lived named file for Windows.
@@ -3690,6 +3811,83 @@ mod tests {
             ]));
     }
 
+    /// Operator-visible argv carries only labels and FD numbers: a
+    /// credential-bearing config must not put a reference or (via the launch
+    /// wire) a resolved value on the process argv.
+    ///
+    /// Mutation note: moving `resolved_header_credentials` (or the durable
+    /// reference) into the `visible` argv vector makes this test fail.
+    #[tokio::test]
+    async fn test_sandbox_cli_args_never_carry_a_credential_value() {
+        use microsandbox_network::config::NetworkBuilder;
+
+        let network = NetworkBuilder::new()
+            .header_credential(|credential| {
+                credential
+                    .id("example")
+                    .reference("example-api-key")
+                    .origin("api.example.com", 443)
+                    .header("x-api-key")
+                    .format("%s")
+            })
+            .build()
+            .unwrap();
+
+        let mut config = SandboxBuilder::new("argv-credentials")
+            .image("/tmp/rootfs")
+            .build()
+            .await
+            .unwrap();
+        config.set_local_network_config(network).unwrap();
+
+        let local = test_local_backend();
+        let (visible, launch) = sandbox_cli_args(
+            &local,
+            &config,
+            42,
+            Path::new("/tmp/msb.db"),
+            30,
+            Path::new("/tmp/logs"),
+            Path::new("/tmp/runtime"),
+            Path::new("/tmp/agent.sock"),
+            Path::new("/tmp/libkrunfw.dylib"),
+            &HashMap::new(),
+            &HashMap::new(),
+            None,
+            None,
+            None,
+            None,
+        );
+
+        let rendered: Vec<String> = visible
+            .iter()
+            .map(|argument| argument.to_string_lossy().into_owned())
+            .collect();
+        for argument in &rendered {
+            assert!(
+                !argument.contains("example-api-key"),
+                "the durable reference must not be on argv: {argument}"
+            );
+            assert!(
+                !argument.contains("sk-live"),
+                "no credential value may be on argv: {argument}"
+            );
+        }
+        // The private channel is named by FD number on argv (pushed in
+        // `spawn_sandbox` once the handoff exists); nothing credential-shaped is.
+        assert!(
+            !rendered
+                .iter()
+                .any(|argument| argument.contains("api.example.com")),
+            "the credential origin must not be on argv: {rendered:?}"
+        );
+        // The launch wire carries the durable reference for the child, and never
+        // a value (values are assigned in `spawn_sandbox` after resolution).
+        let wire = serde_json::to_string(&launch.network).unwrap();
+        assert!(wire.contains("example-api-key"), "{wire}");
+        assert!(launch.resolved_header_credentials.is_empty());
+    }
+
     #[tokio::test]
     async fn test_sandbox_cli_args_include_detached_startup_command() {
         let config = SandboxBuilder::new("test")
@@ -5408,5 +5606,362 @@ mod config_handoff_tests {
         assert_eq!(stat.st_mode & libc::S_IFMT, libc::S_IFREG);
 
         handoff.finish().await.unwrap();
+    }
+
+    /// The inherited config source can land on any reserved FD (96–99) in a
+    /// busy launcher. Relocation must happen before the sibling mappings
+    /// `dup2` onto those numbers, the parent's writer must be CLOEXEC so an
+    /// exec'd child never retains a write end, and closing the parent writer
+    /// must produce EOF for the child's read-to-end.
+    ///
+    /// Mutation note: removing the `move_reserved_source_fd` call lets
+    /// `dup2(/dev/null, 97..99)` clobber the source, so the mapped config is
+    /// empty or the write fails. The test then fails within its 20s bound
+    /// (observed: a bounded failure, never a hang); leaving the writer without
+    /// CLOEXEC would instead make the child's read never see EOF.
+    #[cfg(not(target_os = "linux"))]
+    #[tokio::test]
+    async fn config_handoff_survives_forced_reserved_fd_collisions() {
+        use std::process::Stdio;
+
+        use tokio::io::AsyncReadExt;
+
+        for forced in [
+            microsandbox_runtime::vm::CONFIG_FD,
+            microsandbox_runtime::vm::PARENT_WATCH_FD,
+            microsandbox_runtime::vm::STARTUP_FD,
+            microsandbox_runtime::vm::LIFECYCLE_LOCK_FD,
+        ] {
+            let mut launch = LaunchConfig::default();
+            // Comfortably larger than a typical 64 KiB pipe buffer.
+            launch.exec_args = (0..40_000).map(|i| format!("arg-{i:08}")).collect();
+            let expected = serde_json::to_vec(&launch).unwrap();
+
+            let handoff = create_config_handoff(&launch).unwrap();
+            let source_fd = handoff.child_fd().as_raw_fd();
+            let ConfigHandoff {
+                read_fd,
+                after_spawn,
+            } = handoff;
+            let AfterSpawn::Pipe { write_fd, bytes } = after_spawn else {
+                panic!("this assertion requires the pipe handoff");
+            };
+            let writer_flags = unsafe { libc::fcntl(write_fd.as_raw_fd(), libc::F_GETFD) };
+            assert!(
+                writer_flags >= 0 && writer_flags & libc::FD_CLOEXEC != 0,
+                "the parent config writer must be CLOEXEC"
+            );
+
+            let mut cmd = tokio::process::Command::new("/bin/cat");
+            cmd.stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::null());
+            // SAFETY: the closure only performs `dup2`/`fcntl`/`close`/`open`
+            // syscalls, which are async-signal-safe.
+            unsafe {
+                cmd.pre_exec(move || {
+                    // Force the inherited source onto the reserved FD under test,
+                    // reproducing a launcher whose own descriptors collided.
+                    if libc::dup2(source_fd, forced) < 0 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                    if source_fd != forced && libc::close(source_fd) < 0 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+
+                    let mut config_mapping =
+                        InheritedFdMapping::new(forced, microsandbox_runtime::vm::CONFIG_FD);
+                    let mut next_spare_fd = microsandbox_runtime::vm::LIFECYCLE_LOCK_FD + 1;
+                    move_reserved_source_fd(&mut config_mapping, &mut next_spare_fd)?;
+
+                    // Stand in for the sibling mapped descriptors landing on the
+                    // other reserved numbers.
+                    let devnull = libc::open(c"/dev/null".as_ptr(), libc::O_RDONLY);
+                    if devnull < 0 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                    for dst in [
+                        microsandbox_runtime::vm::PARENT_WATCH_FD,
+                        microsandbox_runtime::vm::STARTUP_FD,
+                        microsandbox_runtime::vm::LIFECYCLE_LOCK_FD,
+                    ] {
+                        if libc::dup2(devnull, dst) < 0 {
+                            return Err(std::io::Error::last_os_error());
+                        }
+                    }
+
+                    dup_inherited_fd(config_mapping.src, config_mapping.dst)?;
+                    // `/bin/cat` reads stdin, so put the mapped config there.
+                    if libc::dup2(microsandbox_runtime::vm::CONFIG_FD, 0) < 0 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                    Ok(())
+                });
+            }
+
+            let mut child = cmd.spawn().expect("spawn /bin/cat");
+            let mut stdout = child.stdout.take().expect("piped stdout");
+
+            // Drain the child's stdout *while* the handoff is written: the child
+            // copies stdin to stdout, so a payload larger than either pipe
+            // buffer only makes progress when both directions move. Waiting for
+            // the write before reading the child's output deadlocks.
+            let reader = async move {
+                let mut out = Vec::new();
+                stdout.read_to_end(&mut out).await.map(|_| out)
+            };
+            let writer = async move {
+                ConfigHandoff {
+                    read_fd,
+                    after_spawn: AfterSpawn::Pipe { write_fd, bytes },
+                }
+                .finish()
+                .await
+            };
+            let (write_result, read_result) =
+                tokio::time::timeout(std::time::Duration::from_secs(20), async {
+                    tokio::join!(writer, reader)
+                })
+                .await
+                .expect(
+                    "the config handoff must make progress: a stalled child or a lost EOF \
+                 must fail here instead of hanging",
+                );
+
+            write_result.unwrap();
+            let out = read_result.unwrap();
+            assert_eq!(
+                out, expected,
+                "forced reserved fd {forced} lost the handoff payload"
+            );
+            let _ = child.wait().await;
+        }
+    }
+}
+
+//--------------------------------------------------------------------------------------------------
+// Tests: Startup child teardown
+//--------------------------------------------------------------------------------------------------
+
+#[cfg(all(test, unix))]
+mod startup_guard_tests {
+    use std::time::Duration;
+
+    use super::*;
+
+    fn spawn_sleeper() -> tokio::process::Child {
+        tokio::process::Command::new("/bin/sleep")
+            .arg("60")
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn /bin/sleep")
+    }
+
+    fn process_is_running(pid: i32) -> bool {
+        let alive = unsafe { libc::kill(pid, 0) };
+        alive == 0
+    }
+
+    /// Wait until `pid` is gone (reaped or already reaped elsewhere).
+    async fn wait_until_gone(pid: i32) {
+        for _ in 0..400 {
+            let mut status = 0;
+            let reaped = unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) };
+            if reaped == pid {
+                return;
+            }
+            if reaped < 0 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ECHILD) {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!("child {pid} still alive after startup teardown");
+    }
+
+    /// Mutation note: deleting `StartupChildGuard`'s `Drop` impl (holding a
+    /// bare `tokio::process::Child`) leaves the VM process running after a
+    /// cancelled launcher future.
+    #[tokio::test]
+    async fn dropping_the_startup_guard_kills_the_spawned_child() {
+        let child = spawn_sleeper();
+        let pid = child.id().expect("child pid") as i32;
+        assert!(process_is_running(pid));
+
+        // Cancellation/early return drops the guard. A plain `Child` would
+        // merely stop waiting; the guard must terminate the process.
+        drop(StartupChildGuard::new(child));
+
+        wait_until_gone(pid).await;
+    }
+
+    /// The success path hands the live child to the `ProcessHandle`, so a
+    /// detached sandbox must not be killed by startup teardown.
+    #[tokio::test]
+    async fn disarming_the_startup_guard_leaves_the_child_alive() {
+        let child = spawn_sleeper();
+        let pid = child.id().expect("child pid") as i32;
+
+        let mut child = StartupChildGuard::new(child).disarm();
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(
+            process_is_running(pid),
+            "a disarmed (successfully started) child must survive"
+        );
+
+        let _ = child.start_kill();
+        let _ = child.wait().await;
+    }
+
+    /// A child that never drains the launch-config pipe must time out rather
+    /// than wait forever, and the caller's teardown must kill it.
+    ///
+    /// Mutation note: dropping the `tokio::time::timeout` wrapper in
+    /// `finish_config_handoff_and_read_startup` makes this test hang instead of
+    /// reporting the bounded timeout.
+    #[cfg(not(target_os = "linux"))]
+    #[tokio::test]
+    async fn config_handoff_is_bounded_when_the_child_never_drains() {
+        let mut launch = LaunchConfig::default();
+        launch.exec_args = (0..40_000).map(|i| format!("arg-{i:08}")).collect();
+        let handoff = create_config_handoff(&launch).unwrap();
+
+        // The pipe hold-back is the parent's own unread read end for this
+        // child (never mapped), plus a payload larger than the pipe buffer.
+        let child = spawn_sleeper();
+        let pid = child.id().expect("child pid") as i32;
+        let mut guard = StartupChildGuard::new(child);
+
+        let result = finish_config_handoff_and_read_startup(
+            handoff,
+            &mut guard,
+            None,
+            Duration::from_millis(150),
+        )
+        .await;
+
+        match result {
+            Err(crate::MicrosandboxError::Runtime(message)) => {
+                assert!(message.contains("startup timeout"), "got: {message}");
+            }
+            other => panic!("expected a bounded startup timeout, got {other:?}"),
+        }
+
+        drop(guard);
+        wait_until_gone(pid).await;
+    }
+}
+
+//--------------------------------------------------------------------------------------------------
+// Tests: Installed-binary capability probe
+//--------------------------------------------------------------------------------------------------
+
+#[cfg(all(test, unix))]
+mod capability_probe_tests {
+    use std::os::unix::fs::PermissionsExt;
+    use std::path::{Path, PathBuf};
+
+    use super::*;
+
+    fn stub_msb(dir: &Path, name: &str, script: &str) -> PathBuf {
+        let path = dir.join(name);
+        std::fs::write(&path, format!("#!/bin/sh\n{script}\n")).unwrap();
+        let mut permissions = std::fs::metadata(&path).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&path, permissions).unwrap();
+        path
+    }
+
+    fn assert_capability_missing(error: crate::MicrosandboxError) {
+        assert!(
+            matches!(
+                error,
+                crate::MicrosandboxError::HeaderCredential(
+                    crate::HeaderCredentialError::RuntimeCapabilityMissing
+                )
+            ),
+            "expected RuntimeCapabilityMissing, got {error:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn probe_accepts_a_supported_binary() {
+        let temp = tempfile::tempdir().unwrap();
+        let stub = stub_msb(
+            temp.path(),
+            "msb-supported",
+            &format!(
+                "printf '%s\\n' {}",
+                microsandbox_types::HEADER_CREDENTIAL_LAUNCH_CAPABILITY
+            ),
+        );
+        ensure_header_credential_launch_capability(&stub)
+            .await
+            .unwrap();
+    }
+
+    /// An older `msb` lacks the hidden subcommand entirely.
+    #[tokio::test]
+    async fn probe_rejects_an_old_binary() {
+        let temp = tempfile::tempdir().unwrap();
+        let stub = stub_msb(
+            temp.path(),
+            "msb-old",
+            "echo 'error: unrecognized subcommand' >&2; exit 2",
+        );
+        let error = ensure_header_credential_launch_capability(&stub)
+            .await
+            .unwrap_err();
+        assert_capability_missing(error);
+    }
+
+    /// The probe is an exact protocol: a token among other output is not a
+    /// capability.
+    #[tokio::test]
+    async fn probe_rejects_extra_or_missing_stdout() {
+        let temp = tempfile::tempdir().unwrap();
+        let token = microsandbox_types::HEADER_CREDENTIAL_LAUNCH_CAPABILITY;
+
+        let noisy = stub_msb(
+            temp.path(),
+            "msb-noisy",
+            &format!("echo 'warning: something'; echo {token}"),
+        );
+        assert_capability_missing(
+            ensure_header_credential_launch_capability(&noisy)
+                .await
+                .unwrap_err(),
+        );
+
+        let silent = stub_msb(temp.path(), "msb-silent", "exit 0");
+        assert_capability_missing(
+            ensure_header_credential_launch_capability(&silent)
+                .await
+                .unwrap_err(),
+        );
+
+        let wrong = stub_msb(temp.path(), "msb-wrong", "echo header-credential-launch-v0");
+        assert_capability_missing(
+            ensure_header_credential_launch_capability(&wrong)
+                .await
+                .unwrap_err(),
+        );
+    }
+
+    /// A non-executable or missing path fails closed rather than being treated
+    /// as supported.
+    #[tokio::test]
+    async fn probe_rejects_a_missing_binary() {
+        let temp = tempfile::tempdir().unwrap();
+        let error = ensure_header_credential_launch_capability(&temp.path().join("absent"))
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            crate::MicrosandboxError::HeaderCredential(
+                crate::HeaderCredentialError::RuntimeProbeFailed
+            )
+        ));
     }
 }

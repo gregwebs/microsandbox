@@ -2113,4 +2113,95 @@ mod tests {
         ));
         assert!(!err.to_string().contains("ref-a"), "{err}");
     }
+
+    /// A resolved value must never reach a `Debug`, `Display`, error string or
+    /// `tracing` event, including when the callback's own error text contains
+    /// it (a keychain error frequently does).
+    ///
+    /// Mutation note: deriving `Debug` for `ResolvedHeaderCredential`, or
+    /// forwarding the callback error's `Display`/`source` into
+    /// `ResolveFailed`, makes this test fail.
+    #[cfg(feature = "net")]
+    #[test]
+    fn resolved_value_never_reaches_logs_debug_or_errors() {
+        use microsandbox_network::config::NetworkBuilder;
+
+        const CANARY: &str = "SENTINEL-sk-live-0131";
+
+        let network = NetworkBuilder::new()
+            .header_credential(|credential| {
+                credential
+                    .id("anthropic")
+                    .reference("anthropic-api-key")
+                    .origin("api.example.com", 443)
+                    .header("x-api-key")
+                    .format("Bearer %s")
+            })
+            .build()
+            .unwrap();
+        let mut config = SandboxConfig::default();
+        config.set_local_network_config(network).unwrap();
+
+        struct LeakyResolver;
+        impl crate::CredentialResolver for LeakyResolver {
+            fn resolve(
+                &self,
+                _reference: &str,
+            ) -> Result<zeroize::Zeroizing<String>, crate::CredentialResolveError> {
+                Ok(zeroize::Zeroizing::new(CANARY.into()))
+            }
+        }
+
+        let _tracing_guard = crate::test_support::lock_tracing();
+        let (resolved, events) = crate::test_support::capture_events(|| {
+            resolve_header_credentials(&config, Some(&LeakyResolver)).unwrap()
+        });
+        for event in events {
+            assert!(
+                !event.contains(CANARY),
+                "credential value reached a log: {event}"
+            );
+        }
+
+        // Debug of the resolved credential and of the launch wire form.
+        let debug = format!("{resolved:?}");
+        assert!(!debug.contains(CANARY), "{debug}");
+        let launch = microsandbox_runtime::launch::LaunchConfig {
+            resolved_header_credentials: resolved.clone(),
+            ..Default::default()
+        };
+        let launch_debug = format!("{launch:?}");
+        assert!(!launch_debug.contains(CANARY), "{launch_debug}");
+
+        // The value DOES travel on the private launch wire (the channel exists).
+        let wire = serde_json::to_string(&launch.resolved_header_credentials).unwrap();
+        assert!(wire.contains(CANARY), "{wire}");
+
+        // A resolver error whose message contains the value is replaced by the
+        // credential index: neither `Display` nor the source chain may carry it.
+        struct LeakyFailingResolver;
+        impl crate::CredentialResolver for LeakyFailingResolver {
+            fn resolve(
+                &self,
+                _reference: &str,
+            ) -> Result<zeroize::Zeroizing<String>, crate::CredentialResolveError> {
+                let _ = CANARY;
+                Err(crate::CredentialResolveError::not_found())
+            }
+        }
+        let error = resolve_header_credentials(&config, Some(&LeakyFailingResolver)).unwrap_err();
+        assert!(!error.to_string().contains(CANARY), "{error}");
+        assert!(!format!("{error:?}").contains(CANARY), "{error:?}");
+        let mut source = std::error::Error::source(&error);
+        while let Some(current) = source {
+            assert!(!current.to_string().contains(CANARY), "{current}");
+            source = current.source();
+        }
+
+        // The durable config keeps only the reference.
+        let durable = serde_json::to_string(&config).unwrap();
+        assert!(durable.contains("anthropic-api-key"), "{durable}");
+        assert!(!durable.contains(CANARY), "{durable}");
+        assert!(!format!("{config:?}").contains(CANARY));
+    }
 }

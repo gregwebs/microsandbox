@@ -1250,6 +1250,64 @@ mod tests {
         assert!(!cfg.dns.rebind_protection);
     }
 
+    /// Adding a header credential must not change egress policy: a credential
+    /// authorizes no route, and `NetworkPolicy` stays byte-identical.
+    #[test]
+    fn header_credential_does_not_change_the_egress_policy() {
+        let baseline = NetworkBuilder::new().build().unwrap();
+        let with_credential = NetworkBuilder::new()
+            .header_credential(|c| {
+                c.id("anthropic")
+                    .reference("anthropic-api-key")
+                    .origin("api.anthropic.com", 443)
+                    .header("x-api-key")
+                    .format("%s")
+            })
+            .build()
+            .unwrap();
+
+        // `NetworkPolicy` intentionally has no `PartialEq`; compare its
+        // serialized form instead of widening the public type.
+        assert_eq!(
+            serde_json::to_string(&baseline.policy).unwrap(),
+            serde_json::to_string(&with_credential.policy).unwrap()
+        );
+        assert!(with_credential.tls.enabled);
+        assert!(with_credential.secrets.secrets.is_empty());
+        assert_eq!(with_credential.secrets.header_credentials.len(), 1);
+    }
+
+    #[test]
+    fn header_credential_refuses_explicitly_disabled_tls_or_network() {
+        // `.header_credential` enables TLS, so disabling it afterwards is the
+        // only builder route to the explicitly-disabled failure.
+        let err = NetworkBuilder::new()
+            .header_credential(|c| {
+                c.id("anthropic")
+                    .reference("anthropic-api-key")
+                    .origin("api.anthropic.com", 443)
+                    .header("x-api-key")
+                    .format("%s")
+            })
+            .tls(|t| t.enabled(false))
+            .build()
+            .unwrap_err();
+        assert!(matches!(err, BuildError::HeaderCredentialRequiresTls));
+
+        let err = NetworkBuilder::new()
+            .enabled(false)
+            .header_credential(|c| {
+                c.id("anthropic")
+                    .reference("anthropic-api-key")
+                    .origin("api.anthropic.com", 443)
+                    .header("x-api-key")
+                    .format("%s")
+            })
+            .build()
+            .unwrap_err();
+        assert!(matches!(err, BuildError::HeaderCredentialRequiresNetwork));
+    }
+
     #[test]
     fn network_builder_rejects_excessive_max_connections() {
         let err = NetworkBuilder::new()

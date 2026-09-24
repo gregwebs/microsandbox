@@ -2491,6 +2491,107 @@ mod tests {
         assert!(stored.spec.labels.is_empty());
     }
 
+    /// The modify persist paths (`config` and `active_config`) must also carry
+    /// the durable reference only: a resolved value is unrepresentable in
+    /// `SandboxConfig`, and this pins that through the real update statements.
+    ///
+    /// Mutation note: a `value` field on the durable credential type (or
+    /// resolving before `persist_config`) puts the canary in the stored JSON
+    /// and fails this test.
+    #[cfg(feature = "net")]
+    #[tokio::test]
+    async fn persist_config_never_stores_a_resolved_credential_value() {
+        use microsandbox_network::config::NetworkBuilder;
+
+        const CANARY: &str = "SENTINEL-sk-live-modify-0131";
+
+        let temp = tempdir().unwrap();
+        let backend: Arc<dyn Backend> = Arc::new(
+            LocalBackend::builder()
+                .home(temp.path())
+                .build()
+                .await
+                .unwrap(),
+        );
+        let pools = backend.as_local().unwrap().db().await.unwrap();
+
+        let network = NetworkBuilder::new()
+            .header_credential(|credential| {
+                credential
+                    .id("example")
+                    .reference("example-api-key")
+                    .origin("api.example.com", 443)
+                    .header("x-api-key")
+                    .format("%s")
+            })
+            .build()
+            .unwrap();
+        let mut updated = config(2, 1024);
+        updated.set_local_network_config(network).unwrap();
+
+        // Prove the canary is a real resolved value for this config.
+        struct CanaryResolver;
+        impl crate::CredentialResolver for CanaryResolver {
+            fn resolve(
+                &self,
+                _reference: &str,
+            ) -> Result<zeroize::Zeroizing<String>, crate::CredentialResolveError> {
+                Ok(zeroize::Zeroizing::new(CANARY.into()))
+            }
+        }
+        let resolved =
+            crate::sandbox::config::resolve_header_credentials(&updated, Some(&CanaryResolver))
+                .unwrap();
+        assert_eq!(resolved[0].value.as_str(), CANARY);
+
+        let model = sandbox_entity::ActiveModel {
+            name: Set(updated.spec.name.clone()),
+            config: Set(serde_json::to_string(&updated).unwrap()),
+            active_config: Set(None),
+            status: Set(SandboxStatus::Stopped),
+            ephemeral: Set(false),
+            created_at: Set(None),
+            updated_at: Set(None),
+            ..Default::default()
+        }
+        .insert(pools.write())
+        .await
+        .unwrap();
+        let sandbox_id = model.id;
+
+        let handle = backend
+            .sandboxes()
+            .get(backend.clone(), &updated.spec.name)
+            .await
+            .unwrap();
+        persist_config(&backend, &handle, &updated).await.unwrap();
+        persist_active_config(&backend, &handle, &updated)
+            .await
+            .unwrap();
+
+        let stored = sandbox_entity::Entity::find_by_id(sandbox_id)
+            .one(pools.read())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            stored.config.contains("example-api-key"),
+            "{}",
+            stored.config
+        );
+        assert!(
+            !stored.config.contains(CANARY),
+            "persist_config stored the resolved value: {}",
+            stored.config
+        );
+        let active = stored.active_config.expect("active_config persisted");
+        assert!(active.contains("example-api-key"), "{active}");
+        assert!(
+            !active.contains(CANARY),
+            "persist_active_config stored the resolved value: {active}"
+        );
+    }
+
     #[test]
     fn running_resource_changes_require_restart_until_live_resize_lands() {
         let patch = SandboxModificationPatch {
