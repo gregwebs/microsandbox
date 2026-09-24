@@ -103,6 +103,10 @@ use crate::{
 #[cfg(unix)]
 static SIGCHLD_ALT_STACK_INIT: tokio::sync::OnceCell<()> = tokio::sync::OnceCell::const_new();
 
+/// Upper bound for reaping a killed startup child. `SIGKILL` terminates the
+/// process immediately; this only bounds the spin-wait on the kernel reaping it.
+const STARTUP_CHILD_REAP_BUDGET: std::time::Duration = std::time::Duration::from_secs(2);
+
 #[cfg(windows)]
 const STARTUP_PIPE_HASH_HEX_LEN: usize = 32;
 #[cfg(target_os = "linux")]
@@ -128,6 +132,54 @@ struct MetricsReservation {
     slot: u32,
     generation: u64,
     registry: MetricsRegistry,
+}
+
+/// Owns a metrics slot reserved for an in-progress launch.
+///
+/// The slot must be returned on *every* exit path, including task cancellation
+/// (dropping the `spawn_sandbox` future), so the release lives in `Drop` rather
+/// than in a web of early-return calls that a cancelled future never reaches.
+/// [`Self::disarm`] transfers ownership to the launched `ProcessHandle` on
+/// success; the handle then owns the release for the sandbox's lifetime.
+struct MetricsReservationGuard {
+    sandbox_name: String,
+    reservation: Option<MetricsReservation>,
+}
+
+impl MetricsReservationGuard {
+    fn new(sandbox_name: String, reservation: Option<MetricsReservation>) -> Self {
+        Self {
+            sandbox_name,
+            reservation,
+        }
+    }
+
+    fn reservation(&self) -> Option<&MetricsReservation> {
+        self.reservation.as_ref()
+    }
+
+    /// Give up responsibility for the slot after a successful startup.
+    fn disarm(mut self) -> Option<MetricsReservation> {
+        self.reservation.take()
+    }
+}
+
+impl Drop for MetricsReservationGuard {
+    fn drop(&mut self) {
+        let Some(reservation) = self.reservation.take() else {
+            return;
+        };
+        if let Err(err) = reservation
+            .registry
+            .release_reserved(reservation.slot, reservation.generation)
+        {
+            tracing::debug!(
+                error = %err,
+                sandbox = %self.sandbox_name,
+                "release: metrics slot release failed"
+            );
+        }
+    }
 }
 
 #[cfg(unix)]
@@ -378,10 +430,38 @@ impl std::ops::DerefMut for StartupChildGuard {
 
 impl Drop for StartupChildGuard {
     fn drop(&mut self) {
-        if let Some(mut child) = self.child.take()
-            && let Err(error) = child.start_kill()
-        {
+        let Some(mut child) = self.child.take() else {
+            return;
+        };
+        if let Err(error) = child.start_kill() {
             tracing::debug!(error = %error, "failed to kill sandbox child during startup teardown");
+        }
+        // Reap deterministically instead of leaving it to the runtime's
+        // opportunistic orphan queue (Tokio's reaper only reaps opportunistically
+        // via SIGCHLD). A cancelled launcher must not leave a zombie — or, worse,
+        // a live VM — behind. `SIGKILL` terminates the process immediately, so
+        // this loop normally reaps on the first `try_wait`.
+        let deadline = std::time::Instant::now() + STARTUP_CHILD_REAP_BUDGET;
+        loop {
+            match child.try_wait() {
+                Ok(Some(_)) => return,
+                Ok(None) => {
+                    if std::time::Instant::now() >= deadline {
+                        tracing::debug!(
+                            "sandbox child not reaped within the startup teardown budget"
+                        );
+                        return;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                }
+                Err(error) => {
+                    tracing::debug!(
+                        error = %error,
+                        "failed to reap sandbox child during startup teardown"
+                    );
+                    return;
+                }
+            }
         }
     }
 }
@@ -534,17 +614,19 @@ pub async fn spawn_sandbox(
     let (staged_file_mounts, file_mounts_staging) = stage_file_mounts(config).await?;
     let named_volumes = resolve_named_volumes(local, config).await?;
     let disk_locks = lock_disk_mounts(config, &named_volumes)?;
-    let metrics_reservation = if config.effective_metrics_interval().is_some() {
-        reserve_metrics_slot(local, config, sandbox_id)
-    } else {
-        None
-    };
+    let metrics_reservation = MetricsReservationGuard::new(
+        config.spec.name.clone(),
+        if config.effective_metrics_interval().is_some() {
+            reserve_metrics_slot(local, config, sandbox_id)
+        } else {
+            None
+        },
+    );
     #[cfg(unix)]
     let parent_watchdog = match mode {
         SpawnMode::Attached => match create_parent_watchdog_pipe() {
             Ok(pipe) => Some(pipe),
             Err(err) => {
-                release_metrics_reservation(config, metrics_reservation.as_ref());
                 return Err(err);
             }
         },
@@ -560,7 +642,6 @@ pub async fn spawn_sandbox(
         SpawnMode::Detached => match create_startup_pipe() {
             Ok(pipe) => Some(pipe),
             Err(err) => {
-                release_metrics_reservation(config, metrics_reservation.as_ref());
                 return Err(err);
             }
         },
@@ -572,7 +653,6 @@ pub async fn spawn_sandbox(
         SpawnMode::Detached => match create_startup_pipe(&config.spec.name, sandbox_id) {
             Ok(pipe) => Some(pipe),
             Err(err) => {
-                release_metrics_reservation(config, metrics_reservation.as_ref());
                 return Err(err);
             }
         },
@@ -583,7 +663,6 @@ pub async fn spawn_sandbox(
         SpawnMode::Attached => match WindowsJob::new_kill_on_close() {
             Ok(job) => Some(job),
             Err(err) => {
-                release_metrics_reservation(config, metrics_reservation.as_ref());
                 return Err(crate::MicrosandboxError::Runtime(format!(
                     "failed to create Windows sandbox job: {err}"
                 )));
@@ -610,7 +689,7 @@ pub async fn spawn_sandbox(
         &libkrunfw_path,
         &staged_file_mounts,
         &named_volumes,
-        metrics_reservation.as_ref(),
+        metrics_reservation.reservation(),
         parent_watchdog
             .as_ref()
             .map(|_| microsandbox_runtime::vm::PARENT_WATCH_FD),
@@ -645,7 +724,6 @@ pub async fn spawn_sandbox(
     let config_handoff = match create_config_handoff(&launch) {
         Ok(handoff) => handoff,
         Err(err) => {
-            release_metrics_reservation(config, metrics_reservation.as_ref());
             return Err(err);
         }
     };
@@ -671,7 +749,6 @@ pub async fn spawn_sandbox(
             file
         }
         Err(err) => {
-            release_metrics_reservation(config, metrics_reservation.as_ref());
             return Err(err);
         }
     };
@@ -782,7 +859,6 @@ pub async fn spawn_sandbox(
         match cmd.spawn() {
             Ok(child) => StartupChildGuard::new(child),
             Err(err) => {
-                release_metrics_reservation(config, metrics_reservation.as_ref());
                 return Err(err.into());
             }
         }
@@ -791,7 +867,6 @@ pub async fn spawn_sandbox(
     let _pid = match child.id() {
         Some(pid) => pid,
         None => {
-            release_metrics_reservation(config, metrics_reservation.as_ref());
             return Err(crate::MicrosandboxError::Runtime(
                 "sandbox process exited immediately".into(),
             ));
@@ -804,7 +879,6 @@ pub async fn spawn_sandbox(
         && let Err(err) = job.assign_pid(_pid)
     {
         let status = terminate_startup_process(&mut child).await;
-        release_metrics_reservation(config, metrics_reservation.as_ref());
         return Err(crate::MicrosandboxError::Runtime(format!(
             "failed to assign sandbox process to Windows job (status: {status:?}): {err}"
         )));
@@ -832,7 +906,6 @@ pub async fn spawn_sandbox(
         Ok(line) => line,
         Err(err) => {
             terminate_startup_process(&mut child).await;
-            release_metrics_reservation(config, metrics_reservation.as_ref());
             return Err(err);
         }
     };
@@ -841,7 +914,6 @@ pub async fn spawn_sandbox(
         Ok(info) => info,
         Err(_) => {
             let status = terminate_startup_process(&mut child).await;
-            release_metrics_reservation(config, metrics_reservation.as_ref());
             tracing::debug!(
                 raw_line = ?line,
                 exit_status = ?status,
@@ -855,7 +927,6 @@ pub async fn spawn_sandbox(
     };
     if startup.pid != _pid {
         let status = terminate_startup_process(&mut child).await;
-        release_metrics_reservation(config, metrics_reservation.as_ref());
         return Err(crate::MicrosandboxError::Runtime(format!(
             "sandbox startup PID mismatch: spawned pid {_pid}, startup pid {} \
              (status: {status:?})",
@@ -869,9 +940,19 @@ pub async fn spawn_sandbox(
         "spawn_sandbox: startup JSON received"
     );
 
-    // Startup completed: hand the live child to the process handle. Dropping
-    // the guard after this point must not kill the sandbox.
+    // Startup completed: hand the live child and the metrics reservation to the
+    // process handle. Disarming both guards makes dropping them a no-op, while
+    // every earlier exit — including task cancellation — still releases the
+    // slot and reaps the child.
     let child = child.disarm();
+    let metrics_reservation = metrics_reservation.disarm().map(|reservation| {
+        MetricsReservationCleanup::new(
+            reservation.shm_name,
+            reservation.slot,
+            reservation.generation,
+            Some(reservation.registry),
+        )
+    });
 
     #[cfg(unix)]
     let handle = ProcessHandle::new(
@@ -881,14 +962,7 @@ pub async fn spawn_sandbox(
         file_mounts_staging,
         disk_locks,
         parent_watchdog.map(|pipe| pipe.write_fd),
-        metrics_reservation.as_ref().map(|reservation| {
-            MetricsReservationCleanup::new(
-                reservation.shm_name.clone(),
-                reservation.slot,
-                reservation.generation,
-                Some(reservation.registry.clone()),
-            )
-        }),
+        metrics_reservation,
     );
 
     #[cfg(windows)]
@@ -899,14 +973,7 @@ pub async fn spawn_sandbox(
         file_mounts_staging,
         disk_locks,
         child_job,
-        metrics_reservation.as_ref().map(|reservation| {
-            MetricsReservationCleanup::new(
-                reservation.shm_name.clone(),
-                reservation.slot,
-                reservation.generation,
-                Some(reservation.registry.clone()),
-            )
-        }),
+        metrics_reservation,
     );
 
     Ok((handle, agent_sock_path))
@@ -1615,18 +1682,6 @@ fn set_cloexec(fd: &OwnedFd, enabled: bool) -> MicrosandboxResult<()> {
     }
 
     Ok(())
-}
-
-fn release_metrics_reservation(config: &SandboxConfig, reservation: Option<&MetricsReservation>) {
-    let Some(reservation) = reservation else {
-        return;
-    };
-    if let Err(err) = reservation
-        .registry
-        .release_reserved(reservation.slot, reservation.generation)
-    {
-        tracing::debug!(error = %err, sandbox = %config.spec.name, "release: metrics slot release failed");
-    }
 }
 
 #[cfg(unix)]
@@ -5765,14 +5820,9 @@ mod startup_guard_tests {
     }
 
     /// Wait until `pid` is gone (reaped or already reaped elsewhere).
-    async fn wait_until_gone(pid: i32) {
+    pub(super) async fn wait_until_gone(pid: i32) {
         for _ in 0..400 {
-            let mut status = 0;
-            let reaped = unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) };
-            if reaped == pid {
-                return;
-            }
-            if reaped < 0 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ECHILD) {
+            if child_was_reaped(pid) {
                 return;
             }
             tokio::time::sleep(Duration::from_millis(10)).await;
@@ -5780,20 +5830,42 @@ mod startup_guard_tests {
         panic!("child {pid} still alive after startup teardown");
     }
 
+    /// Whether the child has already been *reaped* (not merely killed).
+    ///
+    /// A child that was only killed is still a zombie: `waitpid(WNOHANG)`
+    /// returns its pid, and this returns `false` (after reaping the zombie
+    /// itself). Deterministic teardown must have reaped it already, so
+    /// `waitpid` returns `ECHILD`.
+    pub(super) fn child_was_reaped(pid: i32) -> bool {
+        let mut status = 0;
+        let reaped = unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) };
+        reaped < 0 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ECHILD)
+    }
+
     /// Mutation note: deleting `StartupChildGuard`'s `Drop` impl (holding a
     /// bare `tokio::process::Child`) leaves the VM process running after a
-    /// cancelled launcher future.
+    /// cancelled launcher future. Needing `Drop` to do more than `start_kill`
+    /// is what makes [`child_was_reaped`] fail: a killed-but-unreaped child is a
+    /// zombie, not an error.
     #[tokio::test]
-    async fn dropping_the_startup_guard_kills_the_spawned_child() {
+    async fn dropping_the_startup_guard_kills_and_reaps_the_spawned_child() {
         let child = spawn_sleeper();
         let pid = child.id().expect("child pid") as i32;
         assert!(process_is_running(pid));
 
         // Cancellation/early return drops the guard. A plain `Child` would
-        // merely stop waiting; the guard must terminate the process.
+        // merely stop waiting; the guard must terminate *and reap* the process
+        // synchronously, with no polling.
         drop(StartupChildGuard::new(child));
 
-        wait_until_gone(pid).await;
+        assert!(
+            child_was_reaped(pid),
+            "startup teardown must reap the child deterministically, not leave a zombie"
+        );
+        assert!(
+            !process_is_running(pid),
+            "the child must not survive teardown"
+        );
     }
 
     /// The success path hands the live child to the `ProcessHandle`, so a
@@ -5849,7 +5921,10 @@ mod startup_guard_tests {
         }
 
         drop(guard);
-        wait_until_gone(pid).await;
+        assert!(
+            child_was_reaped(pid),
+            "bounded-timeout teardown must reap the child"
+        );
     }
 }
 
@@ -5963,5 +6038,258 @@ mod capability_probe_tests {
                 crate::HeaderCredentialError::RuntimeProbeFailed
             )
         ));
+    }
+}
+
+//--------------------------------------------------------------------------------------------------
+// Tests: Aborted-launch lifecycle (metrics slot + child reaping)
+//--------------------------------------------------------------------------------------------------
+
+#[cfg(all(test, unix))]
+mod launch_lifecycle_tests {
+    use std::os::unix::fs::PermissionsExt;
+    use std::sync::Mutex;
+    use std::time::Duration;
+
+    use super::*;
+    use crate::sandbox::SandboxBuilder;
+
+    /// `MSB_PATH`/`MSB_LIBKRUNFW_PATH` are process-global, so the stub-binary
+    /// lifecycle tests serialize on this lock. Each test uses its own temp home,
+    /// so it also gets its own metrics-registry shared-memory object.
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    /// Restores `MSB_PATH`/`MSB_LIBKRUNFW_PATH` when dropped.
+    struct EnvRestore {
+        msb: Option<OsString>,
+        libkrunfw: Option<OsString>,
+    }
+
+    impl Drop for EnvRestore {
+        fn drop(&mut self) {
+            unsafe {
+                match self.msb.take() {
+                    Some(value) => std::env::set_var("MSB_PATH", value),
+                    None => std::env::remove_var("MSB_PATH"),
+                }
+                match self.libkrunfw.take() {
+                    Some(value) => std::env::set_var("MSB_LIBKRUNFW_PATH", value),
+                    None => std::env::remove_var("MSB_LIBKRUNFW_PATH"),
+                }
+            }
+        }
+    }
+
+    fn point_at_stub(
+        msb: &Path,
+        libkrunfw: &Path,
+    ) -> (std::sync::MutexGuard<'static, ()>, EnvRestore) {
+        let lock = ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+        let restore = EnvRestore {
+            msb: std::env::var_os("MSB_PATH"),
+            libkrunfw: std::env::var_os("MSB_LIBKRUNFW_PATH"),
+        };
+        unsafe {
+            std::env::set_var("MSB_PATH", msb);
+            std::env::set_var("MSB_LIBKRUNFW_PATH", libkrunfw);
+        }
+        (lock, restore)
+    }
+
+    fn executable_stub(dir: &Path, name: &str, script: &str) -> PathBuf {
+        let path = dir.join(name);
+        std::fs::write(&path, format!("#!/bin/sh\n{script}\n")).unwrap();
+        let mut permissions = std::fs::metadata(&path).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&path, permissions).unwrap();
+        path
+    }
+
+    fn dummy_libkrunfw(dir: &Path) -> PathBuf {
+        let path = dir.join("libkrunfw.dylib");
+        std::fs::write(&path, b"stub").unwrap();
+        path
+    }
+
+    fn read_stub_pid(path: &Path) -> Option<i32> {
+        std::fs::read_to_string(path).ok()?.trim().parse().ok()
+    }
+
+    /// A temp dir rooted in `/tmp` so the derived sandbox agent socket path
+    /// stays under the platform's `sockaddr_un` limit.
+    fn short_tempdir() -> tempfile::TempDir {
+        tempfile::Builder::new()
+            .prefix("msblc")
+            .tempdir_in("/tmp")
+            .unwrap_or_else(|_| tempfile::tempdir().unwrap())
+    }
+
+    async fn wait_for_stub_pid(path: &Path) -> i32 {
+        loop {
+            if let Some(pid) = read_stub_pid(path) {
+                return pid;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    }
+
+    /// A cancelled launch must not leave the sandbox lifecycle lock held. The
+    /// lock is a descriptor owned by a RAII guard inside `spawn_sandbox`, so a
+    /// leaked descriptor would keep the namespace locked and make re-acquiring
+    /// it time out. This is process-local (unlike a process-wide `/dev/fd`
+    /// count, which races with other tests running in parallel).
+    async fn lifecycle_lock_was_released(local: &LocalBackend, name: &str) -> bool {
+        super::acquire_sandbox_lifecycle_guard(
+            &local.config().run_dir(),
+            name,
+            Duration::from_millis(500),
+        )
+        .await
+        .is_ok()
+    }
+
+    /// Open the same registry the launch used and reserve one slot. On a fresh
+    /// registry the launch's reservation is the lowest slot, so its release is
+    /// observable as slot 0 being the first free slot again.
+    fn metrics_slot_was_released(local: &LocalBackend) -> bool {
+        let registry = MetricsRegistry::open(&local.config().metrics_registry_shm_name())
+            .expect("metrics registry must exist after a launch attempt");
+        match registry.reserve(ReserveSlot {
+            sandbox_id: 90_001,
+            name: "slot-probe",
+            memory_limit_bytes: 1024 * 1024,
+        }) {
+            Ok(reservation) => {
+                let _ = registry.release_reserved(reservation.slot, reservation.generation);
+                reservation.slot == 0
+            }
+            Err(_) => false,
+        }
+    }
+
+    async fn build_backend_and_config(temp: &Path, name: &str) -> (LocalBackend, SandboxConfig) {
+        let local = LocalBackend::builder()
+            .home(temp.join("home"))
+            .build()
+            .await
+            .unwrap();
+        let config = SandboxBuilder::new(name)
+            .image("/tmp/rootfs")
+            .build()
+            .await
+            .unwrap();
+        (local, config)
+    }
+
+    /// Cancellation: dropping an in-flight `spawn_sandbox` future (with a
+    /// reserved metrics slot and a spawned but not-yet-started child) must reap
+    /// the child deterministically, release the reserved slot, and leak no
+    /// descriptors.
+    ///
+    /// Mutation note: with the metrics release left to explicit early-return
+    /// calls (its pre-fix shape) the slot is never freed, so
+    /// `metrics_slot_was_released` sees slot 1 instead of 0 and fails; with the
+    /// guard only calling `start_kill` (no reap) `child_was_reaped` fails.
+    #[tokio::test]
+    async fn cancelled_launch_reaps_the_child_and_releases_the_metrics_slot() {
+        let temp = short_tempdir();
+        let pid_path = temp.path().join("pid");
+        let stub = executable_stub(
+            temp.path(),
+            "msb-hang",
+            &format!("echo $$ > '{}'\nexec sleep 60", pid_path.display()),
+        );
+        let libkrunfw = dummy_libkrunfw(temp.path());
+        let (_lock, _restore) = point_at_stub(&stub, &libkrunfw);
+
+        let (local, config) = build_backend_and_config(temp.path(), "lifecycle-cancel").await;
+
+        let mut future = Box::pin(spawn_sandbox(
+            &local,
+            &config,
+            1,
+            SpawnMode::Attached,
+            None,
+            None,
+        ));
+        let pid = tokio::time::timeout(Duration::from_secs(15), async {
+            tokio::select! {
+                pid = wait_for_stub_pid(&pid_path) => pid,
+                _ = &mut future => panic!("the stub must not complete startup"),
+            }
+        })
+        .await
+        .expect("the stub msb must be spawned within the bound");
+
+        // Cancellation: drop the in-flight launch future.
+        drop(future);
+
+        assert!(
+            super::startup_guard_tests::child_was_reaped(pid),
+            "a cancelled launch must deterministically reap the child (pid {pid})"
+        );
+        assert!(
+            metrics_slot_was_released(&local),
+            "a cancelled launch must release its reserved metrics slot"
+        );
+        assert!(
+            lifecycle_lock_was_released(&local, &config.spec.name).await,
+            "a cancelled launch leaked the sandbox lifecycle-lock descriptor"
+        );
+    }
+
+    /// Spawn failure after the slot is reserved: the slot must be released and
+    /// no child left behind.
+    #[tokio::test]
+    async fn failed_spawn_releases_the_metrics_slot() {
+        let temp = short_tempdir();
+        // Present but not executable: path resolution accepts it, then
+        // `Command::spawn` fails *after* the metrics slot is reserved.
+        let stub = temp.path().join("msb-not-executable");
+        std::fs::write(&stub, b"#!/bin/sh\nexit 0\n").unwrap();
+        let libkrunfw = dummy_libkrunfw(temp.path());
+        let (_lock, _restore) = point_at_stub(&stub, &libkrunfw);
+
+        let (local, config) = build_backend_and_config(temp.path(), "lifecycle-fail").await;
+        let result = spawn_sandbox(&local, &config, 1, SpawnMode::Attached, None, None).await;
+        assert!(result.is_err(), "a non-executable msb must fail the spawn");
+        assert!(
+            metrics_slot_was_released(&local),
+            "a failed spawn must release its reserved metrics slot"
+        );
+    }
+
+    /// Normal completion: the reservation is transferred to the `ProcessHandle`
+    /// (not released early), then released when the handle is dropped.
+    #[tokio::test]
+    async fn successful_launch_transfers_the_metrics_slot_to_the_handle() {
+        let temp = short_tempdir();
+        let stub = executable_stub(
+            temp.path(),
+            "msb-ok",
+            "printf '{\"pid\": %s}\\n' \"$$\"\nexec sleep 60",
+        );
+        let libkrunfw = dummy_libkrunfw(temp.path());
+        let (_lock, _restore) = point_at_stub(&stub, &libkrunfw);
+
+        let (local, config) = build_backend_and_config(temp.path(), "lifecycle-ok").await;
+        let (handle, _agent_sock) =
+            spawn_sandbox(&local, &config, 1, SpawnMode::Attached, None, None)
+                .await
+                .expect("the stub reports valid startup JSON");
+
+        let pid = handle.pid() as i32;
+        assert!(
+            !metrics_slot_was_released(&local),
+            "a running sandbox must keep its reserved metrics slot"
+        );
+
+        handle.kill().unwrap();
+        drop(handle);
+        assert!(
+            metrics_slot_was_released(&local),
+            "dropping the handle must release the reserved metrics slot"
+        );
+        super::startup_guard_tests::wait_until_gone(pid).await;
     }
 }
