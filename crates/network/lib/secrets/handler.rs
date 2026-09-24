@@ -1552,6 +1552,7 @@ impl SecretsHandler {
             // (e.g. CONNECT), so nothing is injected and nothing is blocked.
             return Ok(None);
         }
+        check_credential_http2_hop_by_hop(headers, &self.header_credentials)?;
         let request = http2_credential_request_origin(headers)?;
         if !self.credential_connection_ok() {
             return Ok(None);
@@ -2763,6 +2764,44 @@ fn check_credential_http2_grammar(headers: &[(Vec<u8>, Vec<u8>)]) -> Result<bool
     Ok(true)
 }
 
+/// Reject an HTTP/2 request that names a configured credential field in a
+/// hop-by-hop `Connection:` token.
+///
+/// HTTP/2 forbids connection-specific fields outright (RFC 9113 §8.2.2), but a
+/// strict peer is not guaranteed on the path: an H2→H1 intermediary may strip
+/// the field a `Connection:` token names, silently dropping the injected
+/// credential, or an RFC-conformant H2 peer may reject the request. The H1 path
+/// already blocks this (`check_credential_http1_grammar`); the H2 initial-request
+/// path must do the same on the *original* decoded block, before injection, and
+/// without mutating any unrelated header. A malformed or empty token list is
+/// blocked too, mirroring the H1 grammar.
+fn check_credential_http2_hop_by_hop(
+    headers: &[(Vec<u8>, Vec<u8>)],
+    credentials: &[ResolvedHeaderCredential],
+) -> Result<(), ViolationAction> {
+    let configured: Vec<String> = credentials
+        .iter()
+        .map(|credential| credential.header.to_ascii_lowercase())
+        .collect();
+
+    for (name, value) in headers {
+        if !name.eq_ignore_ascii_case(b"connection") {
+            continue;
+        }
+        let value = std::str::from_utf8(value).map_err(|_| ViolationAction::Block)?;
+        for token in value.split(',') {
+            let token = token.trim();
+            if token.is_empty() || !token.bytes().all(is_http_token_byte) {
+                return Err(ViolationAction::Block);
+            }
+            if configured.contains(&token.to_ascii_lowercase()) {
+                return Err(ViolationAction::Block);
+            }
+        }
+    }
+    Ok(())
+}
+
 /// The single exact HTTP/2 request origin used for the credential decision.
 ///
 /// A `host` field that disagrees with `:authority` in host or port is blocked;
@@ -3898,6 +3937,20 @@ mod tests {
     }
 
     fn decode_first_h2_headers(data: &[u8]) -> Vec<(Vec<u8>, Vec<u8>)> {
+        decode_first_h2_headers_with_flags(data)
+            .into_iter()
+            .map(|(name, value, _flags)| (name, value))
+            .collect()
+    }
+
+    /// Decode the first HTTP/2 header block, **keeping** the HPACK decoder
+    /// flags. The flags are load-bearing: a field carried with the never-indexed
+    /// representation decodes with [`HpackDecoder::NEVER_INDEXED`], while an
+    /// incrementally indexed field decodes with [`HpackDecoder::WITH_INDEXING`]
+    /// (and an indexed field with `0`). Asserting on them is what pins the
+    /// confidentiality property that an injected credential never enters the
+    /// HPACK dynamic table.
+    fn decode_first_h2_headers_with_flags(data: &[u8]) -> Vec<(Vec<u8>, Vec<u8>, u8)> {
         assert!(data.starts_with(HTTP2_PREFACE));
         let mut cursor = HTTP2_PREFACE.len();
         let mut decoder = HpackDecoder::with_dynamic_size(4096);
@@ -3933,9 +3986,6 @@ mod tests {
         let mut headers = Vec::new();
         decoder.decode(&mut encoded, &mut headers).unwrap();
         headers
-            .into_iter()
-            .map(|(name, value, _flags)| (name, value))
-            .collect()
     }
 
     fn h2_header_value(headers: &[(Vec<u8>, Vec<u8>)], name: &[u8]) -> String {
@@ -6314,6 +6364,7 @@ mod tests {
         let output = handler.substitute(&request).unwrap().into_owned();
         let headers = decode_first_h2_headers(&output);
         assert_eq!(h2_header_value(&headers, b"x-api-key"), "sk-secret");
+        assert_field_never_indexed(&decode_first_h2_headers_with_flags(&output), b"x-api-key");
     }
 
     #[test]
@@ -6478,6 +6529,21 @@ mod tests {
     }
 
     fn decode_h2_header_blocks(data: &[u8]) -> Vec<Vec<(Vec<u8>, Vec<u8>)>> {
+        decode_h2_header_blocks_with_flags(data)
+            .into_iter()
+            .map(|block| {
+                block
+                    .into_iter()
+                    .map(|(name, value, _flags)| (name, value))
+                    .collect()
+            })
+            .collect()
+    }
+
+    /// Decode every HTTP/2 header block, **keeping** the HPACK decoder flags so
+    /// tests can assert the never-indexed representation of the injected field
+    /// (see [`decode_first_h2_headers_with_flags`]).
+    fn decode_h2_header_blocks_with_flags(data: &[u8]) -> Vec<Vec<(Vec<u8>, Vec<u8>, u8)>> {
         assert!(data.starts_with(HTTP2_PREFACE));
         let mut cursor = HTTP2_PREFACE.len();
         let mut decoder = HpackDecoder::with_dynamic_size(4096);
@@ -6519,13 +6585,38 @@ mod tests {
     fn decode_h2_block(
         decoder: &mut HpackDecoder,
         mut encoded: Vec<u8>,
-    ) -> Vec<(Vec<u8>, Vec<u8>)> {
+    ) -> Vec<(Vec<u8>, Vec<u8>, u8)> {
         let mut headers = Vec::new();
         decoder.decode(&mut encoded, &mut headers).unwrap();
         headers
-            .into_iter()
-            .map(|(name, value, _flags)| (name, value))
-            .collect()
+    }
+
+    /// The HPACK decoder flags carried on the named field (assumes it exists).
+    fn h2_header_flags(headers: &[(Vec<u8>, Vec<u8>, u8)], name: &[u8]) -> u8 {
+        headers
+            .iter()
+            .find(|(header_name, _, _)| header_name.eq_ignore_ascii_case(name))
+            .map(|(_, _, flags)| *flags)
+            .expect("header present")
+    }
+
+    /// Assert the named field was emitted with the never-indexed representation:
+    /// its value cannot have entered the HPACK dynamic table. Loading the
+    /// assertion on the decoder flag (rather than only the decoded value) is
+    /// what makes it fail if `encode_headers` ever regresses from
+    /// `NEVER_INDEXED` to an indexed encoder.
+    fn assert_field_never_indexed(headers: &[(Vec<u8>, Vec<u8>, u8)], name: &[u8]) {
+        let flags = h2_header_flags(headers, name);
+        assert_eq!(
+            flags & HpackDecoder::NEVER_INDEXED,
+            HpackDecoder::NEVER_INDEXED,
+            "{name:?} must use the never-indexed representation (flags {flags:#04x})"
+        );
+        assert_eq!(
+            flags & HpackDecoder::WITH_INDEXING,
+            0,
+            "{name:?} must not be incrementally indexed (flags {flags:#04x})"
+        );
     }
 
     fn credential_field_count(headers: &[(Vec<u8>, Vec<u8>)]) -> usize {
@@ -6617,6 +6708,89 @@ mod tests {
     }
 
     #[test]
+    fn header_credential_http2_blocks_connection_token_naming_the_field() {
+        // An H2→H1 intermediary may strip a field named in `Connection:`,
+        // silently dropping the injected credential, and a conformant H2 peer
+        // rejects a connection-specific field outright. Blocked on the original
+        // decoded block, before injection, mirroring the HTTP/1 grammar.
+        let cases: &[&[(&[u8], &[u8])]] = &[
+            // plain token
+            &[
+                (b":method", b"GET"),
+                (b":scheme", b"https"),
+                (b":authority", b"api.example.com"),
+                (b":path", b"/"),
+                (b"connection", b"x-api-key"),
+            ],
+            // comma-separated token list
+            &[
+                (b":method", b"GET"),
+                (b":scheme", b"https"),
+                (b":authority", b"api.example.com"),
+                (b":path", b"/"),
+                (b"connection", b"keep-alive, x-api-key"),
+            ],
+            // case-varied token
+            &[
+                (b":method", b"GET"),
+                (b":scheme", b"https"),
+                (b":authority", b"api.example.com"),
+                (b":path", b"/"),
+                (b"connection", b"X-API-Key"),
+            ],
+            // repeated Connection fields, only the second names the field
+            &[
+                (b":method", b"GET"),
+                (b":scheme", b"https"),
+                (b":authority", b"api.example.com"),
+                (b":path", b"/"),
+                (b"connection", b"keep-alive"),
+                (b"connection", b"x-api-key"),
+            ],
+            // malformed: empty token in the list
+            &[
+                (b":method", b"GET"),
+                (b":scheme", b"https"),
+                (b":authority", b"api.example.com"),
+                (b":path", b"/"),
+                (b"connection", b"x-api-key,"),
+            ],
+        ];
+
+        for case in cases {
+            let mut handler = creds_handler(vec![resolved_credential("sk-secret")], 443);
+            let request = h2_request(case, true);
+            assert_eq!(
+                handler.substitute(&request).unwrap_err(),
+                ViolationAction::Block,
+                "a Connection token naming the credential field must block: {case:?}"
+            );
+        }
+    }
+
+    /// Narrowness control: a `Connection:` field that does not name the
+    /// configured field must not be blocked or mutated, so only the actual
+    /// hop-by-hop attack is rejected.
+    #[test]
+    fn header_credential_http2_permits_an_unrelated_connection_token() {
+        let mut handler = creds_handler(vec![resolved_credential("sk-secret")], 443);
+        let request = h2_request(
+            &[
+                (b":method", b"GET"),
+                (b":scheme", b"https"),
+                (b":authority", b"api.example.com"),
+                (b":path", b"/"),
+                (b"connection", b"keep-alive"),
+            ],
+            true,
+        );
+        let output = handler.substitute(&request).unwrap().into_owned();
+        let headers = decode_first_h2_headers(&output);
+        assert_eq!(h2_header_value(&headers, b"x-api-key"), "sk-secret");
+        assert_eq!(h2_header_value(&headers, b"connection"), "keep-alive");
+    }
+
+    #[test]
     fn header_credential_http2_connect_is_forwarded_uninjected() {
         let mut handler = creds_handler(vec![resolved_credential("sk-secret")], 443);
         let request = h2_request(
@@ -6663,6 +6837,11 @@ mod tests {
         assert_eq!(blocks.len(), 2);
         assert_eq!(h2_header_value(&blocks[0], b"x-api-key"), "sk-secret");
         assert_eq!(credential_field_count(&blocks[1]), 0);
+        // The injected field on the authorized stream must stay never-indexed,
+        // so its value cannot be reflected into the HPACK dynamic table for
+        // subsequent streams on this connection.
+        let flagged = decode_h2_header_blocks_with_flags(&output);
+        assert_field_never_indexed(&flagged[0], b"x-api-key");
     }
 
     #[test]
@@ -6702,6 +6881,7 @@ mod tests {
         let headers = decode_first_h2_headers(&output);
         assert_eq!(h2_header_value(&headers, b"x-api-key"), "sk-secret");
         assert_eq!(h2_header_value(&headers, b":path"), "/split");
+        assert_field_never_indexed(&decode_first_h2_headers_with_flags(&output), b"x-api-key");
     }
 
     //----------------------------------------------------------------------------------------------
