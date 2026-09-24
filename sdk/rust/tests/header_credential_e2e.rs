@@ -388,7 +388,7 @@ curl -k --http1.1 -m 30 -sS -o /dev/null -w 'wrongport=%{{http_code}}\n' \
 
 echo '--- guest env ---'
 env | grep -q '{REAL_VALUE}' && echo 'VALUE_IN_ENV' || echo 'NO_VALUE_IN_ENV'
-tr '\0' '\n' < /proc/self/environ | grep -q '{REAL_VALUE}' && echo 'VALUE_IN_ENVIRON' || echo 'NO_VALUE_IN_ENVIRON'
+tr '\0' '\n' < /proc/self/environ | grep -q '{REAL_VALUE}' && echo 'VALUE_IN_PROC_ENVIRON' || echo 'NO_VALUE_IN_PROC_ENVIRON'
 echo "X_API_KEY=${{X_API_KEY:-<unset>}}"
 found="$(grep -rIl '{REAL_VALUE}' /etc /root /tmp /home /usr /bin /sbin /lib /var 2>/dev/null | head -n 1)"
 if [ -n "$found" ]; then echo "VALUE_FOUND_AT=$found"; else echo 'NO_VALUE_IN_FS'; fi
@@ -421,9 +421,17 @@ if [ -n "$found" ]; then echo "VALUE_FOUND_AT=$found"; else echo 'NO_VALUE_IN_FS
         );
     }
 
-    // The guest has no path to the value.
+    // The guest shell is handed the synthetic canary so it can search for it:
+    // these probes prove that *the paths they inspect* (the shell's `env`, the
+    // raw `/proc/self/environ`, the listed filesystem roots) did not surface the
+    // value. They cannot prove the guest has no path to those bytes at all,
+    // because the searcher must be given the needle. The markers are asserted as
+    // whole lines, not substrings, so `NO_VALUE_IN_ENV` and
+    // `NO_VALUE_IN_PROC_ENVIRON` are independent oracles (neither is a prefix of
+    // the other, and one printing alone cannot satisfy both assertions).
+    let stdout_lines: std::collections::HashSet<&str> = stdout.lines().collect();
     assert!(
-        stdout.contains("NO_VALUE_IN_ENV"),
+        stdout_lines.contains("NO_VALUE_IN_ENV"),
         "guest environment must not contain the real value: {stdout}"
     );
     assert!(
@@ -435,11 +443,11 @@ if [ -n "$found" ]; then echo "VALUE_FOUND_AT=$found"; else echo 'NO_VALUE_IN_FS
         "the credential must not be exposed as an environment variable: {stdout}"
     );
     assert!(
-        stdout.contains("NO_VALUE_IN_ENVIRON"),
+        stdout_lines.contains("NO_VALUE_IN_PROC_ENVIRON"),
         "the credential must not appear in the guest process environment: {stdout}"
     );
     assert!(
-        stdout.contains("NO_VALUE_IN_FS"),
+        stdout_lines.contains("NO_VALUE_IN_FS"),
         "the credential must not be readable from the guest filesystem: {stdout}"
     );
 
