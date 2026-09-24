@@ -30,6 +30,9 @@ use std::{
     sync::Arc,
 };
 
+// `Zeroizing` guards the launch-config bytes, which only exist in the
+// unix-only [`ConfigHandoff`]/[`AfterSpawn`] path.
+#[cfg(unix)]
 use zeroize::Zeroizing;
 
 #[cfg(windows)]
@@ -347,6 +350,11 @@ const STARTUP_HANDOFF_BUDGET: std::time::Duration = std::time::Duration::from_se
 /// processes are trusted; the guest cannot read host memory or FDs). Closing
 /// that window would require `fexecve`-style pinning of one opened file or a
 /// signed-binary digest policy, which this change does not claim.
+///
+/// Unix-only: header credentials are refused on Windows, so the only callers
+/// (`create.rs`'s non-Windows branch and the launch path's unix+net gate) do
+/// not exist there.
+#[cfg(unix)]
 pub(crate) async fn ensure_header_credential_launch_capability(
     msb_path: &Path,
 ) -> MicrosandboxResult<()> {
