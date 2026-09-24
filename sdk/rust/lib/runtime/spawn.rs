@@ -1325,6 +1325,12 @@ enum AfterSpawn {
     Written,
     /// The parent writes these bytes after spawn, then closes the write end to
     /// produce EOF for the child's read-to-end.
+    ///
+    /// Non-Linux unix only: Linux serializes the config into a
+    /// `memfd_create` object before spawn and constructs only
+    /// [`AfterSpawn::Written`], so this variant is gated exactly like its
+    /// construction site (otherwise it is dead code under `-D warnings`).
+    #[cfg(not(target_os = "linux"))]
     Pipe {
         write_fd: OwnedFd,
         bytes: Zeroizing<Vec<u8>>,
@@ -1346,6 +1352,7 @@ impl ConfigHandoff {
     async fn finish(mut self) -> MicrosandboxResult<()> {
         match std::mem::replace(&mut self.after_spawn, AfterSpawn::Written) {
             AfterSpawn::Written => Ok(()),
+            #[cfg(not(target_os = "linux"))]
             AfterSpawn::Pipe { write_fd, bytes } => write_all_nonblocking(write_fd, &bytes).await,
         }
     }
@@ -1431,7 +1438,10 @@ fn set_nonblocking(fd: &OwnedFd) -> MicrosandboxResult<()> {
 
 /// Write every byte of `bytes` on a nonblocking pipe write end without blocking
 /// the Tokio reactor, retrying on `EAGAIN`/`EINTR`.
-#[cfg(unix)]
+///
+/// Non-Linux unix only: its sole caller is the [`AfterSpawn::Pipe`] arm, which
+/// does not exist on Linux (the memfd path is written before spawn).
+#[cfg(all(unix, not(target_os = "linux")))]
 async fn write_all_nonblocking(write_fd: OwnedFd, bytes: &[u8]) -> MicrosandboxResult<()> {
     use tokio::io::unix::AsyncFd;
 
