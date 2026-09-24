@@ -8,8 +8,8 @@ use std::time::Duration;
 
 use ipnetwork::{Ipv4Network, Ipv6Network};
 use microsandbox_types::{
-    NetworkRateLimitDirection, NetworkRateLimiterConfig, RateLimiterConfig, ScopedUpstreamCaCert,
-    ScopedVerifyUpstream, TlsConfig, TokenBucketConfig,
+    DurableHeaderCredential, HttpsOrigin, NetworkRateLimitDirection, NetworkRateLimiterConfig,
+    RateLimiterConfig, ScopedUpstreamCaCert, ScopedVerifyUpstream, TlsConfig, TokenBucketConfig,
 };
 use microsandbox_utils::size::Bytes;
 use zeroize::Zeroizing;
@@ -77,6 +77,29 @@ pub struct SecretBuilder {
     injection: SecretInjection,
     on_violation: Option<ViolationAction>,
     require_tls_identity: bool,
+}
+
+/// Fluent builder for a single durable [`DurableHeaderCredential`].
+///
+/// There is deliberately no `.value(..)`: a caller cannot place plaintext into
+/// a config that might be persisted. The value is supplied at spawn time by a
+/// host-side `CredentialResolver` and travels only on the private launch FD.
+///
+/// ```ignore
+/// HeaderCredentialBuilder::new()
+///     .id("anthropic")
+///     .reference("anthropic-api-key")
+///     .origin("api.anthropic.com", 443)
+///     .header("x-api-key")
+///     .format("%s")
+/// ```
+pub struct HeaderCredentialBuilder {
+    id: Option<String>,
+    reference: Option<String>,
+    origin_host: Option<String>,
+    origin_port: u16,
+    header: Option<String>,
+    format: Option<String>,
 }
 
 /// Fluent builder for a [`ViolationAction`].
@@ -272,9 +295,40 @@ impl NetworkBuilder {
         self.secret_entry(f(SecretBuilder::new()).build())
     }
 
-    /// Add a materialized secret entry.
+    /// Add a secret entry that carries only a host-side source reference and no
+    /// value, resolving it at spawn time over the private launch-config fd.
     pub fn secret_entry(mut self, entry: SecretEntry) -> Self {
         self.config.secrets.secrets.push(entry);
+        self
+    }
+
+    /// Add an origin-scoped header credential via a closure builder.
+    ///
+    /// The credential sets (not substitutes) one named header to a formatted
+    /// value on requests to exactly one HTTPS origin. Its value is supplied at
+    /// spawn time by a host-side `CredentialResolver`, so this builder carries
+    /// only non-secret authorization metadata.
+    ///
+    /// A credential-bearing config can only be injected through TLS
+    /// interception, so this enables TLS; [`NetworkBuilder::build`] fails
+    /// closed if TLS or networking is explicitly disabled.
+    ///
+    /// ```ignore
+    /// .header_credential(|c| c
+    ///     .id("anthropic")
+    ///     .reference("anthropic-api-key")
+    ///     .origin("api.anthropic.com", 443)
+    ///     .header("x-api-key")
+    ///     .format("%s")
+    /// )
+    /// ```
+    pub fn header_credential(
+        mut self,
+        f: impl FnOnce(HeaderCredentialBuilder) -> HeaderCredentialBuilder,
+    ) -> Self {
+        let credential = f(HeaderCredentialBuilder::new()).build();
+        self.config.tls.enabled = true;
+        self.config.secrets.header_credentials.push(credential);
         self
     }
 
@@ -424,6 +478,14 @@ impl NetworkBuilder {
                 != self.config.tls.intercept_ca.key_path.is_some())
         {
             return Err(BuildError::IncompleteInterceptCaConfig);
+        }
+        if !self.config.secrets.header_credentials.is_empty() {
+            if !self.config.enabled {
+                return Err(BuildError::HeaderCredentialRequiresNetwork);
+            }
+            if !self.config.tls.enabled {
+                return Err(BuildError::HeaderCredentialRequiresTls);
+            }
         }
         self.config.secrets.validate()?;
         Ok(self.config)
@@ -816,6 +878,88 @@ impl SecretBuilder {
             on_violation: self.on_violation,
             require_tls_identity: self.require_tls_identity,
         }
+    }
+}
+
+impl HeaderCredentialBuilder {
+    /// Start building a durable header credential.
+    pub fn new() -> Self {
+        Self {
+            id: None,
+            reference: None,
+            origin_host: None,
+            origin_port: 443,
+            header: None,
+            format: None,
+        }
+    }
+
+    /// Set the non-secret diagnostic label.
+    pub fn id(mut self, id: impl Into<String>) -> Self {
+        self.id = Some(id.into());
+        self
+    }
+
+    /// Set the non-secret reference the host resolver understands.
+    pub fn reference(mut self, reference: impl Into<String>) -> Self {
+        self.reference = Some(reference.into());
+        self
+    }
+
+    /// Set the exact origin. A single trailing dot is normalized away.
+    pub fn origin(mut self, host: impl Into<String>, port: u16) -> Self {
+        let mut host = host.into();
+        if host.ends_with('.') {
+            host.pop();
+        }
+        self.origin_host = Some(host);
+        self.origin_port = port;
+        self
+    }
+
+    /// Set the header name that is set (not substituted).
+    pub fn header(mut self, header: impl Into<String>) -> Self {
+        self.header = Some(header.into());
+        self
+    }
+
+    /// Set the value template with exactly one `%s`.
+    pub fn format(mut self, format: impl Into<String>) -> Self {
+        self.format = Some(format.into());
+        self
+    }
+
+    /// Consume the builder and return the credential.
+    ///
+    /// # Panics
+    /// Panics if any required field (`id`, `reference`, `origin`, `header`,
+    /// `format`) was not set, matching [`SecretBuilder`]'s contract. Real
+    /// checking is [`SecretsConfig::validate`](microsandbox_types::SecretsConfig::validate).
+    pub fn build(self) -> DurableHeaderCredential {
+        DurableHeaderCredential {
+            id: self.id.expect("HeaderCredentialBuilder: .id() is required"),
+            reference: self
+                .reference
+                .expect("HeaderCredentialBuilder: .reference() is required"),
+            origin: HttpsOrigin {
+                host: self
+                    .origin_host
+                    .expect("HeaderCredentialBuilder: .origin() is required"),
+                port: self.origin_port,
+            },
+            header: self
+                .header
+                .expect("HeaderCredentialBuilder: .header() is required"),
+            format: self
+                .format
+                .expect("HeaderCredentialBuilder: .format() is required"),
+        }
+    }
+}
+
+impl Default for HeaderCredentialBuilder {
+    fn default() -> Self {
+        Self::new()
     }
 }
 

@@ -3105,6 +3105,7 @@ mod tests {
     fn make_config(secrets: Vec<SecretEntry>) -> SecretsConfig {
         SecretsConfig {
             secrets,
+            header_credentials: Vec::new(),
             on_violation: ViolationAction::Block,
         }
     }

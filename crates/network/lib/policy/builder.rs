@@ -99,6 +99,14 @@ pub enum BuildError {
     #[error("intercept CA config is incomplete; set both cert_path and key_path")]
     IncompleteInterceptCaConfig,
 
+    /// Header credentials were configured while networking is disabled.
+    #[error("header credentials require networking to be enabled")]
+    HeaderCredentialRequiresNetwork,
+
+    /// Header credentials were configured without TLS interception.
+    #[error("header credentials require TLS interception; enable tls in the network config")]
+    HeaderCredentialRequiresTls,
+
     /// `.domain(&str)` or `.domain_suffix(&str)` received a value that
     /// doesn't parse as a [`DomainName`].
     #[error("rule #{rule_index}: invalid domain `{raw}`: {source}")]

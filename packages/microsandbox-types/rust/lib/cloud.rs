@@ -1382,6 +1382,7 @@ impl From<CloudSecretsConfig> for SecretsConfig {
     fn from(config: CloudSecretsConfig) -> Self {
         Self {
             secrets: config.entries.into_iter().map(Into::into).collect(),
+            header_credentials: Vec::new(),
             on_violation: config.on_violation.into(),
         }
     }
@@ -1567,7 +1568,7 @@ mod tests {
         domain.resources.thp = TransparentHugePagePolicy::Always;
 
         let cloud = CloudSandboxSpec::from(domain);
-        let wire = serde_json::to_value(&cloud.resources).unwrap();
+        let wire = serde_json::to_value(cloud.resources).unwrap();
         assert!(wire.get("cpu_placement").is_none());
         assert!(wire.get("placement_profile").is_none());
         assert!(wire.get("thp").is_none());
