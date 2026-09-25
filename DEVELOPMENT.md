@@ -235,6 +235,34 @@ cargo fmt --all           # Format code
 cargo clippy --workspace  # Run lints
 ```
 
+### Cross-target (Windows) Check
+
+`cargo clippy --workspace` only compiles the code the host platform selects. An item gated behind `cfg(windows)`, `cfg(unix)`, or `cfg(target_os = "...")` that is used on one platform and not the other becomes an unused import or dead code on the other, and no other local gate compiles that side. This check does, without a Windows host:
+
+```bash
+just check-windows-target
+```
+
+The recipe installs the `x86_64-pc-windows-gnu` Rust target when it is missing, then runs the `Check msb` and `Clippy msb` steps of the `windows-quality` job in `.github/workflows/check.yml` against that target:
+
+```bash
+cargo check  --no-default-features --features net,ssh -p microsandbox-cli --target x86_64-pc-windows-gnu
+cargo clippy --no-default-features --features net,ssh -p microsandbox-cli --target x86_64-pc-windows-gnu -- -D warnings
+```
+
+CI builds the MSVC targets, which need the Windows SDK; a macOS or Linux host does not have one without vendoring it. This check uses the `-gnu` target instead, which needs only a Windows C toolchain for the workspace's C dependencies (`ring`, `aws-lc-sys`). [zig](https://ziglang.org/download/) supplies one (`brew install zig` on macOS) and must be on `PATH`. The check also needs a current `build/agentd`; run `just build-agentd` if it reports otherwise.
+
+Run it when a change touches `cfg(windows)`, `cfg(unix)`, or `cfg(target_os)` code, or the runtime spawn path — that is where this class of error has come from.
+
+What it does not cover:
+
+- **Linking.** `cargo check` and `cargo clippy` do not link, so linker, ABI, `libkrunfw.dll` import-library, and MSVC environment problems stay out of reach. The `windows-quality` and `windows-build` CI jobs remain the authority for those.
+- **MSVC-only code.** The gnu target stands in for the x86_64 MSVC target CI uses. It selects the same `cfg(windows)` code as long as nothing depends on `target_env` or the MSVC ABI; if that ever changes, a green check no longer implies a compiling MSVC build.
+- **Windows ARM64.** Only the x86_64 Windows target is checked, so `cfg(target_arch = "aarch64")` code — such as the passthroughfs branches under `crates/filesystem` — is left to the `windows-aarch64` runs of the `windows-quality` job.
+- **Test code.** Library and binary targets are checked, not `#[cfg(test)]` modules; the Windows unit-test steps in CI compile those for `microsandbox`, `microsandbox-runtime`, and `microsandbox-network`.
+
+It is deliberately not part of the pre-commit hooks: it downloads an extra toolchain target and takes minutes, where the existing hooks are expected to stay quick.
+
 ## Releasing
 
 Microsandbox releases are automated via CI. All crates and packages share the same version number. The process has two steps:
