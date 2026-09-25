@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Compile and lint the `msb` CLI and its dependency graph for a Windows target
-# from a macOS or Linux host.
+# Compile and lint the `msb` CLI, its test targets, and its dependency graph for
+# a Windows target from a macOS or Linux host.
 #
 # `cargo clippy --workspace` only sees the code the host platform compiles. An
 # item gated behind `cfg(windows)`, `cfg(unix)`, or `cfg(target_os = "...")` that
@@ -31,7 +31,7 @@ Darwin | Linux) ;;
   cat >&2 <<EOF
 error: this check cross-compiles from a macOS or Linux host; on Windows the
 native MSVC check already covers it:
-    cargo clippy --no-default-features --features $FEATURES -p $PACKAGE --target x86_64-pc-windows-msvc -- -D warnings
+    cargo clippy --no-default-features --features $FEATURES -p $PACKAGE --target x86_64-pc-windows-msvc --all-targets -- -D warnings
 EOF
   exit 1
   ;;
@@ -106,4 +106,4 @@ echo "==> cargo check ($RUST_TARGET)"
 cargo check --no-default-features --features "$FEATURES" -p "$PACKAGE" --target "$RUST_TARGET"
 
 echo "==> cargo clippy ($RUST_TARGET)"
-cargo clippy --no-default-features --features "$FEATURES" -p "$PACKAGE" --target "$RUST_TARGET" -- -D warnings
+cargo clippy --no-default-features --features "$FEATURES" -p "$PACKAGE" --target "$RUST_TARGET" --all-targets -- -D warnings
