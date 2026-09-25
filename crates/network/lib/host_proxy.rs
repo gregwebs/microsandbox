@@ -565,8 +565,6 @@ mod tests {
     use std::net::SocketAddr;
     use std::time::Duration;
 
-    use base64::Engine as _;
-    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
     use tokio::net::TcpListener;
     use tokio::sync::oneshot;
 

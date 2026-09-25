@@ -2219,9 +2219,12 @@ mod tests {
         symlink(&actual_root, &linked_root).unwrap();
         let patch = text_patch("/allowed.txt", "hello");
 
-        let error = apply_patches(&bind_root(linked_root.clone(), false), &[patch.clone()])
-            .await
-            .unwrap_err();
+        let error = apply_patches(
+            &bind_root(linked_root.clone(), false),
+            std::slice::from_ref(&patch),
+        )
+        .await
+        .unwrap_err();
         assert!(error.to_string().contains("follow_root_symlinks"));
         assert!(!actual_root.join("allowed.txt").exists());
 

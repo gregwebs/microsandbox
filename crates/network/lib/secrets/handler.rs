@@ -3792,6 +3792,13 @@ mod tests {
     use std::net::{IpAddr, Ipv4Addr};
     use std::time::Duration;
 
+    /// One decoded HTTP/2 header field, keeping the HPACK decoder flags so
+    /// tests can assert the never-indexed representation.
+    type HeaderField = (Vec<u8>, Vec<u8>, u8);
+
+    /// One decoded HTTP/2 header block.
+    type HeaderBlock = Vec<HeaderField>;
+
     fn make_config(secrets: Vec<SecretEntry>) -> SecretsConfig {
         SecretsConfig {
             secrets,
@@ -6553,7 +6560,7 @@ mod tests {
     /// Decode every HTTP/2 header block, **keeping** the HPACK decoder flags so
     /// tests can assert the never-indexed representation of the injected field
     /// (see [`decode_first_h2_headers_with_flags`]).
-    fn decode_h2_header_blocks_with_flags(data: &[u8]) -> Vec<Vec<(Vec<u8>, Vec<u8>, u8)>> {
+    fn decode_h2_header_blocks_with_flags(data: &[u8]) -> Vec<HeaderBlock> {
         assert!(data.starts_with(HTTP2_PREFACE));
         let mut cursor = HTTP2_PREFACE.len();
         let mut decoder = HpackDecoder::with_dynamic_size(4096);
@@ -6592,17 +6599,14 @@ mod tests {
         blocks
     }
 
-    fn decode_h2_block(
-        decoder: &mut HpackDecoder,
-        mut encoded: Vec<u8>,
-    ) -> Vec<(Vec<u8>, Vec<u8>, u8)> {
+    fn decode_h2_block(decoder: &mut HpackDecoder, mut encoded: Vec<u8>) -> HeaderBlock {
         let mut headers = Vec::new();
         decoder.decode(&mut encoded, &mut headers).unwrap();
         headers
     }
 
     /// The HPACK decoder flags carried on the named field (assumes it exists).
-    fn h2_header_flags(headers: &[(Vec<u8>, Vec<u8>, u8)], name: &[u8]) -> u8 {
+    fn h2_header_flags(headers: &[HeaderField], name: &[u8]) -> u8 {
         headers
             .iter()
             .find(|(header_name, _, _)| header_name.eq_ignore_ascii_case(name))

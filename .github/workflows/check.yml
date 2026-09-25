@@ -739,13 +739,16 @@ jobs:
       - name: Check agentd
         run: |
           cargo +stable fmt --manifest-path crates/agentd/Cargo.toml -- --check
-          cargo +stable clippy --manifest-path crates/agentd/Cargo.toml --target x86_64-unknown-linux-musl -- -D warnings
+          cargo +stable clippy --manifest-path crates/agentd/Cargo.toml --target x86_64-unknown-linux-musl --all-targets -- -D warnings
 
       - name: Set up mold
         uses: rui314/setup-mold@9c9c13bf4c3f1adef0cc596abc155580bcb04444 # 2.41.0
 
+      # `--all-targets` includes `#[cfg(test)]` modules and integration tests,
+      # which a plain `cargo clippy` never compiles. Without it, test-only
+      # unused imports and lint regressions reach `main` unnoticed.
       - name: Clippy
-        run: cargo +stable clippy --workspace --exclude microsandbox-agentd -- -D warnings
+        run: cargo +stable clippy --workspace --exclude microsandbox-agentd --all-targets -- -D warnings
 
       - name: Docs
         env:
