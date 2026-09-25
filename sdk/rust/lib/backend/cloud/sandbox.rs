@@ -574,6 +574,10 @@ mod tests {
     use super::*;
     use crate::sandbox::{EnvVar, OciRootfsSource, RootDisk, SandboxBuilder, SandboxSpec};
 
+    /// One wire-missing-field case: the field removed from the request, plus the
+    /// mutation that introduces it into a config the cloud backend accepts.
+    type MissingFieldCase = (&'static str, fn(&mut SandboxConfig));
+
     #[tokio::test]
     async fn cloud_create_request_maps_common_fields() {
         let config = SandboxBuilder::new("agent-1")
@@ -847,7 +851,7 @@ mod tests {
 
     #[test]
     fn cloud_create_request_rejects_fields_missing_from_the_wire() {
-        let cases: [(&str, fn(&mut SandboxConfig)); 8] = [
+        let cases: [MissingFieldCase; 8] = [
             ("max_cpus", |config| config.spec.resources.max_cpus = 2),
             ("max_memory", |config| {
                 config.spec.resources.max_memory_mib = 1024

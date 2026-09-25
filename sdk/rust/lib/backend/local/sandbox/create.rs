@@ -2081,8 +2081,14 @@ mod tests {
     ///
     /// Mutation note: moving the capability gate after `insert_sandbox_record`
     /// (or deleting it) leaves a `sandbox_entity` row and fails this test.
+    ///
+    /// The environment lock is held across the awaits on purpose: it is what
+    /// keeps `MSB_CONFIG_PATH` stable for the whole launch against every other
+    /// environment-mutating test. `#[tokio::test]` is single-threaded, so the
+    /// guard cannot be left behind on another worker thread.
     #[cfg(unix)]
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
     async fn create_refuses_an_old_runtime_before_any_db_write() {
         let _env_guard = crate::test_support::lock_env();
         let temp = tempfile::Builder::new()
@@ -2164,8 +2170,12 @@ mod tests {
 
     /// A supported runtime passes the same gate, so the refusal above is about
     /// the runtime and not about credential-bearing creates in general.
+    ///
+    /// See `create_refuses_an_old_runtime_before_any_db_write` for why the
+    /// environment lock is held across the awaits.
     #[cfg(unix)]
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
     async fn create_passes_the_capability_gate_for_a_supported_runtime() {
         let _env_guard = crate::test_support::lock_env();
         let temp = tempfile::Builder::new()

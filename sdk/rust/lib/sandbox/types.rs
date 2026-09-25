@@ -1355,6 +1355,16 @@ impl From<PathBuf> for ImageSource {
 }
 
 //--------------------------------------------------------------------------------------------------
+// Re-Exports
+//--------------------------------------------------------------------------------------------------
+
+pub use microsandbox_types::{
+    DeploymentProfile, DiskImageFormat, FlatClone, HostPermissions, MountOptions,
+    NamedVolumeCreate, NamedVolumeMode, OciRootfsSource, Patch, RootDisk, RootfsSource,
+    SecurityProfile, StatVirtualization, VolumeKind, VolumeMount,
+};
+
+//--------------------------------------------------------------------------------------------------
 // Tests
 //--------------------------------------------------------------------------------------------------
 
@@ -2190,13 +2200,3 @@ mod tests {
         assert!(result.is_err());
     }
 }
-
-//--------------------------------------------------------------------------------------------------
-// Re-Exports
-//--------------------------------------------------------------------------------------------------
-
-pub use microsandbox_types::{
-    DeploymentProfile, DiskImageFormat, FlatClone, HostPermissions, MountOptions,
-    NamedVolumeCreate, NamedVolumeMode, OciRootfsSource, Patch, RootDisk, RootfsSource,
-    SecurityProfile, StatVirtualization, VolumeKind, VolumeMount,
-};

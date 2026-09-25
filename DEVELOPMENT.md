@@ -212,7 +212,7 @@ See that repository's README for setup, workload descriptions, and usage.
 Pre-commit hooks are installed by `just setup`. They run automatically on every commit and check:
 
 - `cargo fmt --all --check` — formatting
-- `cargo clippy --workspace -- -D warnings` — lints
+- `cargo clippy --workspace --all-targets -- -D warnings` — lints, including test targets
 - `cargo doc` — documentation builds without warnings
 - `cargo build -p microsandbox-cli` — CLI compiles
 - Standard checks (trailing whitespace, merge conflicts, TOML/YAML validity)
@@ -231,9 +231,18 @@ If pre-commit is not installed, install it with `pip install pre-commit` (or `br
 ### Formatting and Linting
 
 ```bash
-cargo fmt --all           # Format code
-cargo clippy --workspace  # Run lints
+cargo fmt --all                        # Format code
+cargo clippy --workspace --all-targets # Run lints
 ```
+
+`--all-targets` is what CI and the pre-commit hook run: a plain `cargo clippy`
+only compiles library and binary targets, so a lint failure in a `#[cfg(test)]`
+module or an integration test stays invisible until CI catches it.
+
+This covers the test targets of the platform CI runs it on, not every target
+configuration. Code behind `cfg(windows)`, `cfg(target_os = "linux")`, or a
+non-default feature still needs the [cross-target check](#cross-target-windows-check)
+or the relevant platform job.
 
 ### Cross-target (Windows) Check
 

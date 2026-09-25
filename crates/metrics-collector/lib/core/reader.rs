@@ -178,7 +178,7 @@ mod tests {
             Some([("user.id".to_string(), "alice".to_string())].as_slice())
         );
         // Sandbox 2 has no labels, so no entry is added.
-        assert!(collection.labels.get(&2).is_none());
+        assert!(!collection.labels.contains_key(&2));
     }
 
     #[tokio::test]

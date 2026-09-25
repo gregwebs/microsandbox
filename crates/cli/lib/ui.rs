@@ -58,6 +58,26 @@ pub struct Table {
 pub struct AlreadyRenderedError;
 
 //--------------------------------------------------------------------------------------------------
+// Types: Pull Progress Display
+//--------------------------------------------------------------------------------------------------
+
+/// Ephemeral multi-line pull progress display.
+///
+/// Shows a header spinner and per-layer progress bars with phase-colored
+/// styling. All output is cleared when [`finish`](Self::finish) is called.
+pub struct PullProgressDisplay {
+    mp: MultiProgress,
+    header: ProgressBar,
+    layer_bars: Vec<ProgressBar>,
+    reference: String,
+    download_style: ProgressStyle,
+    materialize_style: ProgressStyle,
+    done_style: ProgressStyle,
+    verb: &'static str,
+    _echo_guard: Option<EchoGuard>,
+}
+
+//--------------------------------------------------------------------------------------------------
 // Methods
 //--------------------------------------------------------------------------------------------------
 
@@ -272,6 +292,204 @@ impl Table {
             out.push('\n');
         }
         out
+    }
+}
+
+//--------------------------------------------------------------------------------------------------
+// Methods: Pull Progress Display
+//--------------------------------------------------------------------------------------------------
+
+impl PullProgressDisplay {
+    /// Create a new pull progress display for the given image reference.
+    pub fn new(reference: &str) -> Self {
+        Self::new_inner(reference, false, "Pulling")
+    }
+
+    /// Create a no-op pull progress display that produces no output.
+    pub fn quiet(reference: &str) -> Self {
+        Self::new_inner(reference, true, "Pulling")
+    }
+
+    /// Create a progress display for `msb image load` (header reads "Loading").
+    pub fn load(reference: &str, quiet: bool) -> Self {
+        Self::new_inner(reference, quiet, "Loading")
+    }
+
+    fn new_inner(reference: &str, quiet: bool, verb: &'static str) -> Self {
+        let is_tty = !quiet && std::io::stderr().is_terminal();
+
+        let mp = MultiProgress::new();
+        if is_tty {
+            mp.set_draw_target(ProgressDrawTarget::stderr_with_hz(10));
+        } else {
+            mp.set_draw_target(ProgressDrawTarget::hidden());
+        }
+
+        let header = mp.add(ProgressBar::new_spinner());
+        header.set_style(
+            ProgressStyle::default_spinner()
+                .tick_strings(BRAILLE_TICKS)
+                .template("   {spinner} {msg}")
+                .unwrap(),
+        );
+        header.set_message(format!("{:<12} {}", verb, reference));
+        header.enable_steady_tick(Duration::from_millis(80));
+
+        Self {
+            mp,
+            header,
+            layer_bars: Vec::new(),
+            reference: reference.to_string(),
+            verb,
+            _echo_guard: if is_tty { EchoGuard::acquire() } else { None },
+            download_style: ProgressStyle::default_bar()
+                .template(
+                    "     {prefix}  {bar:36.magenta/238}  {bytes}/{total_bytes}  {msg:.magenta}",
+                )
+                .unwrap()
+                .progress_chars("━━╌"),
+            materialize_style: ProgressStyle::default_bar()
+                .template("     {prefix}  {bar:36.blue/238}  {bytes}/{total_bytes}  {msg:.blue}")
+                .unwrap()
+                .progress_chars("━━╌"),
+            done_style: ProgressStyle::default_bar()
+                .template("     {prefix}  {msg}")
+                .unwrap(),
+        }
+    }
+
+    /// Ensure a materialize-styled bar exists for `index`, creating any missing
+    /// bars up to it. No-op when the bar already exists (pull pre-creates them on
+    /// its `Resolved` event); load has no such event, so bars are made lazily as
+    /// each layer starts materializing.
+    fn ensure_layer_bar(&mut self, index: usize) {
+        while self.layer_bars.len() <= index {
+            let n = self.layer_bars.len() + 1;
+            let pb = self.mp.add(ProgressBar::new(1));
+            pb.set_style(self.materialize_style.clone());
+            pb.set_prefix(format!("layer {n}"));
+            pb.set_message("materializing");
+            self.layer_bars.push(pb);
+        }
+    }
+
+    /// Process a single pull progress event, updating the display.
+    pub fn handle_event(&mut self, event: PullProgress) {
+        match event {
+            PullProgress::Resolving { .. } => {
+                self.header
+                    .set_message(format!("{:<12} {}...", "Resolving", self.reference));
+            }
+            PullProgress::Resolved { layer_count, .. } => {
+                self.header.set_message(format!(
+                    "{:<12} {} ({} layer{})",
+                    self.verb,
+                    self.reference,
+                    layer_count,
+                    if layer_count == 1 { "" } else { "s" }
+                ));
+
+                let width = layer_count.to_string().len();
+                for i in 0..layer_count {
+                    let pb = self.mp.add(ProgressBar::new(1));
+                    pb.set_style(self.download_style.clone());
+                    pb.set_prefix(format!("layer {:>width$}/{layer_count}", i + 1));
+                    pb.set_message("downloading");
+                    self.layer_bars.push(pb);
+                }
+            }
+            PullProgress::LayerDownloadProgress {
+                layer_index,
+                downloaded_bytes,
+                total_bytes,
+                ..
+            } => {
+                if let Some(pb) = self.layer_bars.get(layer_index) {
+                    if let Some(total) = total_bytes {
+                        pb.set_length(total);
+                    }
+                    pb.set_position(downloaded_bytes);
+                }
+            }
+            PullProgress::LayerDownloadComplete {
+                layer_index,
+                downloaded_bytes,
+                ..
+            } => {
+                if let Some(pb) = self.layer_bars.get(layer_index) {
+                    pb.set_length(downloaded_bytes);
+                    pb.set_position(downloaded_bytes);
+                }
+            }
+            PullProgress::LayerDownloadVerifying { layer_index, .. } => {
+                if let Some(pb) = self.layer_bars.get(layer_index) {
+                    pb.set_message("verifying");
+                }
+            }
+            PullProgress::LayerMaterializeStarted { layer_index, .. } => {
+                self.ensure_layer_bar(layer_index);
+                if let Some(pb) = self.layer_bars.get(layer_index) {
+                    pb.set_style(self.materialize_style.clone());
+                    pb.set_position(0);
+                    pb.set_length(1);
+                    pb.set_message("materializing");
+                }
+            }
+            PullProgress::LayerMaterializeProgress {
+                layer_index,
+                bytes_read,
+                total_bytes,
+            } => {
+                self.ensure_layer_bar(layer_index);
+                if let Some(pb) = self.layer_bars.get(layer_index) {
+                    pb.set_length(total_bytes);
+                    pb.set_position(bytes_read);
+                }
+            }
+            PullProgress::LayerMaterializeWriting { layer_index } => {
+                self.ensure_layer_bar(layer_index);
+                if let Some(pb) = self.layer_bars.get(layer_index) {
+                    pb.set_position(pb.length().unwrap_or(0));
+                    pb.set_message("writing image");
+                }
+            }
+            PullProgress::LayerMaterializeComplete { layer_index, .. } => {
+                self.ensure_layer_bar(layer_index);
+                if let Some(pb) = self.layer_bars.get(layer_index) {
+                    pb.set_position(pb.length().unwrap_or(0));
+                    pb.set_style(self.done_style.clone());
+                    pb.set_message(format!("{}", style("✓").green()));
+                    pb.tick();
+                }
+            }
+            PullProgress::StitchMergingTrees { layer_count } => {
+                self.header.set_message(format!(
+                    "{:<12} {} ({} layer{})",
+                    "Merging",
+                    self.reference,
+                    layer_count,
+                    if layer_count == 1 { "" } else { "s" }
+                ));
+            }
+            PullProgress::StitchWritingFsmeta => {
+                self.header
+                    .set_message(format!("{:<12} {}", "Writing fsmeta", self.reference));
+            }
+            PullProgress::StitchWritingVmdk => {
+                self.header
+                    .set_message(format!("{:<12} {}", "Writing vmdk", self.reference));
+            }
+            PullProgress::StitchComplete => {
+                self.header
+                    .set_message(format!("{:<12} {}", "Stitched", self.reference));
+            }
+            PullProgress::Complete { .. } => {}
+        }
+    }
+
+    /// Clear all ephemeral progress output from the terminal.
+    pub fn finish(self) {
+        let _ = self.mp.clear();
     }
 }
 
@@ -599,223 +817,5 @@ mod tests {
             super::format_rfc3339_datetime("2026-05-31T09:09:00Z").unwrap(),
             expected
         );
-    }
-}
-
-//--------------------------------------------------------------------------------------------------
-// Types: Pull Progress Display
-//--------------------------------------------------------------------------------------------------
-
-/// Ephemeral multi-line pull progress display.
-///
-/// Shows a header spinner and per-layer progress bars with phase-colored
-/// styling. All output is cleared when [`finish`](Self::finish) is called.
-pub struct PullProgressDisplay {
-    mp: MultiProgress,
-    header: ProgressBar,
-    layer_bars: Vec<ProgressBar>,
-    reference: String,
-    download_style: ProgressStyle,
-    materialize_style: ProgressStyle,
-    done_style: ProgressStyle,
-    verb: &'static str,
-    _echo_guard: Option<EchoGuard>,
-}
-
-//--------------------------------------------------------------------------------------------------
-// Methods: Pull Progress Display
-//--------------------------------------------------------------------------------------------------
-
-impl PullProgressDisplay {
-    /// Create a new pull progress display for the given image reference.
-    pub fn new(reference: &str) -> Self {
-        Self::new_inner(reference, false, "Pulling")
-    }
-
-    /// Create a no-op pull progress display that produces no output.
-    pub fn quiet(reference: &str) -> Self {
-        Self::new_inner(reference, true, "Pulling")
-    }
-
-    /// Create a progress display for `msb image load` (header reads "Loading").
-    pub fn load(reference: &str, quiet: bool) -> Self {
-        Self::new_inner(reference, quiet, "Loading")
-    }
-
-    fn new_inner(reference: &str, quiet: bool, verb: &'static str) -> Self {
-        let is_tty = !quiet && std::io::stderr().is_terminal();
-
-        let mp = MultiProgress::new();
-        if is_tty {
-            mp.set_draw_target(ProgressDrawTarget::stderr_with_hz(10));
-        } else {
-            mp.set_draw_target(ProgressDrawTarget::hidden());
-        }
-
-        let header = mp.add(ProgressBar::new_spinner());
-        header.set_style(
-            ProgressStyle::default_spinner()
-                .tick_strings(BRAILLE_TICKS)
-                .template("   {spinner} {msg}")
-                .unwrap(),
-        );
-        header.set_message(format!("{:<12} {}", verb, reference));
-        header.enable_steady_tick(Duration::from_millis(80));
-
-        Self {
-            mp,
-            header,
-            layer_bars: Vec::new(),
-            reference: reference.to_string(),
-            verb,
-            _echo_guard: if is_tty { EchoGuard::acquire() } else { None },
-            download_style: ProgressStyle::default_bar()
-                .template(
-                    "     {prefix}  {bar:36.magenta/238}  {bytes}/{total_bytes}  {msg:.magenta}",
-                )
-                .unwrap()
-                .progress_chars("━━╌"),
-            materialize_style: ProgressStyle::default_bar()
-                .template("     {prefix}  {bar:36.blue/238}  {bytes}/{total_bytes}  {msg:.blue}")
-                .unwrap()
-                .progress_chars("━━╌"),
-            done_style: ProgressStyle::default_bar()
-                .template("     {prefix}  {msg}")
-                .unwrap(),
-        }
-    }
-
-    /// Ensure a materialize-styled bar exists for `index`, creating any missing
-    /// bars up to it. No-op when the bar already exists (pull pre-creates them on
-    /// its `Resolved` event); load has no such event, so bars are made lazily as
-    /// each layer starts materializing.
-    fn ensure_layer_bar(&mut self, index: usize) {
-        while self.layer_bars.len() <= index {
-            let n = self.layer_bars.len() + 1;
-            let pb = self.mp.add(ProgressBar::new(1));
-            pb.set_style(self.materialize_style.clone());
-            pb.set_prefix(format!("layer {n}"));
-            pb.set_message("materializing");
-            self.layer_bars.push(pb);
-        }
-    }
-
-    /// Process a single pull progress event, updating the display.
-    pub fn handle_event(&mut self, event: PullProgress) {
-        match event {
-            PullProgress::Resolving { .. } => {
-                self.header
-                    .set_message(format!("{:<12} {}...", "Resolving", self.reference));
-            }
-            PullProgress::Resolved { layer_count, .. } => {
-                self.header.set_message(format!(
-                    "{:<12} {} ({} layer{})",
-                    self.verb,
-                    self.reference,
-                    layer_count,
-                    if layer_count == 1 { "" } else { "s" }
-                ));
-
-                let width = layer_count.to_string().len();
-                for i in 0..layer_count {
-                    let pb = self.mp.add(ProgressBar::new(1));
-                    pb.set_style(self.download_style.clone());
-                    pb.set_prefix(format!("layer {:>width$}/{layer_count}", i + 1));
-                    pb.set_message("downloading");
-                    self.layer_bars.push(pb);
-                }
-            }
-            PullProgress::LayerDownloadProgress {
-                layer_index,
-                downloaded_bytes,
-                total_bytes,
-                ..
-            } => {
-                if let Some(pb) = self.layer_bars.get(layer_index) {
-                    if let Some(total) = total_bytes {
-                        pb.set_length(total);
-                    }
-                    pb.set_position(downloaded_bytes);
-                }
-            }
-            PullProgress::LayerDownloadComplete {
-                layer_index,
-                downloaded_bytes,
-                ..
-            } => {
-                if let Some(pb) = self.layer_bars.get(layer_index) {
-                    pb.set_length(downloaded_bytes);
-                    pb.set_position(downloaded_bytes);
-                }
-            }
-            PullProgress::LayerDownloadVerifying { layer_index, .. } => {
-                if let Some(pb) = self.layer_bars.get(layer_index) {
-                    pb.set_message("verifying");
-                }
-            }
-            PullProgress::LayerMaterializeStarted { layer_index, .. } => {
-                self.ensure_layer_bar(layer_index);
-                if let Some(pb) = self.layer_bars.get(layer_index) {
-                    pb.set_style(self.materialize_style.clone());
-                    pb.set_position(0);
-                    pb.set_length(1);
-                    pb.set_message("materializing");
-                }
-            }
-            PullProgress::LayerMaterializeProgress {
-                layer_index,
-                bytes_read,
-                total_bytes,
-            } => {
-                self.ensure_layer_bar(layer_index);
-                if let Some(pb) = self.layer_bars.get(layer_index) {
-                    pb.set_length(total_bytes);
-                    pb.set_position(bytes_read);
-                }
-            }
-            PullProgress::LayerMaterializeWriting { layer_index } => {
-                self.ensure_layer_bar(layer_index);
-                if let Some(pb) = self.layer_bars.get(layer_index) {
-                    pb.set_position(pb.length().unwrap_or(0));
-                    pb.set_message("writing image");
-                }
-            }
-            PullProgress::LayerMaterializeComplete { layer_index, .. } => {
-                self.ensure_layer_bar(layer_index);
-                if let Some(pb) = self.layer_bars.get(layer_index) {
-                    pb.set_position(pb.length().unwrap_or(0));
-                    pb.set_style(self.done_style.clone());
-                    pb.set_message(format!("{}", style("✓").green()));
-                    pb.tick();
-                }
-            }
-            PullProgress::StitchMergingTrees { layer_count } => {
-                self.header.set_message(format!(
-                    "{:<12} {} ({} layer{})",
-                    "Merging",
-                    self.reference,
-                    layer_count,
-                    if layer_count == 1 { "" } else { "s" }
-                ));
-            }
-            PullProgress::StitchWritingFsmeta => {
-                self.header
-                    .set_message(format!("{:<12} {}", "Writing fsmeta", self.reference));
-            }
-            PullProgress::StitchWritingVmdk => {
-                self.header
-                    .set_message(format!("{:<12} {}", "Writing vmdk", self.reference));
-            }
-            PullProgress::StitchComplete => {
-                self.header
-                    .set_message(format!("{:<12} {}", "Stitched", self.reference));
-            }
-            PullProgress::Complete { .. } => {}
-        }
-    }
-
-    /// Clear all ephemeral progress output from the terminal.
-    pub fn finish(self) {
-        let _ = self.mp.clear();
     }
 }

@@ -5632,6 +5632,8 @@ mod tests {
 
 #[cfg(all(test, unix))]
 mod config_handoff_tests {
+    // Only the non-Linux pipe tests read the child's copy of the payload back.
+    #[cfg(not(target_os = "linux"))]
     use std::io::Read;
 
     use super::*;
@@ -5639,10 +5641,12 @@ mod config_handoff_tests {
     #[cfg(not(target_os = "linux"))]
     #[tokio::test]
     async fn config_handoff_pipe_is_anon_fifo_and_delivers_all_bytes() {
-        let mut launch = LaunchConfig::default();
         // Make the payload comfortably larger than a typical 64 KiB pipe buffer
         // so the post-spawn write loop must wait for the reader to drain it.
-        launch.exec_args = (0..40_000).map(|i| format!("arg-{i:08}")).collect();
+        let launch = LaunchConfig {
+            exec_args: (0..40_000).map(|i| format!("arg-{i:08}")).collect(),
+            ..Default::default()
+        };
 
         let handoff = create_config_handoff(&launch).unwrap();
         let read_fd = handoff.child_fd().as_raw_fd();
@@ -5705,9 +5709,10 @@ mod config_handoff_tests {
             microsandbox_runtime::vm::STARTUP_FD,
             microsandbox_runtime::vm::LIFECYCLE_LOCK_FD,
         ] {
-            let mut launch = LaunchConfig::default();
-            // Comfortably larger than a typical 64 KiB pipe buffer.
-            launch.exec_args = (0..40_000).map(|i| format!("arg-{i:08}")).collect();
+            let launch = LaunchConfig {
+                exec_args: (0..40_000).map(|i| format!("arg-{i:08}")).collect(),
+                ..Default::default()
+            };
             let expected = serde_json::to_vec(&launch).unwrap();
 
             let handoff = create_config_handoff(&launch).unwrap();
@@ -5913,8 +5918,10 @@ mod startup_guard_tests {
     #[cfg(not(target_os = "linux"))]
     #[tokio::test]
     async fn config_handoff_is_bounded_when_the_child_never_drains() {
-        let mut launch = LaunchConfig::default();
-        launch.exec_args = (0..40_000).map(|i| format!("arg-{i:08}")).collect();
+        let launch = LaunchConfig {
+            exec_args: (0..40_000).map(|i| format!("arg-{i:08}")).collect(),
+            ..Default::default()
+        };
         let handoff = create_config_handoff(&launch).unwrap();
 
         // The pipe hold-back is the parent's own unread read end for this

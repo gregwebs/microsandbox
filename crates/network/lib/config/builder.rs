@@ -1262,6 +1262,13 @@ impl From<ViolationAction> for ViolationActionBuilder {
 mod tests {
     use super::*;
 
+    /// One missing-field case: the field left out of the builder, plus the
+    /// builder construction that omits it.
+    type MissingFieldCase = (
+        &'static str,
+        fn(HeaderCredentialBuilder) -> HeaderCredentialBuilder,
+    );
+
     /// Network builder happy path returns the config unchanged.
     #[test]
     fn network_builder_happy_path_returns_config() {
@@ -1318,7 +1325,7 @@ mod tests {
     /// field.
     #[test]
     fn network_builder_surfaces_a_missing_header_credential_field() {
-        let cases: [(&str, fn(HeaderCredentialBuilder) -> HeaderCredentialBuilder); 5] = [
+        let cases: [MissingFieldCase; 5] = [
             ("id", |c| {
                 c.reference("r")
                     .origin("api.anthropic.com", 443)
