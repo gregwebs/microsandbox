@@ -253,6 +253,8 @@ pub fn run(args: SandboxArgs) -> ! {
         #[cfg(feature = "net")]
         network: launch.network.unwrap_or_default(),
         #[cfg(feature = "net")]
+        resolved_header_credentials: launch.resolved_header_credentials,
+        #[cfg(feature = "net")]
         deployment_profile: launch.deployment_profile,
         #[cfg(feature = "net")]
         sandbox_slot: launch.sandbox_slot,

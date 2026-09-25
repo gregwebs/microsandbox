@@ -2061,6 +2061,23 @@ pub const MAX_SECRET_PLACEHOLDER_BYTES: usize = 1024;
 /// file is treated as misconfiguration/attack and fails closed.
 pub const MAX_SECRET_FILE_BYTES: usize = 64 * 1024;
 
+/// Maximum number of header credentials accepted in one [`SecretsConfig`].
+pub const MAX_HEADER_CREDENTIALS: usize = 32;
+
+/// Maximum byte length of a header-credential `format` template.
+pub const MAX_HEADER_CREDENTIAL_FORMAT_BYTES: usize = 256;
+
+/// Maximum byte length of a resolved (rendered) header-credential value.
+pub const MAX_HEADER_CREDENTIAL_VALUE_BYTES: usize = 8 * 1024;
+
+/// Fixed, non-secret protocol marker identifying a runtime that understands
+/// origin-scoped header credentials on the private launch-config FD.
+///
+/// This is deliberately not a package version: an older runtime silently
+/// ignores unknown additive fields, so callers must probe the installed
+/// binary for this exact token before handing it a credential-bearing config.
+pub const HEADER_CREDENTIAL_LAUNCH_CAPABILITY: &str = "header-credential-launch-v1";
+
 /// Placeholder-based secret injection for a sandbox's TLS-intercepted egress.
 ///
 /// The sandbox only ever sees each secret's `placeholder`; the local network
@@ -2075,9 +2092,117 @@ pub struct SecretsConfig {
     #[serde(default)]
     pub secrets: Vec<SecretEntry>,
 
+    /// Origin-scoped header credentials set at spawn time by a host resolver.
+    ///
+    /// Entries carry only non-secret authorization metadata (a reference) and
+    /// never a value; see [`DurableHeaderCredential`]. The
+    /// `skip_serializing_if` keeps the serialized shape of existing configs
+    /// unchanged.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub header_credentials: Vec<DurableHeaderCredential>,
+
     /// Default action when a placeholder leaks to a disallowed host.
     #[serde(default)]
     pub on_violation: ViolationAction,
+}
+
+/// An exact HTTPS origin: one host and one port.
+///
+/// No wildcards, IP literals, paths, schemes, or userinfo. A bare
+/// authorization hostname means port 443; the port is always explicit on the
+/// wire because header-credential scoping compares it exactly. The host is
+/// lowercase and has no trailing dot; [`SecretsConfig::validate`] re-checks it.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[serde(deny_unknown_fields)]
+pub struct HttpsOrigin {
+    /// Lowercase hostname (no trailing dot).
+    pub host: String,
+    /// TCP port. Must be non-zero.
+    pub port: u16,
+}
+
+/// A durable, non-secret authorization rule that sets one named request
+/// header to a formatted credential value on requests to exactly one origin.
+///
+/// The plaintext is intentionally **unrepresentable** here: the rule carries
+/// only a non-secret `reference` that a host-side resolver understands. The
+/// resolved value crosses the process boundary only on the private
+/// launch-config FD (see the SDK `CredentialResolver`); it never enters this
+/// type, a serialized [`SecretsConfig`], the sandbox database, argv, or a log.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[serde(deny_unknown_fields)]
+pub struct DurableHeaderCredential {
+    /// Non-secret diagnostic label. Never a value.
+    pub id: String,
+    /// Non-secret reference the embedding application's resolver understands
+    /// (for agent-vm: a keychain service name). Never a value.
+    pub reference: String,
+    /// The single exact origin this credential is scoped to.
+    pub origin: HttpsOrigin,
+    /// Lowercase RFC 9110 field name that is set (not substituted).
+    pub header: String,
+    /// Template with exactly one `%s`, replaced by the resolved value. Other
+    /// literal `%` characters are allowed (`"Token %s; v=100%"` is valid).
+    pub format: String,
+}
+
+/// A plaintext string that wipes itself on drop and redacts itself in [`Debug`].
+///
+/// This is the launch-wire value type for resolved header credentials: the
+/// plaintext is reachable only through [`SecretString::expose_secret`], so every
+/// read is greppable, and there is deliberately no `Display` and no `Deref`/
+/// `DerefMut` implementation. The redaction is a property of the type, so a
+/// containing struct cannot forget to redact it. `Debug` prints `[REDACTED]`.
+///
+/// Serialization is transparent (`#[serde(transparent)]`): on the private
+/// launch-config fd a `SecretString` is exactly a JSON string, byte-identical to
+/// the previous `Zeroizing<String>` representation.
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct SecretString(Zeroizing<String>);
+
+impl SecretString {
+    /// Wrap `value`, taking ownership so the plaintext is wiped on drop.
+    pub fn new(value: impl Into<String>) -> Self {
+        Self(Zeroizing::new(value.into()))
+    }
+
+    /// Borrow the plaintext.
+    ///
+    /// Deliberately named so that every read of a secret is easy to audit by
+    /// grepping for `expose_secret`.
+    pub fn expose_secret(&self) -> &str {
+        self.0.as_str()
+    }
+}
+
+impl From<String> for SecretString {
+    fn from(value: String) -> Self {
+        Self::new(value)
+    }
+}
+
+impl From<&str> for SecretString {
+    fn from(value: &str) -> Self {
+        Self::new(value)
+    }
+}
+
+impl From<Zeroizing<String>> for SecretString {
+    fn from(value: Zeroizing<String>) -> Self {
+        Self(value)
+    }
+}
+
+// The whole point of the newtype: redaction cannot be forgotten by a caller.
+impl fmt::Debug for SecretString {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("[REDACTED]")
+    }
 }
 
 /// A single secret entry.
@@ -2284,14 +2409,127 @@ pub enum SecretConfigError {
         /// Index of the invalid secret entry.
         secret_index: usize,
     },
+
+    /// Too many header credentials were configured.
+    #[error("header credential count {actual} exceeds the maximum of {max}")]
+    CredentialCountExceeded {
+        /// Configured credential count.
+        actual: usize,
+        /// Maximum accepted credential count.
+        max: usize,
+    },
+
+    /// A header credential's `id` is empty.
+    #[error("header credential #{credential_index}: id must not be empty")]
+    EmptyCredentialId {
+        /// Index of the invalid credential.
+        credential_index: usize,
+    },
+
+    /// A header credential's `reference` is empty.
+    #[error("header credential #{credential_index}: reference must not be empty")]
+    EmptyCredentialReference {
+        /// Index of the invalid credential.
+        credential_index: usize,
+    },
+
+    /// A header credential has no resolved value where one is required.
+    #[error("header credential #{credential_index}: value is unresolved")]
+    CredentialValueUnresolved {
+        /// Index of the invalid credential.
+        credential_index: usize,
+    },
+
+    /// A resolved header-credential value is empty or unsafe.
+    #[error("header credential #{credential_index}: resolved value is invalid")]
+    CredentialValueInvalid {
+        /// Index of the invalid credential.
+        credential_index: usize,
+    },
+
+    /// The resolved credential list does not match the durable definitions.
+    #[error("resolved header credential count does not match the configured definitions")]
+    CredentialResolutionMismatch,
+
+    /// A header credential origin host is invalid.
+    #[error("header credential #{credential_index}: origin host is invalid")]
+    CredentialOriginHostInvalid {
+        /// Index of the invalid credential.
+        credential_index: usize,
+    },
+
+    /// A header credential origin port is zero.
+    #[error("header credential #{credential_index}: origin port must not be zero")]
+    CredentialPortZero {
+        /// Index of the invalid credential.
+        credential_index: usize,
+    },
+
+    /// A header credential's header name is not a valid token.
+    #[error("header credential #{credential_index}: header is not a valid field name")]
+    CredentialHeaderNotToken {
+        /// Index of the invalid credential.
+        credential_index: usize,
+    },
+
+    /// A header credential's header name is forbidden.
+    #[error("header credential #{credential_index}: header name is not permitted")]
+    CredentialHeaderForbidden {
+        /// Index of the invalid credential.
+        credential_index: usize,
+    },
+
+    /// A header credential's format does not contain exactly one `%s`.
+    #[error("header credential #{credential_index}: format must contain exactly one `%s`")]
+    CredentialFormatPlaceholderCount {
+        /// Index of the invalid credential.
+        credential_index: usize,
+    },
+
+    /// A header credential's format contains an unsafe byte.
+    #[error("header credential #{credential_index}: format contains an unsafe byte")]
+    CredentialFormatUnsafeBytes {
+        /// Index of the invalid credential.
+        credential_index: usize,
+    },
+
+    /// A header credential's format exceeds the supported byte length.
+    #[error(
+        "header credential #{credential_index}: format must be at most {max_bytes} bytes, got {actual_bytes}"
+    )]
+    CredentialFormatTooLong {
+        /// Index of the invalid credential.
+        credential_index: usize,
+        /// Actual format length in bytes.
+        actual_bytes: usize,
+        /// Maximum supported format length in bytes.
+        max_bytes: usize,
+    },
+
+    /// Two header credentials target the same canonical `(origin, header)`.
+    #[error("header credential #{index} duplicates the target of header credential #{other}")]
+    DuplicateCredentialTarget {
+        /// Index of the duplicate credential.
+        index: usize,
+        /// Index of the earlier credential with the same target.
+        other: usize,
+    },
 }
 
 impl SecretsConfig {
     /// Validate all configured secret entries.
+    ///
+    /// This is **definition-level** validation: it checks the legacy
+    /// [`SecretEntry`] grammar exactly as before and the durable
+    /// header-credential authorization grammar. It does not, and cannot, check
+    /// resolved credential *values* — durable header credentials never carry
+    /// one. Resolved-value validation is a separate runtime-only check
+    /// performed on the launch wire type in the network engine.
     pub fn validate(&self) -> Result<(), SecretConfigError> {
         for (index, secret) in self.secrets.iter().enumerate() {
             secret.validate(index)?;
         }
+        validate_header_credentials(&self.header_credentials)?;
         Ok(())
     }
 }
@@ -2322,6 +2560,30 @@ impl SecretEntry {
         }
 
         Ok(())
+    }
+}
+
+// The credential metadata is caller-controlled; the Debug impl prints only
+// fixed labels so a hostile `id`/`reference`/`format`/host cannot reach a log.
+impl fmt::Debug for DurableHeaderCredential {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("DurableHeaderCredential")
+            .field("id", &"[REDACTED]")
+            .field("reference", &"[REDACTED]")
+            .field("origin", &"[REDACTED]")
+            .field("header", &"[REDACTED]")
+            .field("format", &"[REDACTED]")
+            .finish()
+    }
+}
+
+// Redact the origin fields for the same reason as above.
+impl fmt::Debug for HttpsOrigin {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("HttpsOrigin")
+            .field("host", &"[REDACTED]")
+            .field("port", &"[REDACTED]")
+            .finish()
     }
 }
 
@@ -2403,6 +2665,182 @@ fn validate_env_var(env_var: &str, secret_index: usize) -> Result<(), SecretConf
         return Err(SecretConfigError::EnvVarContainsNul { secret_index });
     }
     Ok(())
+}
+
+/// Validate the durable header-credential grammar and duplicate targets.
+fn validate_header_credentials(
+    credentials: &[DurableHeaderCredential],
+) -> Result<(), SecretConfigError> {
+    if credentials.len() > MAX_HEADER_CREDENTIALS {
+        return Err(SecretConfigError::CredentialCountExceeded {
+            actual: credentials.len(),
+            max: MAX_HEADER_CREDENTIALS,
+        });
+    }
+
+    let mut seen: std::collections::HashMap<(String, u16, String), usize> =
+        std::collections::HashMap::new();
+
+    for (index, credential) in credentials.iter().enumerate() {
+        if credential.id.is_empty() {
+            return Err(SecretConfigError::EmptyCredentialId {
+                credential_index: index,
+            });
+        }
+        if credential.reference.is_empty() {
+            return Err(SecretConfigError::EmptyCredentialReference {
+                credential_index: index,
+            });
+        }
+        validate_origin(&credential.origin, index)?;
+        validate_credential_header(&credential.header, index)?;
+        validate_credential_format(&credential.format, index)?;
+
+        let key = (
+            credential.origin.host.clone(),
+            credential.origin.port,
+            credential.header.to_ascii_lowercase(),
+        );
+        if let Some(&other) = seen.get(&key) {
+            return Err(SecretConfigError::DuplicateCredentialTarget { index, other });
+        }
+        seen.insert(key, index);
+    }
+
+    Ok(())
+}
+
+/// Validate one exact HTTPS origin. The host must be a lowercase LDH label
+/// sequence without a trailing dot, and must not be a wildcard, IP literal,
+/// scheme, path, or userinfo.
+fn validate_origin(origin: &HttpsOrigin, credential_index: usize) -> Result<(), SecretConfigError> {
+    if origin.port == 0 {
+        return Err(SecretConfigError::CredentialPortZero { credential_index });
+    }
+    if !is_valid_origin_host(&origin.host) {
+        return Err(SecretConfigError::CredentialOriginHostInvalid { credential_index });
+    }
+    Ok(())
+}
+
+/// Whether `host` is a valid canonical origin hostname.
+fn is_valid_origin_host(host: &str) -> bool {
+    if host.is_empty() || host.len() > 253 {
+        return false;
+    }
+    // Canonical form only: lowercase, no trailing dot, no scheme/path/userinfo
+    // or wildcard, and no characters outside LDH + `.`.
+    for byte in host.bytes() {
+        let ok = byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-' || byte == b'.';
+        if !ok {
+            return false;
+        }
+    }
+    if host.ends_with('.') {
+        return false;
+    }
+    // Reject bare IPv4 literals (all-numeric labels) and everything that could
+    // parse as an IP address.
+    if host.parse::<std::net::IpAddr>().is_ok() {
+        return false;
+    }
+    let mut label_count = 0usize;
+    for label in host.split('.') {
+        label_count += 1;
+        if label.is_empty() || label.len() > 63 {
+            return false;
+        }
+        if label.starts_with('-') || label.ends_with('-') {
+            return false;
+        }
+    }
+    label_count >= 1
+}
+
+/// Validate a credential header name: a lowercase RFC 9110 token that is not a
+/// framing or hop-by-hop field.
+fn validate_credential_header(
+    header: &str,
+    credential_index: usize,
+) -> Result<(), SecretConfigError> {
+    if header.is_empty() || !is_http_token(header) || header.bytes().any(|b| b.is_ascii_uppercase())
+    {
+        return Err(SecretConfigError::CredentialHeaderNotToken { credential_index });
+    }
+    if is_forbidden_credential_header(header) {
+        return Err(SecretConfigError::CredentialHeaderForbidden { credential_index });
+    }
+    Ok(())
+}
+
+/// Whether `header` is a forbidden framing or hop-by-hop field name.
+fn is_forbidden_credential_header(header: &str) -> bool {
+    matches!(
+        header,
+        "host"
+            | "content-length"
+            | "transfer-encoding"
+            | "connection"
+            | "upgrade"
+            | "te"
+            | "trailer"
+            | "proxy-authorization"
+            | "proxy-connection"
+    )
+}
+
+/// Whether every byte of `name` is an RFC 9110 token character.
+fn is_http_token(name: &str) -> bool {
+    !name.is_empty() && name.bytes().all(is_tchar)
+}
+
+/// RFC 9110 `tchar`.
+fn is_tchar(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric()
+        || matches!(
+            byte,
+            b'!' | b'#'
+                | b'$'
+                | b'%'
+                | b'&'
+                | b'\''
+                | b'*'
+                | b'+'
+                | b'-'
+                | b'.'
+                | b'^'
+                | b'_'
+                | b'`'
+                | b'|'
+                | b'~'
+        )
+}
+
+/// Validate the credential value template: exactly one `%s`, printable ASCII
+/// only, and within the byte cap.
+fn validate_credential_format(
+    format: &str,
+    credential_index: usize,
+) -> Result<(), SecretConfigError> {
+    if format.len() > MAX_HEADER_CREDENTIAL_FORMAT_BYTES {
+        return Err(SecretConfigError::CredentialFormatTooLong {
+            credential_index,
+            actual_bytes: format.len(),
+            max_bytes: MAX_HEADER_CREDENTIAL_FORMAT_BYTES,
+        });
+    }
+    if format.bytes().any(|b| !(0x20..=0x7e).contains(&b)) {
+        return Err(SecretConfigError::CredentialFormatUnsafeBytes { credential_index });
+    }
+    if count_format_placeholders(format) != 1 {
+        return Err(SecretConfigError::CredentialFormatPlaceholderCount { credential_index });
+    }
+    Ok(())
+}
+
+/// Count non-overlapping `%s` occurrences in `format`.
+fn count_format_placeholders(format: &str) -> usize {
+    format.matches("%s").count()
 }
 
 fn validate_placeholder(placeholder: &str, secret_index: usize) -> Result<(), SecretConfigError> {
@@ -3305,5 +3743,321 @@ mod tests {
             assert_eq!(parsed, expected);
             assert_eq!(parsed.as_str(), input);
         }
+    }
+
+    fn header_credential() -> DurableHeaderCredential {
+        DurableHeaderCredential {
+            id: "anthropic".into(),
+            reference: "anthropic-api-key".into(),
+            origin: HttpsOrigin {
+                host: "api.anthropic.com".into(),
+                port: 443,
+            },
+            header: "x-api-key".into(),
+            format: "%s".into(),
+        }
+    }
+
+    fn config_with(credentials: Vec<DurableHeaderCredential>) -> SecretsConfig {
+        SecretsConfig {
+            secrets: Vec::new(),
+            header_credentials: credentials,
+            on_violation: ViolationAction::default(),
+        }
+    }
+
+    #[test]
+    fn header_credential_grammar_accepts_canonical_rule() {
+        assert!(config_with(vec![header_credential()]).validate().is_ok());
+    }
+
+    #[test]
+    fn header_credential_rejects_malformed_rules() {
+        let mut cases: Vec<(DurableHeaderCredential, SecretConfigError)> = Vec::new();
+
+        let mut empty_id = header_credential();
+        empty_id.id = String::new();
+        cases.push((
+            empty_id,
+            SecretConfigError::EmptyCredentialId {
+                credential_index: 0,
+            },
+        ));
+
+        let mut empty_reference = header_credential();
+        empty_reference.reference = String::new();
+        cases.push((
+            empty_reference,
+            SecretConfigError::EmptyCredentialReference {
+                credential_index: 0,
+            },
+        ));
+
+        for bad_host in [
+            "",
+            "API.anthropic.com",
+            "api.anthropic.com.",
+            "*.anthropic.com",
+            "127.0.0.1",
+            "[::1]",
+            "https://api.anthropic.com",
+            "api.anthropic.com/path",
+            "user@api.anthropic.com",
+            "-bad.example.com",
+        ] {
+            let mut bad = header_credential();
+            bad.origin.host = bad_host.into();
+            cases.push((
+                bad,
+                SecretConfigError::CredentialOriginHostInvalid {
+                    credential_index: 0,
+                },
+            ));
+        }
+
+        let mut zero_port = header_credential();
+        zero_port.origin.port = 0;
+        cases.push((
+            zero_port,
+            SecretConfigError::CredentialPortZero {
+                credential_index: 0,
+            },
+        ));
+
+        for bad_header in [
+            "X-Api-Key",
+            "x api key",
+            ":authority",
+            "host",
+            "content-length",
+            "transfer-encoding",
+            "connection",
+            "upgrade",
+            "te",
+            "trailer",
+            "proxy-authorization",
+            "proxy-connection",
+        ] {
+            let mut bad = header_credential();
+            bad.header = bad_header.into();
+            let expected = if matches!(
+                bad_header,
+                "host"
+                    | "content-length"
+                    | "transfer-encoding"
+                    | "connection"
+                    | "upgrade"
+                    | "te"
+                    | "trailer"
+                    | "proxy-authorization"
+                    | "proxy-connection"
+            ) {
+                SecretConfigError::CredentialHeaderForbidden {
+                    credential_index: 0,
+                }
+            } else {
+                SecretConfigError::CredentialHeaderNotToken {
+                    credential_index: 0,
+                }
+            };
+            cases.push((bad, expected));
+        }
+
+        for (bad_format, expected) in [
+            (
+                "Token",
+                SecretConfigError::CredentialFormatPlaceholderCount {
+                    credential_index: 0,
+                },
+            ),
+            (
+                "%s %s",
+                SecretConfigError::CredentialFormatPlaceholderCount {
+                    credential_index: 0,
+                },
+            ),
+            (
+                "%s\r\n",
+                SecretConfigError::CredentialFormatUnsafeBytes {
+                    credential_index: 0,
+                },
+            ),
+            (
+                "%s\n",
+                SecretConfigError::CredentialFormatUnsafeBytes {
+                    credential_index: 0,
+                },
+            ),
+            (
+                "%s\0",
+                SecretConfigError::CredentialFormatUnsafeBytes {
+                    credential_index: 0,
+                },
+            ),
+        ] {
+            let mut bad = header_credential();
+            bad.format = bad_format.into();
+            cases.push((bad, expected));
+        }
+
+        for (bad, expected) in cases {
+            assert_eq!(config_with(vec![bad]).validate().unwrap_err(), expected);
+        }
+    }
+
+    #[test]
+    fn header_credential_allows_literal_percent() {
+        let mut credential = header_credential();
+        credential.format = "Token %s; v=100%".into();
+        assert!(config_with(vec![credential]).validate().is_ok());
+    }
+
+    #[test]
+    fn header_credential_rejects_duplicate_target_after_canonicalization() {
+        let mut duplicate = header_credential();
+        duplicate.id = "other".into();
+        duplicate.reference = "other-ref".into();
+        // Same canonical `(host, port, lowercase header)` target.
+        duplicate.header = "x-api-key".into();
+        let err = config_with(vec![header_credential(), duplicate])
+            .validate()
+            .unwrap_err();
+        assert_eq!(
+            err,
+            SecretConfigError::DuplicateCredentialTarget { index: 1, other: 0 }
+        );
+    }
+
+    #[test]
+    fn empty_header_credentials_keep_legacy_serialized_shape() {
+        let serialized = serde_json::to_string(&SecretsConfig::default()).unwrap();
+        assert_eq!(
+            serialized,
+            r#"{"secrets":[],"on_violation":"block-and-log"}"#
+        );
+    }
+
+    #[test]
+    fn durable_credential_serializes_without_value() {
+        let config = config_with(vec![header_credential()]);
+        let serialized = serde_json::to_string(&config).unwrap();
+        assert!(serialized.contains("header_credentials"));
+        assert!(!serialized.contains("value"));
+
+        // A durable config must reject a `value` field rather than ignore it.
+        let with_value = r#"{"id":"a","reference":"r","origin":{"host":"api.example.com","port":443},"header":"x-api-key","format":"%s","value":"leak"}"#;
+        assert!(serde_json::from_str::<DurableHeaderCredential>(with_value).is_err());
+    }
+
+    #[test]
+    fn header_credential_grammar_fixture() {
+        let raw = include_str!("fixtures/header_credential_grammar.json");
+        let fixture: serde_json::Value = serde_json::from_str(raw).unwrap();
+
+        for entry in fixture["accept"].as_array().unwrap() {
+            let credential: DurableHeaderCredential = serde_json::from_value(entry.clone())
+                .unwrap_or_else(|e| panic!("accept entry failed to parse: {e}"));
+            assert!(
+                config_with(vec![credential]).validate().is_ok(),
+                "expected accept entry to validate: {entry}"
+            );
+        }
+
+        for entry in fixture["reject"].as_array().unwrap() {
+            let text = entry.to_string();
+            let mut entry = entry.clone();
+            if let Some(object) = entry.as_object_mut() {
+                object.remove("_why");
+            }
+            let credential: DurableHeaderCredential = serde_json::from_value(entry)
+                .unwrap_or_else(|e| panic!("reject entry failed to parse: {e}"));
+            assert!(
+                config_with(vec![credential]).validate().is_err(),
+                "expected reject entry to fail validation: {text}"
+            );
+        }
+
+        for raw_entry in fixture["serde_reject"].as_array().unwrap() {
+            let text = raw_entry.as_str().unwrap();
+            assert!(
+                serde_json::from_str::<DurableHeaderCredential>(text).is_err(),
+                "expected serde to reject: {text}"
+            );
+        }
+    }
+
+    #[test]
+    fn header_credential_debug_redacts_caller_metadata() {
+        let sentinel = "SENTINEL-abc123";
+        let mut credential = header_credential();
+        credential.id = sentinel.into();
+        credential.reference = sentinel.into();
+        credential.header = sentinel.to_ascii_lowercase();
+        credential.format = format!("{sentinel} %s");
+        credential.origin.host = sentinel.to_ascii_lowercase();
+
+        let rendered = format!("{credential:?}");
+        assert!(
+            !rendered.contains(sentinel),
+            "Debug leaked metadata: {rendered}"
+        );
+        assert!(
+            !rendered.contains("SENTINEL"),
+            "Debug leaked metadata: {rendered}"
+        );
+
+        let nested = format!("{:?}", config_with(vec![credential]));
+        assert!(
+            !nested.contains("SENTINEL"),
+            "nested Debug leaked: {nested}"
+        );
+    }
+
+    #[test]
+    fn secret_string_debug_is_redacted() {
+        let secret = SecretString::new("SENTINEL-sk-live-42".to_string());
+        let rendered = format!("{secret:?}");
+        assert_eq!(rendered, "[REDACTED]");
+        assert!(
+            !rendered.contains("SENTINEL"),
+            "Debug leaked the value: {rendered}"
+        );
+    }
+
+    #[test]
+    fn secret_string_reads_only_through_the_accessor() {
+        let secret = SecretString::new("sk-live-42".to_string());
+        assert_eq!(secret.expose_secret(), "sk-live-42");
+    }
+
+    #[test]
+    fn secret_string_serde_round_trips_as_a_plain_string() {
+        let secret = SecretString::new("sk-live-42".to_string());
+        let json = serde_json::to_string(&secret).unwrap();
+        assert_eq!(json, "\"sk-live-42\"");
+        let back: SecretString = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.expose_secret(), "sk-live-42");
+    }
+
+    /// The wire form must stay byte-identical to the previous
+    /// `Zeroizing<String>` representation, so `#[serde(transparent)]` is
+    /// load-bearing: a struct whose only field is a `SecretString` serializes
+    /// exactly like the same struct with a `Zeroizing<String>` field.
+    #[test]
+    fn secret_string_json_bytes_match_the_previous_representation() {
+        #[derive(Serialize)]
+        struct With(Zeroizing<String>);
+        #[derive(Serialize)]
+        struct WithSecret(SecretString);
+
+        let raw = With(Zeroizing::new("sk-live-42".to_string()));
+        let wrapped = WithSecret(SecretString::new("sk-live-42"));
+        assert_eq!(
+            serde_json::to_vec(&raw).unwrap(),
+            serde_json::to_vec(&wrapped).unwrap()
+        );
+        // A newtype struct over a transparent wrapper is a plain JSON string,
+        // exactly as `Zeroizing<String>` was.
+        assert_eq!(serde_json::to_vec(&wrapped).unwrap(), br#""sk-live-42""#);
     }
 }

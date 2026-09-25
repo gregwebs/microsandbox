@@ -83,6 +83,10 @@ enum Commands {
     #[command(name = "__schema-baseline", hide = true)]
     SchemaBaseline(self_cmd::SchemaBaselineArgs),
 
+    /// Print the launch capabilities of this binary (internal).
+    #[command(name = "__capabilities", hide = true)]
+    Capabilities(self_cmd::CapabilitiesArgs),
+
     /// Show the active backend and its selection source.
     #[command(visible_alias = "ctx")]
     Context(context::ContextArgs),
@@ -627,6 +631,7 @@ fn run_async_command_anyhow(
     // must remain usable while diagnosing an invalid backend configuration.
     let command = match command {
         Commands::SchemaBaseline(args) => return self_cmd::run_schema_baseline(args),
+        Commands::Capabilities(args) => return self_cmd::run_capabilities(args),
         command => command,
     };
 
@@ -657,6 +662,7 @@ fn run_async_command_anyhow(
         match command {
             Commands::Sandbox(_) => unreachable!("handled before Tokio starts"),
             Commands::SchemaBaseline(_) => unreachable!("handled before backend resolution"),
+            Commands::Capabilities(_) => unreachable!("handled before backend resolution"),
             Commands::Context(args) => context::run(args),
             #[cfg(windows)]
             Commands::WindowsSelfSwap(args) => self_cmd::run_windows_self_swap(args).await,

@@ -193,6 +193,32 @@ pub enum PortProtocol {
 }
 
 //--------------------------------------------------------------------------------------------------
+// Methods
+//--------------------------------------------------------------------------------------------------
+
+impl NetworkConfig {
+    /// The first configured header credential whose origin port is not in the
+    /// TLS [`intercepted_ports`](TlsConfig::intercepted_ports), with that port.
+    ///
+    /// The intercepting proxy decides interception purely **per port**, so a
+    /// credential scoped to a port that is never intercepted would silently
+    /// never be injected. There is no safe automatic widening — adding the port
+    /// would MITM unrelated traffic on it — so both
+    /// [`NetworkBuilder::build`](crate::config::NetworkBuilder::build) and the
+    /// engine fail closed on this instead of enabling it implicitly. Returns the
+    /// credential's non-secret diagnostic `id` and the offending port.
+    pub(crate) fn first_unintercepted_header_credential(&self) -> Option<(&str, u16)> {
+        self.secrets
+            .header_credentials
+            .iter()
+            .find_map(|credential| {
+                (!self.tls.intercepted_ports.contains(&credential.origin.port))
+                    .then_some((credential.id.as_str(), credential.origin.port))
+            })
+    }
+}
+
+//--------------------------------------------------------------------------------------------------
 // Trait Implementations
 //--------------------------------------------------------------------------------------------------
 

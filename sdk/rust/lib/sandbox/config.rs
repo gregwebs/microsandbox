@@ -600,6 +600,56 @@ impl SandboxConfig {
     }
 }
 
+/// Whether a durable config authorizes any origin-scoped header credential.
+pub(crate) fn has_header_credentials(config: &SandboxConfig) -> bool {
+    config
+        .spec
+        .network
+        .secrets
+        .as_ref()
+        .is_some_and(|secrets| !secrets.header_credentials.is_empty())
+}
+
+/// Resolve origin-scoped header-credential references into launch-only values.
+///
+/// Called in the embedding process before `fork`. The returned values are moved
+/// onto the private launch config and never returned to a durable config. An
+/// error carries only a numeric index and a fixed kind.
+#[cfg(feature = "net")]
+pub(crate) fn resolve_header_credentials(
+    config: &SandboxConfig,
+    resolver: Option<&dyn crate::CredentialResolver>,
+) -> crate::MicrosandboxResult<
+    Vec<microsandbox_network::secrets::credential::ResolvedHeaderCredential>,
+> {
+    use microsandbox_network::secrets::credential::ResolvedHeaderCredential;
+
+    let Some(secrets) = config.spec.network.secrets.as_ref() else {
+        return Ok(Vec::new());
+    };
+    if secrets.header_credentials.is_empty() {
+        return Ok(Vec::new());
+    }
+    let resolver = resolver.ok_or(crate::MicrosandboxError::HeaderCredential(
+        crate::HeaderCredentialError::MissingResolver {
+            credential_index: 0,
+        },
+    ))?;
+
+    let mut resolved = Vec::with_capacity(secrets.header_credentials.len());
+    for (index, definition) in secrets.header_credentials.iter().enumerate() {
+        let value = resolver.resolve(&definition.reference).map_err(|_| {
+            crate::MicrosandboxError::HeaderCredential(
+                crate::HeaderCredentialError::ResolveFailed {
+                    credential_index: index,
+                },
+            )
+        })?;
+        resolved.push(ResolvedHeaderCredential::from_definition(definition, value));
+    }
+    Ok(resolved)
+}
+
 /// Resolve reference-model secret entries (host-side `source` references) into
 /// concrete values for this spawn.
 ///
@@ -724,6 +774,8 @@ impl Default for SandboxConfig {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(feature = "net")]
+    use super::resolve_header_credentials;
     use super::{SandboxConfig, merge_env};
     use crate::sandbox::{
         HandoffInit, MountOptions, NamedVolumeMode, RootDisk, RootfsSource, StatVirtualization,
@@ -1965,5 +2017,191 @@ mod tests {
             }
             mount => panic!("expected tmpfs mount, got {mount:?}"),
         }
+    }
+
+    #[cfg(feature = "net")]
+    #[test]
+    fn resolve_header_credentials_requires_a_resolver_and_keeps_the_value_off_durable_config() {
+        use microsandbox_network::config::NetworkBuilder;
+
+        let network = NetworkBuilder::new()
+            .header_credential(|credential| {
+                credential
+                    .id("anthropic")
+                    .reference("anthropic-api-key")
+                    .origin("api.example.com", 443)
+                    .header("x-api-key")
+                    .format("%s")
+            })
+            .build()
+            .expect("credential-bearing network config should build");
+
+        let mut config = SandboxConfig::default();
+        config.set_local_network_config(network).unwrap();
+
+        // The durable config carries the reference but never a value.
+        let durable = serde_json::to_string(&config).unwrap();
+        assert!(durable.contains("header_credentials"), "{durable}");
+        assert!(!durable.contains("value"), "{durable}");
+
+        // No resolver is a typed refusal that names the first index.
+        let err = resolve_header_credentials(&config, None).unwrap_err();
+        assert!(matches!(
+            err,
+            crate::MicrosandboxError::HeaderCredential(
+                crate::HeaderCredentialError::MissingResolver {
+                    credential_index: 0
+                }
+            )
+        ));
+
+        struct FixedResolver;
+        impl crate::CredentialResolver for FixedResolver {
+            fn resolve(
+                &self,
+                _reference: &str,
+            ) -> Result<zeroize::Zeroizing<String>, crate::CredentialResolveError> {
+                Ok(zeroize::Zeroizing::new("sk-secret".into()))
+            }
+        }
+
+        let resolved = resolve_header_credentials(&config, Some(&FixedResolver)).unwrap();
+        assert_eq!(resolved.len(), 1);
+        assert_eq!(resolved[0].value.expose_secret(), "sk-secret");
+        // The launch-only wire form does carry the value.
+        let wire = serde_json::to_string(&resolved).unwrap();
+        assert!(wire.contains("sk-secret"), "{wire}");
+    }
+
+    #[cfg(feature = "net")]
+    #[test]
+    fn resolve_header_credentials_maps_resolver_error_to_index_only() {
+        use microsandbox_network::config::NetworkBuilder;
+
+        let network = NetworkBuilder::new()
+            .header_credential(|credential| {
+                credential
+                    .id("a")
+                    .reference("ref-a")
+                    .origin("api.example.com", 443)
+                    .header("x-api-key")
+                    .format("%s")
+            })
+            .build()
+            .unwrap();
+        let mut config = SandboxConfig::default();
+        config.set_local_network_config(network).unwrap();
+
+        struct FailingResolver;
+        impl crate::CredentialResolver for FailingResolver {
+            fn resolve(
+                &self,
+                _reference: &str,
+            ) -> Result<zeroize::Zeroizing<String>, crate::CredentialResolveError> {
+                Err(crate::CredentialResolveError::not_found())
+            }
+        }
+
+        let err = resolve_header_credentials(&config, Some(&FailingResolver)).unwrap_err();
+        assert!(matches!(
+            err,
+            crate::MicrosandboxError::HeaderCredential(
+                crate::HeaderCredentialError::ResolveFailed {
+                    credential_index: 0
+                }
+            )
+        ));
+        assert!(!err.to_string().contains("ref-a"), "{err}");
+    }
+
+    /// A resolved value must never reach a `Debug`, `Display`, error string or
+    /// `tracing` event, including when the callback's own error text contains
+    /// it (a keychain error frequently does).
+    ///
+    /// Mutation note: deriving `Debug` for `ResolvedHeaderCredential`, or
+    /// forwarding the callback error's `Display`/`source` into
+    /// `ResolveFailed`, makes this test fail.
+    #[cfg(feature = "net")]
+    #[test]
+    fn resolved_value_never_reaches_logs_debug_or_errors() {
+        use microsandbox_network::config::NetworkBuilder;
+
+        const CANARY: &str = "SENTINEL-sk-live-0131";
+
+        let network = NetworkBuilder::new()
+            .header_credential(|credential| {
+                credential
+                    .id("anthropic")
+                    .reference("anthropic-api-key")
+                    .origin("api.example.com", 443)
+                    .header("x-api-key")
+                    .format("Bearer %s")
+            })
+            .build()
+            .unwrap();
+        let mut config = SandboxConfig::default();
+        config.set_local_network_config(network).unwrap();
+
+        struct LeakyResolver;
+        impl crate::CredentialResolver for LeakyResolver {
+            fn resolve(
+                &self,
+                _reference: &str,
+            ) -> Result<zeroize::Zeroizing<String>, crate::CredentialResolveError> {
+                Ok(zeroize::Zeroizing::new(CANARY.into()))
+            }
+        }
+
+        let _tracing_guard = crate::test_support::lock_tracing();
+        let (resolved, events) = crate::test_support::capture_events(|| {
+            resolve_header_credentials(&config, Some(&LeakyResolver)).unwrap()
+        });
+        for event in events {
+            assert!(
+                !event.contains(CANARY),
+                "credential value reached a log: {event}"
+            );
+        }
+
+        // Debug of the resolved credential and of the launch wire form.
+        let debug = format!("{resolved:?}");
+        assert!(!debug.contains(CANARY), "{debug}");
+        let launch = microsandbox_runtime::launch::LaunchConfig {
+            resolved_header_credentials: resolved.clone(),
+            ..Default::default()
+        };
+        let launch_debug = format!("{launch:?}");
+        assert!(!launch_debug.contains(CANARY), "{launch_debug}");
+
+        // The value DOES travel on the private launch wire (the channel exists).
+        let wire = serde_json::to_string(&launch.resolved_header_credentials).unwrap();
+        assert!(wire.contains(CANARY), "{wire}");
+
+        // A resolver error whose message contains the value is replaced by the
+        // credential index: neither `Display` nor the source chain may carry it.
+        struct LeakyFailingResolver;
+        impl crate::CredentialResolver for LeakyFailingResolver {
+            fn resolve(
+                &self,
+                _reference: &str,
+            ) -> Result<zeroize::Zeroizing<String>, crate::CredentialResolveError> {
+                let _ = CANARY;
+                Err(crate::CredentialResolveError::not_found())
+            }
+        }
+        let error = resolve_header_credentials(&config, Some(&LeakyFailingResolver)).unwrap_err();
+        assert!(!error.to_string().contains(CANARY), "{error}");
+        assert!(!format!("{error:?}").contains(CANARY), "{error:?}");
+        let mut source = std::error::Error::source(&error);
+        while let Some(current) = source {
+            assert!(!current.to_string().contains(CANARY), "{current}");
+            source = current.source();
+        }
+
+        // The durable config keeps only the reference.
+        let durable = serde_json::to_string(&config).unwrap();
+        assert!(durable.contains("anthropic-api-key"), "{durable}");
+        assert!(!durable.contains(CANARY), "{durable}");
+        assert!(!format!("{config:?}").contains(CANARY));
     }
 }

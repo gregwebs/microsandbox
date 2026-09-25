@@ -10,12 +10,14 @@ use std::net::{IpAddr, SocketAddr};
 
 use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
 use httlib_hpack::{Decoder as HpackDecoder, Encoder as HpackEncoder};
+use microsandbox_types::SecretString;
 use percent_encoding::percent_decode;
 
 use super::config::{
     HostPattern, MAX_SECRET_PLACEHOLDER_BYTES, SecretEntry, SecretSource, SecretsConfig,
     ViolationAction,
 };
+use super::credential::ResolvedHeaderCredential;
 use super::file_source;
 use crate::netstack::shared::SharedState;
 
@@ -110,6 +112,13 @@ pub struct SecretsHandler {
     unsupported_body_tail: Vec<u8>,
     /// HTTP/2 parser/rewriter state once an HTTP/2 preface is observed.
     http2_state: Option<Http2State>,
+    /// Origin-scoped header credentials authorized for this launch.
+    ///
+    /// Held immutably for the connection's lifetime; a value is rendered per
+    /// request/stream and never cached across requests.
+    header_credentials: Vec<ResolvedHeaderCredential>,
+    /// The verified destination identity for credential injection.
+    credential_identity: CredentialIdentity,
 }
 
 /// HTTP request framing state for the guest→server byte stream.
@@ -175,6 +184,10 @@ struct Http2Frame<'a> {
 
 type Http2Headers = Vec<(Vec<u8>, Vec<u8>)>;
 
+/// Header fields to set on a request, as `(name, rendered value)`. The
+/// rendered value is zeroized on drop.
+type CredentialFields = Vec<(String, SecretString)>;
+
 /// Current chunked-body parser phase.
 #[derive(Debug, Clone, Default)]
 enum ChunkedPhase {
@@ -195,10 +208,51 @@ struct SecretHostIdentity<'a> {
     shared: &'a SharedState,
 }
 
+/// How this connection's destination identity was established for the purpose
+/// of origin-scoped header credentials.
+///
+/// Header credentials additionally require the *destination identity* the
+/// existing secret layer already relies on: on direct TLS the credential host
+/// must be bound to the original guest destination IP by the DNS cache, so a
+/// guest cannot point an intercepted connection at another IP while supplying
+/// the authorized SNI. CONNECT-derived authorities are the deliberate
+/// exception: the proxy verified the SNI against the CONNECT authority.
+#[derive(Debug, Clone)]
+enum CredentialIdentity {
+    /// No verified destination identity: no header credential is injected.
+    Unverified,
+    /// The proxy verified the SNI against the HTTP CONNECT authority.
+    ConnectAuthority,
+    /// Direct TLS: the credential host must appear among the hostnames that
+    /// the original guest destination IP resolved from at connection setup.
+    DnsPinned {
+        /// Hostnames bound to the guest IP by a live DNS-cache entry.
+        hostnames: Vec<String>,
+        /// Whether the guest IP is this sandbox's host gateway (which the
+        /// synthesized host alias resolves to without a DNS lookup).
+        gateway_bound: bool,
+    },
+}
+
 /// Parsed HTTP/1 request metadata needed for validation and framing.
 struct HttpRequestMetadata {
     host_headers: Vec<String>,
     target_authority: Option<String>,
+    /// Scheme of an absolute-form request target, if one was present.
+    target_scheme: Option<String>,
+}
+
+/// The request-origin components a header credential is scoped against.
+struct CredentialRequestOrigin {
+    /// Lowercased request authority host (no trailing dot).
+    host: String,
+    /// Request authority port, defaulted to 443 when absent.
+    port: u16,
+    /// False only when an explicit non-`https` scheme was observed.
+    scheme_https: bool,
+    /// False only when an absolute-form target disagreed with the Host header
+    /// in host or port (HTTP/1); always true for HTTP/2 or relative targets.
+    absolute_form_agrees: bool,
 }
 
 /// Supported request transfer-encoding after strict validation.
@@ -484,7 +538,15 @@ impl SecretsHandler {
     /// `tls_intercepted` indicates whether this is a MITM connection
     /// (true) or a bypass/plain connection (false).
     pub fn new(config: &SecretsConfig, sni: &str, tls_intercepted: bool) -> Self {
-        Self::new_inner(config, sni, tls_intercepted, None, false, false)
+        Self::new_inner(
+            config,
+            sni,
+            tls_intercepted,
+            None,
+            false,
+            false,
+            CredentialIdentity::Unverified,
+        )
     }
 
     /// Create a handler for a TLS-intercepted connection.
@@ -504,6 +566,7 @@ impl SecretsHandler {
             Some(SecretHostIdentity { guest_ip, shared }),
             true,
             false,
+            snapshot_dns_pin(guest_ip, shared),
         )
     }
 
@@ -512,7 +575,15 @@ impl SecretsHandler {
     /// The SNI is authoritative: the proxy already verified it against the
     /// CONNECT authority, so no DNS-cache pin is required.
     pub(crate) fn new_tls_intercepted_via_connect(config: &SecretsConfig, sni: &str) -> Self {
-        Self::new_inner(config, sni, true, None, true, false)
+        Self::new_inner(
+            config,
+            sni,
+            true,
+            None,
+            true,
+            false,
+            CredentialIdentity::ConnectAuthority,
+        )
     }
 
     /// Create a handler for a plain-HTTP (non-TLS) connection.
@@ -532,6 +603,7 @@ impl SecretsHandler {
             Some(SecretHostIdentity { guest_ip, shared }),
             true,
             false,
+            snapshot_dns_pin(guest_ip, shared),
         )
     }
 
@@ -545,7 +617,15 @@ impl SecretsHandler {
             .iter()
             .any(|secret| secret.allowed_hosts.iter().any(|h| *h != HostPattern::Any));
 
-        Self::new_inner(config, "", false, None, false, host_scoped)
+        Self::new_inner(
+            config,
+            "",
+            false,
+            None,
+            false,
+            host_scoped,
+            CredentialIdentity::Unverified,
+        )
     }
 
     /// Handler for HTTP metadata that must never receive substituted secrets.
@@ -554,7 +634,15 @@ impl SecretsHandler {
     /// treated as violations according to their configured action unless a
     /// passthrough policy explicitly allows forwarding the placeholder.
     pub(crate) fn new_plain_http_untrusted_metadata(config: &SecretsConfig) -> Self {
-        Self::new_inner(config, "", false, None, false, true)
+        Self::new_inner(
+            config,
+            "",
+            false,
+            None,
+            false,
+            true,
+            CredentialIdentity::Unverified,
+        )
     }
 
     fn new_inner(
@@ -564,6 +652,7 @@ impl SecretsHandler {
         identity: Option<SecretHostIdentity<'_>>,
         enforce_http_authority: bool,
         force_ineligible: bool,
+        credential_identity: CredentialIdentity,
     ) -> Self {
         let mut eligible_for_substitution = Vec::new();
         let mut ineligible_for_substitution = Vec::new();
@@ -682,7 +771,18 @@ impl SecretsHandler {
             http_pending: Vec::new(),
             unsupported_body_tail: Vec::new(),
             http2_state: None,
+            header_credentials: Vec::new(),
+            credential_identity,
         }
+    }
+
+    /// Attach the origin-scoped header credentials authorized for this launch.
+    ///
+    /// Values are held in memory for the connection's lifetime; an empty list
+    /// is the default for connections with no credentials.
+    pub fn with_header_credentials(mut self, credentials: Vec<ResolvedHeaderCredential>) -> Self {
+        self.header_credentials = credentials;
+        self
     }
 
     /// Attach the original guest destination for structured violation logs.
@@ -811,6 +911,10 @@ impl SecretsHandler {
         // pass through `substitute()` so its headers are substituted and
         // its violations are detected.
         let mut body_substitution_allowed = false;
+        // Header-credential fields for this request, computed once from the
+        // ORIGINAL head. `authorized_http1_credential_fields` runs the strict
+        // grammar checks on that original head before returning any field.
+        let mut credential_fields: Option<CredentialFields> = None;
         let (body_bytes, spillover) = if boundary.is_some() {
             let header_text = String::from_utf8_lossy(header_bytes);
             let request_summary = http1_request_summary(header_text.as_ref());
@@ -828,6 +932,11 @@ impl SecretsHandler {
             {
                 return Err(ViolationAction::Block);
             }
+
+            // Credential-bearing requests are the only ones allowed to set a
+            // named header, so their strict grammar checks run before any
+            // rewrite path is chosen.
+            credential_fields = self.authorized_http1_credential_fields(header_bytes)?;
 
             let transfer_encoding = parse_transfer_encoding(header_text.as_ref())?;
             if transfer_encoding.is_some() && parse_content_length(header_text.as_ref())?.is_some()
@@ -900,7 +1009,7 @@ impl SecretsHandler {
         }
         self.update_tail(this_request);
 
-        if self.eligible_for_substitution.is_empty() {
+        if self.eligible_for_substitution.is_empty() && credential_fields.is_none() {
             // No substitution needed; pass this request through and let the
             // recursive call handle the spillover (if any).
             return self.append_pipelined_spillover(data, this_request, spillover);
@@ -934,6 +1043,17 @@ impl SecretsHandler {
                     body = Some(replaced);
                 }
             }
+        }
+
+        // Apply authorized header credentials after any legacy placeholder
+        // substitution, deleting every existing field with the configured
+        // name and appending exactly one formatted field before the final CRLF.
+        if let Some(fields) = &credential_fields {
+            let source = header_str
+                .as_deref()
+                .map_or(header_bytes, |headers| headers.as_bytes());
+            let rewritten = set_credential_fields_in_head(source, fields)?;
+            header_str = Some(String::from_utf8(rewritten).map_err(|_| ViolationAction::Block)?);
         }
 
         let header_changed = header_str
@@ -1077,7 +1197,7 @@ impl SecretsHandler {
             HttpState::InChunkedBody { state }
         };
 
-        if let Some(headers) = self.substitute_header_bytes(header_bytes) {
+        if let Some(headers) = self.substitute_header_bytes(header_bytes)? {
             let mut output = Vec::with_capacity(headers.len() + body_part.len() + spillover.len());
             output.extend_from_slice(headers.as_bytes());
             output.extend_from_slice(body_part);
@@ -1123,7 +1243,7 @@ impl SecretsHandler {
         };
 
         let header_len = header_bytes.len();
-        let header_out = self.substitute_header_bytes(header_bytes);
+        let header_out = self.substitute_header_bytes(header_bytes)?;
         let mut output = Vec::with_capacity(
             header_out
                 .as_ref()
@@ -1276,6 +1396,7 @@ impl SecretsHandler {
             && matches!(self.http_state, HttpState::AwaitingHeaders)
             && self.eligible_for_substitution.is_empty()
             && self.ineligible_for_substitution.is_empty()
+            && self.header_credentials.is_empty()
     }
 
     fn needs_body_injection(&self) -> bool {
@@ -1363,7 +1484,10 @@ impl SecretsHandler {
         }
     }
 
-    fn substitute_header_bytes(&self, header_bytes: &[u8]) -> Option<String> {
+    fn substitute_header_bytes(
+        &self,
+        header_bytes: &[u8],
+    ) -> Result<Option<String>, ViolationAction> {
         let mut header_str: Option<String> = None;
         for secret in &self.eligible_for_substitution {
             if secret.require_tls_identity && !self.tls_intercepted {
@@ -1376,7 +1500,136 @@ impl SecretsHandler {
             }
         }
 
-        header_str.filter(|headers| headers.as_bytes() != header_bytes)
+        if let Some(fields) = self.authorized_http1_credential_fields(header_bytes)? {
+            let source = header_str
+                .as_deref()
+                .map_or(header_bytes, |headers| headers.as_bytes());
+            let rewritten = set_credential_fields_in_head(source, &fields)?;
+            header_str = Some(String::from_utf8(rewritten).map_err(|_| ViolationAction::Block)?);
+        }
+
+        Ok(header_str.filter(|headers| headers.as_bytes() != header_bytes))
+    }
+
+    /// The header fields to set on this HTTP/1 request, or `None` when no
+    /// credential is authorized for it.
+    ///
+    /// Runs the strict credential grammar checks on the original head, so a
+    /// malformed credential-bearing request is blocked before any rewrite. A
+    /// missing or ambiguous request origin is fail-closed.
+    fn authorized_http1_credential_fields(
+        &self,
+        header_bytes: &[u8],
+    ) -> Result<Option<CredentialFields>, ViolationAction> {
+        if self.header_credentials.is_empty() {
+            return Ok(None);
+        }
+        let metadata = parse_http_request_metadata(header_bytes)?.ok_or(ViolationAction::Block)?;
+        check_credential_http1_grammar(header_bytes, &self.header_credentials)?;
+        if !self.credential_connection_ok() {
+            return Ok(None);
+        }
+        let request = http1_credential_request_origin(&metadata)?;
+        self.rendered_credential_fields(&request)
+    }
+
+    /// The header fields to set on this HTTP/2 initial request stream, or
+    /// `None` when no credential is authorized for it.
+    ///
+    /// Runs the strict credential grammar checks on the *original* decoded
+    /// block, so an ambiguous request whose pseudoheaders different recipients
+    /// could interpret differently is blocked before any rewrite. A missing or
+    /// ambiguous request origin is fail-closed.
+    fn authorized_h2_credential_fields(
+        &self,
+        headers: &[(Vec<u8>, Vec<u8>)],
+    ) -> Result<Option<CredentialFields>, ViolationAction> {
+        if self.header_credentials.is_empty() {
+            return Ok(None);
+        }
+        if !check_credential_http2_grammar(headers)? {
+            // Structurally valid but not a credential-eligible request shape
+            // (e.g. CONNECT), so nothing is injected and nothing is blocked.
+            return Ok(None);
+        }
+        check_credential_http2_hop_by_hop(headers, &self.header_credentials)?;
+        let request = http2_credential_request_origin(headers)?;
+        if !self.credential_connection_ok() {
+            return Ok(None);
+        }
+        self.rendered_credential_fields(&request)
+    }
+
+    fn rendered_credential_fields(
+        &self,
+        request: &CredentialRequestOrigin,
+    ) -> Result<Option<CredentialFields>, ViolationAction> {
+        let mut fields = Vec::new();
+        for credential in &self.header_credentials {
+            if self.credential_authorized(credential, request) {
+                // An empty, unsafe, or over-long rendered value blocks the
+                // connection rather than forwarding an uninjected request. The
+                // failure reason is surfaced (value-free) with the non-secret
+                // credential id so an operator can distinguish the cases; the
+                // value itself is never logged.
+                let rendered = credential.render().map_err(|error| {
+                    tracing::warn!(
+                        credential_id = %credential.id,
+                        error = %error,
+                        "header credential could not be rendered; blocking request"
+                    );
+                    ViolationAction::Block
+                })?;
+                fields.push((credential.header.clone(), rendered));
+            }
+        }
+        if fields.is_empty() {
+            Ok(None)
+        } else {
+            Ok(Some(fields))
+        }
+    }
+
+    /// Whether this connection can receive any header credential at all.
+    fn credential_connection_ok(&self) -> bool {
+        self.tls_intercepted && self.http_sni.is_some() && self.guest_dst.is_some()
+    }
+
+    /// The single canonical origin decision shared by HTTP/1 and HTTP/2.
+    fn credential_authorized(
+        &self,
+        credential: &ResolvedHeaderCredential,
+        request: &CredentialRequestOrigin,
+    ) -> bool {
+        let Some(guest_dst) = self.guest_dst else {
+            return false;
+        };
+        self.tls_intercepted
+            && self.sni.eq_ignore_ascii_case(&credential.origin_host)
+            && self.credential_identity_allows(&credential.origin_host)
+            && guest_dst.port() == credential.origin_port
+            && request.host.eq_ignore_ascii_case(&credential.origin_host)
+            && request.port == credential.origin_port
+            && request.scheme_https
+            && request.absolute_form_agrees
+    }
+
+    /// Whether this connection's verified destination identity binds the
+    /// credential host to the original guest destination.
+    fn credential_identity_allows(&self, host: &str) -> bool {
+        match &self.credential_identity {
+            CredentialIdentity::Unverified => false,
+            CredentialIdentity::ConnectAuthority => true,
+            CredentialIdentity::DnsPinned {
+                hostnames,
+                gateway_bound,
+            } => {
+                hostnames
+                    .iter()
+                    .any(|hostname| hostname.eq_ignore_ascii_case(host))
+                    || (*gateway_bound && host.eq_ignore_ascii_case(crate::HOST_ALIAS))
+            }
+        }
     }
 
     fn consume_chunked_body_with_violation_detection(
@@ -1813,6 +2066,14 @@ impl Http2State {
             validate_http2_authority(&headers, sni, is_initial_request)?;
         }
 
+        // Credential eligibility is decided on the ORIGINAL decoded block,
+        // before legacy placeholder substitution and before injection.
+        let credential_fields = if is_initial_request {
+            handler.authorized_h2_credential_fields(&headers)?
+        } else {
+            None
+        };
+
         let detection_bytes = http2_header_detection_bytes(&headers);
         let detection_text = String::from_utf8_lossy(&detection_bytes);
         let request_summary = http2_request_summary(detection_text.as_ref());
@@ -1827,6 +2088,16 @@ impl Http2State {
         ))?;
 
         handler.substitute_http2_headers(&mut headers);
+        // Header credentials are set only on an initial request stream, never
+        // on a trailer block, and eligibility is decided on the original
+        // decoded block computed above (before placeholder substitution).
+        if let Some(fields) = credential_fields {
+            for (name, value) in fields {
+                headers.retain(|(field_name, _)| !field_name.eq_ignore_ascii_case(name.as_bytes()));
+                headers.push((name.into_bytes(), value.expose_secret().as_bytes().to_vec()));
+            }
+            enforce_http2_header_limits(&headers)?;
+        }
         let encoded = self.encode_headers(&headers)?;
         append_http2_header_frames(output, block.stream_id, block.end_stream, &encoded)?;
         if block.end_stream {
@@ -2065,6 +2336,22 @@ fn validate_http2_authority(
     Ok(())
 }
 
+/// Re-check HTTP/2 header limits after an inserted credential field.
+fn enforce_http2_header_limits(headers: &[(Vec<u8>, Vec<u8>)]) -> Result<(), ViolationAction> {
+    if headers.len() > MAX_HTTP2_HEADER_FIELDS {
+        return Err(ViolationAction::Block);
+    }
+    let decoded_bytes = headers.iter().try_fold(0usize, |acc, (name, value)| {
+        acc.checked_add(name.len())
+            .and_then(|len| len.checked_add(value.len()))
+            .and_then(|len| len.checked_add(4))
+    });
+    if decoded_bytes.is_none_or(|bytes| bytes > MAX_HTTP2_DECODED_HEADER_BYTES) {
+        return Err(ViolationAction::Block);
+    }
+    Ok(())
+}
+
 fn http2_header_detection_bytes(headers: &[(Vec<u8>, Vec<u8>)]) -> Vec<u8> {
     let len = headers
         .iter()
@@ -2100,6 +2387,9 @@ fn parse_http_request_metadata(
     }
 
     let target_authority = request_target_authority(method, target)?;
+    let target_scheme = target
+        .split_once("://")
+        .map(|(scheme, _)| scheme.to_string());
     let mut host_headers = Vec::new();
     for line in lines.take_while(|line| !line.is_empty()) {
         let Some((name, value)) = line.split_once(':') else {
@@ -2122,6 +2412,7 @@ fn parse_http_request_metadata(
     Ok(Some(HttpRequestMetadata {
         host_headers,
         target_authority,
+        target_scheme,
     }))
 }
 
@@ -2308,6 +2599,405 @@ fn authority_hostname(authority: &str) -> Option<&str> {
             Some(host.trim_end_matches('.'))
         }
         _ => Some(authority),
+    }
+}
+
+/// Parse an authority into `(host, Option<port>)`, preserving the port.
+///
+/// Unlike [`authority_hostname`], this keeps the port so credential eligibility
+/// can compare it exactly. It rejects ambiguous delimiters, empty hosts,
+/// non-numeric ports, and bare (unbracketed) colons that would make the host
+/// ambiguous.
+fn authority_origin(authority: &str) -> Option<(&str, Option<u16>)> {
+    let authority = authority.trim();
+    if authority.is_empty() {
+        return None;
+    }
+
+    if let Some(rest) = authority.strip_prefix('[') {
+        let (host, remainder) = rest.split_once(']')?;
+        if host.is_empty() {
+            return None;
+        }
+        let port = match remainder {
+            "" => None,
+            rest => Some(rest.strip_prefix(':')?.parse::<u16>().ok()?),
+        };
+        return Some((host.trim_end_matches('.'), port));
+    }
+
+    if let Some((host, port)) = authority.rsplit_once(':') {
+        if host.is_empty() || host.contains(':') {
+            return None;
+        }
+        return Some((host.trim_end_matches('.'), Some(port.parse::<u16>().ok()?)));
+    }
+
+    if authority.contains(':') {
+        return None;
+    }
+    Some((authority.trim_end_matches('.'), None))
+}
+
+/// The single exact HTTP/1 request origin used for the credential decision.
+fn http1_credential_request_origin(
+    metadata: &HttpRequestMetadata,
+) -> Result<CredentialRequestOrigin, ViolationAction> {
+    if metadata.host_headers.len() != 1 {
+        return Err(ViolationAction::Block);
+    }
+    let (host, port) = authority_origin(&metadata.host_headers[0]).ok_or(ViolationAction::Block)?;
+    let port = port.unwrap_or(443);
+
+    let mut scheme_https = true;
+    let mut absolute_form_agrees = true;
+    if let Some(scheme) = &metadata.target_scheme {
+        scheme_https = scheme.eq_ignore_ascii_case("https");
+        let target = metadata
+            .target_authority
+            .as_deref()
+            .ok_or(ViolationAction::Block)?;
+        let (target_host, target_port) = authority_origin(target).ok_or(ViolationAction::Block)?;
+        absolute_form_agrees =
+            target_host.eq_ignore_ascii_case(host) && target_port.unwrap_or(443) == port;
+    }
+
+    Ok(CredentialRequestOrigin {
+        host: host.to_ascii_lowercase(),
+        port,
+        scheme_https,
+        absolute_form_agrees,
+    })
+}
+
+/// Strict HTTP/2 request grammar scoped to credential-bearing streams.
+///
+/// Returns `Ok(true)` when the original decoded block is a syntactically valid
+/// non-CONNECT request that may be considered for credential injection,
+/// `Ok(false)` when it is structurally valid but not a credential-eligible
+/// request shape (CONNECT), and `Err(Block)` when the block is malformed or
+/// ambiguous — a recipient could otherwise interpret a credential-bearing
+/// stream differently from the next hop.
+///
+/// It runs on the *original* decoded block, before legacy placeholder
+/// substitution or injection.
+fn check_credential_http2_grammar(headers: &[(Vec<u8>, Vec<u8>)]) -> Result<bool, ViolationAction> {
+    let mut seen_regular = false;
+    let mut method: Option<&[u8]> = None;
+    let mut scheme_seen = false;
+    let mut path: Option<&[u8]> = None;
+    let mut authority_seen = false;
+    let mut protocol_seen = false;
+
+    for (name, value) in headers {
+        if name.is_empty() {
+            return Err(ViolationAction::Block);
+        }
+        if name[0] == b':' {
+            // Pseudoheaders must precede every regular field, appear at most
+            // once, be one of the defined request pseudoheaders, and carry a
+            // valid lower-case token name after the colon.
+            if seen_regular || !name[1..].iter().all(|&byte| is_http_token_byte(byte)) {
+                return Err(ViolationAction::Block);
+            }
+            match name.as_slice() {
+                b":method" => {
+                    if method.replace(value.as_slice()).is_some()
+                        || value.is_empty()
+                        || !value.iter().all(|&byte| is_http_token_byte(byte))
+                    {
+                        return Err(ViolationAction::Block);
+                    }
+                }
+                b":scheme" => {
+                    if scheme_seen || value.is_empty() {
+                        return Err(ViolationAction::Block);
+                    }
+                    scheme_seen = true;
+                }
+                b":path" => {
+                    if path.replace(value.as_slice()).is_some() {
+                        return Err(ViolationAction::Block);
+                    }
+                }
+                b":authority" => {
+                    if authority_seen {
+                        return Err(ViolationAction::Block);
+                    }
+                    authority_seen = true;
+                }
+                b":protocol" => {
+                    if protocol_seen {
+                        return Err(ViolationAction::Block);
+                    }
+                    protocol_seen = true;
+                }
+                _ => return Err(ViolationAction::Block),
+            }
+            continue;
+        }
+
+        // A regular field name must be a lowercase token (RFC 9113 §8.2.1).
+        if name.iter().any(|byte| byte.is_ascii_uppercase())
+            || !name.iter().all(|&byte| is_http_token_byte(byte))
+        {
+            return Err(ViolationAction::Block);
+        }
+        seen_regular = true;
+    }
+
+    let method = method.ok_or(ViolationAction::Block)?;
+    if method.eq_ignore_ascii_case(b"CONNECT") {
+        // Ordinary CONNECT carries only `:authority`; extended CONNECT may add
+        // exactly one `:scheme` and one non-empty `:path`. Credentials are not
+        // scoped to a CONNECT tunnel target, so the request stays eligible to
+        // forward but never receives a credential.
+        if !authority_seen {
+            return Err(ViolationAction::Block);
+        }
+        if protocol_seen {
+            if !scheme_seen || path.is_none_or(|path| path.is_empty()) {
+                return Err(ViolationAction::Block);
+            }
+        } else if scheme_seen || path.is_some() {
+            return Err(ViolationAction::Block);
+        }
+        return Ok(false);
+    }
+
+    if !scheme_seen || !authority_seen || protocol_seen {
+        return Err(ViolationAction::Block);
+    }
+    if path.is_none_or(|path| path.is_empty()) {
+        return Err(ViolationAction::Block);
+    }
+    Ok(true)
+}
+
+/// Reject an HTTP/2 request that names a configured credential field in a
+/// hop-by-hop `Connection:` token.
+///
+/// HTTP/2 forbids connection-specific fields outright (RFC 9113 §8.2.2), but a
+/// strict peer is not guaranteed on the path: an H2→H1 intermediary may strip
+/// the field a `Connection:` token names, silently dropping the injected
+/// credential, or an RFC-conformant H2 peer may reject the request. The H1 path
+/// already blocks this (`check_credential_http1_grammar`); the H2 initial-request
+/// path must do the same on the *original* decoded block, before injection, and
+/// without mutating any unrelated header. A malformed or empty token list is
+/// blocked too, mirroring the H1 grammar.
+fn check_credential_http2_hop_by_hop(
+    headers: &[(Vec<u8>, Vec<u8>)],
+    credentials: &[ResolvedHeaderCredential],
+) -> Result<(), ViolationAction> {
+    let configured: Vec<String> = credentials
+        .iter()
+        .map(|credential| credential.header.to_ascii_lowercase())
+        .collect();
+
+    for (name, value) in headers {
+        if !name.eq_ignore_ascii_case(b"connection") {
+            continue;
+        }
+        let value = std::str::from_utf8(value).map_err(|_| ViolationAction::Block)?;
+        for token in value.split(',') {
+            let token = token.trim();
+            if token.is_empty() || !token.bytes().all(is_http_token_byte) {
+                return Err(ViolationAction::Block);
+            }
+            if configured.contains(&token.to_ascii_lowercase()) {
+                return Err(ViolationAction::Block);
+            }
+        }
+    }
+    Ok(())
+}
+
+/// The single exact HTTP/2 request origin used for the credential decision.
+///
+/// A `host` field that disagrees with `:authority` in host or port is blocked;
+/// a non-`https` `:scheme` makes the request ineligible (uninjected forward).
+fn http2_credential_request_origin(
+    headers: &[(Vec<u8>, Vec<u8>)],
+) -> Result<CredentialRequestOrigin, ViolationAction> {
+    let mut authority: Option<&[u8]> = None;
+    let mut host_header: Option<&[u8]> = None;
+    let mut scheme: Option<&[u8]> = None;
+
+    for (name, value) in headers {
+        if name.eq_ignore_ascii_case(b":authority") {
+            if authority.is_some() {
+                return Err(ViolationAction::Block);
+            }
+            authority = Some(value);
+        } else if name.eq_ignore_ascii_case(b"host") {
+            if host_header.is_some() {
+                return Err(ViolationAction::Block);
+            }
+            host_header = Some(value);
+        } else if name.eq_ignore_ascii_case(b":scheme") {
+            if scheme.is_some() {
+                return Err(ViolationAction::Block);
+            }
+            scheme = Some(value);
+        }
+    }
+
+    let authority = authority.ok_or(ViolationAction::Block)?;
+    let authority = std::str::from_utf8(authority).map_err(|_| ViolationAction::Block)?;
+    let (host, port) = authority_origin(authority).ok_or(ViolationAction::Block)?;
+    let port = port.unwrap_or(443);
+
+    if let Some(host_header) = host_header {
+        let host_header = std::str::from_utf8(host_header).map_err(|_| ViolationAction::Block)?;
+        let (host_header_host, host_header_port) =
+            authority_origin(host_header).ok_or(ViolationAction::Block)?;
+        if !host_header_host.eq_ignore_ascii_case(host) || host_header_port.unwrap_or(443) != port {
+            return Err(ViolationAction::Block);
+        }
+    }
+
+    let scheme_https = match scheme {
+        None => true,
+        Some(value) => std::str::from_utf8(value)
+            .map_err(|_| ViolationAction::Block)?
+            .eq_ignore_ascii_case("https"),
+    };
+
+    Ok(CredentialRequestOrigin {
+        host: host.to_ascii_lowercase(),
+        port,
+        scheme_https,
+        absolute_form_agrees: true,
+    })
+}
+
+/// Strict grammar checks scoped to credential-bearing HTTP/1 requests.
+///
+/// Rejects hop-by-hop `Connection:` tokens that name a configured field (or are
+/// empty/malformed), and ambiguous duplicate `Content-Length`. The existing
+/// framing rejects for TE+CL and invalid TE run separately on the same head.
+fn check_credential_http1_grammar(
+    header_bytes: &[u8],
+    credentials: &[ResolvedHeaderCredential],
+) -> Result<(), ViolationAction> {
+    let headers = std::str::from_utf8(header_bytes).map_err(|_| ViolationAction::Block)?;
+    let configured: Vec<String> = credentials
+        .iter()
+        .map(|credential| credential.header.to_ascii_lowercase())
+        .collect();
+
+    let mut content_length_count = 0usize;
+    for line in headers.split("\r\n").skip(1) {
+        if line.is_empty() {
+            continue;
+        }
+        let Some((name, value)) = line.split_once(':') else {
+            return Err(ViolationAction::Block);
+        };
+        if name.is_empty() || !name.bytes().all(is_http_token_byte) {
+            return Err(ViolationAction::Block);
+        }
+        if name.eq_ignore_ascii_case("connection") {
+            for token in value.split(',') {
+                let token = token.trim();
+                if token.is_empty() || !token.bytes().all(is_http_token_byte) {
+                    return Err(ViolationAction::Block);
+                }
+                if configured.contains(&token.to_ascii_lowercase()) {
+                    return Err(ViolationAction::Block);
+                }
+            }
+        } else if name.eq_ignore_ascii_case("content-length") {
+            content_length_count += 1;
+        }
+    }
+
+    if content_length_count > 1 {
+        return Err(ViolationAction::Block);
+    }
+    Ok(())
+}
+
+/// Delete every existing field named in `fields` (case-insensitively) and
+/// append exactly one `name: value` field before the final CRLF, preserving
+/// every other byte of the request head exactly.
+fn set_credential_fields_in_head(
+    head: &[u8],
+    fields: &[(String, SecretString)],
+) -> Result<Vec<u8>, ViolationAction> {
+    let Some(stripped) = head.strip_suffix(b"\r\n\r\n") else {
+        return Err(ViolationAction::Block);
+    };
+
+    let mut output = Vec::with_capacity(head.len() + 64 * fields.len());
+    let mut first_line = true;
+    for line in stripped.split(|&byte| byte == b'\n') {
+        let line = line.strip_suffix(b"\r").unwrap_or(line);
+        if first_line {
+            output.extend_from_slice(line);
+            output.extend_from_slice(b"\r\n");
+            first_line = false;
+            continue;
+        }
+        if line.is_empty() {
+            continue;
+        }
+        let drop = line
+            .iter()
+            .position(|&byte| byte == b':')
+            .is_some_and(|pos| {
+                let name = &line[..pos];
+                fields
+                    .iter()
+                    .any(|(field_name, _)| name.eq_ignore_ascii_case(field_name.as_bytes()))
+            });
+        if !drop {
+            output.extend_from_slice(line);
+            output.extend_from_slice(b"\r\n");
+        }
+    }
+
+    for (name, value) in fields {
+        output.extend_from_slice(name.as_bytes());
+        output.extend_from_slice(b": ");
+        output.extend_from_slice(value.expose_secret().as_bytes());
+        output.extend_from_slice(b"\r\n");
+    }
+    output.extend_from_slice(b"\r\n");
+
+    // The rewritten head is re-parsed (and forwarded) by the next hop, so it
+    // must still fit the same bound the original head was admitted under. Up
+    // to `MAX_HEADER_CREDENTIALS` fields can otherwise push a 64 KiB head past
+    // the parser budget and let hops disagree on framing.
+    if output.len() > MAX_HTTP_HEADER_BYTES {
+        return Err(ViolationAction::Block);
+    }
+    Ok(output)
+}
+
+/// Snapshot the DNS-cache bindings of `guest_ip` for credential injection.
+///
+/// The snapshot is taken once at connection setup, mirroring how the existing
+/// secret layer evaluates its host identity, and is filtered by the cache's
+/// live TTL: a stale or mismatched pin yields no bound hostnames and therefore
+/// no credential injection.
+fn snapshot_dns_pin(guest_ip: IpAddr, shared: &SharedState) -> CredentialIdentity {
+    let mut hostnames = Vec::new();
+    // `any_resolved_hostname` stops at the first matching entry, so always
+    // answer `false` and collect every live hostname instead.
+    let _ = shared.any_resolved_hostname(guest_ip, |hostname| {
+        hostnames.push(hostname.to_string());
+        false
+    });
+    let gateway_bound = shared
+        .gateway_ipv4()
+        .is_some_and(|ip| guest_ip == IpAddr::V4(ip))
+        || shared
+            .gateway_ipv6()
+            .is_some_and(|ip| guest_ip == IpAddr::V6(ip));
+    CredentialIdentity::DnsPinned {
+        hostnames,
+        gateway_bound,
     }
 }
 
@@ -3105,6 +3795,7 @@ mod tests {
     fn make_config(secrets: Vec<SecretEntry>) -> SecretsConfig {
         SecretsConfig {
             secrets,
+            header_credentials: Vec::new(),
             on_violation: ViolationAction::Block,
         }
     }
@@ -3256,6 +3947,20 @@ mod tests {
     }
 
     fn decode_first_h2_headers(data: &[u8]) -> Vec<(Vec<u8>, Vec<u8>)> {
+        decode_first_h2_headers_with_flags(data)
+            .into_iter()
+            .map(|(name, value, _flags)| (name, value))
+            .collect()
+    }
+
+    /// Decode the first HTTP/2 header block, **keeping** the HPACK decoder
+    /// flags. The flags are load-bearing: a field carried with the never-indexed
+    /// representation decodes with [`HpackDecoder::NEVER_INDEXED`], while an
+    /// incrementally indexed field decodes with [`HpackDecoder::WITH_INDEXING`]
+    /// (and an indexed field with `0`). Asserting on them is what pins the
+    /// confidentiality property that an injected credential never enters the
+    /// HPACK dynamic table.
+    fn decode_first_h2_headers_with_flags(data: &[u8]) -> Vec<(Vec<u8>, Vec<u8>, u8)> {
         assert!(data.starts_with(HTTP2_PREFACE));
         let mut cursor = HTTP2_PREFACE.len();
         let mut decoder = HpackDecoder::with_dynamic_size(4096);
@@ -3291,9 +3996,6 @@ mod tests {
         let mut headers = Vec::new();
         decoder.decode(&mut encoded, &mut headers).unwrap();
         headers
-            .into_iter()
-            .map(|(name, value, _flags)| (name, value))
-            .collect()
     }
 
     fn h2_header_value(headers: &[(Vec<u8>, Vec<u8>)], name: &[u8]) -> String {
@@ -5511,5 +6213,767 @@ mod tests {
             b"GET /b HTTP/1.1\r\nHost: example.com\r\nAuth: real-secret\r\n\r\n",
         );
         assert_eq!(out3.as_ref(), expected.as_slice());
+    }
+
+    //----------------------------------------------------------------------------------------------
+    // Header credential tests
+    //----------------------------------------------------------------------------------------------
+
+    fn resolved_credential(value: &str) -> ResolvedHeaderCredential {
+        ResolvedHeaderCredential::from_definition(
+            &microsandbox_types::DurableHeaderCredential {
+                id: "test".into(),
+                reference: "test-ref".into(),
+                origin: microsandbox_types::HttpsOrigin {
+                    host: "api.example.com".into(),
+                    port: 443,
+                },
+                header: "x-api-key".into(),
+                format: "%s".into(),
+            },
+            zeroize::Zeroizing::new(value.into()),
+        )
+    }
+
+    fn creds_only_config() -> SecretsConfig {
+        SecretsConfig {
+            secrets: Vec::new(),
+            header_credentials: Vec::new(),
+            on_violation: ViolationAction::Block,
+        }
+    }
+
+    fn creds_handler(credentials: Vec<ResolvedHeaderCredential>, dst_port: u16) -> SecretsHandler {
+        let ip = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 9));
+        let shared = pinned_shared("api.example.com", ip);
+        creds_handler_on(
+            &shared,
+            "api.example.com",
+            credentials,
+            SocketAddr::from(([203, 0, 113, 9], dst_port)),
+        )
+    }
+
+    /// Shared state with a live DNS-cache binding from `ip` to `host`.
+    fn pinned_shared(host: &str, ip: IpAddr) -> SharedState {
+        let shared = SharedState::new(16);
+        let family = match ip {
+            IpAddr::V4(_) => ResolvedHostnameFamily::Ipv4,
+            IpAddr::V6(_) => ResolvedHostnameFamily::Ipv6,
+        };
+        shared.cache_resolved_hostname(host, family, [ip], Duration::from_secs(300));
+        shared
+    }
+
+    fn creds_handler_on(
+        shared: &SharedState,
+        sni: &str,
+        credentials: Vec<ResolvedHeaderCredential>,
+        dst: SocketAddr,
+    ) -> SecretsHandler {
+        let config = creds_only_config();
+        SecretsHandler::new_tls_intercepted(&config, sni, dst.ip(), shared)
+            .with_header_credentials(credentials)
+            .with_guest_dst(dst)
+    }
+
+    #[test]
+    fn header_credential_sets_absent_field_with_no_secret_entry() {
+        let mut handler = creds_handler(vec![resolved_credential("sk-secret")], 443);
+        let input = b"GET /v1 HTTP/1.1\r\nHost: api.example.com\r\n\r\n";
+        let output = handler.substitute(input).unwrap().into_owned();
+        assert_eq!(
+            String::from_utf8(output).unwrap(),
+            "GET /v1 HTTP/1.1\r\nHost: api.example.com\r\nx-api-key: sk-secret\r\n\r\n"
+        );
+    }
+
+    #[test]
+    fn header_credential_replaces_existing_field_case_insensitively() {
+        let mut handler = creds_handler(vec![resolved_credential("sk-secret")], 443);
+        let input = b"GET /v1 HTTP/1.1\r\nHost: api.example.com\r\nX-API-Key: guest-value\r\n\r\n";
+        let output = handler.substitute(input).unwrap().into_owned();
+        let text = String::from_utf8(output).unwrap();
+        assert_eq!(text.matches("x-api-key:").count(), 1);
+        assert!(!text.contains("guest-value"));
+        assert!(text.ends_with("x-api-key: sk-secret\r\n\r\n"));
+    }
+
+    #[test]
+    fn header_credential_preserves_other_headers_and_body() {
+        let mut handler = creds_handler(vec![resolved_credential("sk-secret")], 443);
+        let input = b"POST /v1 HTTP/1.1\r\nHost: api.example.com\r\nContent-Length: 5\r\nX-Trace: abc\r\n\r\nhello";
+        let output = handler.substitute(input).unwrap().into_owned();
+        let text = String::from_utf8(output).unwrap();
+        assert!(text.contains("Content-Length: 5\r\n"), "{text}");
+        assert!(text.contains("X-Trace: abc\r\n"), "{text}");
+        assert!(
+            text.ends_with("\r\nx-api-key: sk-secret\r\n\r\nhello"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn header_credential_not_injected_for_wrong_guest_port() {
+        let mut handler = creds_handler(vec![resolved_credential("sk-secret")], 8443);
+        let input = b"GET /v1 HTTP/1.1\r\nHost: api.example.com\r\n\r\n";
+        let output = handler.substitute(input).unwrap();
+        assert_eq!(output.as_ref(), input);
+    }
+
+    #[test]
+    fn header_credential_blocks_connection_token_naming_the_field() {
+        let mut handler = creds_handler(vec![resolved_credential("sk-secret")], 443);
+        let input = b"GET /v1 HTTP/1.1\r\nHost: api.example.com\r\nConnection: x-api-key\r\n\r\n";
+        assert_eq!(
+            handler.substitute(input).unwrap_err(),
+            ViolationAction::Block
+        );
+    }
+
+    #[test]
+    fn header_credential_blocks_duplicate_content_length() {
+        let mut handler = creds_handler(vec![resolved_credential("sk-secret")], 443);
+        let input = b"POST /v1 HTTP/1.1\r\nHost: api.example.com\r\nContent-Length: 0\r\nContent-Length: 0\r\n\r\n";
+        assert_eq!(
+            handler.substitute(input).unwrap_err(),
+            ViolationAction::Block
+        );
+    }
+
+    #[test]
+    fn header_credential_unsafe_value_blocks() {
+        let mut handler = creds_handler(vec![resolved_credential("bad\r\nvalue")], 443);
+        let input = b"GET /v1 HTTP/1.1\r\nHost: api.example.com\r\n\r\n";
+        assert_eq!(
+            handler.substitute(input).unwrap_err(),
+            ViolationAction::Block
+        );
+    }
+
+    #[test]
+    fn header_credential_http2_sets_field_on_initial_stream() {
+        let ip = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 9));
+        let shared = pinned_shared("api.example.com", ip);
+        let mut handler = creds_handler_on(
+            &shared,
+            "api.example.com",
+            vec![resolved_credential("sk-secret")],
+            SocketAddr::from(([203, 0, 113, 9], 443)),
+        );
+
+        let request = h2_request(
+            &[
+                (b":method", b"GET"),
+                (b":scheme", b"https"),
+                (b":authority", b"api.example.com"),
+                (b":path", b"/"),
+            ],
+            true,
+        );
+        let output = handler.substitute(&request).unwrap().into_owned();
+        let headers = decode_first_h2_headers(&output);
+        assert_eq!(h2_header_value(&headers, b"x-api-key"), "sk-secret");
+        assert_field_never_indexed(&decode_first_h2_headers_with_flags(&output), b"x-api-key");
+    }
+
+    #[test]
+    fn header_credential_http2_http_scheme_is_not_injected() {
+        let ip = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 9));
+        let shared = pinned_shared("api.example.com", ip);
+        let mut handler = creds_handler_on(
+            &shared,
+            "api.example.com",
+            vec![resolved_credential("sk-secret")],
+            SocketAddr::from(([203, 0, 113, 9], 443)),
+        );
+
+        let request = h2_request(
+            &[
+                (b":method", b"GET"),
+                (b":scheme", b"http"),
+                (b":authority", b"api.example.com"),
+                (b":path", b"/"),
+            ],
+            true,
+        );
+        let output = handler.substitute(&request).unwrap().into_owned();
+        let headers = decode_first_h2_headers(&output);
+        assert!(
+            !headers
+                .iter()
+                .any(|(name, _)| name.eq_ignore_ascii_case(b"x-api-key")),
+            "credential must not be injected for a non-https :scheme"
+        );
+    }
+
+    //----------------------------------------------------------------------------------------------
+    // DNS-pin identity for direct TLS
+    //----------------------------------------------------------------------------------------------
+
+    /// Mutation note: deleting the `credential_identity_allows` conjunct from
+    /// `credential_authorized` makes this test inject and fail.
+    #[test]
+    fn header_credential_direct_tls_requires_a_dns_pin() {
+        // The guest supplied the authorized SNI and port, but the destination
+        // IP was never resolved from that hostname.
+        let shared = SharedState::new(16);
+        let mut handler = creds_handler_on(
+            &shared,
+            "api.example.com",
+            vec![resolved_credential("sk-secret")],
+            SocketAddr::from(([203, 0, 113, 9], 443)),
+        );
+        let input = b"GET /v1 HTTP/1.1\r\nHost: api.example.com\r\n\r\n";
+        let output = handler.substitute(input).unwrap();
+        assert_eq!(output.as_ref(), input);
+    }
+
+    #[test]
+    fn header_credential_dns_pin_to_another_ip_is_not_injected() {
+        // api.example.com resolves to .9; the guest connects to a different IP
+        // while still sending the authorized SNI.
+        let pinned_ip = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 9));
+        let other_ip = Ipv4Addr::new(203, 0, 113, 10);
+        let shared = pinned_shared("api.example.com", pinned_ip);
+        let mut handler = creds_handler_on(
+            &shared,
+            "api.example.com",
+            vec![resolved_credential("sk-secret")],
+            SocketAddr::from((other_ip, 443)),
+        );
+        let input = b"GET /v1 HTTP/1.1\r\nHost: api.example.com\r\n\r\n";
+        let output = handler.substitute(input).unwrap();
+        assert_eq!(output.as_ref(), input);
+    }
+
+    #[test]
+    fn header_credential_dns_pin_to_another_host_is_not_injected() {
+        let ip = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 9));
+        let shared = pinned_shared("other.example.com", ip);
+        let mut handler = creds_handler_on(
+            &shared,
+            "api.example.com",
+            vec![resolved_credential("sk-secret")],
+            SocketAddr::from(([203, 0, 113, 9], 443)),
+        );
+        let input = b"GET /v1 HTTP/1.1\r\nHost: api.example.com\r\n\r\n";
+        let output = handler.substitute(input).unwrap();
+        assert_eq!(output.as_ref(), input);
+    }
+
+    #[test]
+    fn header_credential_stale_dns_pin_is_not_injected() {
+        let ip = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 9));
+        let shared = SharedState::new(16);
+        // An expired cache entry is no longer a live pin.
+        shared.cache_resolved_hostname(
+            "api.example.com",
+            ResolvedHostnameFamily::Ipv4,
+            [ip],
+            Duration::ZERO,
+        );
+        let mut handler = creds_handler_on(
+            &shared,
+            "api.example.com",
+            vec![resolved_credential("sk-secret")],
+            SocketAddr::from(([203, 0, 113, 9], 443)),
+        );
+        let input = b"GET /v1 HTTP/1.1\r\nHost: api.example.com\r\n\r\n";
+        let output = handler.substitute(input).unwrap();
+        assert_eq!(output.as_ref(), input);
+    }
+
+    /// The verified CONNECT authority is the deliberate exception: the proxy
+    /// already proved the SNI matches the CONNECT authority, so no DNS-cache
+    /// binding is required (mirroring the legacy secret identity rule).
+    #[test]
+    fn header_credential_connect_authority_injects_without_a_dns_pin() {
+        let config = creds_only_config();
+        let mut handler =
+            SecretsHandler::new_tls_intercepted_via_connect(&config, "api.example.com")
+                .with_header_credentials(vec![resolved_credential("sk-secret")])
+                .with_guest_dst(SocketAddr::from(([203, 0, 113, 9], 443)));
+        let input = b"GET /v1 HTTP/1.1\r\nHost: api.example.com\r\n\r\n";
+        let output = handler.substitute(input).unwrap();
+        assert_eq!(
+            String::from_utf8(output.into_owned()).unwrap(),
+            "GET /v1 HTTP/1.1\r\nHost: api.example.com\r\nx-api-key: sk-secret\r\n\r\n"
+        );
+    }
+
+    #[test]
+    fn header_credential_http2_direct_tls_requires_a_dns_pin() {
+        let shared = SharedState::new(16);
+        let mut handler = creds_handler_on(
+            &shared,
+            "api.example.com",
+            vec![resolved_credential("sk-secret")],
+            SocketAddr::from(([203, 0, 113, 9], 443)),
+        );
+        let request = h2_initial_request();
+        let output = handler.substitute(&request).unwrap().into_owned();
+        let headers = decode_first_h2_headers(&output);
+        assert!(
+            !headers
+                .iter()
+                .any(|(name, _)| name.eq_ignore_ascii_case(b"x-api-key")),
+            "no DNS pin must mean no injection"
+        );
+    }
+
+    //----------------------------------------------------------------------------------------------
+    // HTTP/2 request grammar
+    //----------------------------------------------------------------------------------------------
+
+    fn h2_initial_request() -> Vec<u8> {
+        h2_request(
+            &[
+                (b":method", b"GET"),
+                (b":scheme", b"https"),
+                (b":authority", b"api.example.com"),
+                (b":path", b"/"),
+            ],
+            true,
+        )
+    }
+
+    fn decode_h2_header_blocks(data: &[u8]) -> Vec<Vec<(Vec<u8>, Vec<u8>)>> {
+        decode_h2_header_blocks_with_flags(data)
+            .into_iter()
+            .map(|block| {
+                block
+                    .into_iter()
+                    .map(|(name, value, _flags)| (name, value))
+                    .collect()
+            })
+            .collect()
+    }
+
+    /// Decode every HTTP/2 header block, **keeping** the HPACK decoder flags so
+    /// tests can assert the never-indexed representation of the injected field
+    /// (see [`decode_first_h2_headers_with_flags`]).
+    fn decode_h2_header_blocks_with_flags(data: &[u8]) -> Vec<Vec<(Vec<u8>, Vec<u8>, u8)>> {
+        assert!(data.starts_with(HTTP2_PREFACE));
+        let mut cursor = HTTP2_PREFACE.len();
+        let mut decoder = HpackDecoder::with_dynamic_size(4096);
+        let mut blocks = Vec::new();
+        let mut header_block: Option<Vec<u8>> = None;
+
+        while cursor + 9 <= data.len() {
+            let len = http2_frame_payload_len(&data[cursor..cursor + 9]);
+            let raw = &data[cursor..cursor + 9 + len];
+            cursor += 9 + len;
+            let frame = parse_http2_frame(raw).unwrap();
+            match frame.kind {
+                HTTP2_FRAME_HEADERS => {
+                    header_block = Some(
+                        http2_headers_fragment(frame.flags, frame.payload)
+                            .unwrap()
+                            .to_vec(),
+                    );
+                    if frame.flags & HTTP2_FLAG_END_HEADERS != 0 {
+                        let encoded = header_block.take().unwrap();
+                        blocks.push(decode_h2_block(&mut decoder, encoded));
+                    }
+                }
+                HTTP2_FRAME_CONTINUATION => {
+                    let block = header_block.as_mut().expect("CONTINUATION without HEADERS");
+                    block.extend_from_slice(frame.payload);
+                    if frame.flags & HTTP2_FLAG_END_HEADERS != 0 {
+                        let encoded = header_block.take().unwrap();
+                        blocks.push(decode_h2_block(&mut decoder, encoded));
+                    }
+                }
+                _ => {}
+            }
+        }
+        assert!(header_block.is_none(), "unterminated header block");
+        blocks
+    }
+
+    fn decode_h2_block(
+        decoder: &mut HpackDecoder,
+        mut encoded: Vec<u8>,
+    ) -> Vec<(Vec<u8>, Vec<u8>, u8)> {
+        let mut headers = Vec::new();
+        decoder.decode(&mut encoded, &mut headers).unwrap();
+        headers
+    }
+
+    /// The HPACK decoder flags carried on the named field (assumes it exists).
+    fn h2_header_flags(headers: &[(Vec<u8>, Vec<u8>, u8)], name: &[u8]) -> u8 {
+        headers
+            .iter()
+            .find(|(header_name, _, _)| header_name.eq_ignore_ascii_case(name))
+            .map(|(_, _, flags)| *flags)
+            .expect("header present")
+    }
+
+    /// Assert the named field was emitted with the never-indexed representation:
+    /// its value cannot have entered the HPACK dynamic table. Loading the
+    /// assertion on the decoder flag (rather than only the decoded value) is
+    /// what makes it fail if `encode_headers` ever regresses from
+    /// `NEVER_INDEXED` to an indexed encoder.
+    fn assert_field_never_indexed(headers: &[(Vec<u8>, Vec<u8>, u8)], name: &[u8]) {
+        let flags = h2_header_flags(headers, name);
+        assert_eq!(
+            flags & HpackDecoder::NEVER_INDEXED,
+            HpackDecoder::NEVER_INDEXED,
+            "{name:?} must use the never-indexed representation (flags {flags:#04x})"
+        );
+        assert_eq!(
+            flags & HpackDecoder::WITH_INDEXING,
+            0,
+            "{name:?} must not be incrementally indexed (flags {flags:#04x})"
+        );
+    }
+
+    fn credential_field_count(headers: &[(Vec<u8>, Vec<u8>)]) -> usize {
+        headers
+            .iter()
+            .filter(|(name, _)| name == b"x-api-key")
+            .count()
+    }
+
+    #[test]
+    fn header_credential_http2_blocks_ambiguous_pseudoheaders() {
+        let cases: &[&[(&[u8], &[u8])]] = &[
+            // duplicate :method
+            &[
+                (b":method", b"GET"),
+                (b":method", b"GET"),
+                (b":scheme", b"https"),
+                (b":authority", b"api.example.com"),
+                (b":path", b"/"),
+            ],
+            // duplicate :path
+            &[
+                (b":method", b"GET"),
+                (b":scheme", b"https"),
+                (b":authority", b"api.example.com"),
+                (b":path", b"/"),
+                (b":path", b"/other"),
+            ],
+            // pseudoheader after a regular field
+            &[
+                (b":method", b"GET"),
+                (b":scheme", b"https"),
+                (b":authority", b"api.example.com"),
+                (b"x-trace", b"1"),
+                (b":path", b"/"),
+            ],
+            // missing :method
+            &[
+                (b":scheme", b"https"),
+                (b":authority", b"api.example.com"),
+                (b":path", b"/"),
+            ],
+            // missing :path
+            &[
+                (b":method", b"GET"),
+                (b":scheme", b"https"),
+                (b":authority", b"api.example.com"),
+            ],
+            // missing :scheme
+            &[
+                (b":method", b"GET"),
+                (b":authority", b"api.example.com"),
+                (b":path", b"/"),
+            ],
+            // unknown pseudoheader
+            &[
+                (b":method", b"GET"),
+                (b":scheme", b"https"),
+                (b":authority", b"api.example.com"),
+                (b":path", b"/"),
+                (b":bogus", b"x"),
+            ],
+            // upper-case regular field name (malformed per RFC 9113 §8.2.1)
+            &[
+                (b":method", b"GET"),
+                (b":scheme", b"https"),
+                (b":authority", b"api.example.com"),
+                (b":path", b"/"),
+                (b"X-Trace", b"1"),
+            ],
+            // empty :path
+            &[
+                (b":method", b"GET"),
+                (b":scheme", b"https"),
+                (b":authority", b"api.example.com"),
+                (b":path", b""),
+            ],
+        ];
+
+        for case in cases {
+            let mut handler = creds_handler(vec![resolved_credential("sk-secret")], 443);
+            let request = h2_request(case, true);
+            assert_eq!(
+                handler.substitute(&request).unwrap_err(),
+                ViolationAction::Block,
+                "ambiguous pseudoheaders must block: {case:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn header_credential_http2_blocks_connection_token_naming_the_field() {
+        // An H2→H1 intermediary may strip a field named in `Connection:`,
+        // silently dropping the injected credential, and a conformant H2 peer
+        // rejects a connection-specific field outright. Blocked on the original
+        // decoded block, before injection, mirroring the HTTP/1 grammar.
+        let cases: &[&[(&[u8], &[u8])]] = &[
+            // plain token
+            &[
+                (b":method", b"GET"),
+                (b":scheme", b"https"),
+                (b":authority", b"api.example.com"),
+                (b":path", b"/"),
+                (b"connection", b"x-api-key"),
+            ],
+            // comma-separated token list
+            &[
+                (b":method", b"GET"),
+                (b":scheme", b"https"),
+                (b":authority", b"api.example.com"),
+                (b":path", b"/"),
+                (b"connection", b"keep-alive, x-api-key"),
+            ],
+            // case-varied token
+            &[
+                (b":method", b"GET"),
+                (b":scheme", b"https"),
+                (b":authority", b"api.example.com"),
+                (b":path", b"/"),
+                (b"connection", b"X-API-Key"),
+            ],
+            // repeated Connection fields, only the second names the field
+            &[
+                (b":method", b"GET"),
+                (b":scheme", b"https"),
+                (b":authority", b"api.example.com"),
+                (b":path", b"/"),
+                (b"connection", b"keep-alive"),
+                (b"connection", b"x-api-key"),
+            ],
+            // malformed: empty token in the list
+            &[
+                (b":method", b"GET"),
+                (b":scheme", b"https"),
+                (b":authority", b"api.example.com"),
+                (b":path", b"/"),
+                (b"connection", b"x-api-key,"),
+            ],
+        ];
+
+        for case in cases {
+            let mut handler = creds_handler(vec![resolved_credential("sk-secret")], 443);
+            let request = h2_request(case, true);
+            assert_eq!(
+                handler.substitute(&request).unwrap_err(),
+                ViolationAction::Block,
+                "a Connection token naming the credential field must block: {case:?}"
+            );
+        }
+    }
+
+    /// Narrowness control: a `Connection:` field that does not name the
+    /// configured field must not be blocked or mutated, so only the actual
+    /// hop-by-hop attack is rejected.
+    #[test]
+    fn header_credential_http2_permits_an_unrelated_connection_token() {
+        let mut handler = creds_handler(vec![resolved_credential("sk-secret")], 443);
+        let request = h2_request(
+            &[
+                (b":method", b"GET"),
+                (b":scheme", b"https"),
+                (b":authority", b"api.example.com"),
+                (b":path", b"/"),
+                (b"connection", b"keep-alive"),
+            ],
+            true,
+        );
+        let output = handler.substitute(&request).unwrap().into_owned();
+        let headers = decode_first_h2_headers(&output);
+        assert_eq!(h2_header_value(&headers, b"x-api-key"), "sk-secret");
+        assert_eq!(h2_header_value(&headers, b"connection"), "keep-alive");
+    }
+
+    #[test]
+    fn header_credential_http2_connect_is_forwarded_uninjected() {
+        let mut handler = creds_handler(vec![resolved_credential("sk-secret")], 443);
+        let request = h2_request(
+            &[
+                (b":method", b"CONNECT"),
+                (b":authority", b"api.example.com:443"),
+            ],
+            true,
+        );
+        let output = handler.substitute(&request).unwrap().into_owned();
+        let headers = decode_first_h2_headers(&output);
+        assert_eq!(credential_field_count(&headers), 0);
+    }
+
+    #[test]
+    fn header_credential_http2_decides_per_stream() {
+        // Stream 1 targets the authorized origin, stream 3 the same host on a
+        // different port. Per-stream decisions are required, never per
+        // connection.
+        let mut handler = creds_handler(vec![resolved_credential("sk-secret")], 443);
+        let mut request = h2_request(
+            &[
+                (b":method", b"GET"),
+                (b":scheme", b"https"),
+                (b":authority", b"api.example.com"),
+                (b":path", b"/authorized"),
+            ],
+            false,
+        );
+        append_h2_headers(
+            &mut request,
+            3,
+            &[
+                (b":method", b"GET"),
+                (b":scheme", b"https"),
+                (b":authority", b"api.example.com:8443"),
+                (b":path", b"/other"),
+            ],
+            true,
+        );
+
+        let output = handler.substitute(&request).unwrap().into_owned();
+        let blocks = decode_h2_header_blocks(&output);
+        assert_eq!(blocks.len(), 2);
+        assert_eq!(h2_header_value(&blocks[0], b"x-api-key"), "sk-secret");
+        assert_eq!(credential_field_count(&blocks[1]), 0);
+        // The injected field on the authorized stream must stay never-indexed,
+        // so its value cannot be reflected into the HPACK dynamic table for
+        // subsequent streams on this connection.
+        let flagged = decode_h2_header_blocks_with_flags(&output);
+        assert_field_never_indexed(&flagged[0], b"x-api-key");
+    }
+
+    #[test]
+    fn header_credential_http2_never_modifies_a_trailer_block() {
+        let mut handler = creds_handler(vec![resolved_credential("sk-secret")], 443);
+        let mut request = h2_request(
+            &[
+                (b":method", b"POST"),
+                (b":scheme", b"https"),
+                (b":authority", b"api.example.com"),
+                (b":path", b"/upload"),
+            ],
+            false,
+        );
+        // A trailer block that names the configured field must be untouched.
+        append_h2_headers(&mut request, 1, &[(b"x-api-key", b"guest-value")], true);
+
+        let output = handler.substitute(&request).unwrap().into_owned();
+        let blocks = decode_h2_header_blocks(&output);
+        assert_eq!(blocks.len(), 2);
+        assert_eq!(h2_header_value(&blocks[0], b"x-api-key"), "sk-secret");
+        assert_eq!(h2_header_value(&blocks[1], b"x-api-key"), "guest-value");
+        assert!(!h2_header_value(&blocks[1], b"x-api-key").contains("sk-secret"));
+    }
+
+    #[test]
+    fn header_credential_http2_continuation_fragmented_block_is_injected() {
+        let encoded_headers: &[(&[u8], &[u8])] = &[
+            (b":method", b"GET"),
+            (b":scheme", b"https"),
+            (b":authority", b"api.example.com"),
+            (b":path", b"/split"),
+        ];
+        let request = h2_request_with_split_headers(encoded_headers, 7);
+        let mut handler = creds_handler(vec![resolved_credential("sk-secret")], 443);
+        let output = handler.substitute(&request).unwrap().into_owned();
+        let headers = decode_first_h2_headers(&output);
+        assert_eq!(h2_header_value(&headers, b"x-api-key"), "sk-secret");
+        assert_eq!(h2_header_value(&headers, b":path"), "/split");
+        assert_field_never_indexed(&decode_first_h2_headers_with_flags(&output), b"x-api-key");
+    }
+
+    //----------------------------------------------------------------------------------------------
+    // HTTP/1 rewritten-head bound
+    //----------------------------------------------------------------------------------------------
+
+    fn padded_head(prefix: &str, pad: usize) -> Vec<u8> {
+        let mut head = prefix.as_bytes().to_vec();
+        head.extend_from_slice(b"X-Pad: ");
+        head.extend(std::iter::repeat_n(b'a', pad));
+        head.extend_from_slice(b"\r\n\r\n");
+        head
+    }
+
+    /// Mutation note: removing the post-insertion bound check in
+    /// `set_credential_fields_in_head` makes this test forward an over-long
+    /// head instead of blocking.
+    #[test]
+    fn header_credential_http1_blocks_when_inserted_head_exceeds_limit() {
+        // One byte more than the bound by the time the field is appended.
+        let prefix = "GET /v1 HTTP/1.1\r\nHost: api.example.com\r\n";
+        let overhead = prefix.len() + b"X-Pad: ".len() + 4 + 22;
+        let pad = MAX_HTTP_HEADER_BYTES - overhead + 1;
+        let input = padded_head(prefix, pad);
+        assert!(input.len() <= MAX_HTTP_HEADER_BYTES);
+
+        let mut handler = creds_handler(vec![resolved_credential("sk-secret")], 443);
+        assert_eq!(
+            handler.substitute(&input).unwrap_err(),
+            ViolationAction::Block
+        );
+    }
+
+    #[test]
+    fn header_credential_http1_allows_head_just_under_limit() {
+        let prefix = "GET /v1 HTTP/1.1\r\nHost: api.example.com\r\n";
+        let overhead = prefix.len() + b"X-Pad: ".len() + 4 + 22;
+        let pad = MAX_HTTP_HEADER_BYTES - overhead;
+        let input = padded_head(prefix, pad);
+
+        let mut handler = creds_handler(vec![resolved_credential("sk-secret")], 443);
+        let output = handler.substitute(&input).unwrap().into_owned();
+        assert!(output.len() <= MAX_HTTP_HEADER_BYTES);
+        assert!(output.ends_with(b"x-api-key: sk-secret\r\n\r\n"));
+    }
+
+    #[test]
+    fn header_credential_http1_chunked_head_is_bounded_after_insertion() {
+        let prefix = "POST /v1 HTTP/1.1\r\nHost: api.example.com\r\nTransfer-Encoding: chunked\r\n";
+        let overhead = prefix.len() + b"X-Pad: ".len() + 4 + 22;
+        let pad = MAX_HTTP_HEADER_BYTES - overhead + 1;
+        let mut input = padded_head(prefix, pad);
+        input.extend_from_slice(b"0\r\n\r\n");
+
+        let mut handler = creds_handler(vec![resolved_credential("sk-secret")], 443);
+        assert_eq!(
+            handler.substitute(&input).unwrap_err(),
+            ViolationAction::Block
+        );
+    }
+
+    #[test]
+    fn header_credential_http1_multiple_fields_can_exceed_the_limit() {
+        let first = resolved_credential("sk-secret");
+        let mut second = resolved_credential("sk-secret");
+        second.header = "x-second-key".into();
+
+        let value = "a".repeat(8 * 1024);
+        let mut first = first;
+        first.value = SecretString::new(value.clone());
+        let mut second = second;
+        second.value = SecretString::new(value);
+
+        let prefix = "GET /v1 HTTP/1.1\r\nHost: api.example.com\r\n";
+        // Leaves room for one rendered field but not two.
+        let pad = MAX_HTTP_HEADER_BYTES - (prefix.len() + b"X-Pad: ".len() + 4) - 9 * 1024;
+        let input = padded_head(prefix, pad);
+
+        let mut handler = creds_handler(vec![first, second], 443);
+        assert_eq!(
+            handler.substitute(&input).unwrap_err(),
+            ViolationAction::Block
+        );
     }
 }

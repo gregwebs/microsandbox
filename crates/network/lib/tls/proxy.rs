@@ -343,6 +343,7 @@ pub(crate) async fn intercept_relay(
         // IP-literal CONNECT authorities retain the existing DNS-pin check.
         SecretsHandler::new_tls_intercepted(&secrets, sni_name, guest_dst.ip(), &shared)
     }
+    .with_header_credentials(tls_state.header_credentials().to_vec())
     .with_guest_dst(guest_dst);
     let mut request_stream =
         open_authorized_request_stream(&extensions, guest_dst, sni_name, via_connect);
@@ -761,6 +762,7 @@ mod tests {
     use crate::intercept::InterceptExtension;
     use crate::intercept::config::{InterceptConfig, InterceptRule};
     use crate::secrets::config::{HostPattern, SecretEntry, SecretInjection, SecretsConfig};
+    use crate::secrets::credential::ResolvedHeaderCredential;
     use crate::secrets::handle::SecretsHandle;
     use crate::tcp::connection::ProxyConnectStatus;
     use crate::tls::state::TlsState;
@@ -844,6 +846,14 @@ mod tests {
         secrets: SecretsConfig,
         intercept_active: bool,
     ) -> Arc<TlsState> {
+        test_tls_state_with_credentials(secrets, intercept_active, Vec::new())
+    }
+
+    fn test_tls_state_with_credentials(
+        secrets: SecretsConfig,
+        intercept_active: bool,
+        credentials: Vec<ResolvedHeaderCredential>,
+    ) -> Arc<TlsState> {
         let dir = tempfile::tempdir().unwrap();
         let ca = crate::tls::ca::CertAuthority::generate();
         let cert_path = dir.path().join("ca.pem");
@@ -859,7 +869,28 @@ mod tests {
             },
             ..Default::default()
         };
-        Arc::new(TlsState::new(config, SecretsHandle::new(secrets), intercept_active).unwrap())
+        Arc::new(
+            TlsState::new(config, SecretsHandle::new(secrets), intercept_active)
+                .unwrap()
+                .with_header_credentials(credentials),
+        )
+    }
+
+    /// A resolved header credential for the `example.com:443` fixture origin.
+    fn example_header_credential(value: &str) -> ResolvedHeaderCredential {
+        ResolvedHeaderCredential::from_definition(
+            &microsandbox_types::DurableHeaderCredential {
+                id: "example".into(),
+                reference: "example-ref".into(),
+                origin: microsandbox_types::HttpsOrigin {
+                    host: "example.com".into(),
+                    port: 443,
+                },
+                header: "x-api-key".into(),
+                format: "%s".into(),
+            },
+            zeroize::Zeroizing::new(value.to_owned()),
+        )
     }
 
     fn guest_client(tls_state: &TlsState) -> rustls::ClientConnection {
@@ -2462,5 +2493,117 @@ mod tests {
             .await
             .is_err()
         );
+    }
+
+    /// P1: the bytes actually received by a real TLS upstream carry the header
+    /// for the authorized origin.
+    ///
+    /// The connection is direct TLS (no CONNECT authority), so this also pins
+    /// the DNS-pin identity end to end: the credential host must be bound to
+    /// the guest destination IP by the DNS cache.
+    ///
+    /// Mutation note: dropping the credential host from the cached resolution
+    /// (or deleting the DNS-pin conjunct in `credential_authorized`) makes the
+    /// injected field disappear and this test fail.
+    #[tokio::test]
+    async fn intercept_relay_injects_header_credential_into_a_real_tls_upstream() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let tls_state = test_tls_state_with_credentials(
+            SecretsConfig::default(),
+            false,
+            vec![example_header_credential("sk-live-secret")],
+        );
+        let (upstream, upstream_request, server) = spawn_upstream_request_sink().await;
+        let guest_destination: SocketAddr = "203.0.113.10:443".parse().unwrap();
+        let shared = Arc::new(SharedState::new(4));
+        shared.cache_resolved_hostname(
+            "example.com",
+            crate::netstack::shared::ResolvedHostnameFamily::Ipv4,
+            [guest_destination.ip()],
+            Duration::from_secs(300),
+        );
+        let (from_tx, from_rx) = mpsc::channel(4);
+        let (to_tx, mut to_rx) = mpsc::channel(4);
+        let mut client = guest_client(&tls_state);
+        send_client_tls_output(&mut client, &from_tx).await;
+        let relay = tokio::spawn(intercept_relay(
+            guest_destination,
+            UpstreamTcpTarget::direct(upstream),
+            "example.com",
+            false,
+            false,
+            Vec::new(),
+            from_rx,
+            to_tx,
+            shared,
+            tls_state,
+            Arc::new(ProxyConnectState::new()),
+            NetworkExtensions::new(),
+            None,
+        ));
+
+        complete_relay_handshake(&mut client, &from_tx, &mut to_rx).await;
+        client
+            .writer()
+            .write_all(b"GET /v1 HTTP/1.1\r\nHost: example.com\r\n\r\n")
+            .unwrap();
+        send_client_tls_output(&mut client, &from_tx).await;
+
+        let upstream_request = tokio::time::timeout(Duration::from_secs(1), upstream_request)
+            .await
+            .expect("upstream did not receive the request")
+            .unwrap();
+        let received = String::from_utf8_lossy(&upstream_request);
+        assert!(
+            received.contains("x-api-key: sk-live-secret\r\n"),
+            "upstream must receive the injected credential: {received}"
+        );
+        assert!(!received.contains("guest-value"), "{received}");
+
+        drop(from_tx);
+        relay.await.unwrap().unwrap();
+        server.await.unwrap().unwrap();
+    }
+
+    /// The same credential-bearing config on a denied route writes nothing
+    /// upstream: a credential never authorizes egress.
+    #[tokio::test]
+    async fn denied_tls_route_never_injects_a_header_credential() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let tls_state = test_tls_state_with_credentials(
+            SecretsConfig::default(),
+            false,
+            vec![example_header_credential("sk-live-secret")],
+        );
+        let shared = Arc::new(SharedState::new(4));
+        shared.cache_resolved_hostname(
+            "example.com",
+            crate::netstack::shared::ResolvedHostnameFamily::Ipv4,
+            ["203.0.113.10".parse::<std::net::IpAddr>().unwrap()],
+            Duration::from_secs(300),
+        );
+        shared.proxy_wake.drain();
+        let proxy_connect = Arc::new(ProxyConnectState::new());
+        let (from_tx, from_rx) = mpsc::channel(1);
+        let (to_tx, _to_rx) = mpsc::channel(1);
+        from_tx.send(guest_client_hello(&tls_state)).await.unwrap();
+        drop(from_tx);
+
+        TlsProxy::new(
+            "203.0.113.10:443".parse().unwrap(),
+            UpstreamTcpTarget::direct("127.0.0.1:9".parse().unwrap()),
+            from_rx,
+            to_tx,
+            shared.clone(),
+            tls_state,
+            Arc::new(NetworkPolicy::none()),
+            proxy_connect.clone(),
+            NetworkExtensions::new(),
+        )
+        .try_run()
+        .await
+        .unwrap();
+
+        assert_eq!(proxy_connect.status(), ProxyConnectStatus::PolicyDenied);
     }
 }

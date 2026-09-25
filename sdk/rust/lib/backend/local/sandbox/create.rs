@@ -81,7 +81,33 @@ impl LocalBackend {
         mut config: SandboxConfig,
         mode: SpawnMode,
         progress: Option<PullProgressSender>,
+        resolver: Option<Arc<dyn crate::CredentialResolver>>,
     ) -> MicrosandboxResult<Sandbox> {
+        // Origin-scoped header credentials are local-only, non-Windows, and
+        // require a per-launch resolver. Refuse before any database mutation,
+        // image pull, or value lookup so a refused launch leaves no state.
+        if crate::sandbox::config::has_header_credentials(&config) {
+            #[cfg(windows)]
+            {
+                return Err(crate::MicrosandboxError::HeaderCredential(
+                    crate::HeaderCredentialError::UnsupportedPlatform,
+                ));
+            }
+            #[cfg(not(windows))]
+            {
+                if resolver.is_none() {
+                    return Err(crate::MicrosandboxError::HeaderCredential(
+                        crate::HeaderCredentialError::MissingResolver {
+                            credential_index: 0,
+                        },
+                    ));
+                }
+                let msb_path = self.config().resolve_msb_path()?;
+                crate::runtime::spawn::ensure_header_credential_launch_capability(&msb_path)
+                    .await?;
+            }
+        }
+
         tracing::debug!(
             sandbox = %config.spec.name,
             image = ?config.spec.image,
@@ -373,7 +399,7 @@ impl LocalBackend {
         // Spawn the sandbox process and create the bridge. On failure, mark the sandbox
         // as stopped so it doesn't appear as a phantom "Running" entry.
         let (local_state, returned_config) = match self
-            .create_sandbox_inner(config, sandbox_id, mode, None)
+            .create_sandbox_inner(config, sandbox_id, mode, None, resolver)
             .await
         {
             Ok(pair) => pair,
@@ -472,9 +498,10 @@ impl LocalBackend {
         sandbox_id: i32,
         mode: SpawnMode,
         lifecycle_guard: Option<microsandbox_runtime::ipc::SandboxLifecycleGuard>,
+        resolver: Option<Arc<dyn crate::CredentialResolver>>,
     ) -> MicrosandboxResult<(crate::backend::SandboxLocalState, SandboxConfig)> {
         let (mut handle, agent_sock_path) =
-            spawn_sandbox(self, &config, sandbox_id, mode, lifecycle_guard).await?;
+            spawn_sandbox(self, &config, sandbox_id, mode, lifecycle_guard, resolver).await?;
         let log_dir = self.sandboxes_dir().join(&config.spec.name).join("logs");
 
         // Wait for the relay socket to become available.
@@ -1476,7 +1503,7 @@ mod tests {
         ];
 
         let err = match backend
-            .create_sandbox(backend_trait, config, SpawnMode::Attached, None)
+            .create_sandbox(backend_trait, config, SpawnMode::Attached, None, None)
             .await
         {
             Ok(_) => panic!("expected invalid direct-config mounts to be rejected"),
@@ -1503,7 +1530,7 @@ mod tests {
         config.spec.runtime.hostname = Some("y".repeat(MAX_HOSTNAME_BYTES + 1));
 
         let err = match backend
-            .create_sandbox(backend.clone(), config, SpawnMode::Attached, None)
+            .create_sandbox(backend.clone(), config, SpawnMode::Attached, None, None)
             .await
         {
             Ok(_) => panic!("invalid hostname should fail before sandbox creation"),
@@ -1973,5 +2000,276 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
+    }
+
+    //----------------------------------------------------------------------------------------------
+    // Header-credential launch capability (old installed runtime)
+    //----------------------------------------------------------------------------------------------
+
+    #[cfg(unix)]
+    struct FixedResolver;
+
+    #[cfg(unix)]
+    impl crate::CredentialResolver for FixedResolver {
+        fn resolve(
+            &self,
+            _reference: &str,
+        ) -> Result<zeroize::Zeroizing<String>, crate::CredentialResolveError> {
+            Ok(zeroize::Zeroizing::new("sk-secret".into()))
+        }
+    }
+
+    #[cfg(unix)]
+    const RESOLVED_VALUE_CANARY: &str = "SENTINEL-sk-live-db-0131";
+
+    #[cfg(unix)]
+    struct CanaryResolver;
+
+    #[cfg(unix)]
+    impl crate::CredentialResolver for CanaryResolver {
+        fn resolve(
+            &self,
+            _reference: &str,
+        ) -> Result<zeroize::Zeroizing<String>, crate::CredentialResolveError> {
+            Ok(zeroize::Zeroizing::new(RESOLVED_VALUE_CANARY.into()))
+        }
+    }
+
+    /// Point the SDK at a stub `msb` through the persisted-config layer, and
+    /// return a credential-bearing config plus a resolver.
+    #[cfg(unix)]
+    fn credential_bearing_config(name: &str) -> SandboxConfig {
+        use microsandbox_network::config::NetworkBuilder;
+
+        let network = NetworkBuilder::new()
+            .header_credential(|credential| {
+                credential
+                    .id("example")
+                    .reference("example-api-key")
+                    .origin("api.example.com", 443)
+                    .header("x-api-key")
+                    .format("%s")
+            })
+            .build()
+            .expect("credential-bearing network config should build");
+
+        let mut config = test_config(name);
+        config.set_local_network_config(network).unwrap();
+        config
+    }
+
+    /// Write a stub `msb` that answers the capability probe like an old or a
+    /// supported runtime, plus a config file that resolves `msb` to it.
+    #[cfg(unix)]
+    fn stage_stub_runtime(dir: &std::path::Path, script: &str) -> (PathBuf, PathBuf) {
+        use std::os::unix::fs::PermissionsExt;
+
+        let stub = dir.join("msb-stub");
+        fs::write(&stub, format!("#!/bin/sh\n{script}\n")).unwrap();
+        let mut permissions = fs::metadata(&stub).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&stub, permissions).unwrap();
+
+        let config_path = dir.join("config.json");
+        let config = serde_json::json!({ "paths": { "msb": stub } });
+        fs::write(&config_path, config.to_string()).unwrap();
+        (stub, config_path)
+    }
+
+    /// An old installed runtime must be refused **before** the sandbox DB
+    /// record is written, so a refused launch leaves no state behind.
+    ///
+    /// Mutation note: moving the capability gate after `insert_sandbox_record`
+    /// (or deleting it) leaves a `sandbox_entity` row and fails this test.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn create_refuses_an_old_runtime_before_any_db_write() {
+        let _env_guard = crate::test_support::lock_env();
+        let temp = tempfile::Builder::new()
+            .prefix("msb-capability")
+            .tempdir_in("/tmp")
+            .unwrap();
+        let (_stub, config_path) = stage_stub_runtime(
+            temp.path(),
+            "echo 'error: unrecognized subcommand' >&2; exit 2",
+        );
+
+        let previous = std::env::var_os("MSB_CONFIG_PATH");
+        // SAFETY: every environment-mutating SDK unit test holds the shared lock.
+        unsafe { std::env::set_var("MSB_CONFIG_PATH", &config_path) };
+        let backend = match LocalBackend::builder()
+            .home(temp.path().join("home"))
+            .build()
+            .await
+        {
+            Ok(backend) => Arc::new(backend),
+            Err(error) => {
+                unsafe {
+                    match previous {
+                        Some(value) => std::env::set_var("MSB_CONFIG_PATH", value),
+                        None => std::env::remove_var("MSB_CONFIG_PATH"),
+                    }
+                }
+                panic!("build test backend: {error}");
+            }
+        };
+        let backend_trait: Arc<dyn Backend> = backend.clone();
+
+        let error = match backend
+            .create_sandbox(
+                backend_trait,
+                credential_bearing_config("old-runtime"),
+                SpawnMode::Attached,
+                None,
+                Some(Arc::new(FixedResolver)),
+            )
+            .await
+        {
+            Ok(_) => panic!("an old runtime must be refused"),
+            Err(error) => error,
+        };
+
+        let pools = backend.db().await.unwrap();
+        let rows = sandbox_entity::Entity::find()
+            .all(pools.write())
+            .await
+            .unwrap();
+
+        unsafe {
+            match previous {
+                Some(value) => std::env::set_var("MSB_CONFIG_PATH", value),
+                None => std::env::remove_var("MSB_CONFIG_PATH"),
+            }
+        }
+
+        assert!(
+            matches!(
+                error,
+                crate::MicrosandboxError::HeaderCredential(
+                    crate::HeaderCredentialError::RuntimeCapabilityMissing
+                )
+            ),
+            "expected the capability gate to refuse an old runtime, got {error:?}"
+        );
+        assert!(
+            rows.is_empty(),
+            "a refused launch must not write a sandbox record: {} row(s)",
+            rows.len()
+        );
+        assert!(
+            !temp.path().join("home").join("sandboxes").exists(),
+            "a refused launch must not create sandbox state"
+        );
+    }
+
+    /// A supported runtime passes the same gate, so the refusal above is about
+    /// the runtime and not about credential-bearing creates in general.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn create_passes_the_capability_gate_for_a_supported_runtime() {
+        let _env_guard = crate::test_support::lock_env();
+        let temp = tempfile::Builder::new()
+            .prefix("msb-capability-ok")
+            .tempdir_in("/tmp")
+            .unwrap();
+        let token = microsandbox_types::HEADER_CREDENTIAL_LAUNCH_CAPABILITY;
+        let (_stub, config_path) =
+            stage_stub_runtime(temp.path(), &format!("printf '%s\\n' {token}; exit 0"));
+
+        let previous = std::env::var_os("MSB_CONFIG_PATH");
+        // SAFETY: every environment-mutating SDK unit test holds the shared lock.
+        unsafe { std::env::set_var("MSB_CONFIG_PATH", &config_path) };
+        let backend = match LocalBackend::builder()
+            .home(temp.path().join("home"))
+            .build()
+            .await
+        {
+            Ok(backend) => Arc::new(backend),
+            Err(error) => {
+                unsafe {
+                    match previous {
+                        Some(value) => std::env::set_var("MSB_CONFIG_PATH", value),
+                        None => std::env::remove_var("MSB_CONFIG_PATH"),
+                    }
+                }
+                panic!("build test backend: {error}");
+            }
+        };
+        let backend_trait: Arc<dyn Backend> = backend.clone();
+
+        let outcome = backend
+            .create_sandbox(
+                backend_trait,
+                credential_bearing_config("supported-runtime"),
+                SpawnMode::Attached,
+                None,
+                Some(Arc::new(FixedResolver)),
+            )
+            .await;
+
+        unsafe {
+            match previous {
+                Some(value) => std::env::set_var("MSB_CONFIG_PATH", value),
+                None => std::env::remove_var("MSB_CONFIG_PATH"),
+            }
+        }
+
+        // The stub is not a real runtime, so creation fails later; the point is
+        // that it is not refused by the capability gate.
+        if let Err(error) = outcome {
+            assert!(
+                !matches!(
+                    error,
+                    crate::MicrosandboxError::HeaderCredential(
+                        crate::HeaderCredentialError::RuntimeCapabilityMissing
+                    )
+                ),
+                "a supported runtime must pass the capability gate, got {error:?}"
+            );
+        }
+    }
+
+    /// The persisted sandbox record carries the durable reference and never a
+    /// resolved value — asserted through the real DB insert, not just a builder.
+    ///
+    /// Mutation note: adding a value field to `DurableHeaderCredential` (or
+    /// resolving values into the durable config before persistence) makes this
+    /// test fail with the canary present in `sandbox.config`.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn persisted_record_never_contains_a_resolved_credential_value() {
+        let temp = tempdir().unwrap();
+        let pools = open_test_pools(&temp.path().join("test.db")).await;
+
+        let config = credential_bearing_config("db-roundtrip");
+        let resolved =
+            crate::sandbox::config::resolve_header_credentials(&config, Some(&CanaryResolver))
+                .unwrap();
+        assert_eq!(resolved.len(), 1);
+        assert_eq!(resolved[0].value.expose_secret(), RESOLVED_VALUE_CANARY);
+
+        // Arbitrary durable serialization keeps the reference only.
+        let json = serde_json::to_string(&config).unwrap();
+        assert!(json.contains("example-api-key"), "{json}");
+        assert!(!json.contains(RESOLVED_VALUE_CANARY), "{json}");
+        assert!(!format!("{config:?}").contains(RESOLVED_VALUE_CANARY));
+
+        let sandbox_id = LocalBackend::insert_sandbox_record(pools.write(), &config)
+            .await
+            .unwrap();
+        let row = sandbox_entity::Entity::find_by_id(sandbox_id)
+            .one(pools.write())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(row.config.contains("example-api-key"), "{}", row.config);
+        assert!(
+            !row.config.contains(RESOLVED_VALUE_CANARY),
+            "the sandbox record must not carry the resolved value: {}",
+            row.config
+        );
+        if let Some(active) = &row.active_config {
+            assert!(!active.contains(RESOLVED_VALUE_CANARY), "{active}");
+        }
     }
 }

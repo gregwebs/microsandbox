@@ -7,8 +7,10 @@
 //! engine-internal query helpers used by the proxy.
 
 pub use microsandbox_types::{
-    HostPattern, MAX_SECRET_FILE_BYTES, MAX_SECRET_PLACEHOLDER_BYTES, SecretConfigError,
-    SecretEntry, SecretInjection, SecretSource, SecretsConfig, ViolationAction,
+    DurableHeaderCredential, HostPattern, HttpsOrigin, MAX_HEADER_CREDENTIAL_FORMAT_BYTES,
+    MAX_HEADER_CREDENTIAL_VALUE_BYTES, MAX_HEADER_CREDENTIALS, MAX_SECRET_FILE_BYTES,
+    MAX_SECRET_PLACEHOLDER_BYTES, SecretConfigError, SecretEntry, SecretInjection, SecretSource,
+    SecretsConfig, ViolationAction,
 };
 
 //--------------------------------------------------------------------------------------------------
@@ -75,12 +77,14 @@ mod tests {
     fn plain_http_candidates_require_tls_opt_out() {
         let tls_only = SecretsConfig {
             secrets: vec![secret(true, vec![HostPattern::Any])],
+            header_credentials: Vec::new(),
             on_violation: ViolationAction::default(),
         };
         assert!(!tls_only.has_plain_http_candidates());
 
         let plain = SecretsConfig {
             secrets: vec![secret(false, vec![HostPattern::Any])],
+            header_credentials: Vec::new(),
             on_violation: ViolationAction::default(),
         };
         assert!(plain.has_plain_http_candidates());
@@ -90,6 +94,7 @@ mod tests {
     fn host_scoped_detects_non_any_pattern() {
         let any = SecretsConfig {
             secrets: vec![secret(true, vec![HostPattern::Any])],
+            header_credentials: Vec::new(),
             on_violation: ViolationAction::default(),
         };
         assert!(!any.has_host_scoped_secrets());
@@ -99,6 +104,7 @@ mod tests {
                 true,
                 vec![HostPattern::Exact("api.example.com".into())],
             )],
+            header_credentials: Vec::new(),
             on_violation: ViolationAction::default(),
         };
         assert!(scoped.has_host_scoped_secrets());

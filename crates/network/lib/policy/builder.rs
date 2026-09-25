@@ -99,6 +99,35 @@ pub enum BuildError {
     #[error("intercept CA config is incomplete; set both cert_path and key_path")]
     IncompleteInterceptCaConfig,
 
+    /// Header credentials were configured while networking is disabled.
+    #[error("header credentials require networking to be enabled")]
+    HeaderCredentialRequiresNetwork,
+
+    /// Header credentials were configured without TLS interception.
+    #[error("header credentials require TLS interception; enable tls in the network config")]
+    HeaderCredentialRequiresTls,
+
+    /// A header-credential builder was built without a required field.
+    #[error(
+        "header credential: {field} is required; call .{field}() before building the credential"
+    )]
+    HeaderCredentialFieldMissing {
+        /// Name of the required field that was not set.
+        field: &'static str,
+    },
+
+    /// A header credential targets an origin port that is not TLS-intercepted,
+    /// so the credential could never be injected.
+    #[error(
+        "header credential `{credential_id}` targets port {port}, which is not TLS-intercepted; add {port} to the TLS intercepted ports (tls.intercepted_ports) because interception is per-port, not per-host"
+    )]
+    HeaderCredentialPortNotIntercepted {
+        /// Non-secret diagnostic `id` of the offending credential.
+        credential_id: String,
+        /// The origin port that is not intercepted.
+        port: u16,
+    },
+
     /// `.domain(&str)` or `.domain_suffix(&str)` received a value that
     /// doesn't parse as a [`DomainName`].
     #[error("rule #{rule_index}: invalid domain `{raw}`: {source}")]

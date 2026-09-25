@@ -9,6 +9,7 @@ pub(crate) mod attach;
 mod builder;
 pub(crate) mod config;
 mod config_patch;
+pub mod credential;
 pub mod exec;
 pub(crate) mod flat_rootfs;
 pub mod fs;
@@ -37,6 +38,8 @@ use microsandbox_protocol::{
     message::MessageType,
 };
 use microsandbox_types::hostname_from_sandbox_name as derive_hostname;
+
+pub use self::credential::{CredentialResolveError, CredentialResolver};
 use sea_orm::{ColumnTrait, EntityTrait, QueryFilter, QueryOrder};
 
 use microsandbox_image::progress_channel;
@@ -308,7 +311,7 @@ impl Sandbox {
         PullProgressHandle,
         tokio::task::JoinHandle<MicrosandboxResult<Self>>,
     ) {
-        Self::create_with_pull_progress_and_mode(config, SpawnMode::Attached)
+        Self::create_with_pull_progress_and_mode(config, SpawnMode::Attached, None)
     }
 
     /// Create a detached sandbox with pull progress reporting.
@@ -321,12 +324,44 @@ impl Sandbox {
         PullProgressHandle,
         tokio::task::JoinHandle<MicrosandboxResult<Self>>,
     ) {
-        Self::create_with_pull_progress_and_mode(config, SpawnMode::Detached)
+        Self::create_with_pull_progress_and_mode(config, SpawnMode::Detached, None)
+    }
+
+    /// Create a sandbox with a per-launch [`CredentialResolver`] and pull
+    /// progress reporting.
+    ///
+    /// The resolver is called in this process, before `fork`, for every
+    /// origin-scoped header credential the config references. The resolved
+    /// values travel only on the private launch-config fd; they never enter the
+    /// durable config, the database, argv, or a log line. **Local backend
+    /// only** — a credential-bearing config is rejected on a cloud backend
+    /// rather than silently dropped.
+    pub fn create_with_pull_progress_and_resolver(
+        config: SandboxConfig,
+        resolver: Arc<dyn CredentialResolver>,
+    ) -> (
+        PullProgressHandle,
+        tokio::task::JoinHandle<MicrosandboxResult<Self>>,
+    ) {
+        Self::create_with_pull_progress_and_mode(config, SpawnMode::Attached, Some(resolver))
+    }
+
+    /// Create a detached sandbox with a per-launch [`CredentialResolver`] and
+    /// pull progress reporting.
+    pub fn create_detached_with_pull_progress_and_resolver(
+        config: SandboxConfig,
+        resolver: Arc<dyn CredentialResolver>,
+    ) -> (
+        PullProgressHandle,
+        tokio::task::JoinHandle<MicrosandboxResult<Self>>,
+    ) {
+        Self::create_with_pull_progress_and_mode(config, SpawnMode::Detached, Some(resolver))
     }
 
     fn create_with_pull_progress_and_mode(
         config: SandboxConfig,
         mode: SpawnMode,
+        resolver: Option<Arc<dyn CredentialResolver>>,
     ) -> (
         PullProgressHandle,
         tokio::task::JoinHandle<MicrosandboxResult<Self>>,
@@ -342,11 +377,17 @@ impl Sandbox {
                         crate::MicrosandboxError::local_only(Operation::SandboxCreate)
                     })?;
                     local
-                        .create_sandbox(backend.clone(), config, mode, Some(sender))
+                        .create_sandbox(backend.clone(), config, mode, Some(sender), resolver)
                         .await
                 }
                 crate::backend::BackendKind::Cloud => {
                     drop(sender); // close the channel — no per-layer events for cloud.
+                    if resolver.is_some() || crate::sandbox::config::has_header_credentials(&config)
+                    {
+                        return Err(crate::MicrosandboxError::HeaderCredential(
+                            crate::HeaderCredentialError::UnsupportedBackend,
+                        ));
+                    }
                     backend
                         .sandboxes()
                         .create(backend.clone(), config, true)

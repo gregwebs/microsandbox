@@ -137,6 +137,15 @@ impl LocalBackend {
         }
 
         let mut config: SandboxConfig = serde_json::from_str(&model.config)?;
+        // A reference-backed header credential cannot be resolved without a
+        // per-launch resolver, and `start(name)` has nowhere to receive one.
+        // Refuse before the status transition or any child process so the
+        // stopped/crashed record is left unchanged for an explicit recreate.
+        if crate::sandbox::config::has_header_credentials(&config) {
+            return Err(crate::MicrosandboxError::HeaderCredential(
+                crate::HeaderCredentialError::RestartRequiresResolver,
+            ));
+        }
         self.apply_deployment_profile(&mut config);
         config.apply_runtime_defaults();
         validate_hostname(config.spec.runtime.hostname.as_deref())?;
@@ -149,7 +158,7 @@ impl LocalBackend {
         Self::update_sandbox_status(write_db, model.id, SandboxStatus::Running).await?;
 
         match self
-            .create_sandbox_inner(config, model.id, mode, Some(lifecycle_guard))
+            .create_sandbox_inner(config, model.id, mode, Some(lifecycle_guard), None)
             .await
         {
             Ok((local_state, returned_config)) => {
@@ -876,7 +885,7 @@ impl SandboxBackend for LocalBackend {
             self.warn_cloud_only(&config);
             // Local backend always boots immediately — `start` only differs
             // for cloud where create-without-start is a distinct state.
-            self.create_sandbox(backend, config, SpawnMode::Attached, None)
+            self.create_sandbox(backend, config, SpawnMode::Attached, None, None)
                 .await
         })
     }
@@ -888,7 +897,7 @@ impl SandboxBackend for LocalBackend {
     ) -> BoxFuture<'a, MicrosandboxResult<Sandbox>> {
         Box::pin(async move {
             self.warn_cloud_only(&config);
-            self.create_sandbox(backend, config, SpawnMode::Detached, None)
+            self.create_sandbox(backend, config, SpawnMode::Detached, None, None)
                 .await
         })
     }

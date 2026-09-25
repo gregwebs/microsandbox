@@ -119,6 +119,10 @@ pub struct SchemaBaselineArgs {
     pub json: bool,
 }
 
+/// Arguments for the hidden launch-capability probe command.
+#[derive(Debug, Args)]
+pub struct CapabilitiesArgs {}
+
 /// Arguments for the deferred Windows self-update or self-downgrade swap helper.
 #[cfg(windows)]
 #[derive(Debug, Args)]
@@ -494,6 +498,21 @@ pub fn run_schema_baseline(args: SchemaBaselineArgs) -> anyhow::Result<()> {
         "migrations": schema_metadata::migration_ids().collect::<Vec<_>>(),
     });
     println!("{}", serde_json::to_string_pretty(&baseline)?);
+    Ok(())
+}
+
+/// Print the fixed, non-secret launch-capability tokens this binary supports.
+///
+/// This is a lightweight probe with no VM boot: an embedding application runs
+/// it against the exact `msb` it is about to spawn and refuses a
+/// credential-bearing launch unless the output contains
+/// [`microsandbox_types::HEADER_CREDENTIAL_LAUNCH_CAPABILITY`]. An older binary
+/// lacks this subcommand, so `clap` exits non-zero and the probe fails closed.
+pub fn run_capabilities(_args: CapabilitiesArgs) -> anyhow::Result<()> {
+    println!(
+        "{}",
+        microsandbox_types::HEADER_CREDENTIAL_LAUNCH_CAPABILITY
+    );
     Ok(())
 }
 
