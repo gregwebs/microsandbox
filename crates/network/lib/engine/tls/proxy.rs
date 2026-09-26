@@ -857,14 +857,14 @@ mod tests {
     }
 
     async fn accept_with_deadline(listener: TcpListener) -> io::Result<TcpStream> {
-        tokio::time::timeout(Duration::from_secs(5), listener.accept())
+        tokio::time::timeout(Duration::from_secs(1), listener.accept())
             .await
             .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "fixture accept timed out"))?
             .map(|(stream, _)| stream)
     }
 
     async fn read_connect_request(stream: &mut TcpStream) -> io::Result<String> {
-        tokio::time::timeout(Duration::from_secs(5), async {
+        tokio::time::timeout(Duration::from_secs(1), async {
             let mut request = Vec::new();
             while !request.ends_with(b"\r\n\r\n") {
                 let mut byte = [0_u8; 1];
@@ -1000,7 +1000,7 @@ mod tests {
                 return;
             }
             let encrypted =
-                tokio::time::timeout(std::time::Duration::from_secs(5), from_relay.recv())
+                tokio::time::timeout(std::time::Duration::from_secs(1), from_relay.recv())
                     .await
                     .expect("guest handshake record timed out")
                     .expect("relay closed during guest handshake");
@@ -1408,7 +1408,7 @@ mod tests {
         // The sink receives this before guest FIN, proving production relay
         // flushes the extension-approved plaintext upstream.
         let upstream_request =
-            tokio::time::timeout(std::time::Duration::from_secs(5), upstream_request)
+            tokio::time::timeout(std::time::Duration::from_secs(1), upstream_request)
                 .await
                 .expect("upstream did not receive flushed request")
                 .unwrap();
@@ -1565,7 +1565,7 @@ mod tests {
             .unwrap();
         send_client_tls_output(&mut client, &from_tx).await;
 
-        let received = tokio::time::timeout(std::time::Duration::from_secs(5), upstream_request)
+        let received = tokio::time::timeout(std::time::Duration::from_secs(1), upstream_request)
             .await
             .expect("upstream did not receive the approved request")
             .unwrap();
