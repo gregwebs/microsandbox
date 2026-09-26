@@ -1096,11 +1096,7 @@ mod tests {
             connect_via_proxy_with_timeout(&endpoint, "example.test", 443, Duration::from_secs(5))
                 .await
         });
-        // Harness timeout only: the connect runs in a spawned task and the
-        // first loopback connect in a process can exceed 1s on macOS. The
-        // assertion below (proxy socket closes on abort) is what this test
-        // verifies, not connect latency.
-        tokio::time::timeout(Duration::from_secs(5), accepted_rx)
+        tokio::time::timeout(Duration::from_secs(1), accepted_rx)
             .await
             .expect("proxy did not receive CONNECT")
             .unwrap();
@@ -1456,10 +1452,7 @@ mod tests {
     }
 
     async fn read_headers(stream: &mut TcpStream) -> String {
-        // Harness timeout only: a fixture that never receives a request should
-        // fail rather than hang; 5s tolerates the slow first loopback connect
-        // on macOS without weakening any assertion.
-        tokio::time::timeout(Duration::from_secs(5), async {
+        tokio::time::timeout(Duration::from_secs(1), async {
             let mut headers = Vec::new();
             let mut byte = [0_u8; 1];
             loop {
