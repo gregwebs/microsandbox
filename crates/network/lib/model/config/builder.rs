@@ -8,8 +8,9 @@ use std::time::Duration;
 
 use ipnetwork::{Ipv4Network, Ipv6Network};
 use microsandbox_types::{
-    DurableHeaderCredential, HttpsOrigin, NetworkRateLimitDirection, NetworkRateLimiterConfig,
-    RateLimiterConfig, ScopedUpstreamCaCert, ScopedVerifyUpstream, TlsConfig, TokenBucketConfig,
+    DurableHeaderCredential, HttpsOrigin, InterceptConfig, InterceptRule,
+    NetworkRateLimitDirection, NetworkRateLimiterConfig, RateLimiterConfig, ScopedUpstreamCaCert,
+    ScopedVerifyUpstream, TlsConfig, TokenBucketConfig,
 };
 use microsandbox_utils::size::Bytes;
 use zeroize::Zeroizing;
@@ -42,6 +43,19 @@ pub struct DnsBuilder {
 /// Fluent builder for [`TlsConfig`].
 pub struct TlsBuilder {
     config: TlsConfig,
+}
+
+/// Fluent builder for [`InterceptConfig`].
+///
+/// ```ignore
+/// .intercept(|i| i
+///     .hook(vec!["agent-vm".into(), "_intercept-hook".into()])
+///     .rule("api.github.com", "GET", "/repos/")
+///     .streaming_rule("github.com", "POST", "/")
+/// )
+/// ```
+pub struct InterceptBuilder {
+    config: InterceptConfig,
 }
 
 /// Fluent builder for a single [`SecretEntry`].
@@ -304,6 +318,30 @@ impl NetworkBuilder {
             }
             Err(err) => self.errors.push(err),
         }
+        self
+    }
+
+    /// Replace the request-interception configuration.
+    ///
+    /// Deliberately does **not** enable TLS: an active `intercept` config with
+    /// `tls.enabled = false` is silently inert, and changing that security
+    /// default is a separate change (see the merge's follow-up ticket). This
+    /// preserves the fork's pre-existing behavior exactly.
+    pub fn intercept(mut self, f: impl FnOnce(InterceptBuilder) -> InterceptBuilder) -> Self {
+        self.config.intercept = f(InterceptBuilder::new()).build();
+        self
+    }
+
+    /// Overlay the request-interception configuration on the current value.
+    ///
+    /// Starts from the existing value rather than defaults; this is what the
+    /// CLI's `merge_intercept` drives.
+    #[doc(hidden)]
+    pub fn intercept_overlay(
+        mut self,
+        f: impl FnOnce(InterceptBuilder) -> InterceptBuilder,
+    ) -> Self {
+        self.config.intercept = f(InterceptBuilder::from_config(self.config.intercept)).build();
         self
     }
 
@@ -864,6 +902,79 @@ impl HeaderCredentialBuilder {
 }
 
 impl Default for HeaderCredentialBuilder {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl InterceptBuilder {
+    /// Start building request-interception configuration.
+    pub fn new() -> Self {
+        Self {
+            config: InterceptConfig::default(),
+        }
+    }
+
+    fn from_config(config: InterceptConfig) -> Self {
+        Self { config }
+    }
+
+    /// Set the subprocess command + args invoked for matched requests.
+    pub fn hook(mut self, argv: Vec<String>) -> Self {
+        self.config.hook = Some(argv);
+        self
+    }
+
+    /// Add a rule that buffers the full request (headers + body) before
+    /// dispatching the hook.
+    pub fn rule(
+        mut self,
+        host: impl Into<String>,
+        method: impl Into<String>,
+        path_prefix: impl Into<String>,
+    ) -> Self {
+        self.config.rules.push(InterceptRule {
+            host: host.into(),
+            method: method.into(),
+            path_prefix: path_prefix.into(),
+            dispatch_on_headers: false,
+        });
+        self
+    }
+
+    /// Add a rule that dispatches the hook as soon as headers are buffered,
+    /// then streams the body through unbuffered. Use for uploads that can
+    /// exceed [`Self::max_request_bytes`] (e.g. `git push` pack data),
+    /// where the policy decision only needs the request line.
+    pub fn streaming_rule(
+        mut self,
+        host: impl Into<String>,
+        method: impl Into<String>,
+        path_prefix: impl Into<String>,
+    ) -> Self {
+        self.config.rules.push(InterceptRule {
+            host: host.into(),
+            method: method.into(),
+            path_prefix: path_prefix.into(),
+            dispatch_on_headers: true,
+        });
+        self
+    }
+
+    /// Set the maximum bytes to buffer per intercepted request before
+    /// refusing it. Default: 64 KiB.
+    pub fn max_request_bytes(mut self, max: usize) -> Self {
+        self.config.max_request_bytes = max;
+        self
+    }
+
+    /// Consume the builder and return the configuration.
+    pub fn build(self) -> InterceptConfig {
+        self.config
+    }
+}
+
+impl Default for InterceptBuilder {
     fn default() -> Self {
         Self::new()
     }
@@ -1589,5 +1700,64 @@ mod tests {
 
         assert!(cfg.secrets.header_credentials.is_empty());
         assert!(cfg.tls.intercepted_ports.is_empty());
+    }
+
+    #[test]
+    fn intercept_builder_sets_hook_rules_and_cap() {
+        let cfg = NetworkBuilder::new()
+            .intercept(|i| {
+                i.hook(vec!["agent-vm".into(), "_intercept-hook".into()])
+                    .rule("api.github.com", "GET", "/repos/")
+                    .streaming_rule("github.com", "POST", "/")
+                    .max_request_bytes(4096)
+            })
+            .build()
+            .unwrap();
+
+        assert_eq!(
+            cfg.intercept.hook,
+            Some(vec!["agent-vm".to_string(), "_intercept-hook".to_string()])
+        );
+        assert_eq!(cfg.intercept.max_request_bytes, 4096);
+        assert_eq!(cfg.intercept.rules.len(), 2);
+        assert_eq!(cfg.intercept.rules[0].host, "api.github.com");
+        assert!(!cfg.intercept.rules[0].dispatch_on_headers);
+        assert_eq!(cfg.intercept.rules[1].host, "github.com");
+        assert!(cfg.intercept.rules[1].dispatch_on_headers);
+        assert!(cfg.intercept.is_active());
+    }
+
+    #[test]
+    fn intercept_overlay_starts_from_current_values() {
+        let cfg = NetworkBuilder::new()
+            .intercept(|i| i.hook(vec!["/bin/cat".into()]))
+            .intercept_overlay(|i| i.rule("api.github.com", "GET", "/"))
+            .build()
+            .unwrap();
+
+        assert_eq!(cfg.intercept.hook, Some(vec!["/bin/cat".to_string()]));
+        assert_eq!(cfg.intercept.rules.len(), 1);
+    }
+
+    /// Pins the fork's pre-existing behaviour: `NetworkBuilder::intercept`
+    /// deliberately does **not** enable TLS, so an active intercept config with
+    /// `tls.enabled = false` is silently inert. That is a fail-open gap in a
+    /// fail-closed feature, but changing the security default is a separate,
+    /// reviewable change (filed as a follow-up), not part of this merge.
+    #[test]
+    fn intercept_without_tls_is_inert() {
+        let cfg = NetworkBuilder::new()
+            .intercept(|i| {
+                i.hook(vec!["/bin/cat".into()])
+                    .rule("api.github.com", "GET", "/")
+            })
+            .build()
+            .unwrap();
+
+        assert!(cfg.intercept.is_active());
+        assert!(
+            !cfg.tls.enabled,
+            "intercept must not enable TLS implicitly (pinned pre-existing behaviour)"
+        );
     }
 }

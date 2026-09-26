@@ -9,6 +9,7 @@ pub mod dns;
 pub mod extensions;
 mod host_proxy;
 pub mod icmp;
+pub mod intercept;
 pub mod netstack;
 pub mod network;
 pub(crate) mod policy;

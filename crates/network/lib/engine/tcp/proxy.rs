@@ -1361,6 +1361,7 @@ mod tests {
             TlsState::new(
                 microsandbox_types::TlsConfig::default(),
                 crate::secrets::handle::SecretsHandle::new(SecretsConfig::default()),
+                false,
             )
             .unwrap(),
         );
@@ -2020,6 +2021,7 @@ mod tests {
             TlsState::new(
                 microsandbox_types::TlsConfig::default(),
                 crate::secrets::handle::SecretsHandle::new(SecretsConfig::default()),
+                false,
             )
             .unwrap(),
         );

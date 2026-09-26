@@ -263,6 +263,24 @@ fn validate_launch_header_credentials(
     Ok(())
 }
 
+/// Install the fail-closed request interceptor when it is active, unless the
+/// caller already installed a request extension.
+///
+/// A caller-installed request extension wins, because `NetworkExtensions`
+/// holds at most one and an embedder may want its own policy.
+fn install_intercept_extension(
+    extensions: NetworkExtensions,
+    intercept: &microsandbox_types::InterceptConfig,
+) -> NetworkExtensions {
+    if intercept.is_active() && extensions.authorized_requests().is_none() {
+        extensions.with_authorized_requests(Arc::new(crate::intercept::InterceptExtension::new(
+            intercept.clone(),
+        )))
+    } else {
+        extensions
+    }
+}
+
 /// Handle for installing host-side termination behavior into the network stack.
 #[derive(Clone)]
 pub struct TerminationHandle {
@@ -432,6 +450,7 @@ impl SmoltcpNetwork {
                 source,
             })?;
         let backend = SmoltcpBackend::new(shared.clone());
+        let extensions = install_intercept_extension(host.extensions, &config.intercept);
 
         // A stored config bypasses the builder, so validate the durable secret
         // grammar and the launch-only resolved list here, independently.
@@ -444,8 +463,12 @@ impl SmoltcpNetwork {
         let secrets = SecretsHandle::new(config.secrets.clone());
         let tls_state = if config.tls.enabled {
             Some(Arc::new(
-                TlsState::new(config.tls.clone(), secrets.clone())?
-                    .with_header_credentials(host.resolved_header_credentials),
+                TlsState::new(
+                    config.tls.clone(),
+                    secrets.clone(),
+                    config.intercept.is_active(),
+                )?
+                .with_header_credentials(host.resolved_header_credentials),
             ))
         } else {
             None
@@ -465,9 +488,9 @@ impl SmoltcpNetwork {
             gateway_ipv4,
             guest_ipv6,
             gateway_ipv6,
+            extensions,
             tls_state,
             secrets,
-            extensions: host.extensions,
         })
     }
 
@@ -1575,5 +1598,28 @@ mod tests {
         // Explicit outbound proxy wins: nothing is installed.
         let skipped = HostIntegrations::default().with_host_proxy(connector, true);
         assert!(skipped.extensions.outbound().is_none());
+    }
+
+    #[test]
+    fn install_intercept_extension_respects_activity() {
+        // Inactive config installs nothing, keeping the default path free.
+        let inactive = install_intercept_extension(
+            NetworkExtensions::default(),
+            &microsandbox_types::InterceptConfig::default(),
+        );
+        assert!(inactive.authorized_requests().is_none());
+
+        let active = microsandbox_types::InterceptConfig {
+            rules: vec![microsandbox_types::InterceptRule {
+                host: "api.github.com".into(),
+                method: "GET".into(),
+                path_prefix: "/".into(),
+                dispatch_on_headers: false,
+            }],
+            hook: Some(vec!["/bin/cat".into()]),
+            max_request_bytes: 1024,
+        };
+        let installed = install_intercept_extension(NetworkExtensions::default(), &active);
+        assert!(installed.authorized_requests().is_some());
     }
 }

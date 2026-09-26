@@ -490,6 +490,8 @@ impl CloudSandboxSpec {
             tls: None,
             strict: self.network.strict,
             secrets: self.network.secrets.map(Into::into),
+            // Request interception has no cloud wire counterpart.
+            intercept: None,
             max_tcp_connections: self.network.max_tcp_connections,
             max_udp_connections: self.network.max_udp_connections,
             rate_limiter: None,

@@ -7,7 +7,7 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::num::NonZeroUsize;
 
 use ipnetwork::{Ipv4Network, Ipv6Network};
-use microsandbox_types::{NetworkRateLimiterConfig, TlsConfig};
+use microsandbox_types::{InterceptConfig, NetworkRateLimiterConfig, TlsConfig};
 use serde::{Deserialize, Serialize};
 
 use crate::dns::Nameserver;
@@ -68,6 +68,11 @@ pub struct NetworkConfig {
     /// Secret injection settings.
     #[serde(default)]
     pub secrets: SecretsConfig,
+
+    /// Fail-closed request interception. Non-optional on the engine side: an
+    /// inactive config is the default and is inert.
+    #[serde(default)]
+    pub intercept: InterceptConfig,
 
     /// TCP connection cap. `None` uses the deployment profile's default.
     #[serde(default)]
@@ -299,6 +304,7 @@ impl Default for NetworkConfig {
             tls: TlsConfig::default(),
             strict: true,
             secrets: SecretsConfig::default(),
+            intercept: InterceptConfig::default(),
             max_tcp_connections: None,
             max_udp_connections: None,
             rate_limiter: None,

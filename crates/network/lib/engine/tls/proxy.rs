@@ -789,3 +789,824 @@ async fn flush_to_guest(
     }
     Ok(())
 }
+#[cfg(test)]
+mod tests {
+    use std::collections::VecDeque;
+    use std::io;
+    use std::net::SocketAddr;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
+
+    use futures::future::BoxFuture;
+    use microsandbox_types::{InterceptCaConfig, TlsConfig};
+    use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+    use tokio::sync::oneshot;
+    use tokio_rustls::TlsAcceptor;
+
+    use crate::extensions::{
+        AuthorizedRouteRequestExtension, AuthorizedTcpRoute, OutboundConnectionExtension,
+    };
+    use crate::intercept::InterceptExtension;
+    use crate::intercept::config::{InterceptConfig, InterceptRule};
+    use crate::secrets::config::{HostPattern, SecretEntry, SecretSubstitution, SecretsConfig};
+    use crate::secrets::credential::ResolvedHeaderCredential;
+    use crate::secrets::handle::SecretsHandle;
+    use crate::tcp::connection::ProxyConnectStatus;
+    use crate::tls::state::TlsState;
+
+    use super::*;
+
+    type RecordedRoute = (SocketAddr, Option<String>, OutboundProtocol);
+
+    struct DirectRecordingConnector {
+        routes: Mutex<Vec<RecordedRoute>>,
+    }
+
+    impl OutboundConnectionExtension for DirectRecordingConnector {
+        fn connect<'a>(
+            &'a self,
+            route: AuthorizedTcpRoute,
+        ) -> BoxFuture<'a, io::Result<TcpStream>> {
+            self.routes.lock().unwrap().push((
+                route.guest_destination(),
+                route.server_name().map(ToOwned::to_owned),
+                route.protocol(),
+            ));
+            Box::pin(route.connect_direct())
+        }
+    }
+
+    struct CountingConnector {
+        calls: std::sync::atomic::AtomicUsize,
+    }
+
+    impl OutboundConnectionExtension for CountingConnector {
+        fn connect<'a>(
+            &'a self,
+            _route: AuthorizedTcpRoute,
+        ) -> BoxFuture<'a, io::Result<TcpStream>> {
+            self.calls
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            Box::pin(async { Err(io::Error::other("unexpected connection extension call")) })
+        }
+    }
+
+    async fn accept_with_deadline(listener: TcpListener) -> io::Result<TcpStream> {
+        tokio::time::timeout(Duration::from_secs(5), listener.accept())
+            .await
+            .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "fixture accept timed out"))?
+            .map(|(stream, _)| stream)
+    }
+
+    async fn read_connect_request(stream: &mut TcpStream) -> io::Result<String> {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            let mut request = Vec::new();
+            while !request.ends_with(b"\r\n\r\n") {
+                let mut byte = [0_u8; 1];
+                stream.read_exact(&mut byte).await?;
+                request.push(byte[0]);
+            }
+            String::from_utf8(request)
+                .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
+        })
+        .await
+        .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "CONNECT request timed out"))?
+    }
+
+    async fn spawn_sink() -> (SocketAddr, tokio::task::JoinHandle<Vec<u8>>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let sink = tokio::spawn(async move {
+            let mut stream = accept_with_deadline(listener).await.unwrap();
+            let mut received = Vec::new();
+            stream.read_to_end(&mut received).await.unwrap();
+            received
+        });
+        (address, sink)
+    }
+
+    fn test_tls_state(secrets: SecretsConfig) -> Arc<TlsState> {
+        test_tls_state_with_intercept(secrets, false)
+    }
+
+    fn test_tls_state_with_intercept(
+        secrets: SecretsConfig,
+        intercept_active: bool,
+    ) -> Arc<TlsState> {
+        test_tls_state_with_credentials(secrets, intercept_active, Vec::new())
+    }
+
+    fn test_tls_state_with_credentials(
+        secrets: SecretsConfig,
+        intercept_active: bool,
+        credentials: Vec<ResolvedHeaderCredential>,
+    ) -> Arc<TlsState> {
+        let dir = tempfile::tempdir().unwrap();
+        let ca = crate::engine::tls::ca::CertAuthority::generate();
+        let cert_path = dir.path().join("ca.pem");
+        let key_path = dir.path().join("ca.key");
+        std::fs::write(&cert_path, ca.cert_pem()).unwrap();
+        std::fs::write(&key_path, ca.key_pem()).unwrap();
+
+        let config = TlsConfig {
+            verify_upstream: false,
+            intercept_ca: InterceptCaConfig {
+                cert_path: Some(cert_path),
+                key_path: Some(key_path),
+            },
+            ..Default::default()
+        };
+        Arc::new(
+            TlsState::new(config, SecretsHandle::new(secrets), intercept_active)
+                .unwrap()
+                .with_header_credentials(credentials),
+        )
+    }
+
+    /// A resolved header credential for the `example.com:443` fixture origin.
+    fn example_header_credential(value: &str) -> ResolvedHeaderCredential {
+        ResolvedHeaderCredential::from_definition(
+            &microsandbox_types::DurableHeaderCredential {
+                id: "example".into(),
+                reference: "example-ref".into(),
+                origin: microsandbox_types::HttpsOrigin {
+                    host: "example.com".into(),
+                    port: 443,
+                },
+                header: "x-api-key".into(),
+                format: "%s".into(),
+            },
+            zeroize::Zeroizing::new(value.to_owned()),
+        )
+    }
+
+    fn guest_client(tls_state: &TlsState) -> rustls::ClientConnection {
+        let mut roots = rustls::RootCertStore::empty();
+        roots.add(tls_state.intercept_ca.cert_der.clone()).unwrap();
+        let config = rustls::ClientConfig::builder()
+            .with_root_certificates(roots)
+            .with_no_client_auth();
+        rustls::ClientConnection::new(
+            Arc::new(config),
+            ServerName::try_from("example.com".to_owned()).unwrap(),
+        )
+        .unwrap()
+    }
+
+    fn guest_client_hello(tls_state: &TlsState) -> Bytes {
+        let mut client = guest_client(tls_state);
+        let mut hello = Vec::new();
+        client.write_tls(&mut hello).unwrap();
+        Bytes::from(hello)
+    }
+
+    fn upstream_server_config() -> Arc<rustls::ServerConfig> {
+        let key_pair = rcgen::KeyPair::generate().unwrap();
+        let params = rcgen::CertificateParams::new(vec!["example.com".to_owned()]).unwrap();
+        let cert = params.self_signed(&key_pair).unwrap();
+        let chain = vec![CertificateDer::from(cert.der().to_vec())];
+        let key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(key_pair.serialize_der()));
+        Arc::new(
+            rustls::ServerConfig::builder()
+                .with_no_client_auth()
+                .with_single_cert(chain, key)
+                .unwrap(),
+        )
+    }
+
+    async fn send_client_tls_output(
+        client: &mut rustls::ClientConnection,
+        to_relay: &mpsc::Sender<Bytes>,
+    ) {
+        while client.wants_write() {
+            let mut encrypted = Vec::new();
+            client.write_tls(&mut encrypted).unwrap();
+            to_relay.send(Bytes::from(encrypted)).await.unwrap();
+        }
+    }
+
+    async fn complete_relay_handshake(
+        client: &mut rustls::ClientConnection,
+        to_relay: &mpsc::Sender<Bytes>,
+        from_relay: &mut mpsc::Receiver<Bytes>,
+    ) {
+        for _ in 0..8 {
+            if !client.is_handshaking() {
+                return;
+            }
+            let encrypted =
+                tokio::time::timeout(std::time::Duration::from_secs(5), from_relay.recv())
+                    .await
+                    .expect("guest handshake record timed out")
+                    .expect("relay closed during guest handshake");
+            let mut input = encrypted.as_ref();
+            client.read_tls(&mut input).unwrap();
+            client.process_new_packets().unwrap();
+            send_client_tls_output(client, to_relay).await;
+        }
+        assert!(
+            !client.is_handshaking(),
+            "guest TLS handshake did not finish"
+        );
+    }
+
+    async fn spawn_upstream_request_sink() -> (
+        SocketAddr,
+        oneshot::Receiver<Vec<u8>>,
+        tokio::task::JoinHandle<io::Result<()>>,
+    ) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let (request_tx, request_rx) = oneshot::channel();
+        let server = tokio::spawn(async move {
+            let stream = accept_with_deadline(listener).await?;
+            let mut stream = TlsAcceptor::from(upstream_server_config())
+                .accept(stream)
+                .await?;
+            let mut buf = [0; RELAY_BUF_SIZE];
+            let request = match stream.read(&mut buf).await {
+                Ok(read) => buf[..read].to_vec(),
+                // Fail-closed relay outcomes drop the upstream connection without
+                // reading queued-but-unsent bytes (e.g. TLS 1.3 session tickets the
+                // server sends unsolicited right after the handshake). Depending on
+                // scheduling, the kernel may report that abrupt drop as a reset
+                // rather than a clean EOF; both mean "no request bytes arrived".
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        io::ErrorKind::UnexpectedEof | io::ErrorKind::ConnectionReset
+                    ) =>
+                {
+                    Vec::new()
+                }
+                Err(error) => return Err(error),
+            };
+            let _ = request_tx.send(request);
+            match stream.shutdown().await {
+                Ok(()) => Ok(()),
+                // Fail-closed relay outcomes may drop the upstream socket before
+                // the fixture can send its TLS close notification.
+                Err(error) if error.kind() == io::ErrorKind::BrokenPipe => Ok(()),
+                Err(error) => Err(error),
+            }
+        });
+        (address, request_rx, server)
+    }
+
+    async fn spawn_upstream_after_eof(
+        response: &'static [u8],
+    ) -> (
+        SocketAddr,
+        oneshot::Receiver<Vec<u8>>,
+        oneshot::Sender<()>,
+        tokio::task::JoinHandle<io::Result<()>>,
+    ) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let (eof_tx, eof_rx) = oneshot::channel();
+        let (release_tx, release_rx) = oneshot::channel();
+        let server = tokio::spawn(async move {
+            let stream = accept_with_deadline(listener).await?;
+            let mut stream = TlsAcceptor::from(upstream_server_config())
+                .accept(stream)
+                .await?;
+            let mut received = Vec::new();
+            stream.read_to_end(&mut received).await?;
+            let _ = eof_tx.send(received);
+            let _ = release_rx.await;
+            stream.write_all(response).await?;
+            stream.shutdown().await
+        });
+        (address, eof_rx, release_tx, server)
+    }
+
+    struct ScriptedRequestStream {
+        actions: VecDeque<RequestAction>,
+    }
+
+    struct RecordingRequestStream {
+        seen: Arc<Mutex<Vec<Vec<u8>>>>,
+    }
+
+    impl AuthorizedRouteRequestStream for RecordingRequestStream {
+        fn process<'a>(&'a mut self, chunk: &'a [u8]) -> BoxFuture<'a, io::Result<RequestAction>> {
+            self.seen.lock().unwrap().push(chunk.to_vec());
+            Box::pin(async { Ok(RequestAction::ForwardCurrent) })
+        }
+    }
+
+    struct RecordingRequestExtension {
+        routes: Mutex<Vec<AuthorizedTlsRoute>>,
+        seen: Arc<Mutex<Vec<Vec<u8>>>>,
+    }
+
+    impl AuthorizedRouteRequestExtension for RecordingRequestExtension {
+        fn open(
+            &self,
+            route: &AuthorizedTlsRoute,
+        ) -> Option<Box<dyn AuthorizedRouteRequestStream>> {
+            self.routes.lock().unwrap().push(route.clone());
+            Some(Box::new(RecordingRequestStream {
+                seen: self.seen.clone(),
+            }))
+        }
+    }
+
+    struct OrderedRequestExtension {
+        order: Arc<Mutex<Vec<&'static str>>>,
+    }
+
+    impl AuthorizedRouteRequestExtension for OrderedRequestExtension {
+        fn open(
+            &self,
+            _route: &AuthorizedTlsRoute,
+        ) -> Option<Box<dyn AuthorizedRouteRequestStream>> {
+            self.order.lock().unwrap().push("request factory");
+            None
+        }
+    }
+
+    struct OrderedConnector {
+        order: Arc<Mutex<Vec<&'static str>>>,
+    }
+
+    impl OutboundConnectionExtension for OrderedConnector {
+        fn connect<'a>(
+            &'a self,
+            route: AuthorizedTcpRoute,
+        ) -> BoxFuture<'a, io::Result<TcpStream>> {
+            self.order.lock().unwrap().push("outbound connector");
+            Box::pin(route.connect_direct())
+        }
+    }
+
+    struct UninterestedRequestExtension(AtomicUsize);
+
+    impl AuthorizedRouteRequestExtension for UninterestedRequestExtension {
+        fn open(
+            &self,
+            _route: &AuthorizedTlsRoute,
+        ) -> Option<Box<dyn AuthorizedRouteRequestStream>> {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            None
+        }
+    }
+
+    struct CountingRequestExtension(AtomicUsize);
+
+    impl AuthorizedRouteRequestExtension for CountingRequestExtension {
+        fn open(
+            &self,
+            _route: &AuthorizedTlsRoute,
+        ) -> Option<Box<dyn AuthorizedRouteRequestStream>> {
+            self.0.fetch_add(1, Ordering::Relaxed);
+            None
+        }
+    }
+
+    fn host_bound_secret_config() -> SecretsConfig {
+        SecretsConfig {
+            secrets: vec![SecretEntry {
+                env_var: "API_KEY".into(),
+                value: zeroize::Zeroizing::new("real-secret-value".into()),
+                source: None,
+                placeholder: "$MSB_KEY".into(),
+                allowed_hosts: vec![HostPattern::Exact("example.com".into())],
+                substitution: SecretSubstitution {
+                    headers: true,
+                    query: false,
+                    body: false,
+                },
+                passthrough_hosts: Vec::new(),
+                violation_action: None,
+                require_tls_identity: true,
+            }],
+            ..Default::default()
+        }
+    }
+
+    struct GatedRequestStream {
+        started: Option<tokio::sync::oneshot::Sender<()>>,
+        release: Option<tokio::sync::oneshot::Receiver<()>>,
+    }
+
+    impl AuthorizedRouteRequestStream for GatedRequestStream {
+        fn process<'a>(&'a mut self, _chunk: &'a [u8]) -> BoxFuture<'a, io::Result<RequestAction>> {
+            let started = self.started.take().expect("process called once");
+            let release = self.release.take().expect("process called once");
+            Box::pin(async move {
+                let _ = started.send(());
+                let _ = release.await;
+                Ok(RequestAction::ForwardCurrent)
+            })
+        }
+    }
+
+    struct DropGuard(Arc<std::sync::atomic::AtomicBool>);
+
+    impl Drop for DropGuard {
+        fn drop(&mut self) {
+            self.0.store(true, std::sync::atomic::Ordering::Release);
+        }
+    }
+
+    struct BlockingRequestStream {
+        started: Option<tokio::sync::oneshot::Sender<()>>,
+        dropped: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    impl AuthorizedRouteRequestStream for BlockingRequestStream {
+        fn process<'a>(&'a mut self, _chunk: &'a [u8]) -> BoxFuture<'a, io::Result<RequestAction>> {
+            let started = self.started.take().expect("process called once");
+            let guard = DropGuard(self.dropped.clone());
+            Box::pin(async move {
+                let _guard = guard;
+                let _ = started.send(());
+                std::future::pending::<io::Result<RequestAction>>().await
+            })
+        }
+    }
+
+    impl AuthorizedRouteRequestStream for ScriptedRequestStream {
+        fn process<'a>(&'a mut self, _chunk: &'a [u8]) -> BoxFuture<'a, io::Result<RequestAction>> {
+            let action = self.actions.pop_front().expect("script action");
+            Box::pin(async move { Ok(action) })
+        }
+    }
+
+    struct ScriptedRequestExtension {
+        actions: Mutex<Option<VecDeque<RequestAction>>>,
+    }
+
+    impl AuthorizedRouteRequestExtension for ScriptedRequestExtension {
+        fn open(
+            &self,
+            _route: &AuthorizedTlsRoute,
+        ) -> Option<Box<dyn AuthorizedRouteRequestStream>> {
+            self.actions
+                .lock()
+                .unwrap()
+                .take()
+                .map(|actions| Box::new(ScriptedRequestStream { actions }) as _)
+        }
+    }
+
+    struct HoldingRequestExtension {
+        processed: Option<oneshot::Sender<()>>,
+        dropped: Arc<AtomicBool>,
+    }
+
+    struct HoldingRequestStream {
+        processed: Option<oneshot::Sender<()>>,
+        dropped: Arc<AtomicBool>,
+    }
+
+    impl Drop for HoldingRequestStream {
+        fn drop(&mut self) {
+            self.dropped.store(true, Ordering::Release);
+        }
+    }
+
+    impl AuthorizedRouteRequestExtension for Mutex<HoldingRequestExtension> {
+        fn open(
+            &self,
+            _route: &AuthorizedTlsRoute,
+        ) -> Option<Box<dyn AuthorizedRouteRequestStream>> {
+            let mut extension = self.lock().unwrap();
+            Some(Box::new(HoldingRequestStream {
+                processed: extension.processed.take(),
+                dropped: extension.dropped.clone(),
+            }))
+        }
+    }
+
+    impl AuthorizedRouteRequestStream for HoldingRequestStream {
+        fn process<'a>(&'a mut self, _chunk: &'a [u8]) -> BoxFuture<'a, io::Result<RequestAction>> {
+            if let Some(processed) = self.processed.take() {
+                let _ = processed.send(());
+            }
+            Box::pin(async { Ok(RequestAction::Hold) })
+        }
+    }
+
+    struct BlockingRequestExtension {
+        started: Option<oneshot::Sender<()>>,
+        dropped: Arc<AtomicBool>,
+    }
+
+    impl AuthorizedRouteRequestExtension for Mutex<BlockingRequestExtension> {
+        fn open(
+            &self,
+            _route: &AuthorizedTlsRoute,
+        ) -> Option<Box<dyn AuthorizedRouteRequestStream>> {
+            let mut extension = self.lock().unwrap();
+            Some(Box::new(BlockingRequestStream {
+                started: extension.started.take(),
+                dropped: extension.dropped.clone(),
+            }))
+        }
+    }
+
+    struct BlockingConnector {
+        started: Mutex<Option<oneshot::Sender<()>>>,
+        dropped: Arc<AtomicBool>,
+    }
+
+    impl OutboundConnectionExtension for BlockingConnector {
+        fn connect<'a>(
+            &'a self,
+            _route: AuthorizedTcpRoute,
+        ) -> BoxFuture<'a, io::Result<TcpStream>> {
+            let started = self.started.lock().unwrap().take();
+            let guard = DropGuard(self.dropped.clone());
+            Box::pin(async move {
+                let _guard = guard;
+                if let Some(started) = started {
+                    let _ = started.send(());
+                }
+                std::future::pending::<io::Result<TcpStream>>().await
+            })
+        }
+    }
+
+    #[test]
+    fn request_factory_can_bypass_unrelated_tls_routes() {
+        let extension = Arc::new(UninterestedRequestExtension(
+            std::sync::atomic::AtomicUsize::new(0),
+        ));
+        let stream = open_authorized_request_stream(
+            &NetworkExtensions::new().with_authorized_requests(extension.clone()),
+            "203.0.113.10:443".parse().unwrap(),
+            "example.com",
+            false,
+        );
+
+        assert!(stream.is_none());
+        assert_eq!(extension.0.load(std::sync::atomic::Ordering::Relaxed), 1);
+        assert!(
+            open_authorized_request_stream(
+                &NetworkExtensions::default(),
+                "203.0.113.10:443".parse().unwrap(),
+                "example.com",
+                false,
+            )
+            .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn intercept_relay_orders_route_factory_secret_substitution_and_upstream_flush() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let tls_state = test_tls_state(host_bound_secret_config());
+        let (upstream, upstream_request, server) = spawn_upstream_request_sink().await;
+        let guest_destination: SocketAddr = "203.0.113.10:443".parse().unwrap();
+        let connector = Arc::new(DirectRecordingConnector {
+            routes: Mutex::new(Vec::new()),
+        });
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let requests = Arc::new(RecordingRequestExtension {
+            routes: Mutex::new(Vec::new()),
+            seen: seen.clone(),
+        });
+        let (from_tx, from_rx) = mpsc::channel(4);
+        let (to_tx, mut to_rx) = mpsc::channel(4);
+        let mut client = guest_client(&tls_state);
+        send_client_tls_output(&mut client, &from_tx).await;
+        let relay = tokio::spawn(intercept_relay(
+            guest_destination,
+            UpstreamTcpTarget::direct(upstream),
+            "example.com",
+            true,
+            true,
+            Vec::new(),
+            from_rx,
+            to_tx,
+            Arc::new(SharedState::new(4)),
+            tls_state,
+            Arc::new(ProxyConnectState::new()),
+            NetworkExtensions::new()
+                .with_outbound(connector.clone())
+                .with_authorized_requests(requests.clone()),
+            None,
+            None,
+        ));
+
+        complete_relay_handshake(&mut client, &from_tx, &mut to_rx).await;
+        client
+            .writer()
+            .write_all(
+                b"GET / HTTP/1.1\r\nHost: example.com\r\nAuthorization: Bearer $MSB_KEY\r\n\r\n",
+            )
+            .unwrap();
+        send_client_tls_output(&mut client, &from_tx).await;
+
+        // The sink receives this before guest FIN, proving production relay
+        // flushes the extension-approved plaintext upstream.
+        let upstream_request =
+            tokio::time::timeout(std::time::Duration::from_secs(5), upstream_request)
+                .await
+                .expect("upstream did not receive flushed request")
+                .unwrap();
+        assert!(
+            upstream_request
+                .windows(b"real-secret-value".len())
+                .any(|w| w == b"real-secret-value")
+        );
+        assert!(
+            !upstream_request
+                .windows(b"$MSB_KEY".len())
+                .any(|w| w == b"$MSB_KEY")
+        );
+        assert_eq!(
+            seen.lock().unwrap().as_slice(),
+            std::slice::from_ref(&upstream_request)
+        );
+        assert_eq!(
+            requests.routes.lock().unwrap().as_slice(),
+            &[AuthorizedTlsRoute::new(
+                guest_destination,
+                "example.com",
+                true
+            )]
+        );
+        assert_eq!(
+            connector.routes.lock().unwrap().as_slice(),
+            &[(
+                guest_destination,
+                Some("example.com".to_owned()),
+                OutboundProtocol::Tls,
+            )]
+        );
+
+        drop(from_tx);
+        relay.await.unwrap().unwrap();
+        server.await.unwrap().unwrap();
+    }
+
+    fn github_style_intercept_config() -> InterceptConfig {
+        InterceptConfig {
+            rules: vec![InterceptRule {
+                host: "example.com".into(),
+                method: "GET".into(),
+                path_prefix: "/allowed".into(),
+                dispatch_on_headers: false,
+            }],
+            hook: Some(vec!["/bin/cat".to_string()]),
+            max_request_bytes: 64 * 1024,
+        }
+    }
+
+    #[tokio::test]
+    async fn intercept_extension_refuses_unmatched_request_and_writes_nothing_upstream() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let tls_state = test_tls_state(SecretsConfig::default());
+        let (upstream, upstream_request, server) = spawn_upstream_request_sink().await;
+        let (from_tx, from_rx) = mpsc::channel(4);
+        let (to_tx, mut to_rx) = mpsc::channel(4);
+        let mut client = guest_client(&tls_state);
+        send_client_tls_output(&mut client, &from_tx).await;
+        let extensions = NetworkExtensions::new().with_authorized_requests(Arc::new(
+            InterceptExtension::new(github_style_intercept_config()),
+        ));
+        let relay = tokio::spawn(intercept_relay(
+            "203.0.113.10:443".parse().unwrap(),
+            UpstreamTcpTarget::direct(upstream),
+            "example.com",
+            false,
+            false,
+            Vec::new(),
+            from_rx,
+            to_tx,
+            Arc::new(SharedState::new(4)),
+            tls_state,
+            Arc::new(ProxyConnectState::new()),
+            extensions,
+            None,
+            None,
+        ));
+
+        complete_relay_handshake(&mut client, &from_tx, &mut to_rx).await;
+        // "/denied" matches no rule — the only configured rule is `GET
+        // /allowed` — so this must be refused, not forwarded.
+        client
+            .writer()
+            .write_all(b"GET /denied HTTP/1.1\r\nHost: example.com\r\n\r\n")
+            .unwrap();
+        send_client_tls_output(&mut client, &from_tx).await;
+
+        let mut response = Vec::new();
+        for _ in 0..4 {
+            let encrypted = to_rx.recv().await.expect("relay closed before response");
+            let mut input = encrypted.as_ref();
+            client.read_tls(&mut input).unwrap();
+            client.process_new_packets().unwrap();
+            let mut buf = [0; RELAY_BUF_SIZE];
+            match client.reader().read(&mut buf) {
+                Ok(n) => response.extend_from_slice(&buf[..n]),
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
+                Err(error) => panic!("failed to decrypt refusal response: {error}"),
+            }
+            if response.starts_with(b"HTTP/1.1 403") {
+                break;
+            }
+        }
+        assert!(
+            response.starts_with(b"HTTP/1.1 403"),
+            "expected a 403 refusal, got: {}",
+            String::from_utf8_lossy(&response)
+        );
+        relay.await.unwrap().unwrap();
+        assert_eq!(
+            upstream_request.await.unwrap(),
+            b"",
+            "no bytes may reach upstream once a policed request is refused"
+        );
+        server.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn intercept_extension_forwards_matched_request_after_hook_approval() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let tls_state = test_tls_state(SecretsConfig::default());
+        let (upstream, upstream_request, server) = spawn_upstream_request_sink().await;
+        let (from_tx, from_rx) = mpsc::channel(4);
+        let (to_tx, mut to_rx) = mpsc::channel(4);
+        let mut client = guest_client(&tls_state);
+        send_client_tls_output(&mut client, &from_tx).await;
+        let extensions = NetworkExtensions::new().with_authorized_requests(Arc::new(
+            InterceptExtension::new(github_style_intercept_config()),
+        ));
+        let relay = tokio::spawn(intercept_relay(
+            "203.0.113.10:443".parse().unwrap(),
+            UpstreamTcpTarget::direct(upstream),
+            "example.com",
+            false,
+            false,
+            Vec::new(),
+            from_rx,
+            to_tx,
+            Arc::new(SharedState::new(4)),
+            tls_state,
+            Arc::new(ProxyConnectState::new()),
+            extensions,
+            None,
+            None,
+        ));
+
+        complete_relay_handshake(&mut client, &from_tx, &mut to_rx).await;
+        client
+            .writer()
+            .write_all(b"GET /allowed HTTP/1.1\r\nHost: example.com\r\nContent-Length: 0\r\n\r\n")
+            .unwrap();
+        send_client_tls_output(&mut client, &from_tx).await;
+
+        let received = tokio::time::timeout(std::time::Duration::from_secs(5), upstream_request)
+            .await
+            .expect("upstream did not receive the approved request")
+            .unwrap();
+        assert!(
+            String::from_utf8_lossy(&received).contains("GET /allowed"),
+            "the hook-approved request must reach upstream: {}",
+            String::from_utf8_lossy(&received)
+        );
+
+        drop(from_tx);
+        relay.await.unwrap().unwrap();
+        server.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn request_dispatch_observes_substituted_secret_bytes() {
+        let mut handler = SecretsHandler::new_tls_intercepted_via_connect(
+            &host_bound_secret_config(),
+            "example.com",
+        );
+        let chunk =
+            b"GET / HTTP/1.1\r\nHost: example.com\r\nAuthorization: Bearer $MSB_KEY\r\n\r\n";
+        let substituted = substitute_request_chunk(&mut handler, chunk).unwrap();
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let mut request_stream = RecordingRequestStream { seen: seen.clone() };
+        let (mut upstream, mut observed) = tokio::io::duplex(256);
+
+        dispatch_request_action(&mut request_stream, &substituted, &mut upstream)
+            .await
+            .unwrap();
+        let mut forwarded = vec![0; substituted.len()];
+        observed.read_exact(&mut forwarded).await.unwrap();
+
+        assert_eq!(seen.lock().unwrap().as_slice(), &[substituted.to_vec()]);
+        assert!(
+            seen.lock().unwrap()[0]
+                .windows(b"real-secret-value".len())
+                .any(|window| window == b"real-secret-value")
+        );
+        assert!(
+            !seen.lock().unwrap()[0]
+                .windows(b"$MSB_KEY".len())
+                .any(|window| window == b"$MSB_KEY")
+        );
+    }
+}
