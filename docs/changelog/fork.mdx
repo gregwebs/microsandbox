@@ -1,0 +1,99 @@
+---
+title: "Changes in this fork"
+sidebarTitle: "This fork"
+description: "Fork-only features: rotating file secrets, header credentials, request interception, and host proxy support."
+icon: "code-fork"
+---
+
+This fork tracks upstream microsandbox and adds the features below. They are not in the dated
+weekly pages, which upstream owns; this page is the fork's own changelog and is the place new
+fork-only entries belong.
+
+## File-backed (rotating) secrets
+
+Secrets can be bound to a host file instead of an environment variable. The network engine
+re-reads the file for every eligible connection, so rotating the credential on disk
+(`echo -n new-token > /run/creds/token`) takes effect on the next connection with no `msb modify`
+call and no sandbox restart. Only the file path is stored in the durable sandbox config; the bytes
+are never persisted, logged, or sent to the guest. A missing, unreadable, symlinked, oversized
+(over 64 KiB), empty, or non-UTF-8 file fails closed: the placeholder is blocked for that
+connection, even under a `Passthrough` violation policy for the host.
+
+```yaml
+TOKEN:
+  value:
+    $msb_file: /run/creds/token
+  allow: ["api.example.com"]
+```
+
+See [Secrets](/sandboxes/secrets#file-backed-rotating-secrets).
+
+## Origin-scoped header credentials
+
+A header credential **sets** one named request header on requests to exactly one HTTPS origin,
+where a placeholder substitutes a value the guest already sent. The durable config carries only a
+non-secret authorization rule plus a reference; an embedding application passes a
+`CredentialResolver` per launch, and the resolved value travels only on the private memory-backed
+launch-config fd — never to the durable config, the database, argv, or a log line.
+
+```yaml
+network:
+  secrets:
+    header_credentials:
+      - id: anthropic
+        reference: anthropic-api-key
+        origin: { host: "api.anthropic.com", port: 443 }
+        header: "x-api-key"
+        format: "%s"
+```
+
+The origin's port must be TLS-intercepted (port `443` by default); a credential on a port that is
+not intercepted is refused at configuration time rather than silently never injected. The
+installed `msb` must advertise the `header_credentials` capability in `msb __launch-protocol`
+before a credential-bearing create, so an older runtime cannot silently ignore the field.
+
+See [Header credentials](/security/secrets#origin-scoped-header-credentials).
+
+## Fail-closed request interception
+
+TLS-intercepted traffic can be checked against a host-run hook before it reaches upstream. A rule
+matches a request by SNI host, HTTP method, and path prefix; the hook decides whether to forward,
+rewrite, or refuse it, and a request on a policed host that matches no rule is refused rather than
+forwarded — never sent upstream with a substituted credential and no policy applied.
+
+```yaml
+network:
+  intercept:
+    hook: ["/usr/local/bin/intercept-hook"]
+    rules:
+      - { host: "api.github.com", method: "GET", path_prefix: "/repos/" }
+```
+
+When interception is active, both the guest-facing certificate and the upstream connector pin
+ALPN to `http/1.1`, so HTTP/2-capable clients and servers downgrade cleanly instead of sending
+framing the interceptor's HTTP/1.1 parser can't read. Note that an `intercept` config with
+`tls.enabled = false` is inert: interception runs inside the TLS-intercepting proxy.
+
+See [Request interception](/sandboxes/intercept).
+
+## Host HTTP proxy
+
+The local runtime reads `HTTPS_PROXY`/`HTTP_PROXY`/`ALL_PROXY`/`NO_PROXY` (and their lowercase
+spellings) and routes authorized TCP connections through an HTTP `CONNECT` proxy with optional
+Basic authentication, so a sandbox running behind a corporate proxy reaches the network without
+per-sandbox configuration. This is separate from upstream's SOCKS [`outbound_proxy`](/networking/outbound-proxy),
+which wins when a sandbox names one explicitly.
+
+See [Host HTTP proxy](/networking/overview#host-http-proxy).
+
+## Auto-published guest listeners
+
+A sandbox can mirror its guest TCP `LISTEN` sockets onto host listeners, Lima-style.
+
+```yaml
+network:
+  auto_publish: true   # or: { poll_interval_ms: 2000, host_bind: "127.0.0.1" }
+```
+
+Host listeners appear as the guest binds and disappear when it closes them, and the SDK can
+observe the same events through `Sandbox::port_events`.

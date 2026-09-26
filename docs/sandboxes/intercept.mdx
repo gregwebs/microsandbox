@@ -27,7 +27,7 @@ let sb = Sandbox::builder("worker")
     .secret(|s| s
         .env("GITHUB_TOKEN")
         .value(std::env::var("GITHUB_TOKEN")?)
-        .allow_host("api.github.com")
+        .allow("api.github.com")
     )
     .network(|n| n
         .tls(|t| t.intercepted_ports(vec![443]))
@@ -136,4 +136,15 @@ the same engine.
 Interception is a local-engine feature: it runs the hook subprocess on the same host process as
 the sandbox runtime, so it is not available for cloud-hosted sandboxes. It layers on top of
 [TLS interception](#configure-a-hook-and-rules) — `tls.enabled` must be true and the target port
-must be in `tls.intercepted_ports` for a host's traffic to reach the interceptor at all.
+must be in `tls.intercepted_ports` (default `[443]`) for a host's traffic to reach the interceptor
+at all.
+
+<Warning>
+  **An `intercept` config with `tls.enabled = false` is inert.** Interception runs inside the
+  TLS-intercepting proxy, so with TLS termination off there is no proxy to install it in: the
+  rules and hook are accepted, stored, and then never consulted. No request is refused, and
+  nothing warns. Enable interception explicitly when you configure rules. Note the asymmetry with
+  secrets: adding a secret flips `tls.enabled` on for you, but `network.intercept` does not, and
+  the per-port credential check above still refuses a credential whose origin port is not
+  TLS-intercepted.
+</Warning>

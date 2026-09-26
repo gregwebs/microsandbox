@@ -36,6 +36,29 @@ task :version_check do
   abort "Ruby/Cargo package version mismatch" unless package_version == version
   abort "Ruby/published Rust SDK must use an exact version pin" unless core_requirement&.start_with?("=")
   abort "Ruby/published Rust SDK version mismatch" unless core_requirement.delete_prefix("=") == version
+
+  # Workspace builds may have no lockfile or a path dependency without a source.
+  # Only registry entries need to match the published SDK pin.
+  pin = core_requirement.delete_prefix("=")
+  lock_path = "ext/microsandbox/Cargo.lock"
+  if File.file?(lock_path)
+    refresh = "run `cargo update -p microsandbox --precise #{pin}` in ext/microsandbox " \
+              "(with no [patch.crates-io] active) and commit the lock"
+    packages = File.read(lock_path).split(/^\[\[package\]\]$/)
+                   .select { |package| package.match?(/^name = "microsandbox"$/) }
+    if packages.empty?
+      abort "Ruby/standalone Cargo.lock has no [[package]] entry named microsandbox, so it " \
+            "was not resolved from ext/microsandbox/Cargo.toml; #{refresh}"
+    end
+
+    packages.select { |package| package.match?(/^source = "registry\+/) }.each do |package|
+      locked = package[/^version = "([^"]+)"$/, 1]
+      next if locked == pin
+
+      abort "Ruby/standalone Cargo.lock resolves crates.io microsandbox #{locked} but " \
+            "Cargo.toml pins #{pin}; #{refresh}"
+    end
+  end
 end
 
 Rake::TestTask.new do |test|
@@ -129,6 +152,12 @@ namespace :cargo do
       microsandbox = { path = "../rust" }
     TOML
     File.write(PATCH_STATE, patch_config_digest)
+
+    # tinyvec 1.13.0 does not import the vec! macro for alloc-only builds.
+    # Keep the temporary patched graph on the version already proven by the
+    # standalone lockfile until an upstream fix supersedes the broken release.
+    sh "cargo", "update", "--manifest-path", "ext/microsandbox/Cargo.toml",
+       "-p", "tinyvec", "--precise", "1.12.0"
   end
 
   desc "Undo cargo:patch_workspace: drop the patch config, restore the lockfile"

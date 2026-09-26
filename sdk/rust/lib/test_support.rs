@@ -1,6 +1,9 @@
-//! Shared synchronization helpers for crate unit tests.
+//! Fixture decoding, isolated backend construction, and synchronization for crate unit tests.
 
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Mutex, MutexGuard};
+
+pub(crate) mod fixtures;
+mod json;
 
 //--------------------------------------------------------------------------------------------------
 // Constants
@@ -25,6 +28,10 @@ pub(crate) struct CapturedEvents {
     events: Mutex<Vec<String>>,
 }
 
+//--------------------------------------------------------------------------------------------------
+// Methods
+//--------------------------------------------------------------------------------------------------
+
 impl CapturedEvents {
     /// Every captured event's formatted field values, in order.
     pub(crate) fn formatted(&self) -> Vec<String> {
@@ -34,6 +41,10 @@ impl CapturedEvents {
             .clone()
     }
 }
+
+//--------------------------------------------------------------------------------------------------
+// Trait Implementations
+//--------------------------------------------------------------------------------------------------
 
 impl tracing::Subscriber for CapturedEvents {
     fn enabled(&self, _metadata: &tracing::Metadata<'_>) -> bool {
@@ -82,10 +93,10 @@ pub(crate) fn lock_env() -> MutexGuard<'static, ()> {
 /// Run `body` with a capturing `tracing` subscriber installed.
 ///
 /// Returns the body's result and every event the body logged. The test-global
-/// subscriber is process-wide, so callers must hold the returned guard for the
+/// subscriber is process-wide, so callers must hold the shared lock for the
 /// duration of the measurement; tests that call this take `lock_tracing()`.
 pub(crate) fn capture_events<T>(body: impl FnOnce() -> T) -> (T, Vec<String>) {
-    let capture = Arc::new(CapturedEvents {
+    let capture = std::sync::Arc::new(CapturedEvents {
         events: Mutex::new(Vec::new()),
     });
     let guard = tracing::subscriber::set_default(capture.clone());
@@ -100,4 +111,46 @@ pub(crate) fn lock_tracing() -> MutexGuard<'static, ()> {
     TRACING_LOCK
         .lock()
         .unwrap_or_else(|error| error.into_inner())
+}
+
+/// Construct a cloud backend with explicitly empty config sources, independent of the host.
+#[cfg(feature = "cloud")]
+pub(crate) fn cloud_backend(
+    url: impl Into<String>,
+    api_key: impl Into<String>,
+) -> crate::MicrosandboxResult<crate::CloudBackend> {
+    crate::CloudBackend::builder()
+        .url(url)
+        .api_key(api_key)
+        .config_sources(crate::config::layers::BackendConfig::new(
+            Default::default(),
+            Default::default(),
+        ))
+        .build()
+}
+
+/// Construct a local backend from explicit settings without reading machine configuration.
+#[cfg(feature = "local")]
+pub(crate) fn local_backend(config: crate::config::GlobalConfig) -> crate::LocalBackend {
+    crate::LocalBackend::from_backend_config(
+        crate::config::layers::BackendConfig::new(
+            crate::config::GlobalConfigPatch::from_present_fields(config),
+            Default::default(),
+        ),
+        crate::BackendSelectionSource::Programmatic,
+        None,
+    )
+}
+
+/// Build against user and managed config files inside a test's temporary home.
+/// Runtime environment paths are still honored for live runtime fixtures.
+#[cfg(feature = "local")]
+pub(crate) fn local_backend_builder(
+    home: impl AsRef<std::path::Path>,
+) -> crate::backend::local::LocalBackendBuilder {
+    let home = home.as_ref();
+    crate::LocalBackend::builder()
+        .config_path(home.join("config.json"))
+        .managed_config_path(home.join("managed.json"))
+        .home(home)
 }

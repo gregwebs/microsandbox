@@ -166,6 +166,8 @@ impl PassthroughFsBuilder {
         }
 
         let cfg_probe = super::PassthroughConfig {
+            owned_checkpoint: None,
+            external_checkpoint: None,
             root_dir: root_dir.clone(),
             no_symlink_root: self.no_symlink_root,
             stat_virtualization: self.stat_virtualization,
@@ -178,6 +180,7 @@ impl PassthroughFsBuilder {
             inject_init: self.inject_init,
             bind_identity_map: self.bind_identity_map,
             quota_bytes: self.quota_bytes,
+            quota_root: None,
         };
 
         // Open the root directory, contained beneath the anchor when one is set.
@@ -205,11 +208,17 @@ impl PassthroughFsBuilder {
 
         let cfg = cfg_probe;
 
-        let quota = cfg
-            .quota_bytes
-            .map(|limit| super::super::quota::DirQuota::new(cfg.root_dir.clone(), limit));
+        let quota = cfg.quota_bytes.map(|limit| {
+            super::super::quota::DirQuota::new(
+                cfg.quota_root
+                    .clone()
+                    .unwrap_or_else(|| cfg.root_dir.clone()),
+                limit,
+            )
+        });
 
         Ok(PassthroughFs {
+            invalid_inodes: RwLock::new(std::collections::BTreeSet::new()),
             cfg,
             root_fd,
             inodes: RwLock::new(MultikeyBTreeMap::new()),

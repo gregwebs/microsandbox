@@ -16,7 +16,8 @@
 //! The suite boots a real VM (libkrun on macOS / KVM on Linux) and is marked
 //! `#[ignore]`, so it must be selected explicitly. It also needs to be pointed
 //! at the `msb` binary built from this branch and the matching `libkrunfw`,
-//! because the SDK execs that binary and probes `msb __capabilities`:
+//! because the SDK execs that binary and requires it to answer
+//! `msb __launch-protocol` with `"header_credentials": true`:
 //!
 //! ```sh
 //! cd vendor/microsandbox

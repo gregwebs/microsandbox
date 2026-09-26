@@ -25,6 +25,7 @@ readonly AGENTD=build/agentd
 scratch="$(mktemp -d "${TMPDIR:-/tmp}/microsandbox-agentd-provenance.XXXXXX")"
 readonly SCRATCH="$scratch"
 readonly EXPLICIT="$SCRATCH/agentd"
+readonly ARTIFACTS="$SCRATCH/artifacts"
 readonly BACKUP="$SCRATCH/agentd.backup"
 moved=false
 
@@ -45,6 +46,8 @@ if [[ ! -f "$AGENTD" ]]; then
 fi
 
 cp "$AGENTD" "$EXPLICIT"
+mkdir -p "$ARTIFACTS"
+cp "$AGENTD" "$ARTIFACTS/agentd"
 
 fail() {
   echo "agentd provenance: FAIL: $*" >&2
@@ -52,21 +55,27 @@ fail() {
 }
 
 # Only the filesystem crate is needed: it owns the build script under test.
-check_prebuilt() {
-  cargo check -p microsandbox-filesystem --lib 2>&1
+check_default() {
+  env -u MSB_EMBED_ARTIFACTS_DIR -u MSB_AGENTD_PATH \
+    cargo check -p microsandbox-filesystem --lib 2>&1
 }
 
-check_prebuilt_explicit() {
-  MSB_AGENTD_PATH="$EXPLICIT" cargo check -p microsandbox-filesystem --lib 2>&1
+check_explicit_artifacts_dir() {
+  env -u MSB_AGENTD_PATH MSB_EMBED_ARTIFACTS_DIR="$ARTIFACTS" \
+    cargo check -p microsandbox-filesystem --lib 2>&1
 }
 
-check_without_prebuilt() {
-  cargo check -p microsandbox-filesystem --lib --no-default-features 2>&1
+check_explicit_agentd_path() {
+  env -u MSB_EMBED_ARTIFACTS_DIR MSB_AGENTD_PATH="$EXPLICIT" \
+    cargo check -p microsandbox-filesystem --lib 2>&1
 }
 
-check_without_prebuilt_explicit() {
-  MSB_AGENTD_PATH="$EXPLICIT" cargo check -p microsandbox-filesystem --lib \
-    --no-default-features 2>&1
+# Without `download-binaries` the local artifact is the only supported source, so
+# the released artifact can never stand in for it.
+check_without_downloads() {
+  env -u MSB_EMBED_ARTIFACTS_DIR -u MSB_AGENTD_PATH \
+    cargo check -p microsandbox-filesystem --lib --no-default-features \
+    --features embed-binaries 2>&1
 }
 
 # The staleness check compares the newest mtime in the guest source tree against
@@ -138,14 +147,21 @@ expect_success_mentioning() {
 
 # A current local artifact is the normal case and must stay quiet.
 mark_artifact_newer_than_sources
-expect_success "fresh build/agentd is embedded with prebuilt enabled" check_prebuilt
+expect_success "fresh build/agentd is embedded" check_default
 
 # Embedding an artifact older than the guest sources is the defect this policy
 # exists to catch: it changes guest behaviour with nothing else failing.
 mark_sources_newer_than_artifact
 expect_failure \
-  "a stale build/agentd fails instead of being embedded with prebuilt enabled" \
-  check_prebuilt \
+  "a stale build/agentd fails instead of being embedded" \
+  check_default \
+  "is older than crates/agentd or crates/protocol source"
+
+# The released-artifact fallback must not be what makes staleness observable, so
+# the refusal is unconditional on the download feature.
+expect_failure \
+  "a stale build/agentd fails without the download feature too" \
+  check_without_downloads \
   "is older than crates/agentd or crates/protocol source"
 
 # A checkout can always rebuild the guest agent, so it must never substitute the
@@ -156,40 +172,34 @@ mark_artifact_newer_than_sources
 remove_artifact
 expect_failure \
   "a missing build/agentd in a checkout fails instead of downloading the release" \
-  check_prebuilt \
-  "will not download a released guest" \
+  check_default \
+  "will not embed a released agentd" \
   "just build-agentd" \
   "cargo build --release --manifest-path crates/agentd/Cargo.toml"
+
+expect_failure \
+  "a missing build/agentd fails without the download feature too" \
+  check_without_downloads \
+  "will not embed a released agentd"
 
 # An explicit artifact is the caller's choice, and says so.
 expect_success_mentioning \
   "MSB_AGENTD_PATH is embedded when build/agentd is missing" \
   "embedding the guest agent from MSB_AGENTD_PATH=$EXPLICIT" \
-  check_prebuilt_explicit
+  check_explicit_agentd_path
 
-# ... and beats a stale local artifact rather than failing on it.
+expect_success \
+  "MSB_EMBED_ARTIFACTS_DIR is embedded when build/agentd is missing" \
+  check_explicit_artifacts_dir
+
+# ... and an explicit artifact beats a stale local one rather than failing on it.
+restore_artifact
 mark_sources_newer_than_artifact
 expect_success_mentioning \
   "MSB_AGENTD_PATH is embedded even when build/agentd is stale" \
   "embedding the guest agent from MSB_AGENTD_PATH=$EXPLICIT" \
-  check_prebuilt_explicit
-
-restore_artifact
-
-# Without `prebuilt` the local artifact is the only supported source, so the
-# environment variable stays ignored (as documented in DEVELOPMENT.md) and a
-# stale or missing artifact keeps failing.
-mark_sources_newer_than_artifact
-expect_failure \
-  "a stale build/agentd fails without the prebuilt feature" \
-  check_without_prebuilt \
-  "is older than crates/agentd or crates/protocol source"
+  check_explicit_agentd_path
 
 mark_artifact_newer_than_sources
-remove_artifact
-expect_failure \
-  "MSB_AGENTD_PATH stays ignored without the prebuilt feature" \
-  check_without_prebuilt_explicit \
-  "binary not found at"
 
 echo "agentd provenance: OK"

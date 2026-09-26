@@ -7,7 +7,9 @@ use std::path::PathBuf;
 use std::str::FromStr;
 
 use ipnetwork::{IpNetwork, Ipv4Network, Ipv6Network};
+use microsandbox_types_macros::ConfigPatch;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use typed_path::{Utf8Component, Utf8UnixComponent, Utf8UnixPath};
 use zeroize::Zeroizing;
 
@@ -363,12 +365,43 @@ pub struct NamedVolumeCreate {
     pub labels: Vec<(String, String)>,
 }
 
+/// Storage for a volume whose lifetime belongs exclusively to its sandbox.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+#[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+pub enum OwnedVolumeStorage {
+    /// A private directory exposed through virtiofs.
+    Directory {
+        /// Guest-write budget in MiB; `None` uses the directory-mount default.
+        quota_mib: Option<u32>,
+    },
+    /// A private ext4 disk exposed through virtio-blk.
+    Disk {
+        /// Required, positive capacity in MiB.
+        capacity_mib: u32,
+    },
+}
+
 /// A volume mount specification for a sandbox.
 #[derive(Clone)]
 #[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[cfg_attr(feature = "ts", ts(tag = "type"))]
 pub enum VolumeMount {
+    /// An unnamed private volume removed with its owning sandbox.
+    Owned {
+        /// Guest mount path, also the stable identity within the sandbox.
+        guest: String,
+        /// Directory or ext4 disk storage.
+        storage: OwnedVolumeStorage,
+        /// Guest mount behavior.
+        options: MountOptions,
+        /// Guest-visible stat virtualization policy for directory storage.
+        stat_virtualization: StatVirtualization,
+        /// Host permission propagation policy for directory storage.
+        host_permissions: HostPermissions,
+    },
     /// Bind mount a host directory into the guest.
     Bind {
         /// Host path to bind mount.
@@ -542,8 +575,8 @@ pub enum Patch {
 
 /// Complete network specification for a sandbox.
 ///
-/// Common, backend-visible fields are typed directly. Rich local-engine subdocuments such as policy, DNS, TLS, request interception, secrets, and interface overrides are carried as JSON so the shared contract can preserve them without depending on the local networking engine crate.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// Common, backend-visible fields are typed directly. Rich local-engine subdocuments such as policy, DNS, TLS, secrets, and interface overrides are carried as JSON so the shared contract can preserve them without depending on the local networking engine crate.
+#[derive(Debug, Clone, Serialize, Deserialize, ConfigPatch)]
 #[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[serde(default)]
@@ -553,6 +586,7 @@ pub struct NetworkSpec {
 
     /// Guest interface overrides for the local network engine.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[config_patch(nested)]
     pub interface: Option<InterfaceOverrides>,
 
     /// Host-to-guest port mappings.
@@ -564,33 +598,55 @@ pub struct NetworkSpec {
 
     /// DNS interception and filtering subdocument.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[config_patch(nested)]
     pub dns: Option<DnsConfig>,
 
     /// TLS interception subdocument.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[config_patch(nested)]
     pub tls: Option<TlsConfig>,
+
+    /// Require hostname-based policy allows to use inspectable application authority.
+    pub strict: bool,
+
+    /// Secret substitution subdocument.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[config_patch(nested)]
+    pub secrets: Option<SecretsConfig>,
 
     /// Fail-closed request-interception subdocument.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[config_patch(nested)]
     pub intercept: Option<InterceptConfig>,
 
-    /// Secret injection subdocument.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub secrets: Option<SecretsConfig>,
+    /// TCP connection cap. `max_connections` is a deprecated configuration alias.
+    // Keep saved configurations readable by releases that predate the TCP-specific name.
+    #[serde(rename = "max_connections", alias = "max_tcp_connections")]
+    pub max_tcp_connections: Option<usize>,
 
-    /// Max concurrent guest connections.
-    pub max_connections: Option<usize>,
+    /// Max concurrent UDP relay sessions. Omitted is unlimited for single-tenant and 1024 for multi-tenant; zero means unlimited.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_udp_connections: Option<usize>,
 
     /// Local network rate limits. Missing means unlimited in both directions.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[config_patch(nested)]
     pub rate_limiter: Option<NetworkRateLimiterConfig>,
 
     /// Whether to copy trusted host CAs into the guest at boot.
     pub trust_host_cas: bool,
 
+    /// Proxy used for outbound sandbox connections and supported datagram flows.
+    ///
+    /// In Rust SDK creation from a concrete `SandboxConfig`, `None` inherits defaults; use a sparse patch to clear.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[config_patch(nullable)]
+    pub outbound_proxy: Option<OutboundProxy>,
+
     /// Auto-publish subdocument: mirror guest TCP LISTEN sockets onto host
     /// listeners (Lima-style). `None` means disabled.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[config_patch(nullable)]
     pub auto_publish: Option<AutoPublishConfig>,
 }
 
@@ -620,6 +676,47 @@ impl Default for AutoPublishConfig {
             host_bind: "127.0.0.1".into(),
         }
     }
+}
+
+/// Proxy configuration for outbound sandbox connections.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[serde(tag = "protocol", rename_all = "lowercase")]
+#[non_exhaustive]
+pub enum OutboundProxy {
+    /// A SOCKS4 proxy at the given `IP:port` address.
+    Socks4 {
+        /// Proxy socket address.
+        address: String,
+        /// Optional user ID sent during the SOCKS4 handshake.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        user_id: Option<String>,
+    },
+
+    /// A SOCKS5 proxy at the given `IP:port` address.
+    Socks5 {
+        /// Proxy socket address.
+        address: String,
+        /// Optional username/password authentication credentials.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        credentials: Option<Socks5Credentials>,
+    },
+}
+
+/// Environment-backed username/password credentials for a SOCKS5 proxy.
+///
+/// This durable configuration contains only the host-side password source.
+/// The resolved password is carried by the private launch contract instead.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+pub struct Socks5Credentials {
+    /// SOCKS5 authentication username.
+    pub username: String,
+
+    /// Host-side source for the SOCKS5 authentication password.
+    pub password: SecretSource,
 }
 
 /// A published port mapping between host and guest.
@@ -661,7 +758,7 @@ pub enum PortProtocol {
 //--------------------------------------------------------------------------------------------------
 
 /// Host services exposed to a sandbox through virtio-vsock.
-#[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize, ConfigPatch)]
 #[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[serde(default)]
@@ -736,7 +833,7 @@ pub struct HandoffInit {
 //--------------------------------------------------------------------------------------------------
 
 /// Sandbox lifecycle policy.
-#[derive(Debug, Default, Clone, Serialize, Deserialize)]
+#[derive(Debug, Default, Clone, Serialize, Deserialize, ConfigPatch)]
 #[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct SandboxPolicy {
@@ -764,41 +861,42 @@ pub struct SandboxPolicy {
 
 /// Inputs to create a snapshot.
 ///
-/// The snapshot's name is its identity; the artifact directory is
-/// `dest_dir.join(name)`, with `dest_dir` defaulting to the snapshots
-/// store. Archive movement happens through save/load (the artifact
-/// directory is also self-contained and safe to move directly).
+/// Installed artifacts live at `dest_dir/<group>/<snapshot_id>`. A friendly name
+/// is scoped to the group; it does not change the portable snapshot identity.
+/// Save/load moves artifacts between stores without starting a VM.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct SnapshotSpec {
-    /// Snapshot name. Always the artifact directory's basename.
+    /// Optional guest writeback policy. Auto flushes live disk-only captures, not full RAM.
+    #[serde(default)]
+    pub guest_flush: crate::GuestFlush,
+    /// Friendly member name within a group; empty selects a generated name.
     pub name: String,
 
-    /// Parent directory to create the artifact in. `None` = the default
-    /// snapshots directory.
+    /// Local snapshot group; defaults to the source sandbox's name.
+    #[serde(default)]
+    pub group: Option<String>,
+
+    /// Group-store root. `None` selects the default snapshots directory.
     #[serde(default)]
     #[cfg_attr(feature = "ts", ts(type = "string | null"))]
     pub dest_dir: Option<PathBuf>,
 
-    /// Name of the source sandbox. Must be stopped.
+    /// Source sandbox. Disk capture accepts running, paused, or stopped sources.
     pub source_sandbox: String,
 
     /// User-supplied labels.
     pub labels: Vec<(String, String)>,
 
-    /// Overwrite an existing artifact at the destination.
+    /// Overwrite a direct archive destination; installed members remain immutable.
     pub force: bool,
 
     /// Compute and record upper-layer content integrity at creation time.
     pub record_integrity: bool,
 
-    /// Request a future resumable snapshot that includes memory/device state.
-    ///
-    /// This is part of the public contract now so callers can validate shape
-    /// early. The local runtime returns an unsupported-feature error until VM
-    /// pause/resume capture lands.
+    /// Capture disk, memory, execution, and device state from a running sandbox.
     #[serde(default)]
-    pub resumable: bool,
+    pub full: bool,
 }
 
 //--------------------------------------------------------------------------------------------------
@@ -808,7 +906,7 @@ pub struct SnapshotSpec {
 /// Backend-neutral sandbox task description.
 ///
 /// This is the durable contract for fields that are already shared across backends. Local-only execution state such as resolved manifest digests, snapshot upper-layer paths, registry credentials, replace flags, and backend dispatch stays outside this type.
-#[derive(Debug, Default, Clone, Serialize, Deserialize)]
+#[derive(Debug, Default, Clone, Serialize, Deserialize, ConfigPatch)]
 #[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[serde(default)]
@@ -821,15 +919,19 @@ pub struct SandboxSpec {
     pub image: RootfsSource,
 
     /// CPU and memory resources.
+    #[config_patch(nested)]
     pub resources: SandboxResources,
 
     /// Guest runtime options.
+    #[config_patch(nested)]
     pub runtime: SandboxRuntimeOptions,
 
     /// Environment variables visible to commands in the sandbox.
+    #[config_patch(merge_with = merge_env_vars)]
     pub env: Vec<EnvVar>,
 
     /// User-defined labels attached to the sandbox.
+    #[config_patch(merge)]
     pub labels: BTreeMap<String, String>,
 
     /// Sandbox-wide resource limits inherited by guest processes.
@@ -842,10 +944,12 @@ pub struct SandboxSpec {
     pub patches: Vec<Patch>,
 
     /// Network specification.
+    #[config_patch(nested)]
     pub network: NetworkSpec,
 
     /// Local host services exposed through virtio-vsock.
     #[serde(default, skip_serializing_if = "VsockSpec::is_empty")]
+    #[config_patch(nested)]
     pub vsock: VsockSpec,
 
     /// Hand off PID 1 to a guest init binary after agentd setup.
@@ -865,11 +969,12 @@ pub struct SandboxSpec {
     pub deployment_profile: DeploymentProfile,
 
     /// Sandbox lifecycle policy.
+    #[config_patch(nested)]
     pub lifecycle: SandboxPolicy,
 }
 
 /// CPU and memory resources for a sandbox.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, ConfigPatch)]
 #[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct SandboxResources {
@@ -890,7 +995,9 @@ pub struct SandboxResources {
     pub cpu_placement: CpuPlacement,
 
     /// Host-defined placement profile selected for this sandbox.
+    /// In Rust SDK creation from a concrete `SandboxConfig`, `None` inherits defaults; use a sparse patch to clear.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[config_patch(nullable)]
     pub placement_profile: Option<String>,
 
     /// Guest transparent huge-page policy selected at boot.
@@ -974,18 +1081,23 @@ pub enum TransparentHugePagePolicy {
 }
 
 /// Guest runtime options for a sandbox.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, ConfigPatch)]
 #[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[serde(default)]
 pub struct SandboxRuntimeOptions {
     /// Working directory inside the guest.
+    /// In Rust SDK creation from a concrete `SandboxConfig`, `None` inherits defaults; use a sparse patch to clear.
+    #[config_patch(nullable)]
     pub workdir: Option<String>,
 
     /// Default shell for scripts and interactive sessions.
+    /// In Rust SDK creation from a concrete `SandboxConfig`, `None` explicitly clears lower-layer defaults; managed overrides still apply.
+    #[config_patch(nullable)]
     pub shell: Option<String>,
 
     /// Named scripts available inside the guest.
+    #[config_patch(merge)]
     pub scripts: BTreeMap<String, String>,
 
     /// Image entrypoint override.
@@ -1001,9 +1113,13 @@ pub struct SandboxRuntimeOptions {
     pub user: Option<String>,
 
     /// Runtime log verbosity.
+    /// In Rust SDK creation from a concrete `SandboxConfig`, `None` explicitly clears lower-layer defaults; managed overrides still apply.
+    #[config_patch(nullable)]
     pub log_level: Option<SandboxLogLevel>,
 
     /// Metrics sampling interval in milliseconds. `None` disables sampling.
+    /// In Rust SDK creation from a concrete `SandboxConfig`, `None` explicitly clears lower-layer defaults; managed overrides still apply.
+    #[config_patch(nullable)]
     pub metrics_sample_interval_ms: Option<u64>,
 
     /// Force-disable metrics sampling regardless of `metrics_sample_interval_ms`.
@@ -1128,6 +1244,28 @@ pub enum LogSource {
 //--------------------------------------------------------------------------------------------------
 // Methods
 //--------------------------------------------------------------------------------------------------
+
+impl SandboxResourcesPatch {
+    /// Whether this patch explicitly sets the initial vCPU count, even to its default value.
+    pub fn has_cpus(&self) -> bool {
+        self.cpus.is_some()
+    }
+
+    /// Whether this patch explicitly sets initial memory, even to its default value.
+    pub fn has_memory_mib(&self) -> bool {
+        self.memory_mib.is_some()
+    }
+
+    /// Whether this patch explicitly sets the maximum vCPU count.
+    pub fn has_max_cpus(&self) -> bool {
+        self.max_cpus.is_some()
+    }
+
+    /// Whether this patch explicitly sets maximum memory.
+    pub fn has_max_memory_mib(&self) -> bool {
+        self.max_memory_mib.is_some()
+    }
+}
 
 impl DiskImageFormat {
     /// Returns the format as a CLI-safe lowercase string.
@@ -1363,6 +1501,7 @@ impl VolumeMount {
     pub fn guest(&self) -> &str {
         match self {
             Self::Bind { guest, .. }
+            | Self::Owned { guest, .. }
             | Self::Named { guest, .. }
             | Self::Tmpfs { guest, .. }
             | Self::DiskImage { guest, .. } => guest,
@@ -1372,6 +1511,7 @@ impl VolumeMount {
     fn guest_mut(&mut self) -> &mut String {
         match self {
             Self::Bind { guest, .. }
+            | Self::Owned { guest, .. }
             | Self::Named { guest, .. }
             | Self::Tmpfs { guest, .. }
             | Self::DiskImage { guest, .. } => guest,
@@ -1390,6 +1530,33 @@ impl VolumeMount {
 //--------------------------------------------------------------------------------------------------
 // Functions: Volume Mounts
 //--------------------------------------------------------------------------------------------------
+
+/// Portable private-volume identity derived from an already canonical guest path.
+/// The ASCII hint is diagnostic; the suffix keeps distinct paths distinct.
+pub fn owned_volume_mount_id(guest: &str) -> String {
+    use std::fmt::Write as _;
+    let slug: String = guest
+        .trim_start_matches('/')
+        .chars()
+        .take(11)
+        .map(|character| {
+            if character.is_ascii_alphanumeric() || character == '-' {
+                character
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    let mut id = if slug.is_empty() {
+        String::new()
+    } else {
+        format!("{slug}_")
+    };
+    for byte in Sha256::digest(guest.as_bytes()).iter().take(4) {
+        let _ = write!(id, "{byte:02x}");
+    }
+    id
+}
 
 /// Canonicalizes guest paths and orders mounts from parent to child.
 ///
@@ -1677,11 +1844,14 @@ impl Default for NetworkSpec {
             policy: None,
             dns: None,
             tls: None,
-            intercept: None,
+            strict: true,
             secrets: None,
-            max_connections: None,
+            intercept: None,
+            max_tcp_connections: None,
+            max_udp_connections: None,
             rate_limiter: None,
             trust_host_cas: false,
+            outbound_proxy: None,
             auto_publish: None,
         }
     }
@@ -1725,11 +1895,35 @@ impl FromStr for SandboxLogLevel {
     }
 }
 
+impl std::fmt::Display for SandboxLogLevel {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
 impl Serialize for VolumeMount {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         use serde::ser::SerializeMap;
 
         match self {
+            Self::Owned {
+                guest,
+                storage,
+                options,
+                stat_virtualization,
+                host_permissions,
+            } => {
+                // A distinct tag is intentional: older runtimes must reject ownership,
+                // not reinterpret a private mount as an external or named volume.
+                let mut map = serializer.serialize_map(Some(6))?;
+                map.serialize_entry("type", "Owned")?;
+                map.serialize_entry("guest", guest)?;
+                map.serialize_entry("storage", storage)?;
+                map.serialize_entry("options", options)?;
+                map.serialize_entry("stat_virtualization", stat_virtualization)?;
+                map.serialize_entry("host_permissions", host_permissions)?;
+                map.end()
+            }
             Self::Bind {
                 host,
                 guest,
@@ -1814,6 +2008,16 @@ impl<'de> Deserialize<'de> for VolumeMount {
         #[derive(Deserialize)]
         #[serde(tag = "type")]
         enum VolumeMountHelper {
+            Owned {
+                guest: String,
+                storage: OwnedVolumeStorage,
+                #[serde(default)]
+                options: MountOptions,
+                #[serde(default = "default_strict")]
+                stat_virtualization: StatVirtualization,
+                #[serde(default = "default_private")]
+                host_permissions: HostPermissions,
+            },
             Bind {
                 host: PathBuf,
                 guest: String,
@@ -1868,6 +2072,19 @@ impl<'de> Deserialize<'de> for VolumeMount {
 
         let helper = VolumeMountHelper::deserialize(deserializer)?;
         Ok(match helper {
+            VolumeMountHelper::Owned {
+                guest,
+                storage,
+                options,
+                stat_virtualization,
+                host_permissions,
+            } => Self::Owned {
+                guest,
+                storage,
+                options,
+                stat_virtualization,
+                host_permissions,
+            },
             VolumeMountHelper::Bind {
                 host,
                 guest,
@@ -1934,6 +2151,20 @@ impl<'de> Deserialize<'de> for VolumeMount {
 impl fmt::Debug for VolumeMount {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::Owned {
+                guest,
+                storage,
+                options,
+                stat_virtualization,
+                host_permissions,
+            } => f
+                .debug_struct("Owned")
+                .field("guest", guest)
+                .field("storage", storage)
+                .field("options", options)
+                .field("stat_virtualization", stat_virtualization)
+                .field("host_permissions", host_permissions)
+                .finish(),
             Self::Bind {
                 host,
                 guest,
@@ -2044,6 +2275,27 @@ fn decode_mount_options(options: Option<MountOptions>, readonly: bool) -> MountO
     })
 }
 
+fn merge_env_vars(base: &mut Vec<EnvVar>, higher: Vec<EnvVar>) {
+    for value in higher {
+        match base.iter_mut().find(|current| current.key == value.key) {
+            Some(current) => *current = value,
+            None => base.push(value),
+        }
+    }
+}
+
+fn merge_secret_entries(base: &mut Vec<SecretEntry>, higher: Vec<SecretEntry>) {
+    for value in higher {
+        match base
+            .iter_mut()
+            .find(|current| current.env_var == value.env_var)
+        {
+            Some(current) => *current = value,
+            None => base.push(value),
+        }
+    }
+}
+
 /// Default stat-virtualization policy (`Strict`) for a deserialized volume mount.
 pub(crate) fn default_strict() -> StatVirtualization {
     StatVirtualization::Strict
@@ -2070,26 +2322,31 @@ pub const MAX_HEADER_CREDENTIAL_FORMAT_BYTES: usize = 256;
 /// Maximum byte length of a resolved (rendered) header-credential value.
 pub const MAX_HEADER_CREDENTIAL_VALUE_BYTES: usize = 8 * 1024;
 
-/// Fixed, non-secret protocol marker identifying a runtime that understands
-/// origin-scoped header credentials on the private launch-config FD.
-///
-/// This is deliberately not a package version: an older runtime silently
-/// ignores unknown additive fields, so callers must probe the installed
-/// binary for this exact token before handing it a credential-bearing config.
-pub const HEADER_CREDENTIAL_LAUNCH_CAPABILITY: &str = "header-credential-launch-v1";
-
-/// Placeholder-based secret injection for a sandbox's TLS-intercepted egress.
+/// Placeholder-based secret substitution for a sandbox's TLS-intercepted egress.
 ///
 /// The sandbox only ever sees each secret's `placeholder`; the local network
 /// engine substitutes the real `value` into outbound requests bound for an
-/// allowed host (and blocks/forwards per [`ViolationAction`] otherwise). Carried
+/// allowed host (and blocks/forwards per [`SecretViolationAction`] otherwise). Carried
 /// in [`NetworkSpec::secrets`](NetworkSpec).
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+///
+/// When constructing directly, use `..Default::default()` for unspecified fields.
+/// The global `passthrough_hosts` field preserves historical defaults; its addition
+/// requires updating older exhaustive struct literals and patterns.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, ConfigPatch)]
 #[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct SecretsConfig {
+    /// Default hosts allowed to receive placeholders unchanged.
+    /// A per-secret violation action overrides this default.
+    #[doc(hidden)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(skip))]
+    #[cfg_attr(feature = "utoipa", schema(ignore))]
+    pub passthrough_hosts: Option<Vec<HostPattern>>,
+
     /// List of secrets to inject.
     #[serde(default)]
+    #[config_patch(merge_with = merge_secret_entries)]
     pub secrets: Vec<SecretEntry>,
 
     /// Origin-scoped header credentials set at spawn time by a host resolver.
@@ -2097,13 +2354,15 @@ pub struct SecretsConfig {
     /// Entries carry only non-secret authorization metadata (a reference) and
     /// never a value; see [`DurableHeaderCredential`]. The
     /// `skip_serializing_if` keeps the serialized shape of existing configs
-    /// unchanged.
+    /// unchanged. This is a plain (replace) patch field rather than a merge:
+    /// credentials are an authorization set, and silently extending one across
+    /// patch layers is the wrong default.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub header_credentials: Vec<DurableHeaderCredential>,
 
     /// Default action when a placeholder leaks to a disallowed host.
     #[serde(default)]
-    pub on_violation: ViolationAction,
+    pub violation_action: SecretViolationAction,
 }
 
 /// An exact HTTPS origin: one host and one port.
@@ -2159,8 +2418,7 @@ pub struct DurableHeaderCredential {
 /// containing struct cannot forget to redact it. `Debug` prints `[REDACTED]`.
 ///
 /// Serialization is transparent (`#[serde(transparent)]`): on the private
-/// launch-config fd a `SecretString` is exactly a JSON string, byte-identical to
-/// the previous `Zeroizing<String>` representation.
+/// launch-config fd a `SecretString` is exactly a JSON string.
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct SecretString(Zeroizing<String>);
@@ -2245,17 +2503,21 @@ pub struct SecretEntry {
     /// must not contain NUL, CR, or LF.
     pub placeholder: String,
 
-    /// Hosts allowed to receive this secret.
+    /// Hosts allowed to receive the substituted secret value.
     #[serde(default)]
     pub allowed_hosts: Vec<HostPattern>,
 
-    /// Where the secret can be injected.
+    /// Request locations where the placeholder can be substituted.
     #[serde(default)]
-    pub injection: SecretInjection,
+    pub substitution: SecretSubstitution,
+
+    /// Hosts allowed to receive the placeholder unchanged.
+    #[serde(default)]
+    pub passthrough_hosts: Vec<HostPattern>,
 
     /// Action on a violation for this secret (overrides the config default).
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub on_violation: Option<ViolationAction>,
+    pub violation_action: Option<SecretViolationAction>,
 
     /// Require verified TLS identity before substituting (default: true).
     ///
@@ -2282,22 +2544,18 @@ pub enum HostPattern {
     Any,
 }
 
-/// Where in the HTTP request a secret can be injected.
+/// Request locations where a placeholder can be substituted with its secret.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
-pub struct SecretInjection {
+pub struct SecretSubstitution {
     /// Substitute in HTTP headers (default: true).
     #[serde(default = "default_true")]
     pub headers: bool,
 
-    /// Substitute in HTTP Basic Auth (default: true).
-    #[serde(default = "default_true")]
-    pub basic_auth: bool,
-
     /// Substitute in URL query parameters (default: false).
     #[serde(default)]
-    pub query_params: bool,
+    pub query: bool,
 
     /// Substitute in request body (default: false).
     ///
@@ -2310,12 +2568,12 @@ pub struct SecretInjection {
     pub body: bool,
 }
 
-/// Action when a secret placeholder is detected going to a disallowed host.
+/// Action when a secret placeholder is not allowed to leave the sandbox.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[serde(rename_all = "kebab-case")]
-pub enum ViolationAction {
+pub enum SecretViolationAction {
     /// Block the request silently.
     #[serde(alias = "Block")]
     Block,
@@ -2326,9 +2584,6 @@ pub enum ViolationAction {
     /// Block and terminate the sandbox.
     #[serde(alias = "BlockAndTerminate", alias = "block_and_terminate")]
     BlockAndTerminate,
-    /// Forward the request with the placeholder unchanged for matching hosts.
-    #[serde(alias = "Passthrough")]
-    Passthrough(Vec<HostPattern>),
 }
 
 /// Invalid secret configuration.
@@ -2358,6 +2613,13 @@ pub enum SecretConfigError {
     /// No allowed hosts were configured for a secret.
     #[error("secret #{secret_index}: at least one allowed host is required")]
     MissingAllowedHosts {
+        /// Index of the invalid secret entry.
+        secret_index: usize,
+    },
+
+    /// No request locations were enabled for substitution.
+    #[error("secret #{secret_index}: at least one substitution location is required")]
+    MissingSubstitutionLocation {
         /// Index of the invalid secret entry.
         secret_index: usize,
     },
@@ -2517,14 +2779,19 @@ pub enum SecretConfigError {
 }
 
 impl SecretsConfig {
+    /// Whether any configured secret requires verified TLS identity.
+    pub fn has_tls_identity_secrets(&self) -> bool {
+        self.secrets
+            .iter()
+            .any(|secret| secret.require_tls_identity)
+    }
+
+    /// Whether a secret is configured for the given environment variable.
+    pub fn contains_env_var(&self, env_var: &str) -> bool {
+        self.secrets.iter().any(|secret| secret.env_var == env_var)
+    }
+
     /// Validate all configured secret entries.
-    ///
-    /// This is **definition-level** validation: it checks the legacy
-    /// [`SecretEntry`] grammar exactly as before and the durable
-    /// header-credential authorization grammar. It does not, and cannot, check
-    /// resolved credential *values* — durable header credentials never carry
-    /// one. Resolved-value validation is a separate runtime-only check
-    /// performed on the launch wire type in the network engine.
     pub fn validate(&self) -> Result<(), SecretConfigError> {
         for (index, secret) in self.secrets.iter().enumerate() {
             secret.validate(index)?;
@@ -2541,6 +2808,10 @@ impl SecretEntry {
 
         if self.allowed_hosts.is_empty() {
             return Err(SecretConfigError::MissingAllowedHosts { secret_index });
+        }
+
+        if !self.substitution.headers && !self.substitution.query && !self.substitution.body {
+            return Err(SecretConfigError::MissingSubstitutionLocation { secret_index });
         }
 
         validate_placeholder(&self.placeholder, secret_index)?;
@@ -2596,8 +2867,9 @@ impl fmt::Debug for SecretEntry {
             .field("source", &self.source)
             .field("placeholder", &self.placeholder)
             .field("allowed_hosts", &self.allowed_hosts)
-            .field("injection", &self.injection)
-            .field("on_violation", &self.on_violation)
+            .field("substitution", &self.substitution)
+            .field("passthrough_hosts", &self.passthrough_hosts)
+            .field("violation_action", &self.violation_action)
             .field("require_tls_identity", &self.require_tls_identity)
             .finish()
     }
@@ -2639,12 +2911,11 @@ impl HostPattern {
     }
 }
 
-impl Default for SecretInjection {
+impl Default for SecretSubstitution {
     fn default() -> Self {
         Self {
             headers: true,
-            basic_auth: true,
-            query_params: false,
+            query: false,
             body: false,
         }
     }
@@ -2876,7 +3147,7 @@ fn validate_placeholder(placeholder: &str, secret_index: usize) -> Result<(), Se
 /// The local network engine terminates TCP at its in-process stack, so TLS MITM
 /// is handled by proxy tasks — these fields configure which ports/domains are
 /// intercepted and how the interception CA is sourced.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, ConfigPatch)]
 #[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct TlsConfig {
@@ -3037,7 +3308,7 @@ fn default_cert_validity_hours() -> u64 {
 /// synthesized response and the connection closes, anything else replaces the buffered bytes
 /// before forwarding. A request on a policed SNI (any SNI a rule names) that matches no rule is
 /// refused rather than forwarded — see [`InterceptConfig::is_active`].
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, ConfigPatch)]
 #[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct InterceptConfig {
@@ -3255,7 +3526,7 @@ fn action_deny() -> Action {
 //--------------------------------------------------------------------------------------------------
 
 /// DNS interception and filtering settings. Carried in [`NetworkSpec::dns`].
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ConfigPatch)]
 #[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[serde(default)]
@@ -3282,7 +3553,7 @@ impl Default for DnsConfig {
 /// Optional guest interface overrides. Unset fields are derived from the
 /// sandbox slot by the local network engine. Carried in
 /// [`NetworkSpec::interface`].
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, ConfigPatch)]
 #[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[serde(default)]
@@ -3333,7 +3604,7 @@ pub enum NetworkRateLimitDirection {
 }
 
 /// Egress and ingress rate limits for a local sandbox network.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, ConfigPatch)]
 #[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[serde(default)]
@@ -3455,23 +3726,30 @@ impl fmt::Display for NetworkRateLimitDirection {
 mod tests {
     use super::*;
 
-    fn tmpfs_mount(guest: &str) -> VolumeMount {
-        VolumeMount::Tmpfs {
-            guest: guest.to_owned(),
-            size_mib: None,
-            options: MountOptions::default(),
+    fn secret_entry(env_var: &str, require_tls_identity: bool) -> SecretEntry {
+        SecretEntry {
+            env_var: env_var.to_owned(),
+            value: Zeroizing::new("secret".to_owned()),
+            source: None,
+            placeholder: format!("$MSB_{env_var}"),
+            allowed_hosts: vec![HostPattern::Any],
+            substitution: SecretSubstitution::default(),
+            passthrough_hosts: Vec::new(),
+            violation_action: None,
+            require_tls_identity,
         }
     }
 
     fn secret_entry_with_source(source: Option<SecretSource>) -> SecretEntry {
         SecretEntry {
             env_var: "API_KEY".into(),
-            value: zeroize::Zeroizing::new(String::new()),
+            value: Zeroizing::new(String::new()),
             source,
             placeholder: "$MSB_API_KEY".into(),
             allowed_hosts: vec![HostPattern::Exact("api.example.com".into())],
-            injection: SecretInjection::default(),
-            on_violation: None,
+            substitution: SecretSubstitution::default(),
+            passthrough_hosts: Vec::new(),
+            violation_action: None,
             require_tls_identity: true,
         }
     }
@@ -3505,6 +3783,248 @@ mod tests {
         assert!(entry.value.is_empty());
     }
 
+    fn header_credential(id: &str, host: &str, port: u16, header: &str) -> DurableHeaderCredential {
+        DurableHeaderCredential {
+            id: id.into(),
+            reference: format!("{id}-ref"),
+            origin: HttpsOrigin {
+                host: host.into(),
+                port,
+            },
+            header: header.into(),
+            format: "%s".into(),
+        }
+    }
+
+    #[test]
+    fn header_credential_grammar_accepts_a_canonical_definition() {
+        let config = SecretsConfig {
+            header_credentials: vec![header_credential(
+                "anthropic",
+                "api.anthropic.com",
+                443,
+                "x-api-key",
+            )],
+            ..Default::default()
+        };
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn header_credential_grammar_rejects_duplicate_targets() {
+        let config = SecretsConfig {
+            header_credentials: vec![
+                header_credential("a", "api.example.com", 443, "x-api-key"),
+                header_credential("b", "api.example.com", 443, "x-api-key"),
+            ],
+            ..Default::default()
+        };
+        assert!(matches!(
+            config.validate(),
+            Err(SecretConfigError::DuplicateCredentialTarget { index: 1, other: 0 })
+        ));
+    }
+
+    #[test]
+    fn header_credential_grammar_rejects_forbidden_and_malformed_fields() {
+        let forbidden = SecretsConfig {
+            header_credentials: vec![header_credential("a", "api.example.com", 443, "host")],
+            ..Default::default()
+        };
+        assert!(matches!(
+            forbidden.validate(),
+            Err(SecretConfigError::CredentialHeaderForbidden {
+                credential_index: 0
+            })
+        ));
+
+        let uppercase = SecretsConfig {
+            header_credentials: vec![header_credential("a", "api.example.com", 443, "X-Api-Key")],
+            ..Default::default()
+        };
+        assert!(matches!(
+            uppercase.validate(),
+            Err(SecretConfigError::CredentialHeaderNotToken {
+                credential_index: 0
+            })
+        ));
+    }
+
+    #[test]
+    fn header_credential_grammar_rejects_bad_format_and_origin() {
+        let mut no_placeholder = header_credential("a", "api.example.com", 443, "x-api-key");
+        no_placeholder.format = "literal".into();
+        assert!(matches!(
+            SecretsConfig {
+                header_credentials: vec![no_placeholder],
+                ..Default::default()
+            }
+            .validate(),
+            Err(SecretConfigError::CredentialFormatPlaceholderCount {
+                credential_index: 0
+            })
+        ));
+
+        let wildcard = SecretsConfig {
+            header_credentials: vec![header_credential("a", "*.example.com", 443, "x-api-key")],
+            ..Default::default()
+        };
+        assert!(matches!(
+            wildcard.validate(),
+            Err(SecretConfigError::CredentialOriginHostInvalid {
+                credential_index: 0
+            })
+        ));
+
+        let zero_port = SecretsConfig {
+            header_credentials: vec![header_credential("a", "api.example.com", 0, "x-api-key")],
+            ..Default::default()
+        };
+        assert!(matches!(
+            zero_port.validate(),
+            Err(SecretConfigError::CredentialPortZero {
+                credential_index: 0
+            })
+        ));
+    }
+
+    #[test]
+    fn header_credential_grammar_rejects_empty_id_and_reference() {
+        let mut empty_id = header_credential("", "api.example.com", 443, "x-api-key");
+        empty_id.id = String::new();
+        assert!(matches!(
+            SecretsConfig {
+                header_credentials: vec![empty_id],
+                ..Default::default()
+            }
+            .validate(),
+            Err(SecretConfigError::EmptyCredentialId {
+                credential_index: 0
+            })
+        ));
+
+        let mut empty_reference = header_credential("a", "api.example.com", 443, "x-api-key");
+        empty_reference.reference = String::new();
+        assert!(matches!(
+            SecretsConfig {
+                header_credentials: vec![empty_reference],
+                ..Default::default()
+            }
+            .validate(),
+            Err(SecretConfigError::EmptyCredentialReference {
+                credential_index: 0
+            })
+        ));
+    }
+
+    #[test]
+    fn header_credential_grammar_rejects_too_many_credentials() {
+        let credentials = (0..=MAX_HEADER_CREDENTIALS)
+            .map(|i| {
+                header_credential(
+                    &format!("c{i}"),
+                    "api.example.com",
+                    443,
+                    &format!("x-key-{i}"),
+                )
+            })
+            .collect();
+        assert!(matches!(
+            SecretsConfig {
+                header_credentials: credentials,
+                ..Default::default()
+            }
+            .validate(),
+            Err(SecretConfigError::CredentialCountExceeded { .. })
+        ));
+    }
+
+    #[test]
+    fn durable_header_credential_rejects_a_value_field() {
+        // The durable type is deliberately value-free: `deny_unknown_fields`
+        // rejects a stray `value` rather than silently accepting credentials
+        // into a persisted config.
+        let json = serde_json::json!({
+            "id": "a",
+            "reference": "r",
+            "origin": { "host": "api.example.com", "port": 443 },
+            "header": "x-api-key",
+            "format": "%s",
+            "value": "sk-leaked",
+        });
+        assert!(serde_json::from_value::<DurableHeaderCredential>(json).is_err());
+    }
+
+    /// The checked-in accept/reject corpus, consumed verbatim.
+    ///
+    /// The hand-written cases above pin individual rules; this pins the whole
+    /// grammar against a corpus an embedding application can read and reuse, so
+    /// the two grammars cannot drift apart silently.
+    #[test]
+    fn header_credential_grammar_fixture() {
+        let raw = include_str!("fixtures/header_credential_grammar.json");
+        let fixture: serde_json::Value = serde_json::from_str(raw).unwrap();
+
+        for entry in fixture["accept"].as_array().unwrap() {
+            let credential: DurableHeaderCredential = serde_json::from_value(entry.clone())
+                .unwrap_or_else(|e| panic!("accept entry failed to parse: {e}"));
+            assert!(
+                SecretsConfig {
+                    header_credentials: vec![credential],
+                    ..Default::default()
+                }
+                .validate()
+                .is_ok(),
+                "expected accept entry to validate: {entry}"
+            );
+        }
+
+        for entry in fixture["reject"].as_array().unwrap() {
+            let text = entry.to_string();
+            let mut entry = entry.clone();
+            if let Some(object) = entry.as_object_mut() {
+                object.remove("_why");
+            }
+            let credential: DurableHeaderCredential = serde_json::from_value(entry)
+                .unwrap_or_else(|e| panic!("reject entry failed to parse: {e}"));
+            assert!(
+                SecretsConfig {
+                    header_credentials: vec![credential],
+                    ..Default::default()
+                }
+                .validate()
+                .is_err(),
+                "expected reject entry to fail validation: {text}"
+            );
+        }
+
+        for raw_entry in fixture["serde_reject"].as_array().unwrap() {
+            let text = raw_entry.as_str().unwrap();
+            assert!(
+                serde_json::from_str::<DurableHeaderCredential>(text).is_err(),
+                "expected serde to reject: {text}"
+            );
+        }
+    }
+
+    #[test]
+    fn empty_header_credentials_keep_legacy_serialized_shape() {
+        let value = serde_json::to_value(SecretsConfig::default()).unwrap();
+        assert!(value.get("header_credentials").is_none(), "{value}");
+        assert_eq!(
+            value["violation_action"],
+            serde_json::json!("block-and-log")
+        );
+    }
+
+    fn tmpfs_mount(guest: &str) -> VolumeMount {
+        VolumeMount::Tmpfs {
+            guest: guest.to_owned(),
+            size_mib: None,
+            options: MountOptions::default(),
+        }
+    }
+
     #[test]
     fn mount_options_omit_unset_owner_but_accept_missing_fields() {
         let value = serde_json::to_value(MountOptions::default()).unwrap();
@@ -3530,6 +4050,21 @@ mod tests {
             mounts.iter().map(VolumeMount::guest).collect::<Vec<_>>(),
             vec!["/workspace", "/alpha/z", "/workspace/persist/logs"]
         );
+    }
+
+    #[test]
+    fn secrets_config_queries_entries() {
+        let mut config = SecretsConfig {
+            secrets: vec![secret_entry("HTTP_TOKEN", false)],
+            ..Default::default()
+        };
+
+        assert!(!config.has_tls_identity_secrets());
+        assert!(config.contains_env_var("HTTP_TOKEN"));
+        assert!(!config.contains_env_var("MISSING"));
+
+        config.secrets.push(secret_entry("API_KEY", true));
+        assert!(config.has_tls_identity_secrets());
     }
 
     #[test]
@@ -3743,321 +4278,5 @@ mod tests {
             assert_eq!(parsed, expected);
             assert_eq!(parsed.as_str(), input);
         }
-    }
-
-    fn header_credential() -> DurableHeaderCredential {
-        DurableHeaderCredential {
-            id: "anthropic".into(),
-            reference: "anthropic-api-key".into(),
-            origin: HttpsOrigin {
-                host: "api.anthropic.com".into(),
-                port: 443,
-            },
-            header: "x-api-key".into(),
-            format: "%s".into(),
-        }
-    }
-
-    fn config_with(credentials: Vec<DurableHeaderCredential>) -> SecretsConfig {
-        SecretsConfig {
-            secrets: Vec::new(),
-            header_credentials: credentials,
-            on_violation: ViolationAction::default(),
-        }
-    }
-
-    #[test]
-    fn header_credential_grammar_accepts_canonical_rule() {
-        assert!(config_with(vec![header_credential()]).validate().is_ok());
-    }
-
-    #[test]
-    fn header_credential_rejects_malformed_rules() {
-        let mut cases: Vec<(DurableHeaderCredential, SecretConfigError)> = Vec::new();
-
-        let mut empty_id = header_credential();
-        empty_id.id = String::new();
-        cases.push((
-            empty_id,
-            SecretConfigError::EmptyCredentialId {
-                credential_index: 0,
-            },
-        ));
-
-        let mut empty_reference = header_credential();
-        empty_reference.reference = String::new();
-        cases.push((
-            empty_reference,
-            SecretConfigError::EmptyCredentialReference {
-                credential_index: 0,
-            },
-        ));
-
-        for bad_host in [
-            "",
-            "API.anthropic.com",
-            "api.anthropic.com.",
-            "*.anthropic.com",
-            "127.0.0.1",
-            "[::1]",
-            "https://api.anthropic.com",
-            "api.anthropic.com/path",
-            "user@api.anthropic.com",
-            "-bad.example.com",
-        ] {
-            let mut bad = header_credential();
-            bad.origin.host = bad_host.into();
-            cases.push((
-                bad,
-                SecretConfigError::CredentialOriginHostInvalid {
-                    credential_index: 0,
-                },
-            ));
-        }
-
-        let mut zero_port = header_credential();
-        zero_port.origin.port = 0;
-        cases.push((
-            zero_port,
-            SecretConfigError::CredentialPortZero {
-                credential_index: 0,
-            },
-        ));
-
-        for bad_header in [
-            "X-Api-Key",
-            "x api key",
-            ":authority",
-            "host",
-            "content-length",
-            "transfer-encoding",
-            "connection",
-            "upgrade",
-            "te",
-            "trailer",
-            "proxy-authorization",
-            "proxy-connection",
-        ] {
-            let mut bad = header_credential();
-            bad.header = bad_header.into();
-            let expected = if matches!(
-                bad_header,
-                "host"
-                    | "content-length"
-                    | "transfer-encoding"
-                    | "connection"
-                    | "upgrade"
-                    | "te"
-                    | "trailer"
-                    | "proxy-authorization"
-                    | "proxy-connection"
-            ) {
-                SecretConfigError::CredentialHeaderForbidden {
-                    credential_index: 0,
-                }
-            } else {
-                SecretConfigError::CredentialHeaderNotToken {
-                    credential_index: 0,
-                }
-            };
-            cases.push((bad, expected));
-        }
-
-        for (bad_format, expected) in [
-            (
-                "Token",
-                SecretConfigError::CredentialFormatPlaceholderCount {
-                    credential_index: 0,
-                },
-            ),
-            (
-                "%s %s",
-                SecretConfigError::CredentialFormatPlaceholderCount {
-                    credential_index: 0,
-                },
-            ),
-            (
-                "%s\r\n",
-                SecretConfigError::CredentialFormatUnsafeBytes {
-                    credential_index: 0,
-                },
-            ),
-            (
-                "%s\n",
-                SecretConfigError::CredentialFormatUnsafeBytes {
-                    credential_index: 0,
-                },
-            ),
-            (
-                "%s\0",
-                SecretConfigError::CredentialFormatUnsafeBytes {
-                    credential_index: 0,
-                },
-            ),
-        ] {
-            let mut bad = header_credential();
-            bad.format = bad_format.into();
-            cases.push((bad, expected));
-        }
-
-        for (bad, expected) in cases {
-            assert_eq!(config_with(vec![bad]).validate().unwrap_err(), expected);
-        }
-    }
-
-    #[test]
-    fn header_credential_allows_literal_percent() {
-        let mut credential = header_credential();
-        credential.format = "Token %s; v=100%".into();
-        assert!(config_with(vec![credential]).validate().is_ok());
-    }
-
-    #[test]
-    fn header_credential_rejects_duplicate_target_after_canonicalization() {
-        let mut duplicate = header_credential();
-        duplicate.id = "other".into();
-        duplicate.reference = "other-ref".into();
-        // Same canonical `(host, port, lowercase header)` target.
-        duplicate.header = "x-api-key".into();
-        let err = config_with(vec![header_credential(), duplicate])
-            .validate()
-            .unwrap_err();
-        assert_eq!(
-            err,
-            SecretConfigError::DuplicateCredentialTarget { index: 1, other: 0 }
-        );
-    }
-
-    #[test]
-    fn empty_header_credentials_keep_legacy_serialized_shape() {
-        let serialized = serde_json::to_string(&SecretsConfig::default()).unwrap();
-        assert_eq!(
-            serialized,
-            r#"{"secrets":[],"on_violation":"block-and-log"}"#
-        );
-    }
-
-    #[test]
-    fn durable_credential_serializes_without_value() {
-        let config = config_with(vec![header_credential()]);
-        let serialized = serde_json::to_string(&config).unwrap();
-        assert!(serialized.contains("header_credentials"));
-        assert!(!serialized.contains("value"));
-
-        // A durable config must reject a `value` field rather than ignore it.
-        let with_value = r#"{"id":"a","reference":"r","origin":{"host":"api.example.com","port":443},"header":"x-api-key","format":"%s","value":"leak"}"#;
-        assert!(serde_json::from_str::<DurableHeaderCredential>(with_value).is_err());
-    }
-
-    #[test]
-    fn header_credential_grammar_fixture() {
-        let raw = include_str!("fixtures/header_credential_grammar.json");
-        let fixture: serde_json::Value = serde_json::from_str(raw).unwrap();
-
-        for entry in fixture["accept"].as_array().unwrap() {
-            let credential: DurableHeaderCredential = serde_json::from_value(entry.clone())
-                .unwrap_or_else(|e| panic!("accept entry failed to parse: {e}"));
-            assert!(
-                config_with(vec![credential]).validate().is_ok(),
-                "expected accept entry to validate: {entry}"
-            );
-        }
-
-        for entry in fixture["reject"].as_array().unwrap() {
-            let text = entry.to_string();
-            let mut entry = entry.clone();
-            if let Some(object) = entry.as_object_mut() {
-                object.remove("_why");
-            }
-            let credential: DurableHeaderCredential = serde_json::from_value(entry)
-                .unwrap_or_else(|e| panic!("reject entry failed to parse: {e}"));
-            assert!(
-                config_with(vec![credential]).validate().is_err(),
-                "expected reject entry to fail validation: {text}"
-            );
-        }
-
-        for raw_entry in fixture["serde_reject"].as_array().unwrap() {
-            let text = raw_entry.as_str().unwrap();
-            assert!(
-                serde_json::from_str::<DurableHeaderCredential>(text).is_err(),
-                "expected serde to reject: {text}"
-            );
-        }
-    }
-
-    #[test]
-    fn header_credential_debug_redacts_caller_metadata() {
-        let sentinel = "SENTINEL-abc123";
-        let mut credential = header_credential();
-        credential.id = sentinel.into();
-        credential.reference = sentinel.into();
-        credential.header = sentinel.to_ascii_lowercase();
-        credential.format = format!("{sentinel} %s");
-        credential.origin.host = sentinel.to_ascii_lowercase();
-
-        let rendered = format!("{credential:?}");
-        assert!(
-            !rendered.contains(sentinel),
-            "Debug leaked metadata: {rendered}"
-        );
-        assert!(
-            !rendered.contains("SENTINEL"),
-            "Debug leaked metadata: {rendered}"
-        );
-
-        let nested = format!("{:?}", config_with(vec![credential]));
-        assert!(
-            !nested.contains("SENTINEL"),
-            "nested Debug leaked: {nested}"
-        );
-    }
-
-    #[test]
-    fn secret_string_debug_is_redacted() {
-        let secret = SecretString::new("SENTINEL-sk-live-42".to_string());
-        let rendered = format!("{secret:?}");
-        assert_eq!(rendered, "[REDACTED]");
-        assert!(
-            !rendered.contains("SENTINEL"),
-            "Debug leaked the value: {rendered}"
-        );
-    }
-
-    #[test]
-    fn secret_string_reads_only_through_the_accessor() {
-        let secret = SecretString::new("sk-live-42".to_string());
-        assert_eq!(secret.expose_secret(), "sk-live-42");
-    }
-
-    #[test]
-    fn secret_string_serde_round_trips_as_a_plain_string() {
-        let secret = SecretString::new("sk-live-42".to_string());
-        let json = serde_json::to_string(&secret).unwrap();
-        assert_eq!(json, "\"sk-live-42\"");
-        let back: SecretString = serde_json::from_str(&json).unwrap();
-        assert_eq!(back.expose_secret(), "sk-live-42");
-    }
-
-    /// The wire form must stay byte-identical to the previous
-    /// `Zeroizing<String>` representation, so `#[serde(transparent)]` is
-    /// load-bearing: a struct whose only field is a `SecretString` serializes
-    /// exactly like the same struct with a `Zeroizing<String>` field.
-    #[test]
-    fn secret_string_json_bytes_match_the_previous_representation() {
-        #[derive(Serialize)]
-        struct With(Zeroizing<String>);
-        #[derive(Serialize)]
-        struct WithSecret(SecretString);
-
-        let raw = With(Zeroizing::new("sk-live-42".to_string()));
-        let wrapped = WithSecret(SecretString::new("sk-live-42"));
-        assert_eq!(
-            serde_json::to_vec(&raw).unwrap(),
-            serde_json::to_vec(&wrapped).unwrap()
-        );
-        // A newtype struct over a transparent wrapper is a plain JSON string,
-        // exactly as `Zeroizing<String>` was.
-        assert_eq!(serde_json::to_vec(&wrapped).unwrap(), br#""sk-live-42""#);
     }
 }

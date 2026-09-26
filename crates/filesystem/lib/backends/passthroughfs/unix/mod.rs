@@ -11,6 +11,7 @@ mod file_ops;
 mod host_mode;
 pub(crate) mod inode;
 mod metadata;
+mod mobility;
 mod remove_ops;
 mod special;
 mod xattr_ops;
@@ -113,6 +114,10 @@ pub enum HostPermissions {
 /// Configuration for the passthrough filesystem backend.
 #[derive(Debug, Clone)]
 pub struct PassthroughConfig {
+    /// Seal owned namespace/data and reconstruct private linked or detached objects.
+    pub owned_checkpoint: Option<super::OwnedDirectoryCheckpoint>,
+    /// Capture external-object identity and apply explicit destination reconciliation.
+    pub external_checkpoint: Option<super::ExternalCheckpointOptions>,
     /// Path to the root directory on the host.
     pub root_dir: PathBuf,
 
@@ -171,6 +176,12 @@ pub struct PassthroughConfig {
     /// `None` means unbounded. When set, guest-attributable growth past this
     /// many bytes is rejected with `ENOSPC`.
     pub quota_bytes: Option<u64>,
+
+    /// Optional quota accounting root when it differs from `root_dir`.
+    ///
+    /// Single-file mounts anchor pathname resolution at the parent directory,
+    /// while accounting only the selected file. `None` uses `root_dir`.
+    pub quota_root: Option<PathBuf>,
 }
 
 /// Passthrough filesystem backend.
@@ -178,6 +189,8 @@ pub struct PassthroughConfig {
 /// Implements [`DynFileSystem`] by mapping guest filesystem operations to
 /// the host filesystem, with stat virtualization via xattr.
 pub struct PassthroughFs {
+    /// Invalid restored node identities are never reused when a path later reappears.
+    pub(crate) invalid_inodes: RwLock<std::collections::BTreeSet<u64>>,
     /// Configuration.
     pub(crate) cfg: PassthroughConfig,
 
@@ -222,6 +235,12 @@ pub struct PassthroughFs {
 
 /// Open directory handle with a lazy point-in-time snapshot.
 pub(crate) struct PassthroughDirHandle {
+    /// Guest-visible inode that owns this directory handle.
+    pub inode: u64,
+
+    /// Guest open flags used when the handle was admitted.
+    pub flags: u32,
+
     /// Real open fd for directory operations.
     pub file: RwLock<File>,
 
@@ -255,6 +274,19 @@ pub(crate) struct PassthroughDirEntry {
 //--------------------------------------------------------------------------------------------------
 
 impl PassthroughFs {
+    /// Validate external checkpoint structure without resolving or creating host paths.
+    pub fn validate_external_state(bytes: &[u8]) -> io::Result<()> {
+        mobility::validate_unavailable(bytes)
+    }
+
+    /// Validate the single-file facade's inner namespace before translating its selected name.
+    pub(crate) fn prepare_single_file_state(
+        bytes: &[u8],
+        source: &CStr,
+        destination: &CStr,
+    ) -> io::Result<(Vec<u8>, super::ExternalSingleFileIndex)> {
+        mobility::prepare_single_file_state(bytes, source, destination)
+    }
     /// Create a builder for constructing a `PassthroughFs` instance.
     pub fn builder() -> builder::PassthroughFsBuilder {
         builder::PassthroughFsBuilder::new()
@@ -264,10 +296,53 @@ impl PassthroughFs {
     ///
     /// Opens the root directory and optionally probes for xattr support.
     pub fn new(cfg: PassthroughConfig) -> io::Result<Self> {
+        Self::new_with_stat_probe(cfg, None)
+    }
+
+    /// Create a passthrough backend whose strict-stat probe targets one child.
+    ///
+    /// A single-file facade uses this to verify the only exposed inode instead
+    /// of the otherwise-hidden parent directory. The normal directory backend
+    /// continues to probe its root because every child is guest-visible.
+    pub(crate) fn new_with_stat_probe(
+        cfg: PassthroughConfig,
+        probe_name: Option<&CStr>,
+    ) -> io::Result<Self> {
+        if cfg.owned_checkpoint.is_some() && (cfg.external_checkpoint.is_some() || cfg.inject_init)
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "owned directory checkpoints require an ordinary, non-external directory backend",
+            ));
+        }
         // Open the root directory, contained beneath the anchor when one is set.
         let root_fd = open_root(&cfg)?;
 
-        probe_strict_xattr_support(&cfg, root_fd.as_raw_fd())?;
+        let probe_file = match probe_name {
+            Some(name) => {
+                let access_mode = if cfg.readonly() {
+                    libc::O_RDONLY
+                } else {
+                    libc::O_WRONLY
+                };
+                let fd = unsafe {
+                    libc::openat(
+                        root_fd.as_raw_fd(),
+                        name.as_ptr(),
+                        access_mode | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+                    )
+                };
+                if fd < 0 {
+                    return Err(platform::linux_error(io::Error::last_os_error()));
+                }
+                Some(unsafe { File::from_raw_fd(fd) })
+            }
+            None => None,
+        };
+        let probe_fd = probe_file
+            .as_ref()
+            .map_or_else(|| root_fd.as_raw_fd(), AsRawFd::as_raw_fd);
+        probe_strict_xattr_support(&cfg, probe_fd)?;
 
         // Create the init binary file.
         let init_file = init_binary::create_init_file()?;
@@ -287,11 +362,17 @@ impl PassthroughFs {
             unsafe { File::from_raw_fd(fd) }
         };
 
-        let quota = cfg
-            .quota_bytes
-            .map(|limit| super::quota::DirQuota::new(cfg.root_dir.clone(), limit));
+        let quota = cfg.quota_bytes.map(|limit| {
+            super::quota::DirQuota::new(
+                cfg.quota_root
+                    .clone()
+                    .unwrap_or_else(|| cfg.root_dir.clone()),
+                limit,
+            )
+        });
 
         Ok(Self {
+            invalid_inodes: RwLock::new(std::collections::BTreeSet::new()),
             cfg,
             root_fd,
             inodes: RwLock::new(MultikeyBTreeMap::new()),
@@ -456,6 +537,8 @@ impl PassthroughConfig {
 impl Default for PassthroughConfig {
     fn default() -> Self {
         Self {
+            owned_checkpoint: None,
+            external_checkpoint: None,
             root_dir: PathBuf::new(),
             no_symlink_root: false,
             stat_virtualization: StatVirtualization::Strict,
@@ -468,6 +551,7 @@ impl Default for PassthroughConfig {
             inject_init: true,
             bind_identity_map: None,
             quota_bytes: None,
+            quota_root: None,
         }
     }
 }
@@ -483,6 +567,25 @@ pub use stat_override::{BindIdentityMap, BindIdentityMapHandle};
 //--------------------------------------------------------------------------------------------------
 
 impl DynFileSystem for PassthroughFs {
+    fn request_error(&self, inode: u64) -> Option<i32> {
+        self.invalid_inodes
+            .read()
+            .unwrap()
+            .contains(&inode)
+            .then_some(116)
+    }
+    fn capture_state(&self) -> io::Result<Vec<u8>> {
+        mobility::capture(self)
+    }
+
+    fn validate_state(&self, state: &[u8]) -> io::Result<()> {
+        mobility::prepare(self, state).map(drop)
+    }
+
+    fn restore_state(&self, state: &[u8]) -> io::Result<()> {
+        mobility::restore(self, state)
+    }
+
     fn init(&self, capable: FsOptions) -> io::Result<FsOptions> {
         // Register root inode (inode 1) in the inode table.
         // The guest kernel issues GETATTR on the root inode immediately after FUSE_INIT.

@@ -328,6 +328,21 @@ async fn run(
     debug_assert_eq!(ready.t, MessageType::Ready);
     drop(read_half_tmp);
 
+    // Auto-publish is a generation-10 feature: `LoopbackForward` and
+    // `core.port.event` do not exist before it. Against an older guest (e.g. a
+    // fork-built agentd advertising generation 8, or any pre-10 build), stay
+    // inert rather than erroring per port — the host cannot deliver the events
+    // and the request would be refused locally anyway. Logged once; the
+    // supervisor treats `Ok(())` as a clean stop and does not reconnect.
+    if ready.v < MessageType::LoopbackForward.min_protocol_version() {
+        tracing::info!(
+            guest_generation = ready.v,
+            required = MessageType::LoopbackForward.min_protocol_version(),
+            "auto-publish: guest predates the feature; staying inert"
+        );
+        return Ok(());
+    }
+
     let (mut read_half, mut write_half) = stream.into_split();
     let mut buf_read = BufReader::new(&mut read_half);
 
@@ -647,6 +662,7 @@ async fn read_proc(
     // `FsOp::Read { path }` no longer exists.)
     let open_id = next_req_id.next();
     let open_req = FsRequest {
+        bulk: None,
         op: FsOp::OpenFile {
             path: path.to_string(),
             options: FsOpenOptions {
@@ -685,6 +701,7 @@ async fn read_proc(
 
     let read_id = next_req_id.next();
     let read_req = FsRequest {
+        bulk: None,
         op: FsOp::Read {
             handle,
             offset: 0,
@@ -722,6 +739,7 @@ async fn read_proc(
     // Close the handle (best-effort) before returning.
     let close_id = next_req_id.next();
     let close_req = FsRequest {
+        bulk: None,
         op: FsOp::CloseHandle { handle },
     };
     if let Ok(msg) = Message::with_payload(MessageType::FsRequest, close_id, &close_req) {

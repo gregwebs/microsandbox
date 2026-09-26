@@ -762,3 +762,66 @@ async fn explicitly_published_port_is_excluded_from_auto_publish() {
         "no PortCommand should ever be emitted for an explicitly-published port"
     );
 }
+
+/// A generation-9 guest predates `LoopbackForward`/`core.port.event`, so the
+/// poll task must stay inert — no `PortCommand`, no `PortEvent` — and let the
+/// supervisor treat the clean return as a stop rather than reconnecting.
+#[tokio::test]
+async fn auto_publish_stays_inert_against_a_pre_generation_10_guest() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let sock_path = dir.path().join("agent.sock");
+    let listener = UnixListener::bind(&sock_path).expect("bind fake agent.sock");
+
+    tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.expect("accept");
+        let (mut read_half, mut write_half) = stream.into_split();
+        write_half.write_all(&1u32.to_be_bytes()).await.unwrap();
+        write_half
+            .write_all(&10_000u32.to_be_bytes())
+            .await
+            .unwrap();
+        let mut ready = Message::new(MessageType::Ready, 0, Vec::new());
+        ready.v = 9;
+        write_message(&mut write_half, &ready).await.unwrap();
+        let mut buf = [0u8; 64];
+        let _ = read_half.read(&mut buf).await;
+    });
+
+    let (port_tx, mut port_rx) = mpsc::unbounded_channel::<PortCommand>();
+    let (event_tx, mut event_rx) = mpsc::unbounded_channel::<PortEvent>();
+    let broadcast: Arc<dyn EventBroadcast> = Arc::new(TestBroadcast(event_tx));
+    let cfg = AutoPublishConfig {
+        poll_interval_ms: 20,
+        host_bind: IpAddr::V4(Ipv4Addr::LOCALHOST),
+    };
+    spawn(
+        &tokio::runtime::Handle::current(),
+        sock_path,
+        cfg,
+        port_tx,
+        Some(Ipv4Addr::new(172, 16, 0, 2)),
+        None,
+        broadcast,
+        HashSet::new(),
+    );
+
+    // The task stops cleanly (the supervisor does not reconnect), so drain
+    // whatever reached the channels rather than awaiting a message.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let mut commands = Vec::new();
+    while let Ok(cmd) = port_rx.try_recv() {
+        commands.push(cmd);
+    }
+    assert!(
+        commands.is_empty(),
+        "a pre-generation-10 guest must produce no PortCommand"
+    );
+    let mut events = Vec::new();
+    while let Ok(event) = event_rx.try_recv() {
+        events.push(event);
+    }
+    assert!(
+        events.is_empty(),
+        "a pre-generation-10 guest must produce no PortEvent"
+    );
+}
