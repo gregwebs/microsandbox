@@ -47,6 +47,7 @@
               "sandboxes/commands",
               "sandboxes/filesystem",
               "sandboxes/secrets",
+              "sandboxes/intercept",
               "images/overview",
               "sandboxes/volumes",
               "sandboxes/ssh",
@@ -363,6 +364,13 @@
             "group": "Releases",
             "icon": "clock-rotate-left",
             "pages": [
+              {
+                "group": "This fork",
+                "expanded": true,
+                "pages": [
+                  "changelog/fork"
+                ]
+              },
               {
                 "group": "September 2026",
                 "expanded": true,

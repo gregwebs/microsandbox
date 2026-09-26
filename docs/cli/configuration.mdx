@@ -71,7 +71,7 @@ Scoped files contain one group of settings without its wrapper key. Unrelated fi
 | Flag | Accepted fields |
 | --- | --- |
 | `--conf PATH` | Any sandbox configuration field |
-| `--net-conf PATH` | `policy`, `allow`, `deny`, `ports`, `dns`, `tls`, `strict`, `trust_host_cas`, `max_tcp_connections`, `max_udp_connections` |
+| `--net-conf PATH` | `policy`, `allow`, `deny`, `ports`, `dns`, `tls`, `intercept`, `strict`, `trust_host_cas`, `max_tcp_connections`, `max_udp_connections`, `auto_publish` |
 | `--resource-conf PATH` | `cpus`, `memory`, `max_duration`, `idle_timeout`, `rlimits` |
 | `--runtime-conf PATH` | `workdir`, `shell`, `user`, `hostname`, `security`, `entrypoint`, `cmd`, `env`, `labels`, `init` |
 | `--fs-conf PATH` | `mounts`, `patch_files`, `patches` |
@@ -263,16 +263,27 @@ network:
     bypass: ["*.internal.example"]
     verify_upstream: true
     block_quic: true
+  intercept:
+    hook: ["/usr/local/bin/intercept-hook"]
+    max_request_bytes: 65536
+    rules:
+      - { host: "api.github.com", method: "GET", path_prefix: "/repos/" }
+      - { host: "github.com", method: "POST", path_prefix: "/", dispatch_on_headers: true }
   strict: true
   trust_host_cas: false
   max_tcp_connections: 256
+  auto_publish: true
 ```
+
+`intercept` configures [request interception](/sandboxes/intercept): `hook` is the host command that decides each matched request, `rules` match on SNI host, method, and path prefix (`dispatch_on_headers: true` fires the hook as soon as the headers arrive and streams the body), and `max_request_bytes` caps the buffered request. It requires `tls.enabled` — interception runs inside the TLS-intercepting proxy, and an `intercept` block with TLS off is inert.
+
+`auto_publish: true` mirrors guest TCP `LISTEN` sockets onto host listeners with the defaults (2s poll, `127.0.0.1` bind); the object form overrides `poll_interval_ms` and `host_bind`.
 
 A non-empty `allow` list implies deny-by-default egress. `strict` defaults to `true` and requires hostname-based allow rules to use an inspectable request authority. Plain HTTP exposes that authority in `Host`; HTTPS only exposes it when TLS interception is enabled and not bypassed. Without that visibility, strict mode denies HTTPS that would otherwise be allowed only by a hostname rule. Set `strict: false` to opt out. Top-level `ports` is shorthand for `network.ports`; when both are present, the lists are combined and duplicate host ports are rejected.
 
 ### Secrets
 
-Every secret requires a non-empty destination allowlist. When `value` is omitted, the host environment variable with the same name is used. An exact `${NAME}` value records `NAME` as the host-side source instead of copying its plaintext into durable config.
+Every secret requires a non-empty destination allowlist. When `value` is omitted, the host environment variable with the same name is used. An exact `${NAME}` value records `NAME` as the host-side source instead of copying its plaintext into durable config, and `{$msb_env: NAME}` records the same thing explicitly. `{$msb_file: /path}` binds the secret to a host file instead, re-read on every eligible connection — see [file-backed secrets](/sandboxes/secrets#file-backed-rotating-secrets).
 
 ```yaml
 secrets:
@@ -281,6 +292,10 @@ secrets:
   DATABASE_URL:
     value: "${DB_DSN}"
     allow: ["db.internal"]
+  ROTATING_TOKEN:
+    value:
+      $msb_file: /run/creds/token
+    allow: ["api.example.com"]
     substitution:
       headers: false
       query: false
