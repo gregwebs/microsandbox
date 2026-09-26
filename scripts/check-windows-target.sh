@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Compile and lint the `msb` CLI, its test targets, and its dependency graph for
-# a Windows target from a macOS or Linux host.
+# Compile and lint the `msb` CLI and its test targets, and compile the SDK and
+# engine library test targets, for a Windows target from a macOS or Linux host.
 #
 # `cargo clippy --workspace` only sees the code the host platform compiles. An
 # item gated behind `cfg(windows)`, `cfg(unix)`, or `cfg(target_os = "...")` that
@@ -9,21 +9,22 @@
 # `cargo clippy` for the Windows target type-check it without linking, so no
 # MSVC, no Windows SDK, and no libkrunfw.dll import library is involved.
 #
-# This mirrors the "Check msb" and "Clippy msb" steps of the `windows-quality`
-# job in .github/workflows/check.yml, with `x86_64-pc-windows-gnu` in place of
-# the x86_64 MSVC target CI builds. See the "Cross-target (Windows) check"
-# section of DEVELOPMENT.md for what that leaves uncovered.
+# This mirrors the "Check msb" and "Clippy msb" steps and the `--lib` Windows
+# unit-test steps of the `windows-quality` job in .github/workflows/check.yml,
+# with `x86_64-pc-windows-gnu` in place of the x86_64 MSVC target CI builds. See
+# the "Cross-target (Windows) check" section of DEVELOPMENT.md for what that
+# leaves uncovered.
 
 set -euo pipefail
 
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
 
-# The Rust target this script checks, and the package and feature set the Windows
-# CI jobs compile. The shim below repeats the target in zig's spelling because it
-# runs as its own process.
+# The Rust target this script checks, and the CLI package and feature set the
+# Windows CI jobs compile. The shim below repeats the target in zig's spelling
+# because it runs as its own process.
 readonly RUST_TARGET=x86_64-pc-windows-gnu
-readonly PACKAGE=microsandbox-cli
-readonly FEATURES=net,ssh
+readonly CLI_PACKAGE=microsandbox-cli
+readonly CLI_FEATURES=net,ssh
 
 case "$(uname -s)" in
 Darwin | Linux) ;;
@@ -31,7 +32,7 @@ Darwin | Linux) ;;
   cat >&2 <<EOF
 error: this check cross-compiles from a macOS or Linux host; on Windows the
 native MSVC check already covers it:
-    cargo clippy --no-default-features --features $FEATURES -p $PACKAGE --target x86_64-pc-windows-msvc --all-targets -- -D warnings
+    cargo clippy --no-default-features --features $CLI_FEATURES -p $CLI_PACKAGE --target x86_64-pc-windows-msvc --all-targets -- -D warnings
 EOF
   exit 1
   ;;
@@ -99,11 +100,35 @@ if [[ -n "${CC_x86_64_pc_windows_gnu:-}" && "$CC_x86_64_pc_windows_gnu" != "$shi
 fi
 export CC_x86_64_pc_windows_gnu="$shim"
 
-# The guest agent is embedded by the build script in crates/filesystem, so
-# build/agentd has to be current; that script says what to run when it is not.
+# No `build/agentd` is needed: none of these checks enables `embed-binaries`, so
+# the guest-agent staging in the `crates/filesystem` build script stays off.
 
-echo "==> cargo check ($RUST_TARGET)"
-cargo check --no-default-features --features "$FEATURES" -p "$PACKAGE" --target "$RUST_TARGET"
+echo "==> cargo check -p $CLI_PACKAGE ($RUST_TARGET)"
+cargo check --no-default-features --features "$CLI_FEATURES" -p "$CLI_PACKAGE" --target "$RUST_TARGET"
 
-echo "==> cargo clippy ($RUST_TARGET)"
-cargo clippy --no-default-features --features "$FEATURES" -p "$PACKAGE" --target "$RUST_TARGET" --all-targets -- -D warnings
+echo "==> cargo clippy -p $CLI_PACKAGE ($RUST_TARGET)"
+cargo clippy --no-default-features --features "$CLI_FEATURES" -p "$CLI_PACKAGE" --target "$RUST_TARGET" --all-targets -- -D warnings
+
+# `--all-targets` on the CLI does not reach the library unit tests of the SDK and
+# the engine crates under it: those are separate packages with different
+# features, and their `#[cfg(windows)]` / `#[cfg(unix)]` test modules are only
+# compiled by the `cargo test --lib` steps of the `windows-quality` job. Each
+# command below mirrors the features of the step it stands in for, and
+# `--profile test` is what puts the lib test target in scope. `microsandbox-network`
+# keeps its default features because its CI step passes no feature flags.
+#
+# These are `check` rather than `clippy` because CI compiles them without
+# `-D warnings`; linting them here would fail on warnings CI accepts.
+
+# sdk/rust: `--features local,net` is the SDK's local-backend test configuration.
+echo "==> cargo check -p microsandbox --lib ($RUST_TARGET)"
+cargo check --no-default-features --features local,net -p microsandbox --lib --profile test --target "$RUST_TARGET"
+
+# crates/runtime: the bind-rootfs backend test runs with the runner, not the
+# CLI's download/embed payload path.
+echo "==> cargo check -p microsandbox-runtime --lib ($RUST_TARGET)"
+cargo check --no-default-features --features net,runner -p microsandbox-runtime --lib --profile test --target "$RUST_TARGET"
+
+# crates/network: the Windows DNS resolver test uses the default feature set.
+echo "==> cargo check -p microsandbox-network --lib ($RUST_TARGET)"
+cargo check -p microsandbox-network --lib --profile test --target "$RUST_TARGET"
