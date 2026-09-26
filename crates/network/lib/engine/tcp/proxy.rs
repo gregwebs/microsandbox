@@ -24,6 +24,7 @@ use crate::engine::secrets::config::SecretsConfigExt;
 use crate::engine::tls::proxy::TlsProxy;
 use crate::engine::tls::sni;
 use crate::engine::tls::state::TlsState;
+use crate::extensions::{NetworkExtensions, OutboundProtocol};
 use crate::netstack::shared::SharedState;
 use crate::policy::{EgressEvaluation, HostnameSource, NetworkPolicy, Protocol};
 use crate::proxy::ResolvedOutboundProxy;
@@ -79,6 +80,7 @@ pub(crate) struct TcpProxy {
     tls_state: Option<Arc<TlsState>>,
     strict: bool,
     proxy_connect: Arc<ProxyConnectState>,
+    extensions: NetworkExtensions,
     outbound_proxy: Option<Arc<ResolvedOutboundProxy>>,
 }
 
@@ -145,6 +147,7 @@ impl TcpProxy {
         tls_state: Option<Arc<TlsState>>,
         strict: bool,
         proxy_connect: Arc<ProxyConnectState>,
+        extensions: NetworkExtensions,
         outbound_proxy: Option<Arc<ResolvedOutboundProxy>>,
     ) -> Self {
         Self {
@@ -158,6 +161,7 @@ impl TcpProxy {
             tls_state,
             strict,
             proxy_connect,
+            extensions,
             outbound_proxy,
         }
     }
@@ -190,6 +194,7 @@ impl TcpProxy {
             tls_state,
             strict,
             proxy_connect,
+            extensions,
             outbound_proxy,
         } = self;
 
@@ -292,6 +297,7 @@ impl TcpProxy {
                 tls_state,
                 strict,
                 proxy_connect,
+                extensions.clone(),
                 outbound_proxy,
                 None,
             )
@@ -303,7 +309,15 @@ impl TcpProxy {
         // seen the server's banner; with the socket already open we can relay that
         // banner while we wait, instead of burning the peek budget pre-connect.
         let stream = connect_target
-            .connect(&proxy_connect, &shared, outbound_proxy.as_deref())
+            .connect(
+                guest_dst,
+                sni.as_deref(),
+                OutboundProtocol::Tcp,
+                &extensions,
+                &proxy_connect,
+                &shared,
+                outbound_proxy.clone(),
+            )
             .await?;
         let connect_dst = stream.peer_addr().unwrap_or(connect_target.primary());
         let (mut server_rx, mut server_tx) = stream.into_split();
@@ -354,6 +368,7 @@ impl TcpProxy {
                 tls_state,
                 strict,
                 proxy_connect,
+                extensions.clone(),
                 outbound_proxy,
                 Some(proxy_stream),
             )
@@ -446,6 +461,7 @@ impl TcpProxy {
                                     tls_state,
                                     strict,
                                     proxy_connect,
+                                    extensions.clone(),
                                     outbound_proxy,
                                     Some(proxy_stream),
                                 )
@@ -559,6 +575,7 @@ pub fn spawn_tcp_proxy(
         tls_state,
         strict,
         proxy_connect,
+        NetworkExtensions::default(),
         outbound_proxy,
     );
 
@@ -605,6 +622,7 @@ async fn handle_connect_tunnel(
     tls_state: Arc<TlsState>,
     strict: bool,
     proxy_connect: Arc<ProxyConnectState>,
+    extensions: NetworkExtensions,
     outbound_proxy: Option<Arc<ResolvedOutboundProxy>>,
     preconnected_proxy: Option<TcpStream>,
 ) -> io::Result<()> {
@@ -631,7 +649,15 @@ async fn handle_connect_tunnel(
         Some(stream) => stream,
         None => {
             proxy_target
-                .connect(&proxy_connect, &shared, outbound_proxy.as_deref())
+                .connect(
+                    guest_dst,
+                    None,
+                    OutboundProtocol::Tcp,
+                    &extensions,
+                    &proxy_connect,
+                    &shared,
+                    outbound_proxy,
+                )
                 .await?
         }
     };
@@ -730,6 +756,7 @@ async fn handle_connect_tunnel(
         network_policy,
         strict,
         proxy_connect,
+        extensions,
         // Unused: `upstream_stream` is already `Some` below, so the
         // outbound proxy (already applied when dialing `proxy_stream`
         // above) is never consulted again.
@@ -1260,7 +1287,15 @@ mod tests {
         let shared = SharedState::new(4);
         let proxy_connect = ProxyConnectState::new();
         let mut stream = UpstreamTcpTarget::direct(addr)
-            .connect(&proxy_connect, &shared, None)
+            .connect(
+                addr,
+                None,
+                OutboundProtocol::Tcp,
+                &NetworkExtensions::default(),
+                &proxy_connect,
+                &shared,
+                None,
+            )
             .await
             .unwrap();
         stream.write_all(b"hello").await.unwrap();
@@ -1342,6 +1377,7 @@ mod tests {
             tls_state,
             false,
             proxy_connect.clone(),
+            NetworkExtensions::default(),
             Some(Arc::new(outbound_proxy)),
             None,
         )
@@ -2056,6 +2092,7 @@ mod tests {
             None,
             false,
             proxy_connect,
+            NetworkExtensions::default(),
             None,
         )
         .try_run()
@@ -2230,6 +2267,7 @@ mod tests {
             None,
             true,
             proxy_connect.clone(),
+            NetworkExtensions::default(),
             None,
         )
         .try_run()
@@ -2271,6 +2309,7 @@ mod tests {
             None,
             true,
             proxy_connect.clone(),
+            NetworkExtensions::default(),
             None,
         )
         .try_run()
@@ -2373,6 +2412,7 @@ mod tests {
             None,
             false,
             proxy_connect,
+            NetworkExtensions::default(),
             None,
         )
         .try_run()
@@ -2445,6 +2485,7 @@ mod tests {
             None,
             false,
             proxy_connect,
+            NetworkExtensions::default(),
             None,
         )
         .try_run()
@@ -2549,6 +2590,7 @@ mod tests {
             None,
             false,
             proxy_connect,
+            NetworkExtensions::default(),
             None,
         )
         .try_run()

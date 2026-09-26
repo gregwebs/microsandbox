@@ -6,6 +6,8 @@
 
 pub(crate) mod addr;
 pub mod dns;
+pub mod extensions;
+mod host_proxy;
 pub mod icmp;
 pub mod netstack;
 pub mod network;

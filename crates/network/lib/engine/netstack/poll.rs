@@ -29,6 +29,7 @@ use crate::engine::dns::{
     proxies::{dot::DotProxy, tcp::DnsTcpProxy},
 };
 use crate::engine::tls::{proxy::TlsProxy, state::TlsState};
+use crate::extensions::NetworkExtensions;
 use crate::icmp::relay::IcmpRelay;
 use crate::policy::{EgressEvaluation, HostnameSource, NetworkPolicy, Protocol};
 use crate::ports::PortPublisher;
@@ -193,10 +194,18 @@ pub fn create_interface(device: &mut SmoltcpDevice, config: &PollLoopConfig) -> 
     iface
 }
 
-/// Main smoltcp poll loop. Runs on a dedicated OS thread.
+/// Host-local wiring handed to one poll loop.
 ///
-/// Processes guest frames with pre-inspection, drives smoltcp's TCP/IP stack,
-/// and sleeps via `poll(2)` between events.
+/// Everything here is installed by the host process for one sandbox and is
+/// deliberately absent by default. The auto-publish commit adds
+/// `port_commands` here; this commit installs the extension seam only.
+#[derive(Default)]
+pub struct PollLoopHost {
+    /// Outbound/request extension adapters.
+    pub extensions: NetworkExtensions,
+}
+
+/// Main smoltcp poll loop. Runs on a dedicated OS thread.
 ///
 /// # Phases per iteration
 ///
@@ -224,6 +233,7 @@ pub fn create_interface(device: &mut SmoltcpDevice, config: &PollLoopConfig) -> 
 ///   [`TcpConnectionTracker`]; `None` uses the default.
 /// * `tokio_handle` - Runtime handle used for proxy tasks, DNS forwarding, port publishing,
 ///   and ICMP relays.
+/// * `host` - Host-local, non-serialized extension wiring; defaults install none.
 #[allow(clippy::too_many_arguments)]
 pub fn smoltcp_poll_loop(
     shared: Arc<SharedState>,
@@ -239,7 +249,9 @@ pub fn smoltcp_poll_loop(
     tokio_handle: tokio::runtime::Handle,
     secrets: SecretsHandle,
     outbound_proxy: Option<Arc<ResolvedOutboundProxy>>,
+    host: PollLoopHost,
 ) {
+    let extensions = host.extensions;
     let mut device = SmoltcpDevice::new(shared.clone(), config.mtu);
     let mut iface = create_interface(&mut device, &config);
     let mut sockets = SocketSet::new(vec![]);
@@ -546,6 +558,7 @@ pub fn smoltcp_poll_loop(
                     network_policy.clone(),
                     strict,
                     conn.proxy_connect,
+                    extensions.clone(),
                     connection_outbound_proxy,
                 );
                 tokio_handle.spawn(proxy.run());
@@ -621,6 +634,7 @@ pub fn smoltcp_poll_loop(
                 tls_state.clone(),
                 strict,
                 conn.proxy_connect,
+                extensions.clone(),
                 connection_outbound_proxy,
             );
             tokio_handle.spawn(proxy.run());

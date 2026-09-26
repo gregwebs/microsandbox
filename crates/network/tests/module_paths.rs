@@ -49,6 +49,26 @@ fn legacy_module_paths_alias_canonical_modules() {
 }
 
 #[test]
+#[cfg(feature = "engine")]
+fn upstream_network_constructor_signature_is_pinned() {
+    // `SmoltcpNetwork::new` keeps upstream's three-argument shape, so a future
+    // upstream sync notices immediately if the fork drifted it. Host-local
+    // integrations are installed through `with_host` instead.
+    let _: fn(
+        microsandbox_network::ResolvedNetworkConfig,
+        u16,
+        microsandbox_types::DeploymentProfile,
+    ) -> Result<
+        microsandbox_network::network::SmoltcpNetwork,
+        microsandbox_network::network::NetworkInitError,
+    > = microsandbox_network::network::SmoltcpNetwork::new;
+
+    // The host-local extension seam is exported at its documented public path.
+    let _: microsandbox_network::extensions::NetworkExtensions =
+        microsandbox_network::extensions::NetworkExtensions::default();
+}
+
+#[test]
 fn tls_config_path_remains_available_without_the_engine() {
     assert_same_type::<microsandbox_network::tls::TlsConfig, microsandbox_types::TlsConfig>();
 }

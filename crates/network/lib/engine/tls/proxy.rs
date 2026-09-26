@@ -5,18 +5,23 @@
 //! connection to the real server. Bypass mode replays buffered bytes and
 //! splices the connection without termination.
 
+use std::borrow::Cow;
 use std::io::{self, Read, Write};
 use std::net::SocketAddr;
 use std::sync::Arc;
 
 use bytes::Bytes;
 use rustls::pki_types::ServerName;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::sync::mpsc;
 
 use super::sni;
 use super::state::TlsState;
+use crate::extensions::{
+    AuthorizedRouteRequestStream, AuthorizedTlsRoute, NetworkExtensions, OutboundProtocol,
+    RequestAction,
+};
 use crate::netstack::shared::SharedState;
 use crate::policy::{EgressEvaluation, HostnameSource, NetworkPolicy, Protocol};
 use crate::proxy::ResolvedOutboundProxy;
@@ -49,6 +54,7 @@ pub(crate) struct TlsProxy {
     network_policy: Arc<NetworkPolicy>,
     strict: bool,
     proxy_connect: Arc<ProxyConnectState>,
+    extensions: NetworkExtensions,
     outbound_proxy: Option<Arc<ResolvedOutboundProxy>>,
     /// Pre-connected upstream; when `Some`, skips dialing `connect_target`.
     upstream_stream: Option<TcpStream>,
@@ -77,6 +83,7 @@ impl TlsProxy {
         network_policy: Arc<NetworkPolicy>,
         strict: bool,
         proxy_connect: Arc<ProxyConnectState>,
+        extensions: NetworkExtensions,
         outbound_proxy: Option<Arc<ResolvedOutboundProxy>>,
     ) -> Self {
         Self {
@@ -89,6 +96,7 @@ impl TlsProxy {
             network_policy,
             strict,
             proxy_connect,
+            extensions,
             outbound_proxy,
             upstream_stream: None,
             expected_sni: None,
@@ -152,6 +160,7 @@ impl TlsProxy {
             network_policy,
             strict,
             proxy_connect,
+            extensions,
             upstream_stream,
             outbound_proxy,
             expected_sni,
@@ -232,12 +241,15 @@ impl TlsProxy {
         if should_bypass {
             tracing::debug!(sni = %sni_name, dst = %connect_dst, guest_dst = %guest_dst, "TLS bypass");
             bypass_relay(
+                guest_dst,
                 connect_target,
+                &sni_name,
                 initial_buf,
                 from_smoltcp,
                 to_smoltcp,
                 shared,
                 proxy_connect,
+                extensions,
                 upstream_stream,
                 outbound_proxy,
             )
@@ -256,6 +268,7 @@ impl TlsProxy {
                 shared,
                 tls_state,
                 proxy_connect,
+                extensions,
                 upstream_stream,
                 outbound_proxy,
             )
@@ -271,12 +284,15 @@ impl TlsProxy {
 /// Bypass mode: plain TCP splice, no TLS termination.
 #[allow(clippy::too_many_arguments)]
 async fn bypass_relay(
+    guest_dst: SocketAddr,
     connect_target: UpstreamTcpTarget,
+    sni_name: &str,
     initial_buf: Vec<u8>,
     mut from_smoltcp: mpsc::Receiver<Bytes>,
     to_smoltcp: mpsc::Sender<Bytes>,
     shared: Arc<SharedState>,
     proxy_connect: Arc<ProxyConnectState>,
+    extensions: NetworkExtensions,
     upstream_stream: Option<TcpStream>,
     outbound_proxy: Option<Arc<ResolvedOutboundProxy>>,
 ) -> io::Result<()> {
@@ -284,7 +300,15 @@ async fn bypass_relay(
         Some(s) => s,
         None => {
             connect_target
-                .connect(&proxy_connect, &shared, outbound_proxy.as_deref())
+                .connect(
+                    guest_dst,
+                    Some(sni_name),
+                    OutboundProtocol::Tls,
+                    &extensions,
+                    &proxy_connect,
+                    &shared,
+                    outbound_proxy,
+                )
                 .await?
         }
     };
@@ -341,15 +365,12 @@ pub(crate) async fn intercept_relay(
     shared: Arc<SharedState>,
     tls_state: Arc<TlsState>,
     proxy_connect: Arc<ProxyConnectState>,
+    extensions: NetworkExtensions,
     upstream_stream: Option<TcpStream>,
     outbound_proxy: Option<Arc<ResolvedOutboundProxy>>,
 ) -> io::Result<()> {
     // Per-connection snapshot: live secret updates apply to later connections.
     let secrets = tls_state.secrets.load();
-    // `via_connect` is retained for the request-extension seam (a later commit
-    // passes it to `AuthorizedTlsRoute::new`); it is not otherwise consulted
-    // here, where the handler choice depends on hostname authority instead.
-    let _ = via_connect;
     let mut secrets_handler = if has_connect_hostname_authority {
         SecretsHandler::new_tls_intercepted_via_connect(&secrets, sni_name)
     } else {
@@ -359,6 +380,8 @@ pub(crate) async fn intercept_relay(
     }
     .with_header_credentials(tls_state.header_credentials().to_vec())
     .with_guest_dst(guest_dst);
+    let mut request_stream =
+        open_authorized_request_stream(&extensions, guest_dst, sni_name, via_connect);
 
     // Get or generate per-domain certificate (includes cached ServerConfig).
     let domain_cert = tls_state
@@ -412,7 +435,15 @@ pub(crate) async fn intercept_relay(
         Some(s) => s,
         None => {
             connect_target
-                .connect(&proxy_connect, &shared, outbound_proxy.as_deref())
+                .connect(
+                    guest_dst,
+                    Some(sni_name),
+                    OutboundProtocol::Tls,
+                    &extensions,
+                    &proxy_connect,
+                    &shared,
+                    outbound_proxy,
+                )
                 .await?
         }
     };
@@ -432,14 +463,20 @@ pub(crate) async fn intercept_relay(
     // In TLS 1.3, the client sends Finished + application data in the same
     // flight, so process_new_packets() during the handshake loop may have
     // already decrypted the first HTTP request into the plaintext buffer.
-    forward_plaintext(
+    if forward_plaintext(
         &mut guest_tls,
         &mut server_tls,
         &mut secrets_handler,
+        request_stream.as_deref_mut(),
         &shared,
         &mut plaintext_buf,
+        &to_smoltcp,
+        &mut tls_buf,
     )
-    .await?;
+    .await?
+    {
+        return Ok(());
+    }
 
     let mut guest_eof = false;
     loop {
@@ -455,6 +492,9 @@ pub(crate) async fn intercept_relay(
                     // with its own close_notify, ending the relay.)
                     None => {
                         guest_eof = true;
+                        // EOF has no extension callback. Drop held request state
+                        // before continuing the server-to-guest half of the relay.
+                        request_stream = None;
                         if server_tls.shutdown().await.is_err() {
                             break;
                         }
@@ -470,14 +510,20 @@ pub(crate) async fn intercept_relay(
                     guest_tls
                         .process_new_packets()
                         .map_err(io::Error::other)?;
-                    forward_plaintext(
+                    if forward_plaintext(
                         &mut guest_tls,
                         &mut server_tls,
                         &mut secrets_handler,
+                        request_stream.as_deref_mut(),
                         &shared,
                         &mut plaintext_buf,
+                        &to_smoltcp,
+                        &mut tls_buf,
                     )
-                    .await?;
+                    .await?
+                    {
+                        return Ok(());
+                    }
                 }
             }
 
@@ -542,14 +588,23 @@ pub(crate) async fn extract_sni_from_channel(
 
 /// Read all available decrypted plaintext from the guest-facing TLS
 /// connection and forward it to the upstream server, applying secret
-/// substitution when configured.
+/// substitution and, when a request extension is installed, the
+/// post-substitution request action.
+///
+/// Returns `true` when the relay was terminated by a synthetic response
+/// (the caller must stop relaying). The no-extension branch is byte-for-byte
+/// the previous behavior: `request_stream.is_none()` forwards as before.
+#[allow(clippy::too_many_arguments)]
 async fn forward_plaintext(
     guest_tls: &mut rustls::ServerConnection,
     server_tls: &mut tokio_rustls::client::TlsStream<TcpStream>,
     secrets_handler: &mut SecretsHandler,
+    mut request_stream: Option<&mut (dyn AuthorizedRouteRequestStream + '_)>,
     shared: &SharedState,
     buf: &mut [u8],
-) -> io::Result<()> {
+    to_smoltcp: &mpsc::Sender<Bytes>,
+    tls_buf: &mut Vec<u8>,
+) -> io::Result<bool> {
     let mut wrote_plaintext = false;
 
     loop {
@@ -560,21 +615,38 @@ async fn forward_plaintext(
             Err(e) => return Err(e),
         };
 
-        if secrets_handler.is_empty() {
-            server_tls.write_all(&buf[..n]).await?;
-            wrote_plaintext = true;
+        // The default path (no request extension) is the existing direct
+        // forwarding, unchanged.
+        if request_stream.is_none() {
+            if secrets_handler.is_empty() {
+                server_tls.write_all(&buf[..n]).await?;
+                wrote_plaintext = true;
+                continue;
+            }
+
+            match secrets_handler.substitute(&buf[..n]) {
+                Ok(data) => {
+                    if !data.is_empty() {
+                        server_tls.write_all(&data).await?;
+                        wrote_plaintext = true;
+                    }
+                }
+                Err(action) => {
+                    if matches!(action, SecretViolationAction::BlockAndTerminate) {
+                        shared.trigger_termination();
+                    }
+                    return Err(io::Error::new(
+                        io::ErrorKind::PermissionDenied,
+                        "secret violation: placeholder sent to disallowed host",
+                    ));
+                }
+            }
             continue;
         }
 
-        match secrets_handler.substitute(&buf[..n]) {
-            Ok(data) => {
-                if !data.is_empty() {
-                    server_tls.write_all(&data).await?;
-                    wrote_plaintext = true;
-                }
-            }
+        let substituted = match substitute_request_chunk(secrets_handler, &buf[..n]) {
+            Ok(data) => data,
             Err(action) => {
-                // Violation: placeholder going to disallowed host. Drop the connection.
                 if matches!(action, SecretViolationAction::BlockAndTerminate) {
                     shared.trigger_termination();
                 }
@@ -582,6 +654,28 @@ async fn forward_plaintext(
                     io::ErrorKind::PermissionDenied,
                     "secret violation: placeholder sent to disallowed host",
                 ));
+            }
+        };
+        if substituted.is_empty() {
+            continue;
+        }
+
+        match dispatch_request_action(
+            request_stream
+                .as_deref_mut()
+                .expect("request stream checked above"),
+            substituted.as_ref(),
+            server_tls,
+        )
+        .await?
+        {
+            RequestDispatch::Continue { wrote } => wrote_plaintext |= wrote,
+            RequestDispatch::RespondAndClose(response) => {
+                if wrote_plaintext {
+                    server_tls.flush().await?;
+                }
+                send_synthetic_response(guest_tls, &response, to_smoltcp, shared, tls_buf).await?;
+                return Ok(true);
             }
         }
     }
@@ -592,7 +686,83 @@ async fn forward_plaintext(
         server_tls.flush().await?;
     }
 
-    Ok(())
+    Ok(false)
+}
+
+/// The local result of one applied request action.
+enum RequestDispatch {
+    /// Forwarding continues; `wrote` records whether upstream bytes were sent.
+    Continue { wrote: bool },
+    /// A synthetic response must be sent to the guest and the relay terminated.
+    RespondAndClose(Vec<u8>),
+}
+
+fn open_authorized_request_stream(
+    extensions: &NetworkExtensions,
+    guest_destination: SocketAddr,
+    server_name: &str,
+    via_connect: bool,
+) -> Option<Box<dyn AuthorizedRouteRequestStream>> {
+    extensions.authorized_requests().and_then(|extension| {
+        // Constructing route metadata copies the SNI. Keep the default-empty
+        // path allocation-free until a host actually installs this extension.
+        extension.open(&AuthorizedTlsRoute::new(
+            guest_destination,
+            server_name,
+            via_connect,
+        ))
+    })
+}
+
+/// Substitute secrets in one chunk, borrowing when no handler is installed so
+/// the zero-substitution path stays copy-free.
+fn substitute_request_chunk<'a>(
+    secrets_handler: &mut SecretsHandler,
+    chunk: &'a [u8],
+) -> Result<Cow<'a, [u8]>, SecretViolationAction> {
+    if secrets_handler.is_empty() {
+        Ok(Cow::Borrowed(chunk))
+    } else {
+        secrets_handler.substitute(chunk)
+    }
+}
+
+async fn dispatch_request_action<W: AsyncWrite + Unpin>(
+    request_stream: &mut dyn AuthorizedRouteRequestStream,
+    chunk: &[u8],
+    upstream: &mut W,
+) -> io::Result<RequestDispatch> {
+    match request_stream.process(chunk).await? {
+        RequestAction::ForwardCurrent => {
+            upstream.write_all(chunk).await?;
+            Ok(RequestDispatch::Continue { wrote: true })
+        }
+        RequestAction::Hold => Ok(RequestDispatch::Continue { wrote: false }),
+        RequestAction::ForwardOwned(bytes) => {
+            if bytes.is_empty() {
+                Ok(RequestDispatch::Continue { wrote: false })
+            } else {
+                upstream.write_all(&bytes).await?;
+                Ok(RequestDispatch::Continue { wrote: true })
+            }
+        }
+        RequestAction::RespondAndClose(response) => Ok(RequestDispatch::RespondAndClose(response)),
+    }
+}
+
+/// Encrypt and enqueue a request-extension synthetic response for the guest.
+async fn send_synthetic_response(
+    guest_tls: &mut rustls::ServerConnection,
+    response: &[u8],
+    to_smoltcp: &mpsc::Sender<Bytes>,
+    shared: &SharedState,
+    tls_buf: &mut Vec<u8>,
+) -> io::Result<()> {
+    guest_tls
+        .writer()
+        .write_all(response)
+        .map_err(io::Error::other)?;
+    flush_to_guest(guest_tls, to_smoltcp, shared, tls_buf).await
 }
 
 /// Flush pending TLS output from the guest-facing rustls connection

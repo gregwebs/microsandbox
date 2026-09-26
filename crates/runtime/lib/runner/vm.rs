@@ -2549,7 +2549,11 @@ fn build_vm(
             vm.deployment_profile,
             microsandbox_network::network::HostIntegrations {
                 resolved_header_credentials: vm.resolved_header_credentials.clone(),
-            },
+                ..Default::default()
+            }
+            // Explicit `outbound_proxy` (SOCKS) wins over an ambient
+            // `HTTPS_PROXY`/`HTTP_PROXY`/`ALL_PROXY` host HTTP proxy.
+            .with_ambient_host_proxy(vm.network.config().outbound_proxy.is_some()),
         )
         .map_err(|err| RuntimeError::Custom(format!("initialize network: {err}")))?;
         if let Some(restore) = &vm.checkpoint_restore {

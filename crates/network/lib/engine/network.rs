@@ -22,9 +22,10 @@ use msb_krun::backends::net::NetBackend;
 
 use crate::config::{ConnectionLimit, NetworkConfig, ResolvedNetworkConfig};
 use crate::engine::tls::state::{TlsState, TlsStateError};
+use crate::extensions::NetworkExtensions;
 use crate::netstack::{
     backend::SmoltcpBackend,
-    poll::{self, GatewayIps, PollLoopConfig},
+    poll::{self, GatewayIps, PollLoopConfig, PollLoopHost},
     shared::{DEFAULT_QUEUE_CAPACITY, SharedState},
 };
 use crate::policy::{NetworkPolicy, NetworkProfile};
@@ -77,6 +78,9 @@ pub struct SmoltcpNetwork {
 
     // Live-swappable secrets view shared with the poll loop and TLS state.
     secrets: SecretsHandle,
+
+    // Host-local extension adapters, threaded into the poll loop.
+    extensions: NetworkExtensions,
 }
 
 #[derive(Clone, Copy)]
@@ -93,9 +97,70 @@ struct HostRoutes {
 /// feature: these extras are orthogonal and all optional.
 #[derive(Default)]
 pub struct HostIntegrations {
+    /// Outbound-connection and authorized-request extension adapters.
+    pub extensions: NetworkExtensions,
     /// Launch-only resolved header credentials; must match the durable
     /// definitions in `config.secrets.header_credentials` one-to-one.
     pub resolved_header_credentials: Vec<ResolvedHeaderCredential>,
+}
+
+impl HostIntegrations {
+    /// Install the ambient host HTTP `CONNECT` proxy, if the environment sets
+    /// one and no explicit configuration takes precedence.
+    ///
+    /// An explicit `outbound_proxy` (the guest's SOCKS proxy) wins over an
+    /// ambient `HTTPS_PROXY`/`HTTP_PROXY`/`ALL_PROXY`: the two are distinct
+    /// mechanisms, and silently replacing configured SOCKS egress with an
+    /// ambient HTTP proxy would ignore explicit configuration. A caller that
+    /// has already installed its own outbound extension also wins.
+    pub fn with_ambient_host_proxy(mut self, explicit_outbound_proxy: bool) -> Self {
+        let connector = crate::engine::host_proxy::HostHttpProxyConnector::from_env();
+        if explicit_outbound_proxy && connector.is_some() {
+            tracing::info!(
+                "explicit outbound_proxy configured; ignoring the ambient host HTTP proxy"
+            );
+            return self;
+        }
+        self.extensions = install_host_proxy_extension(self.extensions, connector);
+        self
+    }
+
+    /// Testable core of [`Self::with_ambient_host_proxy`].
+    #[cfg(test)]
+    fn with_host_proxy(
+        mut self,
+        connector: Option<crate::engine::host_proxy::HostHttpProxyConnector>,
+        explicit_outbound_proxy: bool,
+    ) -> Self {
+        if explicit_outbound_proxy {
+            return self;
+        }
+        self.extensions = install_host_proxy_extension(self.extensions, connector);
+        self
+    }
+}
+
+fn install_host_proxy_extension(
+    extensions: NetworkExtensions,
+    host_proxy: Option<crate::engine::host_proxy::HostHttpProxyConnector>,
+) -> NetworkExtensions {
+    let Some(host_proxy) = host_proxy else {
+        return extensions;
+    };
+    if extensions.outbound().is_some() {
+        tracing::debug!(
+            "caller-installed outbound connection extension takes precedence over host HTTP proxy"
+        );
+        return extensions;
+    }
+    let (https, http) = host_proxy.endpoint_displays();
+    tracing::info!(
+        https = ?https,
+        http = ?http,
+        no_proxy_configured = host_proxy.has_no_proxy_rules(),
+        "guest egress will use the host HTTP proxy"
+    );
+    extensions.with_outbound(Arc::new(host_proxy))
 }
 
 /// Errors that prevent the smoltcp network from being created safely.
@@ -402,6 +467,7 @@ impl SmoltcpNetwork {
             gateway_ipv6,
             tls_state,
             secrets,
+            extensions: host.extensions,
         })
     }
 
@@ -466,6 +532,7 @@ impl SmoltcpNetwork {
         let secrets = self.secrets.clone();
         let activation_gate = self.activation_gate.take();
         let outbound_proxy = self.config.outbound_proxy().cloned().map(Arc::new);
+        let host_extensions = self.extensions.clone();
 
         self.poll_handle = Some(
             std::thread::Builder::new()
@@ -488,6 +555,9 @@ impl SmoltcpNetwork {
                         tokio_handle,
                         secrets,
                         outbound_proxy,
+                        PollLoopHost {
+                            extensions: host_extensions.clone(),
+                        },
                     );
                 })
                 .expect("failed to spawn smoltcp poll thread"),
@@ -1492,5 +1562,18 @@ mod tests {
         let mut empty = NetworkConfig::default();
         empty.tls.enabled = true;
         assert!(validate_launch_header_credentials(&empty, &[]).is_ok());
+    }
+
+    #[test]
+    fn ambient_host_proxy_is_installed_only_without_explicit_config() {
+        let connector = crate::engine::host_proxy::HostHttpProxyConnector::from_url(
+            "http://proxy.example:3128",
+        );
+        // No explicit outbound proxy: the ambient connector is installed.
+        let installed = HostIntegrations::default().with_host_proxy(connector.clone(), false);
+        assert!(installed.extensions.outbound().is_some());
+        // Explicit outbound proxy wins: nothing is installed.
+        let skipped = HostIntegrations::default().with_host_proxy(connector, true);
+        assert!(skipped.extensions.outbound().is_none());
     }
 }
