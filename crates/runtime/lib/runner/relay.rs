@@ -480,6 +480,24 @@ pub struct AgentRelay {
     /// Number of user-volume mounts that use the shared bind identity map.
     #[cfg(unix)]
     bind_identity_map_mount_count: usize,
+    /// Connected-clients map. Lives on the struct rather than as a `run()`
+    /// local so a [`RelayBroadcast`] taken before `run()` can push frames for
+    /// the relay's lifetime (used by the auto-publish loop for
+    /// `core.port.event`).
+    clients: Arc<Mutex<HashMap<u32, ClientState>>>,
+}
+
+/// Cloneable handle that pushes one host-originated frame to every connected client.
+///
+/// Used for host-originated broadcasts that are not responses to a specific
+/// client request — currently the auto-publish loop's `core.port.event`. Each
+/// event is queued best-effort into every client's bounded mailbox: a client
+/// whose output budget is exhausted misses the event rather than blocking the
+/// publisher, and `try_lock` means a contended map is retried on the next
+/// event instead of blocking a non-async caller.
+#[derive(Clone)]
+pub struct RelayBroadcast {
+    clients: Arc<Mutex<HashMap<u32, ClientState>>>,
 }
 
 /// Platform-specific listener for SDK client connections.
@@ -1103,6 +1121,22 @@ impl AgentListener {
     }
 }
 
+impl RelayBroadcast {
+    /// Encode `message` and queue it to every connected client.
+    ///
+    /// Best-effort by design: a client whose output budget is exhausted is
+    /// skipped, and an encode failure drops the broadcast rather than
+    /// disrupting the publisher.
+    pub fn broadcast(&self, message: &Message) {
+        let Ok(map) = self.clients.try_lock() else {
+            return;
+        };
+        for client in map.values() {
+            let _ = queue_host_frame(&client.write_tx, &client.write_budget, message);
+        }
+    }
+}
+
 impl AgentRelay {
     /// Create a new agent relay.
     ///
@@ -1113,6 +1147,18 @@ impl AgentRelay {
         shared: Arc<ConsoleSharedState>,
     ) -> RuntimeResult<Self> {
         Self::new_with_bulk(agent_sock_path, shared, None).await
+    }
+
+    /// Get a [`RelayBroadcast`] handle that can push frames to every connected
+    /// client for the relay's lifetime.
+    ///
+    /// Safe to call before [`run`](Self::run): the handle keeps an `Arc` to the
+    /// same clients map `run` populates, so a broadcast taken early still
+    /// reaches clients connected later.
+    pub fn broadcast_handle(&self) -> RelayBroadcast {
+        RelayBroadcast {
+            clients: Arc::clone(&self.clients),
+        }
     }
 
     /// Create a relay with an optional unpublished bulk console lane.
@@ -1140,6 +1186,7 @@ impl AgentRelay {
             bind_identity_map: None,
             #[cfg(unix)]
             bind_identity_map_mount_count: 0,
+            clients: Arc::new(Mutex::new(HashMap::new())),
         })
     }
 
@@ -1169,6 +1216,7 @@ impl AgentRelay {
             bind_identity_map: None,
             #[cfg(unix)]
             bind_identity_map_mount_count: 0,
+            clients: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -1776,8 +1824,10 @@ impl AgentRelay {
             .take()
             .ok_or_else(|| RuntimeError::Custom("agent relay: endpoint not published".into()))?;
 
-        // Shared state: map from client slot index to client state.
-        let clients: Arc<Mutex<HashMap<u32, ClientState>>> = Arc::new(Mutex::new(HashMap::new()));
+        // Shared state: map from client slot index to client state. The map
+        // itself lives on `self` so a `broadcast_handle()` obtained before
+        // `run()` reaches clients connected later.
+        let clients = self.clients.clone();
 
         // Bounded channel for client reader tasks to send frames to the ring writer.
         // Backpressure prevents unbounded memory growth from client floods.
@@ -4177,26 +4227,29 @@ fn queue_bulk_open_rejection(
     queue_client_rejection(write_tx, write_budget, &message)
 }
 
-/// Host-side rejection uses the same bounded mailbox as guest responses.
-fn queue_client_rejection(
+/// Queue one runtime-originated frame into a client's bounded mailbox.
+///
+/// Runtime-generated writes have no guest-lane allocation, so they carry no
+/// lane permit, but they must still charge the per-client output budget or the
+/// unbounded channel would have no backpressure at all.
+fn queue_host_frame(
     write_tx: &mpsc::UnboundedSender<ClientWrite>,
     write_budget: &Arc<Semaphore>,
     message: &Message,
 ) -> RuntimeResult<()> {
     let mut wire = Vec::new();
-    codec::encode_to_buf(message, &mut wire).map_err(|error| {
-        RuntimeError::Custom(format!("encode bulk admission rejection frame: {error}"))
-    })?;
+    codec::encode_to_buf(message, &mut wire)
+        .map_err(|error| RuntimeError::Custom(format!("encode host frame: {error}")))?;
     let charged = wire
         .len()
         .div_ceil(OUTPUT_BUDGET_GRANULE)
         .saturating_mul(OUTPUT_BUDGET_GRANULE);
     let charged = u32::try_from(charged)
-        .map_err(|_| RuntimeError::Custom("bulk admission rejection budget overflow".into()))?;
+        .map_err(|_| RuntimeError::Custom("host frame output budget overflow".into()))?;
     let client_permit = Arc::clone(write_budget)
         .try_acquire_many_owned(charged)
         .map_err(|_| {
-            RuntimeError::Custom("client output full while rejecting a bulk operation".into())
+            RuntimeError::Custom("client output full while queueing a host frame".into())
         })?;
     write_tx
         .send(ClientWrite {
@@ -4204,7 +4257,18 @@ fn queue_client_rejection(
             _lane_permit: None,
             _client_permit: client_permit,
         })
-        .map_err(|_| RuntimeError::Custom("client writer stopped during bulk rejection".into()))
+        .map_err(|_| {
+            RuntimeError::Custom("client writer stopped while queueing a host frame".into())
+        })
+}
+
+/// Host-side rejection uses the same bounded mailbox as guest responses.
+fn queue_client_rejection(
+    write_tx: &mpsc::UnboundedSender<ClientWrite>,
+    write_budget: &Arc<Semaphore>,
+    message: &Message,
+) -> RuntimeResult<()> {
+    queue_host_frame(write_tx, write_budget, message)
 }
 
 /// Background task that reads frames from a client and forwards them to the
@@ -5240,6 +5304,7 @@ mod tests {
     };
     use microsandbox_protocol::core::Ready;
     use microsandbox_protocol::fs::FsResponse;
+    use microsandbox_protocol::network::{PORT_EVENT_BROADCAST_ID, PortEvent};
     use microsandbox_protocol::transport::{
         BulkTransportReady, RelayLeaseReady, decode_bulk_ack, encode_bulk_hello,
     };
@@ -8855,5 +8920,151 @@ mod tests {
                 .unwrap_err()
                 .contains("closed")
         );
+    }
+
+    fn broadcast_test_client(
+        write_tx: mpsc::UnboundedSender<ClientWrite>,
+        byte_budget: usize,
+    ) -> ClientState {
+        let (disconnect_tx, _disconnect_rx) = watch::channel(false);
+        ClientState {
+            incarnation: None,
+            active_sessions: HashSet::new(),
+            active_bulk: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            write_tx,
+            write_budget: Arc::new(Semaphore::new(byte_budget)),
+            disconnect_tx,
+            #[cfg(unix)]
+            local_outbound: None,
+        }
+    }
+
+    fn broadcast_test_event() -> Message {
+        Message::with_payload(
+            MessageType::PortEvent,
+            PORT_EVENT_BROADCAST_ID,
+            &PortEvent::Added {
+                host_bind: std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+                host_port: 8080,
+                guest_port: 80,
+            },
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn relay_broadcast_reaches_every_connected_client() {
+        let (first_tx, mut first_rx) = mpsc::unbounded_channel();
+        let (second_tx, mut second_rx) = mpsc::unbounded_channel();
+        let broadcast = RelayBroadcast {
+            clients: Arc::new(Mutex::new(HashMap::from([
+                (
+                    0,
+                    broadcast_test_client(first_tx, CLIENT_OUTPUT_PER_CLIENT_BYTE_CAPACITY),
+                ),
+                (
+                    1,
+                    broadcast_test_client(second_tx, CLIENT_OUTPUT_PER_CLIENT_BYTE_CAPACITY),
+                ),
+            ]))),
+        };
+
+        broadcast.broadcast(&broadcast_test_event());
+
+        let first = first_rx
+            .try_recv()
+            .expect("first client receives the frame");
+        let second = second_rx
+            .try_recv()
+            .expect("second client receives the frame");
+        let first_bytes = first.data.inline().expect("inline control frame");
+        let second_bytes = second.data.inline().expect("inline control frame");
+        assert_eq!(first_bytes, second_bytes);
+        // A broadcast travels the ordinary control path: no guest-lane permit
+        // and the raw-bulk flag is never set, so the incarnation prefix is not
+        // involved.
+        assert!(first._lane_permit.is_none());
+        assert!(second._lane_permit.is_none());
+        assert_eq!(first_bytes[8] & FLAG_BULK, 0);
+
+        let decoded = codec::decode_message_frame(first_bytes).unwrap();
+        assert_eq!(decoded.t, MessageType::PortEvent);
+        assert_eq!(decoded.id, PORT_EVENT_BROADCAST_ID);
+    }
+
+    #[test]
+    fn relay_broadcast_skips_a_client_with_a_full_output_budget() {
+        let (exhausted_tx, mut exhausted_rx) = mpsc::unbounded_channel();
+        let (healthy_tx, mut healthy_rx) = mpsc::unbounded_channel();
+        // A zero-capacity budget rejects every charged frame, modelling a
+        // client whose writer mailbox is already full.
+        let broadcast = RelayBroadcast {
+            clients: Arc::new(Mutex::new(HashMap::from([
+                (0, broadcast_test_client(exhausted_tx, 0)),
+                (
+                    1,
+                    broadcast_test_client(healthy_tx, CLIENT_OUTPUT_PER_CLIENT_BYTE_CAPACITY),
+                ),
+            ]))),
+        };
+
+        broadcast.broadcast(&broadcast_test_event());
+
+        assert!(
+            exhausted_rx.try_recv().is_err(),
+            "a budget-exhausted client misses the event instead of blocking the publisher"
+        );
+        assert!(
+            healthy_rx.try_recv().is_ok(),
+            "a healthy client still receives the event"
+        );
+    }
+
+    #[test]
+    fn relay_broadcast_survives_a_disconnected_client() {
+        let (gone_tx, gone_rx) = mpsc::unbounded_channel();
+        // Dropping the receiver models a client that disconnected mid-broadcast.
+        drop(gone_rx);
+        let (healthy_tx, mut healthy_rx) = mpsc::unbounded_channel();
+        let clients = Arc::new(Mutex::new(HashMap::from([
+            (
+                0,
+                broadcast_test_client(gone_tx, CLIENT_OUTPUT_PER_CLIENT_BYTE_CAPACITY),
+            ),
+            (
+                1,
+                broadcast_test_client(healthy_tx, CLIENT_OUTPUT_PER_CLIENT_BYTE_CAPACITY),
+            ),
+        ])));
+        let broadcast = RelayBroadcast {
+            clients: Arc::clone(&clients),
+        };
+
+        broadcast.broadcast(&broadcast_test_event());
+        assert!(healthy_rx.try_recv().is_ok());
+        // The map is neither poisoned nor mutated by the failed send.
+        assert_eq!(clients.try_lock().unwrap().len(), 2);
+        broadcast.broadcast(&broadcast_test_event());
+    }
+
+    #[test]
+    fn relay_broadcast_before_run_is_a_no_op() {
+        // A handle taken before `run()` has populated the map must not panic.
+        let broadcast = RelayBroadcast {
+            clients: Arc::new(Mutex::new(HashMap::new())),
+        };
+        broadcast.broadcast(&broadcast_test_event());
+    }
+
+    #[test]
+    fn port_event_broadcast_id_lies_outside_every_client_range() {
+        for slot in 0..AGENT_RELAY_MAX_CLIENTS {
+            let (id_start, id_end_exclusive) =
+                relay_client_id_range(slot).expect("allocated slot has a canonical range");
+            assert!(
+                !(id_start..id_end_exclusive).contains(&PORT_EVENT_BROADCAST_ID),
+                "reserved broadcast id collides with client slot {slot}"
+            );
+        }
     }
 }
