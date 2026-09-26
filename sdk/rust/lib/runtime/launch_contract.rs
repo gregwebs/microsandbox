@@ -568,15 +568,23 @@ pub(crate) async fn require_restore_backing(path: &Path) -> MicrosandboxResult<(
 /// build report the same version, and an unknown additive field would be
 /// dropped (older runtimes) or rejected (`deny_unknown_fields`) rather than
 /// honoured. An absent capability, an unparsable reply, a non-zero exit, and a
-/// timeout are all refusals.
+/// timeout are all refusals, reported as the typed [`HeaderCredentialError`]
+/// variants rather than as a plain runtime error, because the caller's remedy
+/// (a resolver plus a capable runtime) is specific to this feature.
+///
+/// [`HeaderCredentialError`]: crate::HeaderCredentialError
 pub(crate) async fn require_header_credentials(path: &Path) -> MicrosandboxResult<()> {
-    let output = bounded_probe(path, "__launch-protocol").await?;
+    let output = bounded_probe(path, "__launch-protocol")
+        .await
+        .map_err(|_| {
+            MicrosandboxError::HeaderCredential(crate::HeaderCredentialError::RuntimeProbeFailed)
+        })?;
     let supported = serde_json::from_slice::<LaunchCapabilities>(&output)
         .is_ok_and(|capabilities| capabilities.header_credentials);
     if !supported {
-        return Err(MicrosandboxError::Runtime(upgrade_required(
-            "origin-scoped header credentials",
-        )));
+        return Err(MicrosandboxError::HeaderCredential(
+            crate::HeaderCredentialError::RuntimeCapabilityMissing,
+        ));
     }
     Ok(())
 }
@@ -732,12 +740,24 @@ mod tests {
             "old-capabilities",
             "printf '%s' '{\"protocols\":[2,1],\"required_restore_backing\":true}'",
         );
-        let error = require_header_credentials(&old)
-            .await
-            .unwrap_err()
-            .to_string();
-        assert!(error.contains("upgrade msb"));
-        assert!(error.contains("origin-scoped header credentials"));
+        // A runtime that answers the probe without the capability is refused by
+        // name, with a remedy, rather than by version.
+        let error = require_header_credentials(&old).await.unwrap_err();
+        assert!(
+            matches!(
+                error,
+                MicrosandboxError::HeaderCredential(
+                    crate::HeaderCredentialError::RuntimeCapabilityMissing
+                )
+            ),
+            "{error:?}"
+        );
+        let rendered = error.to_string();
+        assert!(rendered.contains("upgrade msb"), "{rendered}");
+        assert!(
+            rendered.contains("origin-scoped header credentials"),
+            "{rendered}"
+        );
 
         let new = script(
             dir.path(),
@@ -746,15 +766,30 @@ mod tests {
         );
         require_header_credentials(&new).await.unwrap();
 
+        // A binary that cannot be probed at all is the other typed refusal, so the
+        // two remain distinguishable.
         let malformed = script(
             dir.path(),
             "malformed-capabilities",
             "printf '%s' 'not-json'",
         );
-        assert!(require_header_credentials(&malformed).await.is_err());
+        assert!(matches!(
+            require_header_credentials(&malformed).await.unwrap_err(),
+            MicrosandboxError::HeaderCredential(
+                crate::HeaderCredentialError::RuntimeCapabilityMissing
+            )
+        ));
 
         let failing = script(dir.path(), "failing-capabilities", "exit 3");
-        assert!(require_header_credentials(&failing).await.is_err());
+        assert!(
+            matches!(
+                require_header_credentials(&failing).await.unwrap_err(),
+                MicrosandboxError::HeaderCredential(
+                    crate::HeaderCredentialError::RuntimeProbeFailed
+                )
+            ),
+            "a non-zero probe exit is a probe failure"
+        );
     }
 
     #[test]

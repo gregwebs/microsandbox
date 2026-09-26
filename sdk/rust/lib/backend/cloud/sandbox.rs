@@ -412,6 +412,24 @@ impl TryFrom<SandboxConfig> for CloudCreateBody {
                 UnsupportedReason::ConfigField("ca_certs"),
             ));
         }
+        // Origin-scoped header credentials have no cloud-wire representation
+        // (the value is resolved in *this* process and delivered on the local
+        // launch fd), and `CloudSecretsConfig` would drop the definitions
+        // silently. Refuse the create instead. This is the single client-side
+        // chokepoint every cloud create passes through, so a direct
+        // `Sandbox::create` and a fluent `SandboxBuilder::build` both refuse.
+        #[cfg(feature = "net")]
+        if config
+            .spec
+            .network
+            .secrets
+            .as_ref()
+            .is_some_and(|secrets| !secrets.header_credentials.is_empty())
+        {
+            return Err(MicrosandboxError::HeaderCredential(
+                crate::HeaderCredentialError::UnsupportedBackend,
+            ));
+        }
         reject_dropped_cloud_create_fields(&config)?;
         #[cfg(feature = "net")]
         {

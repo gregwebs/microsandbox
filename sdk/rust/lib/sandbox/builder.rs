@@ -1607,7 +1607,8 @@ impl SandboxBuilder {
                 SpawnMode::Attached
             };
             // Keep the local restore future off callers' stacks, including cloud callers.
-            return Box::pin(local.create_sandbox(backend.clone(), self, mode, progress)).await;
+            return Box::pin(local.create_sandbox(backend.clone(), self, mode, progress, None))
+                .await;
         }
 
         // Cloud doesn't transmit progress information yet.

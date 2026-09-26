@@ -13,8 +13,8 @@ use microsandbox::sandbox::{
 };
 #[cfg(feature = "net")]
 use microsandbox::sandbox::{
-    DnsConfigPatch, NetworkPolicy, NetworkProfile, NetworkSpecPatch, SecretsConfigPatch,
-    TlsConfigPatch,
+    DnsConfigPatch, InterceptConfigPatch, NetworkPolicy, NetworkProfile, NetworkSpecPatch,
+    SecretsConfigPatch, TlsConfigPatch,
 };
 use microsandbox_image::RegistryAuth;
 use microsandbox_types_macros::ConfigPatch;
@@ -396,11 +396,31 @@ struct NetworkConfigInput {
     dns: Option<DnsInput>,
     #[config_patch(nested)]
     tls: Option<TlsInput>,
+    #[config_patch(nested)]
+    intercept: Option<InterceptInput>,
     strict: Option<bool>,
     trust_host_cas: Option<bool>,
     #[serde(alias = "max_connections")]
     max_tcp_connections: Option<usize>,
     max_udp_connections: Option<usize>,
+    auto_publish: Option<AutoPublishInput>,
+}
+
+/// Auto-publish Sandboxfile input: `true` enables it with defaults (2s poll,
+/// `127.0.0.1` host bind); an object enables it with overrides. `false` or
+/// omitted leaves auto-publish disabled.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(untagged)]
+enum AutoPublishInput {
+    Enabled(bool),
+    Object(AutoPublishPatch),
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct AutoPublishPatch {
+    poll_interval_ms: Option<u64>,
+    host_bind: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize, ConfigPatch)]
@@ -418,6 +438,28 @@ struct TlsInput {
     bypass: Option<Vec<String>>,
     verify_upstream: Option<bool>,
     block_quic: Option<bool>,
+}
+
+/// Sparse fail-closed request-interception config-file surface.
+///
+/// Deliberately minimal (no CLI flag grammar — config-file only): a hook
+/// command, match rules, and the buffer cap. See `docs/sandboxes/intercept.mdx`.
+#[derive(Debug, Clone, Default, Deserialize, ConfigPatch)]
+#[serde(default, deny_unknown_fields)]
+struct InterceptInput {
+    hook: Option<Vec<String>>,
+    rules: Option<Vec<InterceptRuleInput>>,
+    max_request_bytes: Option<usize>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct InterceptRuleInput {
+    host: String,
+    method: String,
+    path_prefix: String,
+    #[serde(default)]
+    dispatch_on_headers: bool,
 }
 
 #[derive(Debug, Clone, Default, Deserialize, ConfigPatch)]
@@ -441,6 +483,12 @@ enum SecretValueInput {
     Environment {
         #[serde(rename = "$msb_env")]
         env: String,
+    },
+    File {
+        /// Absolute host path re-read on every eligible connection, so
+        /// rotating the file takes effect without a sandbox restart.
+        #[serde(rename = "$msb_file")]
+        file: String,
     },
 }
 
@@ -1726,6 +1774,56 @@ fn materialize_network_patch(
         }
         patch = patch.secrets(secrets);
     }
+    if let Some(intercept) = input.intercept {
+        let mut value = InterceptConfigPatch::new();
+        if let Some(hook) = intercept.hook {
+            value = value.hook(hook);
+        }
+        if let Some(rules) = intercept.rules {
+            value = value.rules(
+                rules
+                    .into_iter()
+                    .map(
+                        |rule| microsandbox_network::intercept::config::InterceptRule {
+                            host: rule.host,
+                            method: rule.method,
+                            path_prefix: rule.path_prefix,
+                            dispatch_on_headers: rule.dispatch_on_headers,
+                        },
+                    )
+                    .collect(),
+            );
+        }
+        if let Some(max) = intercept.max_request_bytes {
+            value = value.max_request_bytes(max);
+        }
+        patch = patch.intercept(value);
+    }
+    if let Some(auto_publish) = input.auto_publish {
+        let enabled = match &auto_publish {
+            AutoPublishInput::Enabled(enabled) => *enabled,
+            AutoPublishInput::Object(_) => true,
+        };
+        if enabled {
+            let mut cfg = microsandbox_types::AutoPublishConfig::default();
+            if let AutoPublishInput::Object(object) = auto_publish {
+                if let Some(poll_interval_ms) = object.poll_interval_ms {
+                    cfg.poll_interval_ms = poll_interval_ms;
+                }
+                if let Some(host_bind) = object.host_bind {
+                    // The wire type carries a string; reject a value the engine
+                    // cannot parse here, at config load, rather than at boot.
+                    host_bind.parse::<std::net::IpAddr>().map_err(|error| {
+                        anyhow::anyhow!(
+                            "invalid network.auto_publish.host_bind {host_bind:?}: {error}"
+                        )
+                    })?;
+                    cfg.host_bind = host_bind;
+                }
+            }
+            patch = patch.auto_publish(cfg);
+        }
+    }
     if let Some(enabled) = input.strict {
         patch = patch.strict(enabled);
     }
@@ -1756,6 +1854,10 @@ fn materialize_secrets(
             Some(SecretValueInput::Environment { env }) => (
                 Zeroizing::new(String::new()),
                 Some(SecretSource::Env { var: env.clone() }),
+            ),
+            Some(SecretValueInput::File { file }) => (
+                Zeroizing::new(String::new()),
+                Some(SecretSource::File { path: file.into() }),
             ),
             None => (
                 Zeroizing::new(String::new()),
@@ -2631,6 +2733,178 @@ secrets:
         assert_eq!(config.spec.network.ports.len(), 0);
         assert!(config.spec.network.tls.as_ref().unwrap().enabled);
         assert!(config.spec.network.dns.is_none());
+    }
+
+    #[cfg(feature = "net")]
+    #[tokio::test]
+    async fn sparse_intercept_config_round_trips_into_the_sandbox_spec() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = write_config(
+            dir.path(),
+            "agent.yaml",
+            r#"
+image: "python:3.12"
+network:
+  policy: public
+  intercept:
+    hook: ["agent-vm", "_intercept-hook"]
+    max_request_bytes: 4096
+    rules:
+      - { host: "api.github.com", method: "GET", path_prefix: "/repos/" }
+      - { host: "github.com", method: "POST", path_prefix: "/", dispatch_on_headers: true }
+"#,
+        );
+        let sources = SandboxConfigSources::default().source(SandboxConfigKind::Root, root);
+        let resolved = resolve(&sources).unwrap();
+        let image = resolved.image(None, None).unwrap();
+        let builder = resolved
+            .apply(SandboxBuilder::new("intercept-config-test"))
+            .unwrap();
+        let config = image.apply(builder).unwrap().build().await.unwrap();
+
+        let intercept = config
+            .spec
+            .network
+            .intercept
+            .as_ref()
+            .expect("intercept subdocument present");
+        assert_eq!(
+            intercept.hook,
+            Some(vec!["agent-vm".to_string(), "_intercept-hook".to_string()])
+        );
+        assert_eq!(intercept.max_request_bytes, 4096);
+        assert_eq!(intercept.rules.len(), 2);
+        assert_eq!(intercept.rules[0].host, "api.github.com");
+        assert!(!intercept.rules[0].dispatch_on_headers);
+        assert_eq!(intercept.rules[1].host, "github.com");
+        assert!(intercept.rules[1].dispatch_on_headers);
+        assert!(intercept.is_active());
+    }
+
+    #[cfg(feature = "net")]
+    #[test]
+    fn secret_config_parses_msb_file_value() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_config(
+            dir.path(),
+            "secrets.yaml",
+            r#"
+TOKEN:
+  value:
+    $msb_file: /run/creds/token
+  allow: ["api.example.com"]
+"#,
+        );
+        let sources = SandboxConfigSources::default().source(SandboxConfigKind::Secrets, path);
+
+        let resolved = resolve(&sources).unwrap();
+        let secrets = resolved.input.secrets.unwrap();
+        let secret = &secrets["TOKEN"];
+        assert!(matches!(
+            secret.value,
+            Some(SecretValueInput::File { ref file }) if file == "/run/creds/token"
+        ));
+
+        // `materialize_secrets` must accept the parsed File value without error;
+        // the resulting `SecretSource::File` reference then flows through the
+        // SDK's config-patch machinery unchanged.
+        assert!(materialize_secrets(&secrets).is_ok());
+    }
+
+    /// A Sandboxfile `auto_publish` key must deserialize past
+    /// `deny_unknown_fields`, materialize into the `NetworkSpecPatch`, and
+    /// survive all the way into the built `SandboxConfig`'s persisted
+    /// `NetworkSpec` — the acceptance criterion's "sandbox specs round-trip the
+    /// setting".
+    #[cfg(feature = "net")]
+    #[tokio::test]
+    async fn cli_network_auto_publish_object_round_trips_into_spec() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = write_config(
+            dir.path(),
+            "agent.yaml",
+            "image: \"python\"\nnetwork:\n  auto_publish:\n    poll_interval_ms: 750\n    host_bind: \"0.0.0.0\"\n",
+        );
+        let sources = SandboxConfigSources::default().source(SandboxConfigKind::Root, root);
+        let resolved = resolve(&sources).unwrap();
+        let opts = SandboxOpts {
+            no_net: true,
+            ..SandboxOpts::default()
+        };
+        let builder = resolved
+            .image(None, None)
+            .unwrap()
+            .apply(SandboxBuilder::new("network-auto-publish"))
+            .unwrap();
+        let builder = resolved.apply(builder).unwrap();
+        let config = crate::commands::common::apply_sandbox_opts_after_config(builder, &opts)
+            .unwrap()
+            .build()
+            .await
+            .unwrap();
+
+        let auto_publish = config
+            .spec
+            .network
+            .auto_publish
+            .as_ref()
+            .expect("auto_publish should survive the Sandboxfile -> spec round trip");
+        assert_eq!(auto_publish.poll_interval_ms, 750);
+        assert_eq!(auto_publish.host_bind, "0.0.0.0");
+    }
+
+    /// `auto_publish: true` enables it with the documented defaults (2s poll,
+    /// `127.0.0.1` bind) rather than requiring every field.
+    #[cfg(feature = "net")]
+    #[tokio::test]
+    async fn cli_network_auto_publish_bool_enables_with_defaults() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = write_config(
+            dir.path(),
+            "agent.yaml",
+            "image: \"python\"\nnetwork:\n  auto_publish: true\n",
+        );
+        let sources = SandboxConfigSources::default().source(SandboxConfigKind::Root, root);
+        let resolved = resolve(&sources).unwrap();
+        let opts = SandboxOpts {
+            no_net: true,
+            ..SandboxOpts::default()
+        };
+        let builder = resolved
+            .image(None, None)
+            .unwrap()
+            .apply(SandboxBuilder::new("network-auto-publish-bool"))
+            .unwrap();
+        let builder = resolved.apply(builder).unwrap();
+        let config = crate::commands::common::apply_sandbox_opts_after_config(builder, &opts)
+            .unwrap()
+            .build()
+            .await
+            .unwrap();
+
+        let auto_publish = config
+            .spec
+            .network
+            .auto_publish
+            .as_ref()
+            .expect("auto_publish: true should enable with defaults");
+        assert_eq!(auto_publish.poll_interval_ms, 2000);
+        assert_eq!(auto_publish.host_bind, "127.0.0.1");
+    }
+
+    /// An invalid host bind is rejected at config load rather than at boot.
+    #[cfg(feature = "net")]
+    #[test]
+    fn cli_network_auto_publish_rejects_an_unparsable_host_bind() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = write_config(
+            dir.path(),
+            "agent.yaml",
+            "image: \"python\"\nnetwork:\n  auto_publish:\n    host_bind: \"not-an-address\"\n",
+        );
+        let sources = SandboxConfigSources::default().source(SandboxConfigKind::Root, root);
+        let error = resolve(&sources).unwrap_err().to_string();
+        assert!(error.contains("network.auto_publish.host_bind"), "{error}");
     }
 
     #[test]

@@ -7,6 +7,8 @@
 
 #[cfg(windows)]
 use std::fmt::Write as _;
+#[cfg(windows)]
+use std::io::{Seek, SeekFrom, Write as IoWrite};
 #[cfg(unix)]
 use std::os::fd::AsRawFd;
 #[cfg(unix)]
@@ -24,10 +26,15 @@ use std::{
     ffi::{OsStr, OsString},
     fs::File,
     future::Future,
-    io::{Seek, SeekFrom, Write as IoWrite},
     path::{Path, PathBuf},
     process::Stdio,
+    sync::Arc,
 };
+
+// `Zeroizing` guards the launch-config bytes, which only exist in the unix-only
+// [`ConfigHandoff`] path.
+#[cfg(unix)]
+use zeroize::Zeroizing;
 
 #[cfg(windows)]
 use rand::Rng;
@@ -118,6 +125,13 @@ const AUTO_BLOCK_WRITEBACK_POOL_DIVISOR: u64 = 10;
 #[cfg(target_os = "linux")]
 const MIN_BLOCK_WRITEBACK_LIMIT_BYTES: u64 = 128 * 1024 * 1024;
 
+/// Bound for the private config handoff plus the child's startup line.
+///
+/// A child that never drains the launch-config pipe, or that exits without
+/// reporting startup, must not leave the launcher waiting forever with a live
+/// VM process behind it.
+const STARTUP_HANDOFF_BUDGET: std::time::Duration = std::time::Duration::from_secs(30);
+
 //--------------------------------------------------------------------------------------------------
 // Types
 //--------------------------------------------------------------------------------------------------
@@ -136,6 +150,59 @@ struct MetricsReservation {
     slot: u32,
     generation: u64,
     registry: MetricsRegistry,
+}
+
+/// Owns a metrics slot reserved for an in-progress launch.
+///
+/// The slot must be returned on *every* exit path, including task cancellation
+/// (dropping the `spawn_sandbox` future), so the release lives in `Drop` rather
+/// than in a web of early-return calls that a cancelled future never reaches.
+/// [`Self::disarm`] transfers ownership to the launched `ProcessHandle` — via
+/// a [`MetricsReservationCleanup`] — as soon as the child exists; the handle
+/// then owns the release for the sandbox's lifetime.
+///
+/// This covers the window *before* the child is spawned, which
+/// [`StartupProcess`](super::handle::StartupProcess) does not: it is created
+/// only after `spawn` returns.
+struct MetricsReservationGuard {
+    sandbox_name: String,
+    reservation: Option<MetricsReservation>,
+}
+
+impl MetricsReservationGuard {
+    fn new(sandbox_name: String, reservation: Option<MetricsReservation>) -> Self {
+        Self {
+            sandbox_name,
+            reservation,
+        }
+    }
+
+    fn reservation(&self) -> Option<&MetricsReservation> {
+        self.reservation.as_ref()
+    }
+
+    /// Give up responsibility for the slot; the caller now owns it.
+    fn disarm(mut self) -> Option<MetricsReservation> {
+        self.reservation.take()
+    }
+}
+
+impl Drop for MetricsReservationGuard {
+    fn drop(&mut self) {
+        let Some(reservation) = self.reservation.take() else {
+            return;
+        };
+        if let Err(err) = reservation
+            .registry
+            .release_reserved(reservation.slot, reservation.generation)
+        {
+            tracing::debug!(
+                error = %err,
+                sandbox = %self.sandbox_name,
+                "release: metrics slot release failed"
+            );
+        }
+    }
 }
 
 #[cfg(unix)]
@@ -303,7 +370,10 @@ pub async fn spawn_sandbox(
     sandbox_id: i32,
     mode: SpawnMode,
     lifecycle_guard: Option<microsandbox_runtime::ipc::SandboxLifecycleGuard>,
+    resolver: Option<Arc<dyn crate::CredentialResolver>>,
 ) -> MicrosandboxResult<(ProcessHandle, PathBuf)> {
+    #[cfg(not(feature = "net"))]
+    let _ = &resolver;
     // Durable configuration stores only host-side source references. Resolve
     // them into the private runtime configuration before the sandbox process
     // is spawned.
@@ -328,6 +398,25 @@ pub async fn spawn_sandbox(
     let resolved_runtime = crate::setup::resolve_runtime(global)?;
     ensure_sigchld_handler_uses_alt_stack_before_spawn().await?;
     let launch_contract = launch_contract::resolve(&resolved_runtime.msb_path).await?;
+
+    // Origin-scoped header credentials are refused on Windows, and on every
+    // platform the installed binary must advertise the launch capability before
+    // any value is looked up. These repeat the create-time gates defensively,
+    // immediately before the resolver runs: a stopped sandbox is started by
+    // name, so the create-time gate is not on this path.
+    #[cfg(windows)]
+    if crate::sandbox::config::has_header_credentials(config) {
+        return Err(crate::MicrosandboxError::HeaderCredential(
+            crate::HeaderCredentialError::UnsupportedPlatform,
+        ));
+    }
+    #[cfg(all(unix, feature = "net"))]
+    if crate::sandbox::config::has_header_credentials(config) {
+        launch_contract::require_header_credentials(&resolved_runtime.msb_path).await?;
+    }
+    #[cfg(feature = "net")]
+    let resolved_header_credentials =
+        crate::sandbox::config::resolve_header_credentials(config, resolver.as_deref())?;
     // A stopped sandbox may have been edited without a runtime installed, or
     // the selected executable may have changed since creation. Validate its
     // effective configuration here for both initial launch and later starts.
@@ -478,17 +567,19 @@ pub async fn spawn_sandbox(
     let owned_root = local.sandboxes_dir().join(&config.spec.name);
     super::owned_volumes::validate(&owned_root, &config.spec.mounts)?;
     let disk_locks = lock_disk_mounts(config, &named_volumes, &owned_root)?;
-    let metrics_reservation = if config.effective_metrics_interval().is_some() {
-        reserve_metrics_slot(local, config, sandbox_id)
-    } else {
-        None
-    };
+    let metrics_reservation = MetricsReservationGuard::new(
+        config.spec.name.clone(),
+        if config.effective_metrics_interval().is_some() {
+            reserve_metrics_slot(local, config, sandbox_id)
+        } else {
+            None
+        },
+    );
     #[cfg(unix)]
     let parent_watchdog = match mode {
         SpawnMode::Attached => match create_parent_watchdog_pipe() {
             Ok(pipe) => Some(pipe),
             Err(err) => {
-                release_metrics_reservation(config, metrics_reservation.as_ref());
                 return Err(err);
             }
         },
@@ -504,7 +595,6 @@ pub async fn spawn_sandbox(
         SpawnMode::Detached => match create_startup_pipe() {
             Ok(pipe) => Some(pipe),
             Err(err) => {
-                release_metrics_reservation(config, metrics_reservation.as_ref());
                 return Err(err);
             }
         },
@@ -516,7 +606,6 @@ pub async fn spawn_sandbox(
         SpawnMode::Detached => match create_startup_pipe(&config.spec.name, sandbox_id) {
             Ok(pipe) => Some(pipe),
             Err(err) => {
-                release_metrics_reservation(config, metrics_reservation.as_ref());
                 return Err(err);
             }
         },
@@ -527,7 +616,6 @@ pub async fn spawn_sandbox(
         SpawnMode::Attached => match WindowsJob::new_kill_on_close() {
             Ok(job) => Some(job),
             Err(err) => {
-                release_metrics_reservation(config, metrics_reservation.as_ref());
                 return Err(crate::MicrosandboxError::Runtime(format!(
                     "failed to create Windows sandbox job: {err}"
                 )));
@@ -543,7 +631,6 @@ pub async fn spawn_sandbox(
         match block_writeback_policy(&global.runtime) {
             Ok(policy) => policy,
             Err(err) => {
-                release_metrics_reservation(config, metrics_reservation.as_ref());
                 return Err(err);
             }
         };
@@ -560,7 +647,6 @@ pub async fn spawn_sandbox(
     let network_slot = match lease {
         Ok(slot) => slot,
         Err(err) => {
-            release_metrics_reservation(config, metrics_reservation.as_ref());
             return Err(err);
         }
     };
@@ -584,7 +670,7 @@ pub async fn spawn_sandbox(
         &libkrunfw_path,
         &file_mounts,
         &named_volumes,
-        metrics_reservation.as_ref(),
+        metrics_reservation.reservation(),
         parent_watchdog
             .as_ref()
             .map(|_| microsandbox_runtime::vm::PARENT_WATCH_FD),
@@ -626,7 +712,6 @@ pub async fn spawn_sandbox(
         .is_some_and(|r| r.memory_descriptor)
         != branch_memory_fd.is_some()
     {
-        release_metrics_reservation(config, metrics_reservation.as_ref());
         return Err(MicrosandboxError::Runtime(
             "branch restore is missing its owned memory descriptor".into(),
         ));
@@ -634,24 +719,28 @@ pub async fn spawn_sandbox(
     if !launch_contract.machine {
         visible[0] = OsString::from("sandbox");
     }
+    // The resolved credential values travel only on the private config fd; the
+    // durable config on argv and in the database keeps only the reference.
+    #[cfg(feature = "net")]
+    {
+        launch.resolved_header_credentials = resolved_header_credentials;
+    }
     let launch_value = match launch_contract.encode(&launch) {
         Ok(launch) => launch,
         Err(error) => {
-            release_metrics_reservation(config, metrics_reservation.as_ref());
             return Err(error);
         }
     };
     let launch_bytes = serde_json::to_vec(&launch_value)?;
     #[cfg(unix)]
-    let config_file = match write_launch_config_fd(&launch_bytes) {
-        Ok(file) => file,
+    let config_handoff = match create_config_handoff(&launch_bytes) {
+        Ok(handoff) => handoff,
         Err(err) => {
-            release_metrics_reservation(config, metrics_reservation.as_ref());
             return Err(err);
         }
     };
     #[cfg(unix)]
-    let config_raw_fd = config_file.as_raw_fd();
+    let config_raw_fd = config_handoff.child_fd().as_raw_fd();
     #[cfg(unix)]
     {
         visible.push(OsString::from("--config-fd"));
@@ -676,7 +765,6 @@ pub async fn spawn_sandbox(
             file
         }
         Err(err) => {
-            release_metrics_reservation(config, metrics_reservation.as_ref());
             return Err(err);
         }
     };
@@ -818,7 +906,6 @@ pub async fn spawn_sandbox(
         ) {
             Ok(child) => child,
             Err(err) => {
-                release_metrics_reservation(config, metrics_reservation.as_ref());
                 return Err(err.into());
             }
         }
@@ -827,7 +914,6 @@ pub async fn spawn_sandbox(
     let _pid = match child.id() {
         Some(pid) => pid,
         None => {
-            release_metrics_reservation(config, metrics_reservation.as_ref());
             return Err(crate::MicrosandboxError::Runtime(
                 "sandbox process exited immediately".into(),
             ));
@@ -843,6 +929,17 @@ pub async fn spawn_sandbox(
 
     // Install cancellation ownership before the first post-spawn await, including failures
     // during Windows job assignment and the initial startup reply.
+    //
+    // The metrics reservation moves with the child: `StartupProcess` owns it from here, so a
+    // cancelled launch releases the slot through the same ownership path that reaps the VM.
+    let metrics_cleanup = metrics_reservation.disarm().map(|reservation| {
+        MetricsReservationCleanup::new(
+            reservation.shm_name,
+            reservation.slot,
+            reservation.generation,
+            Some(reservation.registry),
+        )
+    });
     let mut startup_process = StartupProcess::new(ProcessHandle::new(
         _pid,
         config.spec.name.clone(),
@@ -852,14 +949,7 @@ pub async fn spawn_sandbox(
         parent_watchdog.map(|pipe| pipe.write_fd),
         #[cfg(windows)]
         child_job,
-        metrics_reservation.as_ref().map(|reservation| {
-            MetricsReservationCleanup::new(
-                reservation.shm_name.clone(),
-                reservation.slot,
-                reservation.generation,
-                Some(reservation.registry.clone()),
-            )
-        }),
+        metrics_cleanup,
     ));
 
     #[cfg(windows)]
@@ -907,18 +997,31 @@ pub async fn spawn_sandbox(
         }
     }
 
-    let startup_result = match tokio::time::timeout(
-        std::time::Duration::from_secs(30),
-        read_startup_line(startup_process.child_mut(), startup_pipe),
+    // Complete the private config handoff *and* read the startup line under one
+    // bounded budget. For the macOS/other-Unix pipe this writes the launch JSON
+    // and closes the write end so the child's read-to-end terminates; a child
+    // that never drains the pipe must refuse rather than hang the launcher, and
+    // a short or failed write kills the child rather than leaving it waiting for
+    // a config that never arrives. Windows has no config-handoff step, only the
+    // named startup file.
+    #[cfg(unix)]
+    let startup_reply = finish_config_handoff_and_read_startup(
+        config_handoff,
+        startup_process.child_mut(),
+        startup_pipe,
+        STARTUP_HANDOFF_BUDGET,
     )
-    .await
-    {
-        Ok(reply) => reply
-            .and_then(|(line, reader)| parse_startup_info(&line, _pid).map(|info| (info, reader))),
-        Err(_) => Err(crate::MicrosandboxError::Runtime(
-            "sandbox startup timeout: no JSON received within 30 seconds".into(),
-        )),
-    };
+    .await;
+    #[cfg(windows)]
+    let startup_reply = read_startup_line_bounded(
+        startup_process.child_mut(),
+        startup_pipe,
+        STARTUP_HANDOFF_BUDGET,
+    )
+    .await;
+
+    let startup_result = startup_reply
+        .and_then(|(line, reader)| parse_startup_info(&line, _pid).map(|info| (info, reader)));
     let (startup, reader) = match startup_result {
         Ok(startup) => startup,
         Err(error) => {
@@ -1342,17 +1445,220 @@ fn create_pipe() -> MicrosandboxResult<Pipe> {
     Ok(Pipe { read_fd, write_fd })
 }
 
-/// Write the negotiated launch JSON into an anonymous temp file, rewound
-/// to offset 0. The file is unlinked on creation, so there is no path to clean
-/// up or race on; it is `dup2`'d onto
-/// [`CONFIG_FD`](microsandbox_runtime::vm::CONFIG_FD) for the child to read.
+/// Serialize the negotiated launch JSON into an anonymous, memory-backed object
+/// for the child to read to EOF on
+/// [`CONFIG_FD`](microsandbox_runtime::vm::CONFIG_FD).
+///
+/// Linux uses a `memfd_create` anonymous memory file (written and rewound
+/// before spawn). macOS and other Unix use an anonymous pipe: the parent writes
+/// the JSON *after* `spawn` (see [`ConfigHandoff::finish`]) and then closes the
+/// write end, so a config larger than the pipe buffer cannot deadlock. No
+/// filesystem-backed temporary file carries the plaintext, and there is no
+/// fallback to one.
 #[cfg(unix)]
-fn write_launch_config_fd(json: &[u8]) -> MicrosandboxResult<std::fs::File> {
-    let mut file = tempfile::tempfile()?;
-    file.write_all(json)?;
-    file.flush()?;
-    file.seek(SeekFrom::Start(0))?;
-    Ok(file)
+struct ConfigHandoff {
+    read_fd: OwnedFd,
+    after_spawn: AfterSpawn,
+}
+
+#[cfg(unix)]
+enum AfterSpawn {
+    /// The object was written and rewound before spawn (Linux memfd).
+    Written,
+    /// The parent writes these bytes after spawn, then closes the write end to
+    /// produce EOF for the child's read-to-end.
+    ///
+    /// Non-Linux unix only: Linux serializes the config into a `memfd_create`
+    /// object before spawn and constructs only [`AfterSpawn::Written`], so this
+    /// variant is gated exactly like its construction site (otherwise it is dead
+    /// code under `-D warnings`).
+    #[cfg(not(target_os = "linux"))]
+    Pipe {
+        write_fd: OwnedFd,
+        bytes: Zeroizing<Vec<u8>>,
+    },
+}
+
+#[cfg(unix)]
+impl ConfigHandoff {
+    /// The inherited fd that is `dup2`'d onto the child's config fd.
+    fn child_fd(&self) -> &OwnedFd {
+        &self.read_fd
+    }
+
+    /// Complete the handoff after the child has been spawned.
+    ///
+    /// For the pipe case this writes the JSON from the *same* future (no
+    /// background thread) and closes the write end, producing EOF for the
+    /// child's read-to-end. The write loop must not block the Tokio reactor.
+    async fn finish(mut self) -> MicrosandboxResult<()> {
+        match std::mem::replace(&mut self.after_spawn, AfterSpawn::Written) {
+            AfterSpawn::Written => Ok(()),
+            #[cfg(not(target_os = "linux"))]
+            AfterSpawn::Pipe { write_fd, bytes } => write_all_nonblocking(write_fd, &bytes).await,
+        }
+    }
+}
+
+/// Build the private, memory-backed launch-config handoff.
+#[cfg(unix)]
+fn create_config_handoff(json: &[u8]) -> MicrosandboxResult<ConfigHandoff> {
+    let bytes = Zeroizing::new(json.to_vec());
+
+    #[cfg(target_os = "linux")]
+    {
+        let fd = unsafe { libc::memfd_create(c"msb-launch-config".as_ptr(), libc::MFD_CLOEXEC) };
+        if fd < 0 {
+            return Err(std::io::Error::last_os_error().into());
+        }
+        let read_fd = unsafe { OwnedFd::from_raw_fd(fd) };
+        write_all_blocking(&read_fd, &bytes)?;
+        if unsafe { libc::lseek(read_fd.as_raw_fd(), 0, libc::SEEK_SET) } < 0 {
+            return Err(std::io::Error::last_os_error().into());
+        }
+        Ok(ConfigHandoff {
+            read_fd,
+            after_spawn: AfterSpawn::Written,
+        })
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    {
+        let Pipe { read_fd, write_fd } = create_pipe()?;
+        set_nonblocking(&write_fd)?;
+        Ok(ConfigHandoff {
+            read_fd,
+            after_spawn: AfterSpawn::Pipe { write_fd, bytes },
+        })
+    }
+}
+
+/// Write every byte of `bytes` to `fd`, retrying on `EINTR` (Linux pre-spawn).
+#[cfg(target_os = "linux")]
+fn write_all_blocking(fd: &OwnedFd, bytes: &[u8]) -> MicrosandboxResult<()> {
+    let mut offset = 0usize;
+    while offset < bytes.len() {
+        let written = unsafe {
+            libc::write(
+                fd.as_raw_fd(),
+                bytes[offset..].as_ptr() as *const libc::c_void,
+                bytes.len() - offset,
+            )
+        };
+        if written < 0 {
+            let err = std::io::Error::last_os_error();
+            if err.kind() == std::io::ErrorKind::Interrupted {
+                continue;
+            }
+            return Err(err.into());
+        }
+        if written == 0 {
+            return Err(crate::MicrosandboxError::Runtime(
+                "config fd write returned zero bytes".into(),
+            ));
+        }
+        offset += written as usize;
+    }
+    Ok(())
+}
+
+/// Set `O_NONBLOCK` on `fd`.
+#[cfg(all(unix, not(target_os = "linux")))]
+fn set_nonblocking(fd: &OwnedFd) -> MicrosandboxResult<()> {
+    let flags = unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_GETFL) };
+    if flags < 0 {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    if unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0 {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    Ok(())
+}
+
+/// Write every byte of `bytes` on a nonblocking pipe write end without blocking
+/// the Tokio reactor, retrying on `EAGAIN`/`EINTR`.
+///
+/// Non-Linux unix only: its sole caller is the [`AfterSpawn::Pipe`] arm, which
+/// does not exist on Linux (the memfd path is written before spawn).
+#[cfg(all(unix, not(target_os = "linux")))]
+async fn write_all_nonblocking(write_fd: OwnedFd, bytes: &[u8]) -> MicrosandboxResult<()> {
+    use tokio::io::unix::AsyncFd;
+
+    let async_fd = AsyncFd::new(write_fd)?;
+    let mut offset = 0usize;
+    while offset < bytes.len() {
+        let mut guard = async_fd.writable().await?;
+        match guard.try_io(|inner| {
+            let written = unsafe {
+                libc::write(
+                    inner.as_raw_fd(),
+                    bytes[offset..].as_ptr() as *const libc::c_void,
+                    bytes.len() - offset,
+                )
+            };
+            if written < 0 {
+                Err(std::io::Error::last_os_error())
+            } else {
+                Ok(written as usize)
+            }
+        }) {
+            Ok(Ok(0)) => {
+                return Err(crate::MicrosandboxError::Runtime(
+                    "config fd write returned zero bytes".into(),
+                ));
+            }
+            Ok(Ok(written)) => offset += written,
+            Ok(Err(err)) if err.kind() == std::io::ErrorKind::Interrupted => continue,
+            Ok(Err(err)) => return Err(err.into()),
+            Err(_would_block) => continue,
+        }
+    }
+    // Dropping `async_fd` closes the write end, producing EOF for the child.
+    Ok(())
+}
+
+/// Complete the private config handoff and read the startup line under one
+/// bounded budget.
+///
+/// Returns the timeout error (rather than waiting forever) when a spawned child
+/// never drains the launch-config pipe or never reports startup.
+#[cfg(unix)]
+async fn finish_config_handoff_and_read_startup(
+    handoff: ConfigHandoff,
+    child: &mut tokio::process::Child,
+    startup_pipe: Option<Pipe>,
+    budget: std::time::Duration,
+) -> MicrosandboxResult<(String, Box<dyn AsyncBufRead + Send + Unpin>)> {
+    match tokio::time::timeout(budget, async {
+        handoff.finish().await?;
+        read_startup_line(child, startup_pipe).await
+    })
+    .await
+    {
+        Ok(result) => result,
+        Err(_) => Err(crate::MicrosandboxError::Runtime(
+            "sandbox startup timeout: the private config handoff or the startup JSON did not \
+             complete within the startup budget"
+                .into(),
+        )),
+    }
+}
+
+/// Read the child's startup line under a bounded budget (Windows has no
+/// config-handoff step, only the named startup file).
+#[cfg(windows)]
+async fn read_startup_line_bounded(
+    child: &mut tokio::process::Child,
+    startup_pipe: Option<StartupPipe>,
+    budget: std::time::Duration,
+) -> MicrosandboxResult<(String, Box<dyn AsyncBufRead + Send + Unpin>)> {
+    match tokio::time::timeout(budget, read_startup_line(child, startup_pipe)).await {
+        Ok(result) => result,
+        Err(_) => Err(crate::MicrosandboxError::Runtime(
+            "sandbox startup timeout: the startup JSON did not complete within the startup budget"
+                .into(),
+        )),
+    }
 }
 
 /// Write the negotiated launch JSON to a short-lived named file for Windows.
@@ -1555,18 +1861,6 @@ fn set_cloexec(fd: &OwnedFd, enabled: bool) -> MicrosandboxResult<()> {
     }
 
     Ok(())
-}
-
-fn release_metrics_reservation(config: &SandboxConfig, reservation: Option<&MetricsReservation>) {
-    let Some(reservation) = reservation else {
-        return;
-    };
-    if let Err(err) = reservation
-        .registry
-        .release_reserved(reservation.slot, reservation.generation)
-    {
-        tracing::debug!(error = %err, sandbox = %config.spec.name, "release: metrics slot release failed");
-    }
 }
 
 #[cfg(unix)]
@@ -6775,5 +7069,457 @@ mod tests {
                 (Some(1024 * 1024 * 1024), Some(512 * 1024 * 1024))
             );
         }
+    }
+
+    /// Operator-visible argv carries only labels and FD numbers: a
+    /// credential-bearing config must not put a reference or (via the launch
+    /// wire) a resolved value on the process argv.
+    ///
+    /// Mutation note: pushing the durable reference (or a resolved value) into
+    /// the `visible` argv vector makes this test fail.
+    #[cfg(feature = "net")]
+    #[tokio::test]
+    async fn test_sandbox_cli_args_never_carry_a_credential_value() {
+        use microsandbox_network::config::NetworkBuilder;
+
+        let network = NetworkBuilder::new()
+            .header_credential(|credential| {
+                credential
+                    .id("example")
+                    .reference("example-api-key")
+                    .origin("api.example.com", 443)
+                    .header("x-api-key")
+                    .format("%s")
+            })
+            .build()
+            .unwrap();
+
+        let mut config = SandboxBuilder::new("argv-credentials")
+            .image("/tmp/rootfs")
+            .build()
+            .await
+            .unwrap();
+        config.set_local_network_config(network).unwrap();
+
+        let local = test_local_backend();
+        let (visible, launch) = machine_cli_args(
+            &local,
+            &config,
+            42,
+            test_network_slot(),
+            test_resolved_network(&config),
+            Path::new("/tmp/msb.db"),
+            30,
+            Path::new("/tmp/logs"),
+            Path::new("/tmp/runtime"),
+            Path::new("/tmp/agent.sock"),
+            Path::new("/tmp/libkrunfw.dylib"),
+            &HashMap::new(),
+            &HashMap::new(),
+            None,
+            None,
+            None,
+            None,
+        );
+
+        let rendered: Vec<String> = visible
+            .iter()
+            .map(|argument| argument.to_string_lossy().into_owned())
+            .collect();
+        for argument in &rendered {
+            assert!(
+                !argument.contains("example-api-key"),
+                "the durable reference must not be on argv: {argument}"
+            );
+            assert!(
+                !argument.contains("sk-live"),
+                "no credential value may be on argv: {argument}"
+            );
+        }
+        // The private channel is named by FD number on argv (pushed in
+        // `spawn_sandbox` once the handoff exists); nothing credential-shaped is.
+        assert!(
+            !rendered
+                .iter()
+                .any(|argument| argument.contains("api.example.com")),
+            "the credential origin must not be on argv: {rendered:?}"
+        );
+        // The launch wire carries the durable reference for the child, and never
+        // a value (values are assigned in `spawn_sandbox` after resolution).
+        let wire = serde_json::to_string(&launch.network).unwrap();
+        assert!(wire.contains("example-api-key"), "{wire}");
+        assert!(launch.resolved_header_credentials.is_empty());
+    }
+}
+//--------------------------------------------------------------------------------------------------
+// Tests: Private config handoff
+//--------------------------------------------------------------------------------------------------
+
+#[cfg(all(test, unix))]
+mod config_handoff_tests {
+    // Only the non-Linux pipe tests read the child's copy of the payload back.
+    #[cfg(not(target_os = "linux"))]
+    use std::io::Read;
+
+    use super::*;
+
+    #[cfg(not(target_os = "linux"))]
+    #[tokio::test]
+    async fn config_handoff_pipe_is_anon_fifo_and_delivers_all_bytes() {
+        // Make the payload comfortably larger than a typical 64 KiB pipe buffer
+        // so the post-spawn write loop must wait for the reader to drain it.
+        let launch = LaunchConfig {
+            exec_args: (0..40_000).map(|i| format!("arg-{i:08}")).collect(),
+            ..Default::default()
+        };
+        let expected = serde_json::to_vec(&launch).unwrap();
+
+        let handoff = create_config_handoff(&expected).unwrap();
+        let read_fd = handoff.child_fd().as_raw_fd();
+
+        // The object is an anonymous pipe (unlinked FIFO), not a filesystem file.
+        let mut stat: libc::stat = unsafe { std::mem::zeroed() };
+        assert_eq!(unsafe { libc::fstat(read_fd, &mut stat) }, 0);
+        assert_eq!(stat.st_mode & libc::S_IFMT, libc::S_IFIFO);
+
+        let reader_fd = unsafe { libc::dup(read_fd) };
+        assert!(reader_fd >= 0);
+        let reader = tokio::task::spawn_blocking(move || {
+            let mut file = unsafe { std::fs::File::from_raw_fd(reader_fd) };
+            let mut buf = Vec::new();
+            file.read_to_end(&mut buf).unwrap();
+            buf
+        });
+
+        handoff.finish().await.unwrap();
+
+        let bytes = reader.await.unwrap();
+        assert_eq!(bytes, expected);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn config_handoff_memfd_is_memory_backed() {
+        let launch = LaunchConfig::default();
+        let bytes = serde_json::to_vec(&launch).unwrap();
+        let handoff = create_config_handoff(&bytes).unwrap();
+        let fd = handoff.child_fd().as_raw_fd();
+
+        let mut stat: libc::stat = unsafe { std::mem::zeroed() };
+        assert_eq!(unsafe { libc::fstat(fd, &mut stat) }, 0);
+        assert_eq!(stat.st_mode & libc::S_IFMT, libc::S_IFREG);
+
+        handoff.finish().await.unwrap();
+    }
+
+    /// The inherited config source can land on any reserved FD (96-99) in a
+    /// busy launcher. Relocation must happen before the sibling mappings
+    /// `dup2` onto those numbers, the parent's writer must be CLOEXEC so an
+    /// exec'd child never retains a write end, and closing the parent writer
+    /// must produce EOF for the child's read-to-end.
+    ///
+    /// Mutation note: removing the `move_reserved_source_fd` call lets
+    /// `dup2(/dev/null, 97..99)` clobber the source, so the mapped config is
+    /// empty or the write fails. The test then fails within its 20s bound
+    /// (observed: a bounded failure, never a hang); leaving the writer without
+    /// CLOEXEC would instead make the child's read never see EOF.
+    #[cfg(not(target_os = "linux"))]
+    #[tokio::test]
+    async fn config_handoff_survives_forced_reserved_fd_collisions() {
+        use std::process::Stdio;
+
+        use tokio::io::AsyncReadExt;
+
+        for forced in [
+            microsandbox_runtime::vm::CONFIG_FD,
+            microsandbox_runtime::vm::PARENT_WATCH_FD,
+            microsandbox_runtime::vm::STARTUP_FD,
+            microsandbox_runtime::vm::LIFECYCLE_LOCK_FD,
+        ] {
+            let launch = LaunchConfig {
+                exec_args: (0..40_000).map(|i| format!("arg-{i:08}")).collect(),
+                ..Default::default()
+            };
+            let expected = serde_json::to_vec(&launch).unwrap();
+
+            let handoff = create_config_handoff(&expected).unwrap();
+            let source_fd = handoff.child_fd().as_raw_fd();
+            let ConfigHandoff {
+                read_fd,
+                after_spawn,
+            } = handoff;
+            let AfterSpawn::Pipe { write_fd, bytes } = after_spawn else {
+                panic!("this assertion requires the pipe handoff");
+            };
+            let writer_flags = unsafe { libc::fcntl(write_fd.as_raw_fd(), libc::F_GETFD) };
+            assert!(
+                writer_flags >= 0 && writer_flags & libc::FD_CLOEXEC != 0,
+                "the parent config writer must be CLOEXEC"
+            );
+
+            let mut cmd = tokio::process::Command::new("/bin/cat");
+            cmd.stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::null());
+            // SAFETY: the closure only performs `dup2`/`fcntl`/`close`/`open`
+            // syscalls, which are async-signal-safe.
+            unsafe {
+                cmd.pre_exec(move || {
+                    // Force the inherited source onto the reserved FD under test,
+                    // reproducing a launcher whose own descriptors collided.
+                    if libc::dup2(source_fd, forced) < 0 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                    if source_fd != forced && libc::close(source_fd) < 0 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+
+                    let mut config_mapping =
+                        InheritedFdMapping::new(forced, microsandbox_runtime::vm::CONFIG_FD);
+                    let mut next_spare_fd = microsandbox_runtime::vm::LIFECYCLE_LOCK_FD + 1;
+                    move_reserved_source_fd(&mut config_mapping, &mut next_spare_fd)?;
+
+                    // Stand in for the sibling mapped descriptors landing on the
+                    // other reserved numbers.
+                    let devnull = libc::open(c"/dev/null".as_ptr(), libc::O_RDONLY);
+                    if devnull < 0 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                    for dst in [
+                        microsandbox_runtime::vm::PARENT_WATCH_FD,
+                        microsandbox_runtime::vm::STARTUP_FD,
+                        microsandbox_runtime::vm::LIFECYCLE_LOCK_FD,
+                    ] {
+                        if libc::dup2(devnull, dst) < 0 {
+                            return Err(std::io::Error::last_os_error());
+                        }
+                    }
+
+                    dup_inherited_fd(config_mapping.src, config_mapping.dst)?;
+                    // `/bin/cat` reads stdin, so put the mapped config there.
+                    if libc::dup2(microsandbox_runtime::vm::CONFIG_FD, 0) < 0 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                    Ok(())
+                });
+            }
+
+            let mut child = cmd.spawn().expect("spawn /bin/cat");
+            let mut stdout = child.stdout.take().expect("piped stdout");
+
+            // Drain the child's stdout *while* the handoff is written: the child
+            // copies stdin to stdout, so a payload larger than either pipe
+            // buffer only makes progress when both directions move. Waiting for
+            // the write before reading the child's output deadlocks.
+            let reader = async move {
+                let mut out = Vec::new();
+                stdout.read_to_end(&mut out).await.map(|_| out)
+            };
+            let writer = async move {
+                ConfigHandoff {
+                    read_fd,
+                    after_spawn: AfterSpawn::Pipe { write_fd, bytes },
+                }
+                .finish()
+                .await
+            };
+            let (write_result, read_result) =
+                tokio::time::timeout(std::time::Duration::from_secs(20), async {
+                    tokio::join!(writer, reader)
+                })
+                .await
+                .expect(
+                    "the config handoff must make progress: a stalled child or a lost EOF \
+                     must fail here instead of hanging",
+                );
+
+            write_result.unwrap();
+            let out = read_result.unwrap();
+            assert_eq!(
+                out, expected,
+                "forced reserved fd {forced} lost the handoff payload"
+            );
+            let _ = child.wait().await;
+        }
+    }
+
+    /// A child that never drains the launch-config pipe must time out rather
+    /// than wait forever.
+    ///
+    /// Mutation note: dropping the `tokio::time::timeout` wrapper in
+    /// `finish_config_handoff_and_read_startup` makes this test hang instead of
+    /// reporting the bounded timeout.
+    #[cfg(not(target_os = "linux"))]
+    #[tokio::test]
+    async fn config_handoff_is_bounded_when_the_child_never_drains() {
+        let launch = LaunchConfig {
+            exec_args: (0..40_000).map(|i| format!("arg-{i:08}")).collect(),
+            ..Default::default()
+        };
+        let bytes = serde_json::to_vec(&launch).unwrap();
+        let handoff = create_config_handoff(&bytes).unwrap();
+
+        // The pipe hold-back is the parent's own unread read end for this child
+        // (never mapped), plus a payload larger than the pipe buffer.
+        let mut child = tokio::process::Command::new("/bin/sleep")
+            .arg("60")
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn /bin/sleep");
+        let result = finish_config_handoff_and_read_startup(
+            handoff,
+            &mut child,
+            None,
+            std::time::Duration::from_millis(150),
+        )
+        .await;
+
+        match result {
+            Err(crate::MicrosandboxError::Runtime(message)) => {
+                assert!(message.contains("startup timeout"), "got: {message}");
+            }
+            Ok(_) => panic!("expected a bounded startup timeout"),
+            Err(other) => panic!("expected a bounded startup timeout, got {other}"),
+        }
+
+        let _ = child.start_kill();
+        // `wait` reaps it; a successful wait is the evidence that the timed-out
+        // child did not survive the bound.
+        let _ = child.wait().await;
+    }
+}
+
+//--------------------------------------------------------------------------------------------------
+// Tests: Pre-spawn metrics reservation ownership
+//--------------------------------------------------------------------------------------------------
+
+#[cfg(all(test, unix))]
+mod metrics_guard_tests {
+    use super::*;
+    use crate::sandbox::SandboxBuilder;
+
+    /// A temp dir rooted in `/tmp` so the derived sandbox agent socket path
+    /// stays under the platform's `sockaddr_un` limit.
+    fn short_tempdir() -> tempfile::TempDir {
+        tempfile::Builder::new()
+            .prefix("msblc")
+            .tempdir_in("/tmp")
+            .unwrap_or_else(|_| tempfile::tempdir().unwrap())
+    }
+
+    async fn backend_and_config(temp: &Path) -> (LocalBackend, SandboxConfig) {
+        let local = LocalBackend::builder()
+            .home(temp.join("home"))
+            .build()
+            .await
+            .unwrap();
+        let mut config = SandboxBuilder::new("metrics-guard")
+            .image("/tmp/rootfs")
+            .build()
+            .await
+            .unwrap();
+        // A reservation only exists when sampling is enabled.
+        config.spec.runtime.metrics_sample_interval_ms = Some(1_000);
+        (local, config)
+    }
+
+    /// Open the same registry the launch used and reserve one slot. On a fresh
+    /// registry the launch's reservation is the lowest slot, so its release is
+    /// observable as slot 0 being the first free slot again.
+    fn metrics_slot_was_released(local: &LocalBackend) -> bool {
+        let registry = MetricsRegistry::open(&local.config().metrics_registry_shm_name())
+            .expect("metrics registry must exist after a reservation");
+        match registry.reserve(ReserveSlot {
+            sandbox_id: 90_001,
+            name: "slot-probe",
+            memory_limit_bytes: 1024 * 1024,
+        }) {
+            Ok(reservation) => {
+                let _ = registry.release_reserved(reservation.slot, reservation.generation);
+                reservation.slot == 0
+            }
+            Err(_) => false,
+        }
+    }
+
+    /// The pre-spawn guard must return the slot on *every* exit path, including
+    /// dropping the `spawn_sandbox` future before the child exists — the window
+    /// upstream's `StartupProcess` cannot cover, because it is created only after
+    /// `Command::spawn`.
+    ///
+    /// Mutation note: deleting `MetricsReservationGuard`'s `Drop` impl (leaving
+    /// only the explicit `release_metrics_reservation` calls upstream relies on)
+    /// leaves slot 0 reserved and fails this test.
+    #[tokio::test]
+    async fn dropping_the_metrics_guard_releases_the_reserved_slot() {
+        let temp = short_tempdir();
+        let (local, config) = backend_and_config(temp.path()).await;
+        let reservation = reserve_metrics_slot(&local, &config, 7);
+        assert!(reservation.is_some(), "sampling must reserve a slot");
+
+        let guard = MetricsReservationGuard::new(config.spec.name.clone(), reservation);
+        assert!(guard.reservation().is_some());
+        assert!(
+            !metrics_slot_was_released(&local),
+            "a live guard must still own its slot"
+        );
+
+        drop(guard);
+        assert!(
+            metrics_slot_was_released(&local),
+            "dropping the guard must release the reserved slot"
+        );
+    }
+
+    /// The success path transfers the slot to the child owner exactly once, so
+    /// dropping the (disarmed) guard must not release a slot the live sandbox
+    /// still holds.
+    #[tokio::test]
+    async fn disarming_the_metrics_guard_transfers_the_reservation() {
+        let temp = short_tempdir();
+        let (local, config) = backend_and_config(temp.path()).await;
+        let reservation = reserve_metrics_slot(&local, &config, 8);
+        let guard = MetricsReservationGuard::new(config.spec.name.clone(), reservation);
+
+        let transfer = guard.disarm();
+        assert!(
+            !metrics_slot_was_released(&local),
+            "a disarmed guard must not release the slot it gave up"
+        );
+
+        // The transfer is now the caller's, exactly like a `ProcessHandle`'s.
+        let reservation = transfer.expect("disarm must hand the reservation over");
+        reservation
+            .registry
+            .release_reserved(reservation.slot, reservation.generation)
+            .expect("the transferred slot is still reserved");
+        assert!(metrics_slot_was_released(&local));
+    }
+
+    /// A launch with sampling disabled reserves nothing, so the guard must be a
+    /// no-op rather than creating a shared-memory registry.
+    #[tokio::test]
+    async fn a_disabled_sampler_reserves_nothing() {
+        let temp = short_tempdir();
+        let (local, config) = backend_and_config(temp.path()).await;
+        let mut config = config;
+        config.spec.runtime.disable_metrics_sample = true;
+        assert!(config.effective_metrics_interval().is_none());
+        // Mirrors `spawn_sandbox`'s gate: the effective interval decides whether
+        // a slot is asked for at all.
+        let reservation = if config.effective_metrics_interval().is_some() {
+            reserve_metrics_slot(&local, &config, 9)
+        } else {
+            None
+        };
+        assert!(reservation.is_none());
+
+        let guard = MetricsReservationGuard::new(config.spec.name.clone(), reservation);
+        assert!(guard.reservation().is_none());
+        drop(guard);
+        // Nothing was created, so opening the registry must still fail.
+        assert!(MetricsRegistry::open(&local.config().metrics_registry_shm_name()).is_err());
     }
 }

@@ -136,7 +136,7 @@ async fn assert_rejection_preserves_target(
         archive.to_string_lossy(),
     ));
     let error = match backend
-        .create_sandbox(backend.clone(), config, SpawnMode::Attached, None)
+        .create_sandbox(backend.clone(), config, SpawnMode::Attached, None, None)
         .await
     {
         Ok(_) => panic!("unsupported archive must not launch"),

@@ -17,6 +17,7 @@ mod compact;
 pub(crate) mod config;
 #[cfg(any(windows, test))]
 mod control_pipe;
+pub mod credential;
 pub mod exec;
 #[cfg(feature = "local")]
 pub(crate) mod flat_rootfs;
@@ -132,6 +133,7 @@ pub(crate) use types::validate_volume_mounts;
 // Re-Exports
 //--------------------------------------------------------------------------------------------------
 
+pub use self::credential::{CredentialResolveError, CredentialResolver};
 pub use crate::logs::{LogEntry, LogOptions, LogSource, LogStreamOptions};
 pub use attach::AttachOptionsBuilder;
 pub use branch::{BranchBuilder, BranchManyBuilder, BranchOutcome};
@@ -174,8 +176,9 @@ pub use microsandbox_types::SandboxLogLevel as LogLevel;
 pub use microsandbox_types::{CpuPlacement, PullPolicy};
 #[cfg(feature = "net")]
 pub use microsandbox_types::{
-    DnsConfigPatch, HostPattern, InterfaceOverridesPatch, NetworkRateLimiterConfigPatch,
-    SecretSubstitution, SecretViolationAction, SecretsConfigPatch, TlsConfigPatch,
+    DnsConfigPatch, HostPattern, InterceptConfigPatch, InterfaceOverridesPatch,
+    NetworkRateLimiterConfigPatch, SecretSubstitution, SecretViolationAction, SecretsConfigPatch,
+    TlsConfigPatch,
 };
 pub use microsandbox_types::{
     EnvVar, MAX_HOSTNAME_BYTES, MAX_SANDBOX_NAME_BYTES, NetworkSpec, NetworkSpecPatch,
@@ -367,7 +370,7 @@ impl Sandbox {
         PullProgressHandle,
         tokio::task::JoinHandle<MicrosandboxResult<Self>>,
     ) {
-        Self::create_with_pull_progress_and_mode(config, SpawnMode::Attached)
+        Self::create_with_pull_progress_and_mode(config, SpawnMode::Attached, None)
     }
 
     /// Create a detached sandbox with pull progress reporting.
@@ -381,13 +384,50 @@ impl Sandbox {
         PullProgressHandle,
         tokio::task::JoinHandle<MicrosandboxResult<Self>>,
     ) {
-        Self::create_with_pull_progress_and_mode(config, SpawnMode::Detached)
+        Self::create_with_pull_progress_and_mode(config, SpawnMode::Detached, None)
+    }
+
+    /// Create a sandbox with a per-launch [`CredentialResolver`] and pull
+    /// progress reporting.
+    ///
+    /// The resolver is called in this process, before `fork`, for every
+    /// origin-scoped header credential the config references. The resolved
+    /// values travel only on the private launch-config fd; they never enter the
+    /// durable config, the database, argv, or a log line. **Local backend
+    /// only** — a credential-bearing config is rejected on a cloud backend
+    /// rather than silently dropped.
+    #[cfg(feature = "local")]
+    pub fn create_with_pull_progress_and_resolver(
+        config: SandboxConfig,
+        resolver: std::sync::Arc<dyn CredentialResolver>,
+    ) -> (
+        PullProgressHandle,
+        tokio::task::JoinHandle<MicrosandboxResult<Self>>,
+    ) {
+        Self::create_with_pull_progress_and_mode(config, SpawnMode::Attached, Some(resolver))
+    }
+
+    /// Create a detached sandbox with a per-launch [`CredentialResolver`] and
+    /// pull progress reporting.
+    ///
+    /// Like [`Self::create_with_pull_progress_and_resolver`] but spawns the
+    /// sandbox process in detached mode.
+    #[cfg(feature = "local")]
+    pub fn create_detached_with_pull_progress_and_resolver(
+        config: SandboxConfig,
+        resolver: std::sync::Arc<dyn CredentialResolver>,
+    ) -> (
+        PullProgressHandle,
+        tokio::task::JoinHandle<MicrosandboxResult<Self>>,
+    ) {
+        Self::create_with_pull_progress_and_mode(config, SpawnMode::Detached, Some(resolver))
     }
 
     #[cfg(feature = "local")]
     fn create_with_pull_progress_and_mode(
         config: SandboxConfig,
         requested_mode: SpawnMode,
+        resolver: Option<std::sync::Arc<dyn CredentialResolver>>,
     ) -> (
         PullProgressHandle,
         tokio::task::JoinHandle<MicrosandboxResult<Self>>,
@@ -404,11 +444,18 @@ impl Sandbox {
                         crate::MicrosandboxError::local_only(Operation::SandboxCreate)
                     })?;
                     local
-                        .create_sandbox(backend.clone(), config, mode, Some(sender))
+                        .create_sandbox(backend.clone(), config, mode, Some(sender), resolver)
                         .await
                 }
                 crate::backend::BackendKind::Cloud => {
                     drop(sender); // close the channel — no per-layer events for cloud.
+                    #[cfg(feature = "net")]
+                    if resolver.is_some() || crate::sandbox::config::has_header_credentials(&config)
+                    {
+                        return Err(crate::MicrosandboxError::HeaderCredential(
+                            crate::HeaderCredentialError::UnsupportedBackend,
+                        ));
+                    }
                     backend
                         .sandboxes()
                         .create(backend.clone(), config, true)
@@ -872,6 +919,53 @@ impl Sandbox {
         {
             false
         }
+    }
+
+    /// Subscribe to the runtime's published-port event stream.
+    ///
+    /// Yields each [`microsandbox_protocol::network::PortEvent`] emitted by the
+    /// runtime — today the auto-publish task pushes `Added` / `Removed` events
+    /// as guest LISTEN sockets appear and disappear. The receiver gets `None`
+    /// when the relay connection drops (sandbox stopped).
+    ///
+    /// **Local-only**: panics if called on a cloud sandbox (mirrors
+    /// [`client`](Self::client)). The cloud worker owns the in-VM bridge, so
+    /// there is no local [`AgentClient`] to subscribe on.
+    ///
+    /// **One subscriber per [`AgentClient`] instance.** The runtime broadcasts
+    /// on a single reserved correlation ID, so a second call panics rather than
+    /// silently stealing the first subscriber's events; drop the previous
+    /// receiver before subscribing again. For multi-consumer fan-out, wrap the
+    /// returned stream in a `broadcast::channel` at the call site.
+    #[cfg(feature = "net")]
+    pub async fn port_events(
+        &self,
+    ) -> tokio::sync::mpsc::UnboundedReceiver<microsandbox_protocol::network::PortEvent> {
+        let id = microsandbox_protocol::network::PORT_EVENT_BROADCAST_ID;
+        let mut raw = self
+            .client()
+            .subscribe(id)
+            .await
+            .expect("only one port-event subscription per AgentClient is supported");
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        tokio::spawn(async move {
+            while let Some(msg) = raw.recv().await {
+                if msg.t != MessageType::PortEvent {
+                    continue;
+                }
+                match msg.payload::<microsandbox_protocol::network::PortEvent>() {
+                    Ok(event) => {
+                        if tx.send(event).is_err() {
+                            break;
+                        }
+                    }
+                    Err(error) => {
+                        tracing::debug!(?error, "port_events: failed to decode PortEvent payload");
+                    }
+                }
+            }
+        });
+        rx
     }
 
     /// Read, write, and manage files inside the running sandbox.

@@ -34,6 +34,7 @@ fn error_type_str(err: &MicrosandboxError) -> &'static str {
         MicrosandboxError::RuntimeIncomplete(_) => "RuntimeIncomplete",
         MicrosandboxError::Database(_) => "Database",
         MicrosandboxError::InvalidConfig(_) => "InvalidConfig",
+        MicrosandboxError::HeaderCredential(_) => "HeaderCredential",
         MicrosandboxError::NoDefaultCommand => "NoDefaultCommand",
         MicrosandboxError::SandboxNotFound(_) => "SandboxNotFound",
         MicrosandboxError::SandboxAlreadyExists(_) => "SandboxAlreadyExists",

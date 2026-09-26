@@ -330,6 +330,7 @@ mod tests {
                 fixture.config.clone(),
                 crate::runtime::SpawnMode::Detached,
                 None,
+                None,
             )
             .await
             .err()

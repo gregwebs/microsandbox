@@ -185,6 +185,16 @@ impl LocalBackend {
         }
 
         let mut config: SandboxConfig = serde_json::from_str::<SandboxConfig>(&model.config)?;
+        // A reference-backed header credential cannot be resolved without a
+        // per-launch resolver, and `start(name)` has nowhere to receive one.
+        // Refuse before the status transition or any child process so the
+        // stopped/crashed record is left unchanged for an explicit recreate.
+        #[cfg(feature = "net")]
+        if crate::sandbox::config::has_header_credentials(&config) {
+            return Err(crate::MicrosandboxError::HeaderCredential(
+                crate::HeaderCredentialError::RestartRequiresResolver,
+            ));
+        }
         // Also cover starts after crashes or a stop performed by an older SDK. Lifecycle
         // ownership alone can become available during Linux's deferred disk/KVM teardown.
         // Observe only this sandbox's owned markers; actual shared-disk conflicts still fail
@@ -239,7 +249,7 @@ impl LocalBackend {
         let lifecycle_guard = None;
 
         match self
-            .create_sandbox_inner(config, model.id, mode, lifecycle_guard)
+            .create_sandbox_inner(config, model.id, mode, lifecycle_guard, None)
             .await
         {
             Ok((local_state, returned_config)) => {
@@ -1199,7 +1209,7 @@ impl SandboxBackend for LocalBackend {
         Box::pin(async move {
             // Local backend always boots immediately — `start` only differs
             // for cloud where create-without-start is a distinct state.
-            self.create_sandbox(backend, config, SpawnMode::Attached, None)
+            self.create_sandbox(backend, config, SpawnMode::Attached, None, None)
                 .await
         })
     }
@@ -1210,7 +1220,7 @@ impl SandboxBackend for LocalBackend {
         config: SandboxConfig,
     ) -> BoxFuture<'a, MicrosandboxResult<Sandbox>> {
         Box::pin(async move {
-            self.create_sandbox(backend, config, SpawnMode::Detached, None)
+            self.create_sandbox(backend, config, SpawnMode::Detached, None, None)
                 .await
         })
     }

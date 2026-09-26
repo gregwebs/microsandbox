@@ -3955,6 +3955,58 @@ mod tests {
         assert!(serde_json::from_value::<DurableHeaderCredential>(json).is_err());
     }
 
+    /// The checked-in accept/reject corpus, consumed verbatim.
+    ///
+    /// The hand-written cases above pin individual rules; this pins the whole
+    /// grammar against a corpus an embedding application can read and reuse, so
+    /// the two grammars cannot drift apart silently.
+    #[test]
+    fn header_credential_grammar_fixture() {
+        let raw = include_str!("fixtures/header_credential_grammar.json");
+        let fixture: serde_json::Value = serde_json::from_str(raw).unwrap();
+
+        for entry in fixture["accept"].as_array().unwrap() {
+            let credential: DurableHeaderCredential = serde_json::from_value(entry.clone())
+                .unwrap_or_else(|e| panic!("accept entry failed to parse: {e}"));
+            assert!(
+                SecretsConfig {
+                    header_credentials: vec![credential],
+                    ..Default::default()
+                }
+                .validate()
+                .is_ok(),
+                "expected accept entry to validate: {entry}"
+            );
+        }
+
+        for entry in fixture["reject"].as_array().unwrap() {
+            let text = entry.to_string();
+            let mut entry = entry.clone();
+            if let Some(object) = entry.as_object_mut() {
+                object.remove("_why");
+            }
+            let credential: DurableHeaderCredential = serde_json::from_value(entry)
+                .unwrap_or_else(|e| panic!("reject entry failed to parse: {e}"));
+            assert!(
+                SecretsConfig {
+                    header_credentials: vec![credential],
+                    ..Default::default()
+                }
+                .validate()
+                .is_err(),
+                "expected reject entry to fail validation: {text}"
+            );
+        }
+
+        for raw_entry in fixture["serde_reject"].as_array().unwrap() {
+            let text = raw_entry.as_str().unwrap();
+            assert!(
+                serde_json::from_str::<DurableHeaderCredential>(text).is_err(),
+                "expected serde to reject: {text}"
+            );
+        }
+    }
+
     #[test]
     fn empty_header_credentials_keep_legacy_serialized_shape() {
         let value = serde_json::to_value(SecretsConfig::default()).unwrap();
