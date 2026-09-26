@@ -38,6 +38,9 @@ use microsandbox_protocol::exec::{
 use microsandbox_protocol::fs::{FS_CHUNK_SIZE, FsData, FsRequest, FsResponse};
 use microsandbox_protocol::heartbeat::{ActivityCounters, Heartbeat};
 use microsandbox_protocol::message::{FRAME_HEADER_SIZE, Message, MessageType};
+use microsandbox_protocol::network::{
+    LoopbackForwardCancelReq, LoopbackForwardReq, LoopbackForwardResp,
+};
 use microsandbox_protocol::tcp::{TcpClose, TcpConnect, TcpData, TcpEof, TcpFailed};
 use microsandbox_protocol::transport::{
     BULK_BINDING_SIZE, BulkTransportReady, CLIENT_INCARNATION_SIZE, ClientIncarnation,
@@ -52,6 +55,7 @@ use microsandbox_protocol::transport::{
 use crate::config::{AgentdConfig, scripts_path};
 use crate::error::{AgentdError, AgentdResult};
 use crate::fs::{FsReadSession, FsState, FsStreamSession, FsWriteSession};
+use crate::loopback::ForwarderRegistry;
 use crate::process::ProcessManager;
 use crate::serial::{AGENT_BULK_PORT_NAME, AGENT_PORT_NAME, InputCharge, InputLane, InputWindow};
 use crate::session::{
@@ -164,6 +168,10 @@ struct AgentState {
     bulk_received_offsets: HashMap<u32, u64>,
     pending_bulk_finishes: HashMap<u32, BulkFinish>,
     fs: FsState,
+    /// Active loopback forwarders (eth0_ip:port → 127.0.0.1:port). One per
+    /// published port; idempotent re-spawn and cancel are driven by the host
+    /// runtime via `LoopbackForward*` messages.
+    forwarders: ForwarderRegistry,
 }
 
 /// Bounded command path for one filesystem bulk write, isolated from the control loop.
@@ -293,6 +301,7 @@ impl Default for AgentState {
             bulk_received_offsets: HashMap::new(),
             pending_bulk_finishes: HashMap::new(),
             fs: FsState::default(),
+            forwarders: ForwarderRegistry::new(),
         }
     }
 }
@@ -3115,6 +3124,38 @@ async fn handle_message_with_charge(
             }
         }
 
+        MessageType::LoopbackForward => {
+            let Some(req) = decode_payload_or_core_error::<LoopbackForwardReq>(&msg, out_buf)?
+            else {
+                return Ok(());
+            };
+            let resp = match state
+                .forwarders
+                .spawn(req.bind_addr, req.port, req.loopback_target)
+                .await
+            {
+                Ok(()) => LoopbackForwardResp {
+                    ok: true,
+                    error: None,
+                },
+                Err(e) => LoopbackForwardResp {
+                    ok: false,
+                    error: Some(e),
+                },
+            };
+            write_loopback_resp(out_buf, msg.id, resp.ok, resp.error)?;
+        }
+
+        MessageType::LoopbackForwardCancel => {
+            let Some(req) =
+                decode_payload_or_core_error::<LoopbackForwardCancelReq>(&msg, out_buf)?
+            else {
+                return Ok(());
+            };
+            state.forwarders.cancel(req.port);
+            write_loopback_resp(out_buf, msg.id, true, None)?;
+        }
+
         MessageType::Shutdown => {
             // Graceful shutdown — signal all sessions, then ask the guest
             // kernel to power off so block-root filesystems can shut down
@@ -3517,6 +3558,23 @@ fn encode_tcp_failed(id: u32, error: String, out_buf: &mut Vec<u8>) -> AgentdRes
         .map_err(|e| AgentdError::ExecSession(format!("encode tcp failed: {e}")))?;
     codec::encode_to_buf(&reply, out_buf)
         .map_err(|e| AgentdError::ExecSession(format!("encode tcp failed frame: {e}")))?;
+    Ok(())
+}
+
+/// Encode a [`LoopbackForwardResp`] frame onto `out_buf` for the given
+/// correlation id. Both the `LoopbackForward` and `LoopbackForwardCancel` arms
+/// reply with the same terminal payload shape.
+fn write_loopback_resp(
+    out_buf: &mut Vec<u8>,
+    id: u32,
+    ok: bool,
+    error: Option<String>,
+) -> AgentdResult<()> {
+    let payload = LoopbackForwardResp { ok, error };
+    let msg = Message::with_payload(MessageType::LoopbackForwardResp, id, &payload)
+        .map_err(|e| AgentdError::ExecSession(format!("encode loopback resp: {e}")))?;
+    codec::encode_to_buf(&msg, out_buf)
+        .map_err(|e| AgentdError::ExecSession(format!("encode loopback resp frame: {e}")))?;
     Ok(())
 }
 
