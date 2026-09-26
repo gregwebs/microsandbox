@@ -49,7 +49,7 @@ There are two related values to preserve:
 | Known-operation availability gate | Minimum of host generation and ready-frame generation | Minimum of generation 1 and ready-frame generation |
 | Generation emitted in native/encoded envelopes | Host's existing `PROTOCOL_VERSION` | Generation 1 |
 
-The current path historically emits the host generation even when its availability gate is lower. The extraction preserves that behavior. Do not rewrite every outgoing agent `v` to the negotiated minimum under the assumption that this would be a neutral cleanup. The Rust agent constant remains 9 and the standalone TypeScript client retains its existing generation 5; adding framed host control does not bump either value or imply that both client packages expose every agent operation.
+The current path historically emits the host generation even when its availability gate is lower. The extraction preserves that behavior. Do not rewrite every outgoing agent `v` to the negotiated minimum under the assumption that this would be a neutral cleanup. The Rust agent constant remains 10 and the standalone TypeScript client retains its existing generation 5; adding framed host control does not bump either value or imply that both client packages expose every agent operation.
 
 Known message types have an introduction generation in `MessageType::min_protocol_version()`. `AgentProtocol::prepare` checks availability before admitting native or encoded sends. An unsupported known operation returns the shared client's unsupported-operation category without sending it or closing unrelated streams. Dynamic names and raw bytes remain available to callers who deliberately own their protocol interpretation.
 
@@ -139,6 +139,8 @@ The stable wire header and ordinary control body are:
 body = CBOR { v, t, p }            <- ordinary control envelope
               p = CBOR { ... }     <- payload for that message type
 ```
+
+Generation 10 adds host-side published-port events and in-guest loopback forwarding: `core.port.event` broadcasts a published-port mapping being added or removed on the reserved [`PORT_EVENT_BROADCAST_ID`](lib/network.rs) correlation ID, while `core.loopback.forward`, `core.loopback.forward.cancel`, and their terminal `core.loopback.forward.resp` reply let the host ask agentd to bridge a guest loopback listener onto the guest's NIC address. A host connected to a generation-9 or older runtime never sends them; the capability gate rejects those operations before sending. These types were developed on a fork that also assigned them generation 8; that assignment is discarded and the released generation-8 bulk contract is unchanged.
 
 Generation 9 adds attempt-scoped workload freeze/thaw for full checkpoint capture and activation. Hosts reject those operations against generation-8 agents before sending. Generation 8's released bulk-transfer contract remains unchanged; the discarded, unreleased freeze/thaw assignment to generation 8 has no compatibility shim.
 

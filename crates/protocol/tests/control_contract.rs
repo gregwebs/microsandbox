@@ -313,7 +313,7 @@ fn neutral_envelope_preserves_existing_agent_encoding() {
     assert_eq!(agent_bytes, neutral_bytes);
     assert_eq!(
         message::PROTOCOL_VERSION,
-        9,
+        10,
         "control must not bump the agent generation"
     );
 }

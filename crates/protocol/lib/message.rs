@@ -9,7 +9,7 @@ use crate::error::ProtocolResult;
 //--------------------------------------------------------------------------------------------------
 
 /// Current protocol version.
-pub const PROTOCOL_VERSION: u8 = 9;
+pub const PROTOCOL_VERSION: u8 = 10;
 
 /// Frame flag: this is the last message for the given correlation ID.
 ///
@@ -278,6 +278,34 @@ pub enum MessageType {
     /// Host supplies one-shot guest bootstrap configuration.
     #[strum(serialize = "core.bootstrap")]
     Bootstrap,
+
+    /// Host-side broadcast: a published-port mapping was added or
+    /// removed. Emitted by the runtime relay on the reserved
+    /// correlation ID [`crate::network::PORT_EVENT_BROADCAST_ID`].
+    /// Payload: [`crate::network::PortEvent`].
+    #[strum(serialize = "core.port.event")]
+    PortEvent,
+
+    /// Host → agentd: request an in-guest loopback forwarder
+    /// (`bind_addr:port` → `127.0.0.1:port`). Payload:
+    /// [`crate::network::LoopbackForwardReq`]. Reply is a
+    /// terminal [`Self::LoopbackForwardResp`] on the same
+    /// correlation ID.
+    #[strum(serialize = "core.loopback.forward")]
+    LoopbackForward,
+
+    /// Host → agentd: cancel a forwarder previously installed via
+    /// [`Self::LoopbackForward`]. Payload:
+    /// [`crate::network::LoopbackForwardCancelReq`]. Reply is a
+    /// terminal [`Self::LoopbackForwardResp`].
+    #[strum(serialize = "core.loopback.forward.cancel")]
+    LoopbackForwardCancel,
+
+    /// agentd → host: ack for a LoopbackForward /
+    /// LoopbackForwardCancel. Terminal. Payload:
+    /// [`crate::network::LoopbackForwardResp`].
+    #[strum(serialize = "core.loopback.forward.resp")]
+    LoopbackForwardResp,
 }
 
 //--------------------------------------------------------------------------------------------------
@@ -335,6 +363,14 @@ impl MessageType {
     }
 
     /// Computes the frame flags byte for this message type.
+    ///
+    /// `LoopbackForward` and `LoopbackForwardCancel` are intentionally
+    /// NOT marked `FLAG_SESSION_START` — they're one-shot RPCs,
+    /// not streaming sessions, so the relay shouldn't register
+    /// their correlation IDs into `client.active_sessions`. The
+    /// matching `LoopbackForwardResp` still carries `FLAG_TERMINAL`
+    /// so the SDK client's pending-map subscription is removed
+    /// after the reply is delivered.
     pub fn flags(&self) -> u8 {
         match self {
             Self::Pong
@@ -347,7 +383,8 @@ impl MessageType {
             | Self::ExecFailed
             | Self::FsResponse
             | Self::TcpClosed
-            | Self::TcpFailed => FLAG_TERMINAL,
+            | Self::TcpFailed
+            | Self::LoopbackForwardResp => FLAG_TERMINAL,
             Self::ExecRequest | Self::FsRequest | Self::TcpConnect => FLAG_SESSION_START,
             Self::Shutdown => FLAG_SHUTDOWN,
             _ => 0,
@@ -396,6 +433,15 @@ impl MessageType {
             Self::CoreError => 5,
             Self::Ping | Self::Pong | Self::Touch | Self::Touched => 6,
             Self::Bootstrap => 7,
+            // Auto-publish port mirroring + in-guest loopback forwarding.
+            // Generations 8 (raw bulk) and 9 (workload freeze / root disk)
+            // already shipped without these types, so they are introduced at
+            // generation 10 — a literal, like every other arm, so it stays
+            // correct if PROTOCOL_VERSION moves again.
+            Self::PortEvent
+            | Self::LoopbackForward
+            | Self::LoopbackForwardCancel
+            | Self::LoopbackForwardResp => 10,
             Self::WorkloadFreeze
             | Self::WorkloadFrozen
             | Self::WorkloadThaw
@@ -551,6 +597,16 @@ mod tests {
             (MessageType::TcpClose, "core.tcp.close"),
             (MessageType::TcpClosed, "core.tcp.closed"),
             (MessageType::TcpFailed, "core.tcp.failed"),
+            (MessageType::PortEvent, "core.port.event"),
+            (MessageType::LoopbackForward, "core.loopback.forward"),
+            (
+                MessageType::LoopbackForwardCancel,
+                "core.loopback.forward.cancel",
+            ),
+            (
+                MessageType::LoopbackForwardResp,
+                "core.loopback.forward.resp",
+            ),
         ];
 
         for (mt, expected_str) in &types {
@@ -603,6 +659,10 @@ mod tests {
             MessageType::TcpClose,
             MessageType::TcpClosed,
             MessageType::TcpFailed,
+            MessageType::PortEvent,
+            MessageType::LoopbackForward,
+            MessageType::LoopbackForwardCancel,
+            MessageType::LoopbackForwardResp,
         ];
 
         for mt in &types {
@@ -672,6 +732,14 @@ mod tests {
         assert_eq!(MessageType::TcpData.flags(), 0);
         assert_eq!(MessageType::TcpEof.flags(), 0);
         assert_eq!(MessageType::TcpClose.flags(), 0);
+        assert_eq!(MessageType::PortEvent.flags(), 0);
+        // Loopback RPCs are one-shot, not sessions — the relay must
+        // not register their correlation IDs into active_sessions.
+        assert_eq!(MessageType::LoopbackForward.flags(), 0);
+        assert_eq!(MessageType::LoopbackForwardCancel.flags(), 0);
+        // The reply is still terminal so the SDK client drops the
+        // pending-map subscription.
+        assert_eq!(MessageType::LoopbackForwardResp.flags(), FLAG_TERMINAL);
     }
 
     #[test]
@@ -733,6 +801,17 @@ mod tests {
         // generation-7 peer must remain on the framed compatibility path.
         assert!(!MessageType::BulkAccepted.is_available_at(7));
         assert!(MessageType::BulkAccepted.is_available_at(8));
+        // Auto-publish port mirroring + loopback forwarding are generation-10
+        // additions: generations 8 (raw bulk) and 9 (workload freeze / root
+        // disk) already shipped without them.
+        assert!(!MessageType::PortEvent.is_available_at(9));
+        assert!(MessageType::PortEvent.is_available_at(10));
+        assert!(!MessageType::LoopbackForward.is_available_at(9));
+        assert!(MessageType::LoopbackForward.is_available_at(10));
+        assert!(!MessageType::LoopbackForwardCancel.is_available_at(9));
+        assert!(MessageType::LoopbackForwardCancel.is_available_at(10));
+        assert!(!MessageType::LoopbackForwardResp.is_available_at(9));
+        assert!(MessageType::LoopbackForwardResp.is_available_at(10));
     }
 
     #[test]
@@ -800,8 +879,41 @@ mod tests {
             assert_eq!(mt.min_protocol_version(), 9, "{mt:?} should require gen 9");
         }
 
+        for mt in [
+            MessageType::PortEvent,
+            MessageType::LoopbackForward,
+            MessageType::LoopbackForwardCancel,
+            MessageType::LoopbackForwardResp,
+        ] {
+            assert_eq!(
+                mt.min_protocol_version(),
+                10,
+                "{mt:?} should require gen 10"
+            );
+        }
+
         // Every current type must be sendable to a current peer.
         assert!(MessageType::FsRequest.min_protocol_version() <= PROTOCOL_VERSION);
+    }
+
+    #[test]
+    fn retired_fork_wire_names_are_not_recognized() {
+        // The fork's original four messages used `host.*` / `guest.*` wire
+        // names at a colliding generation 8. They were renamed to the `core.*`
+        // convention at generation 10, so the retired spellings must not
+        // resolve — a partial rename would otherwise silently accept them.
+        for retired in [
+            "host.port.event",
+            "guest.loopback.forward",
+            "guest.loopback.forward.cancel",
+            "guest.loopback.forward.resp",
+        ] {
+            assert_eq!(
+                MessageType::from_wire_str(retired),
+                None,
+                "{retired} must be retired"
+            );
+        }
     }
 
     #[test]
