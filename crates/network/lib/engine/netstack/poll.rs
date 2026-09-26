@@ -33,6 +33,7 @@ use crate::extensions::NetworkExtensions;
 use crate::icmp::relay::IcmpRelay;
 use crate::policy::{EgressEvaluation, HostnameSource, NetworkPolicy, Protocol};
 use crate::ports::PortPublisher;
+use crate::ports::publisher::PortCommand;
 use crate::proxy::ResolvedOutboundProxy;
 use crate::secrets::handle::SecretsHandle;
 use crate::tcp::{connection::TcpConnectionTracker, proxy::TcpProxy, upstream::UpstreamTcpTarget};
@@ -197,10 +198,11 @@ pub fn create_interface(device: &mut SmoltcpDevice, config: &PollLoopConfig) -> 
 /// Host-local wiring handed to one poll loop.
 ///
 /// Everything here is installed by the host process for one sandbox and is
-/// deliberately absent by default. The auto-publish commit adds
-/// `port_commands` here; this commit installs the extension seam only.
+/// deliberately absent by default.
 #[derive(Default)]
 pub struct PollLoopHost {
+    /// Runtime port add/remove commands (auto-publish). `None` disables it.
+    pub port_commands: Option<tokio::sync::mpsc::UnboundedReceiver<PortCommand>>,
     /// Outbound/request extension adapters.
     pub extensions: NetworkExtensions,
 }
@@ -252,6 +254,12 @@ pub fn smoltcp_poll_loop(
     host: PollLoopHost,
 ) {
     let extensions = host.extensions;
+    // `SmoltcpNetwork` always creates the port-command pair, so this is
+    // `Some` in production; the `None` default still needs a live receiver.
+    let port_cmd_rx = host.port_commands.unwrap_or_else(|| {
+        let (_tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        rx
+    });
     let mut device = SmoltcpDevice::new(shared.clone(), config.mtu);
     let mut iface = create_interface(&mut device, &config);
     let mut sockets = SocketSet::new(vec![]);
@@ -300,6 +308,7 @@ pub fn smoltcp_poll_loop(
         network_policy.clone(),
         shared.clone(),
         &tokio_handle,
+        port_cmd_rx,
     );
     let mut udp_relay = UdpRelay::new(
         shared.clone(),

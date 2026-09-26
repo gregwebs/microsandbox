@@ -790,6 +790,9 @@ async fn flush_to_guest(
     Ok(())
 }
 #[cfg(test)]
+// Some ported helper types are used only by tests not restored in this
+// commit; keep them for the follow-up suite rather than dropping coverage.
+#[allow(dead_code)]
 mod tests {
     use std::collections::VecDeque;
     use std::io;
@@ -814,7 +817,6 @@ mod tests {
     use crate::secrets::config::{HostPattern, SecretEntry, SecretSubstitution, SecretsConfig};
     use crate::secrets::credential::ResolvedHeaderCredential;
     use crate::secrets::handle::SecretsHandle;
-    use crate::tcp::connection::ProxyConnectStatus;
     use crate::tls::state::TlsState;
 
     use super::*;

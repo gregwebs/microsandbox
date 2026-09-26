@@ -29,6 +29,7 @@ use crate::netstack::{
     shared::{DEFAULT_QUEUE_CAPACITY, SharedState},
 };
 use crate::policy::{NetworkPolicy, NetworkProfile};
+use crate::ports::publisher::PortCommand;
 use crate::secrets::credential::{ResolvedHeaderCredential, validate_resolved_header_credentials};
 use crate::secrets::handle::SecretsHandle;
 
@@ -81,6 +82,12 @@ pub struct SmoltcpNetwork {
 
     // Host-local extension adapters, threaded into the poll loop.
     extensions: NetworkExtensions,
+    /// Sender for runtime [`PortCommand`]s. Created up front (before the poll
+    /// thread spawns) so callers can obtain a [`Self::port_handle`] before
+    /// [`Self::start`].
+    port_cmd_tx: tokio::sync::mpsc::UnboundedSender<PortCommand>,
+    /// Receiver handed to the poll loop once. `None` after `start`.
+    port_cmd_rx: Option<tokio::sync::mpsc::UnboundedReceiver<PortCommand>>,
 }
 
 #[derive(Clone, Copy)]
@@ -451,6 +458,7 @@ impl SmoltcpNetwork {
             })?;
         let backend = SmoltcpBackend::new(shared.clone());
         let extensions = install_intercept_extension(host.extensions, &config.intercept);
+        let (port_cmd_tx, port_cmd_rx) = tokio::sync::mpsc::unbounded_channel();
 
         // A stored config bypasses the builder, so validate the durable secret
         // grammar and the launch-only resolved list here, independently.
@@ -489,6 +497,8 @@ impl SmoltcpNetwork {
             guest_ipv6,
             gateway_ipv6,
             extensions,
+            port_cmd_tx,
+            port_cmd_rx: Some(port_cmd_rx),
             tls_state,
             secrets,
         })
@@ -556,6 +566,7 @@ impl SmoltcpNetwork {
         let activation_gate = self.activation_gate.take();
         let outbound_proxy = self.config.outbound_proxy().cloned().map(Arc::new);
         let host_extensions = self.extensions.clone();
+        let port_cmd_rx = self.port_cmd_rx.take();
 
         self.poll_handle = Some(
             std::thread::Builder::new()
@@ -580,6 +591,7 @@ impl SmoltcpNetwork {
                         outbound_proxy,
                         PollLoopHost {
                             extensions: host_extensions.clone(),
+                            port_commands: port_cmd_rx,
                         },
                     );
                 })
@@ -590,6 +602,22 @@ impl SmoltcpNetwork {
     /// Take the `NetBackend` for `VmBuilder::net()`. One-shot.
     pub fn take_backend(&mut self) -> Box<dyn NetBackend + Send> {
         Box::new(self.backend.take().expect("backend already taken"))
+    }
+
+    /// Cloneable sender for runtime [`PortCommand`]s. Stays valid for the
+    /// sandbox's lifetime; the poll loop owns the matching receiver.
+    pub fn port_handle(&self) -> tokio::sync::mpsc::UnboundedSender<PortCommand> {
+        self.port_cmd_tx.clone()
+    }
+
+    /// The host-side guest IPv4 address, when active.
+    pub fn guest_ipv4(&self) -> Option<Ipv4Addr> {
+        self.guest_ipv4
+    }
+
+    /// The host-side guest IPv6 address, when active.
+    pub fn guest_ipv6(&self) -> Option<Ipv6Addr> {
+        self.guest_ipv6
     }
 
     /// Guest MAC address for `VmBuilder::net().mac()`.

@@ -40,7 +40,7 @@ pub use cloud::{
 #[doc(hidden)]
 pub use command::{CommandResolutionError, ResolvedCommand, resolve_default_command};
 pub use domain::{
-    Action, CertCacheConfig, CpuPlacement, DEFAULT_METRICS_SAMPLE_INTERVAL_MS,
+    Action, AutoPublishConfig, CertCacheConfig, CpuPlacement, DEFAULT_METRICS_SAMPLE_INTERVAL_MS,
     DEFAULT_SANDBOX_CPUS, DEFAULT_SANDBOX_MEMORY_MIB, DeploymentProfile, Destination,
     DestinationGroup, Direction, DiskImageFormat, DnsConfig, DnsConfigPatch,
     DurableHeaderCredential, EnvVar, FlatClone, HandoffInit, HostPattern, HostPermissions,

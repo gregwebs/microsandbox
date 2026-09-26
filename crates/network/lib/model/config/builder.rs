@@ -16,7 +16,8 @@ use microsandbox_utils::size::Bytes;
 use zeroize::Zeroizing;
 
 use crate::config::{
-    ConnectionLimit, DnsConfig, InterfaceOverrides, NetworkConfig, PortProtocol, PublishedPort,
+    AutoPublishConfig, ConnectionLimit, DnsConfig, InterfaceOverrides, NetworkConfig, PortProtocol,
+    PublishedPort,
 };
 use crate::dns::Nameserver;
 use crate::policy::{BuildError, NetworkPolicy};
@@ -342,6 +343,18 @@ impl NetworkBuilder {
         f: impl FnOnce(InterceptBuilder) -> InterceptBuilder,
     ) -> Self {
         self.config.intercept = f(InterceptBuilder::from_config(self.config.intercept)).build();
+        self
+    }
+
+    /// Enable auto-publish with the default configuration.
+    pub fn auto_publish(mut self) -> Self {
+        self.config.auto_publish = Some(AutoPublishConfig::default());
+        self
+    }
+
+    /// Enable auto-publish with an explicit configuration.
+    pub fn auto_publish_with(mut self, cfg: AutoPublishConfig) -> Self {
+        self.config.auto_publish = Some(cfg);
         self
     }
 

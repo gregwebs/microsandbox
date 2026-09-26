@@ -103,6 +103,45 @@ pub struct NetworkConfig {
     /// relays non-DNS UDP; SOCKS4 blocks it because that protocol has no UDP command.
     #[serde(default)]
     pub outbound_proxy: Option<OutboundProxy>,
+
+    /// Auto-publish: mirror guest TCP LISTEN sockets onto host listeners. The
+    /// publisher emits `MessageType::PortEvent` frames for SDK clients to
+    /// observe. Default: `None` (disabled).
+    #[serde(default)]
+    pub auto_publish: Option<AutoPublishConfig>,
+}
+
+/// Configuration for the runtime auto-publish loop.
+///
+/// This is a distinct, engine-local struct from the wire
+/// [`microsandbox_types::AutoPublishConfig`]: `host_bind` is parsed to an
+/// [`IpAddr`] here, where the wire twin carries a `String`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AutoPublishConfig {
+    /// Poll interval in milliseconds. Default 2000 (matches Lima).
+    #[serde(default = "default_auto_publish_poll_ms")]
+    pub poll_interval_ms: u64,
+
+    /// Host bind address for mirrored listeners. Default `127.0.0.1`.
+    #[serde(default = "default_auto_publish_host_bind")]
+    pub host_bind: IpAddr,
+}
+
+fn default_auto_publish_poll_ms() -> u64 {
+    2000
+}
+
+fn default_auto_publish_host_bind() -> IpAddr {
+    IpAddr::V4(Ipv4Addr::LOCALHOST)
+}
+
+impl Default for AutoPublishConfig {
+    fn default() -> Self {
+        Self {
+            poll_interval_ms: default_auto_publish_poll_ms(),
+            host_bind: default_auto_publish_host_bind(),
+        }
+    }
 }
 
 /// Network configuration whose runtime-only values have been resolved.
@@ -310,6 +349,7 @@ impl Default for NetworkConfig {
             rate_limiter: None,
             trust_host_cas: false,
             outbound_proxy: None,
+            auto_publish: None,
         }
     }
 }

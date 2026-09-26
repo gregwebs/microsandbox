@@ -458,7 +458,34 @@ type VmBuildOutput = (
     BindIdentityMapRegistration,
     Option<crate::checkpoint::RestoredAgentState>,
     std::collections::BTreeMap<String, microsandbox_filesystem::OwnedDirectoryCheckpoint>,
+    Option<AutoPublishHandles>,
 );
+
+/// Handles the auto-publish poll task needs to drive the live
+/// [`SmoltcpNetwork`](microsandbox_network::network::SmoltcpNetwork) and report
+/// mappings to SDK clients. Captured in `build_vm` right after the network is
+/// constructed, and consumed by `run()` once the relay's broadcast handle is
+/// also available.
+///
+/// Auto-publish dials the relay's loopback Unix socket directly (see
+/// `crate::auto_publish`'s module docs), so it is unix-only regardless of the
+/// `net` feature — the unit-struct fallback covers both "no net feature" and
+/// "net feature on a non-unix host".
+#[cfg(all(feature = "net", unix))]
+struct AutoPublishHandles {
+    port_handle: tokio::sync::mpsc::UnboundedSender<microsandbox_network::publisher::PortCommand>,
+    cfg: microsandbox_network::config::AutoPublishConfig,
+    guest_ipv4: Option<std::net::Ipv4Addr>,
+    guest_ipv6: Option<std::net::Ipv6Addr>,
+    /// Guest ports already covered by a boot-time `--publish` listener. Passed
+    /// to `auto_publish::spawn` so it never mirrors a guest LISTEN that an
+    /// explicit listener already serves (which would bind a duplicate
+    /// host-port and fall back to an ephemeral one).
+    explicit_guest_ports: std::collections::HashSet<u16>,
+}
+
+#[cfg(not(all(feature = "net", unix)))]
+struct AutoPublishHandles;
 
 /// Public runtime endpoints held back until a restored guest is activated.
 struct RestoreEndpointPublication {
@@ -1046,6 +1073,7 @@ fn run(
         bind_identity_map,
         mut restored_agent,
         owned_directory_checkpoints,
+        auto_publish_handles,
     ) = match build_result {
         Ok(vm) => vm,
         Err(e) => {
@@ -1274,6 +1302,46 @@ fn run(
     let restore_runtime_dir = config.runtime_dir.clone();
     let relay_boot_log_dir = config.log_dir.clone();
     let restore_startup_progress = startup_progress.clone();
+
+    // Auto-publish: poll the guest's /proc/net/tcp{,6} and mirror new LISTEN
+    // sockets onto host listeners. Only spawned when the sandbox opted in
+    // (`NetworkConfig.auto_publish`) and a unix host made the handles available.
+    #[cfg(all(feature = "net", unix))]
+    if let Some(handles) = auto_publish_handles {
+        // Adapter so the network-agnostic poll task never imports `AgentRelay`.
+        struct RelayBroadcastAdapter {
+            relay_broadcast: relay::RelayBroadcast,
+        }
+
+        impl crate::auto_publish::EventBroadcast for RelayBroadcastAdapter {
+            fn broadcast_port_event(&self, event: microsandbox_protocol::network::PortEvent) {
+                match Message::with_payload(
+                    MessageType::PortEvent,
+                    microsandbox_protocol::network::PORT_EVENT_BROADCAST_ID,
+                    &event,
+                ) {
+                    Ok(msg) => self.relay_broadcast.broadcast(&msg),
+                    Err(e) => {
+                        tracing::warn!(error = %e, "auto-publish: failed to encode PortEvent");
+                    }
+                }
+            }
+        }
+
+        crate::auto_publish::spawn(
+            tokio_rt.handle(),
+            config.agent_sock_path.clone(),
+            handles.cfg,
+            handles.port_handle,
+            handles.guest_ipv4,
+            handles.guest_ipv6,
+            Arc::new(RelayBroadcastAdapter {
+                relay_broadcast: relay.broadcast_handle(),
+            }),
+            handles.explicit_guest_ports,
+        );
+    }
+
     tokio_rt.spawn(async move {
         let ready_result = tokio::task::spawn_blocking(move || {
             if let (Some(restored), Some(control)) =
@@ -2438,6 +2506,8 @@ fn build_vm(
     let mut network_secrets_handle = None;
     #[cfg(feature = "net")]
     let mut network_activation_handle = None;
+    #[cfg_attr(not(all(feature = "net", unix)), allow(unused_mut, unused_variables))]
+    let mut auto_publish_handles: Option<AutoPublishHandles> = None;
     #[cfg(not(feature = "net"))]
     let network_activation_handle: Option<NetworkActivationHandle> = None;
 
@@ -2578,6 +2648,23 @@ fn build_vm(
 
         if vm.checkpoint_restore.is_some() {
             network_activation_handle = Some(network.defer_activation());
+        }
+
+        #[cfg(all(feature = "net", unix))]
+        if let Some(ap_cfg) = vm.network.config().auto_publish.clone() {
+            auto_publish_handles = Some(AutoPublishHandles {
+                port_handle: network.port_handle(),
+                cfg: ap_cfg,
+                guest_ipv4: network.guest_ipv4(),
+                guest_ipv6: network.guest_ipv6(),
+                explicit_guest_ports: vm
+                    .network
+                    .config()
+                    .ports
+                    .iter()
+                    .map(|p| p.guest_port)
+                    .collect(),
+            });
         }
 
         network.start(tokio_handle.clone());
@@ -2725,6 +2812,7 @@ fn build_vm(
         bind_identity_map,
         restored_agent,
         owned_directory_checkpoints,
+        auto_publish_handles,
     ))
 }
 

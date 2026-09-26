@@ -187,6 +187,47 @@ struct CorrelationRoute {
     state: CorrelationState,
 }
 
+/// Live host-originated broadcast subscription.
+///
+/// Registering a subscription is not a session start: it allocates no id and
+/// sends no frame, so the relay never observes a session begin. Dropping it
+/// unregisters the correlation so a later owner of the same id cannot receive
+/// this subscriber's frames.
+pub struct Subscription {
+    id: u32,
+    rx: mpsc::Receiver<Message>,
+    pending: Arc<Mutex<HashMap<u32, CorrelationRoute>>>,
+}
+
+impl Subscription {
+    /// The correlation id this subscription receives frames for.
+    pub fn id(&self) -> u32 {
+        self.id
+    }
+
+    /// Receive the next broadcast message, or `None` once the connection closes.
+    pub async fn recv(&mut self) -> Option<Message> {
+        self.rx.recv().await
+    }
+}
+
+impl Drop for Subscription {
+    fn drop(&mut self) {
+        let pending = Arc::clone(&self.pending);
+        let id = self.id;
+        if let Ok(mut map) = pending.try_lock() {
+            map.remove(&id);
+        } else if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            // The map is momentarily contended because a frame is being
+            // dispatched; hand removal to the runtime rather than blocking a
+            // synchronous drop on an async lock.
+            handle.spawn(async move {
+                pending.lock().await.remove(&id);
+            });
+        }
+    }
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum CorrelationState {
     Active,
@@ -611,6 +652,42 @@ impl AgentClient {
         let (tx, rx) = mpsc::channel(STREAM_QUEUE_CAPACITY);
         tokio::spawn(decode_frame_stream_task(raw_rx, tx));
         Ok((id, rx))
+    }
+
+    /// Subscribe to host-originated broadcast frames on a well-known correlation id.
+    ///
+    /// Unlike [`stream`](Self::stream)/[`stream_raw`](Self::stream_raw), this
+    /// allocates no id and sends **no** frame, so the relay never observes a
+    /// session start. It registers a receiver for `id` so the reader loop routes
+    /// frames the runtime broadcasts there — e.g. `core.port.event` on
+    /// [`PORT_EVENT_BROADCAST_ID`](microsandbox_protocol::network::PORT_EVENT_BROADCAST_ID).
+    /// Broadcast frames are non-terminal, so the subscription stays live for the
+    /// connection's lifetime; dropping the returned [`Subscription`] unregisters
+    /// the correlation.
+    ///
+    /// Refuses to clobber an existing correlation on the same id.
+    pub async fn subscribe(&self, id: u32) -> AgentClientResult<Subscription> {
+        let (raw_tx, raw_rx) = mpsc::channel(STREAM_QUEUE_CAPACITY);
+        {
+            let mut pending = self.pending.lock().await;
+            if pending.contains_key(&id) {
+                return Err(AgentClientError::IdRangeExhausted);
+            }
+            pending.insert(
+                id,
+                CorrelationRoute {
+                    tx: raw_tx,
+                    state: CorrelationState::Active,
+                },
+            );
+        }
+        let (tx, rx) = mpsc::channel(STREAM_QUEUE_CAPACITY);
+        tokio::spawn(decode_stream_task(raw_rx, tx));
+        Ok(Subscription {
+            id,
+            rx,
+            pending: Arc::clone(&self.pending),
+        })
     }
 
     /// Send a follow-up typed message on an existing correlation id.
@@ -2150,5 +2227,81 @@ mod tests {
         );
         assert!(!client.pending.lock().await.contains_key(&id));
         server.await.unwrap();
+    }
+
+    #[cfg(feature = "stream")]
+    #[tokio::test]
+    async fn subscribe_delivers_reserved_broadcasts_and_unregisters_on_drop() {
+        use microsandbox_protocol::network::{PORT_EVENT_BROADCAST_ID, PortEvent};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let (client_io, mut server_io) = tokio::io::duplex(64 * 1024);
+        let ready_msg = Message::with_payload(MessageType::Ready, 0, &Ready::default()).unwrap();
+        let event = PortEvent::Added {
+            host_bind: "127.0.0.1".parse().unwrap(),
+            host_port: 8080,
+            guest_port: 80,
+        };
+        let broadcast =
+            Message::with_payload(MessageType::PortEvent, PORT_EVENT_BROADCAST_ID, &event).unwrap();
+        tokio::spawn(async move {
+            server_io.write_all(&1u32.to_be_bytes()).await.unwrap();
+            server_io.write_all(&1024u32.to_be_bytes()).await.unwrap();
+            codec::write_message(&mut server_io, &ready_msg)
+                .await
+                .unwrap();
+            // A subscription sends nothing; the host pushes the broadcast.
+            codec::write_message(&mut server_io, &broadcast)
+                .await
+                .unwrap();
+            let mut buf = [0u8; 1];
+            let _ = server_io.read(&mut buf).await;
+        });
+
+        let client = AgentClient::connect_stream_with_deadline(
+            client_io,
+            Instant::now() + Duration::from_secs(1),
+        )
+        .await
+        .unwrap();
+
+        let mut sub = client.subscribe(PORT_EVENT_BROADCAST_ID).await.unwrap();
+        assert_eq!(sub.id(), PORT_EVENT_BROADCAST_ID);
+        let received = tokio::time::timeout(Duration::from_secs(2), sub.recv())
+            .await
+            .expect("broadcast did not arrive")
+            .expect("subscription closed");
+        assert_eq!(received.t, MessageType::PortEvent);
+        let got: PortEvent = received.payload().unwrap();
+        assert_eq!(got, event);
+        assert!(
+            client
+                .pending
+                .lock()
+                .await
+                .contains_key(&PORT_EVENT_BROADCAST_ID)
+        );
+
+        drop(sub);
+        // Removal is synchronous unless the map was contended; poll briefly.
+        for _ in 0..50 {
+            if !client
+                .pending
+                .lock()
+                .await
+                .contains_key(&PORT_EVENT_BROADCAST_ID)
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(
+            !client
+                .pending
+                .lock()
+                .await
+                .contains_key(&PORT_EVENT_BROADCAST_ID),
+            "dropping the subscription must unregister the correlation"
+        );
     }
 }

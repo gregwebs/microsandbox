@@ -54,7 +54,7 @@ pub use icmp::{error as icmp_error, relay as icmp_relay};
 #[cfg(feature = "engine")]
 pub use netstack::{backend, device, poll as stack, shared};
 #[cfg(feature = "engine")]
-pub use ports::publisher;
+pub use ports::{auto_publish, publisher};
 #[cfg(feature = "engine")]
 pub use tcp::connection as conn;
 #[cfg(feature = "engine")]

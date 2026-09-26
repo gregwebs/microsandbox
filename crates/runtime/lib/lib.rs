@@ -6,6 +6,8 @@
 
 #![warn(missing_docs)]
 
+#[cfg(all(feature = "runner", unix))]
+pub mod auto_publish;
 #[cfg(feature = "client")]
 pub mod checkpoint;
 #[cfg(feature = "client")]
