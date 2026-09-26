@@ -91,6 +91,8 @@ pub(crate) fn do_open(
 
     let handle = fs.next_handle.fetch_add(1, Ordering::Relaxed);
     let data = Arc::new(HandleData {
+        inode,
+        flags,
         file: RwLock::new(file),
     });
 
@@ -115,6 +117,14 @@ pub(crate) fn do_read(
 
     let handles = fs.handles.read().unwrap();
     let data = handles.get(&handle).ok_or_else(platform::ebadf)?;
+    // A detached macOS handle can duplicate a read/write pin; its guest access
+    // mode still applies, except for reads required by writeback caching.
+    #[cfg(target_os = "macos")]
+    if data.flags as i32 & libc::O_ACCMODE == libc::O_WRONLY
+        && !fs.writeback.load(Ordering::Relaxed)
+    {
+        return Err(platform::ebadf());
+    }
     let f = data.file.read().unwrap();
     w.write_from(&f, size as usize, offset)
 }
@@ -144,6 +154,10 @@ pub(crate) fn do_write(
 
     let handles = fs.handles.read().unwrap();
     let data = handles.get(&handle).ok_or_else(platform::ebadf)?;
+    #[cfg(target_os = "macos")]
+    if data.flags as i32 & libc::O_ACCMODE == libc::O_RDONLY {
+        return Err(platform::ebadf());
+    }
     let f = data.file.read().unwrap();
 
     let fd = f.as_raw_fd();

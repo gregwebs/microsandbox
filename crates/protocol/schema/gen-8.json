@@ -1,5 +1,16 @@
 {
+  "bulk": {
+    "default_filesystem_record_payload": 3145728,
+    "default_record_payload": 262144,
+    "default_window": 8388608,
+    "format_raw_v1": 1,
+    "header_size": 12,
+    "max_record_payload": 3145728,
+    "max_window": 33554432,
+    "min_record_payload": 16384
+  },
   "frame": {
+    "flag_bulk": 8,
     "flag_session_start": 2,
     "flag_shutdown": 4,
     "flag_terminal": 1,
@@ -50,6 +61,22 @@
     {
       "introduced_in": 5,
       "wire": "core.error"
+    },
+    {
+      "introduced_in": 8,
+      "wire": "core.bulk.accepted"
+    },
+    {
+      "introduced_in": 8,
+      "wire": "core.bulk.credit"
+    },
+    {
+      "introduced_in": 8,
+      "wire": "core.bulk.finish"
+    },
+    {
+      "introduced_in": 8,
+      "wire": "core.bulk.cancel"
     },
     {
       "introduced_in": 1,
@@ -134,22 +161,6 @@
     {
       "introduced_in": 7,
       "wire": "core.bootstrap"
-    },
-    {
-      "introduced_in": 8,
-      "wire": "host.port.event"
-    },
-    {
-      "introduced_in": 8,
-      "wire": "guest.loopback.forward"
-    },
-    {
-      "introduced_in": 8,
-      "wire": "guest.loopback.forward.cancel"
-    },
-    {
-      "introduced_in": 8,
-      "wire": "guest.loopback.forward.resp"
     }
   ],
   "protocol_version": 8

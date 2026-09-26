@@ -1,33 +1,11 @@
 use std::any::TypeId;
-use std::sync::Arc;
-
-use microsandbox_network::config::{DnsConfig, PublishedPort};
-use microsandbox_network::netstack::poll::PollLoopConfig;
-use microsandbox_network::netstack::shared::SharedState;
-use microsandbox_network::policy::NetworkPolicy;
-use microsandbox_network::publisher::PortCommand;
-use microsandbox_network::secrets::handle::SecretsHandle;
-use microsandbox_network::tls::state::TlsState;
-
-type LegacyPollLoop = fn(
-    Arc<SharedState>,
-    PollLoopConfig,
-    NetworkPolicy,
-    Option<NetworkPolicy>,
-    DnsConfig,
-    Option<Arc<TlsState>>,
-    Vec<PublishedPort>,
-    tokio::sync::mpsc::UnboundedReceiver<PortCommand>,
-    Option<usize>,
-    tokio::runtime::Handle,
-    SecretsHandle,
-);
 
 fn assert_same_type<T: 'static, U: 'static>() {
     assert_eq!(TypeId::of::<T>(), TypeId::of::<U>());
 }
 
 #[test]
+#[cfg(feature = "engine")]
 fn legacy_module_paths_alias_canonical_modules() {
     assert_same_type::<
         microsandbox_network::backend::SmoltcpBackend,
@@ -54,8 +32,8 @@ fn legacy_module_paths_alias_canonical_modules() {
         microsandbox_network::config::NetworkBuilder,
     >();
     assert_same_type::<
-        microsandbox_network::conn::ConnectionTracker,
-        microsandbox_network::tcp::connection::ConnectionTracker,
+        microsandbox_network::conn::TcpConnectionTracker,
+        microsandbox_network::tcp::connection::TcpConnectionTracker,
     >();
     assert_same_type::<
         microsandbox_network::icmp_relay::IcmpRelay,
@@ -68,7 +46,25 @@ fn legacy_module_paths_alias_canonical_modules() {
 
     let _legacy_proxy = microsandbox_network::proxy::spawn_tcp_proxy;
     let _canonical_proxy = microsandbox_network::tcp::proxy::spawn_tcp_proxy;
+}
 
-    let _: LegacyPollLoop = microsandbox_network::stack::smoltcp_poll_loop;
-    let _: LegacyPollLoop = microsandbox_network::netstack::poll::smoltcp_poll_loop;
+#[test]
+fn tls_config_path_remains_available_without_the_engine() {
+    assert_same_type::<microsandbox_network::tls::TlsConfig, microsandbox_types::TlsConfig>();
+}
+
+#[test]
+#[cfg(feature = "engine")]
+#[allow(deprecated)]
+fn deprecated_tracker_names_remain_source_compatible() {
+    assert_same_type::<
+        microsandbox_network::conn::ConnectionTracker,
+        microsandbox_network::tcp::connection::TcpConnectionTracker,
+    >();
+    assert_same_type::<
+        microsandbox_network::tcp::connection::ConnectionTracker,
+        microsandbox_network::tcp::connection::TcpConnectionTracker,
+    >();
+    let _ = microsandbox_network::conn::ConnectionTracker::new(None);
+    let _ = microsandbox_network::tcp::connection::ConnectionTracker::new(None);
 }

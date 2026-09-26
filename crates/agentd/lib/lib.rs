@@ -8,7 +8,10 @@
 
 mod config;
 mod error;
+mod mount_checkpoint;
 mod rlimit;
+mod root_disk;
+mod workload;
 
 //--------------------------------------------------------------------------------------------------
 // Exports
@@ -20,7 +23,6 @@ pub mod fs;
 pub mod handoff;
 pub mod heartbeat;
 pub mod init;
-pub mod loopback;
 pub mod network;
 pub mod process;
 pub mod serial;

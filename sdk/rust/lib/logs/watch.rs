@@ -25,6 +25,7 @@ use std::sync::{Arc, Mutex, mpsc};
 use notify::Watcher;
 use tokio::sync::{oneshot, watch};
 
+#[cfg(feature = "local")]
 use super::logger::{RegisteredSandboxLogger, SandboxLogger};
 use crate::{MicrosandboxError, MicrosandboxResult};
 
@@ -180,6 +181,7 @@ impl LogRegistry {
     /// Async and non-blocking: the blocking `watch()` runs on the
     /// watcher-admin thread and `register` only awaits its reply, so a
     /// caller on the tokio runtime never stalls a worker.
+    #[cfg(feature = "local")]
     pub async fn register(
         &self,
         logger: SandboxLogger,
@@ -464,21 +466,19 @@ fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 // Tests
 //--------------------------------------------------------------------------------------------------
 
-#[cfg(test)]
+#[cfg(all(test, feature = "local"))]
 mod tests {
     use super::*;
-
-    /// The directory map a watch-loop test drives, plus the receivers that keep
-    /// each directory's watch channel alive.
-    type DirsAndReceivers = (
-        Arc<Mutex<HashMap<PathBuf, DirEntry>>>,
-        Vec<watch::Receiver<u64>>,
-    );
 
     /// Build a `dirs` map with the given directories, each with a fresh
     /// signal and refcount 1, plus a retained receiver per dir so the
     /// senders observe changes.
-    fn map_with(dirs: &[&std::path::Path]) -> DirsAndReceivers {
+    fn map_with(
+        dirs: &[&std::path::Path],
+    ) -> (
+        Arc<Mutex<HashMap<PathBuf, DirEntry>>>,
+        Vec<watch::Receiver<u64>>,
+    ) {
         let map = Arc::new(Mutex::new(HashMap::new()));
         let mut receivers = Vec::new();
         {

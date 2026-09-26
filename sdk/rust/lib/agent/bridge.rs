@@ -21,7 +21,9 @@ use tokio::sync::Mutex;
 use tokio::sync::Notify;
 use tokio::sync::mpsc::Receiver;
 
-use super::{AgentClient, connect_sandbox, connect_sandbox_with_timeout};
+use super::AgentClient;
+#[cfg(feature = "local")]
+use super::{connect_sandbox, connect_sandbox_with_timeout};
 use microsandbox_agent_client::{AgentClientError, AgentClientResult};
 
 //--------------------------------------------------------------------------------------------------
@@ -69,6 +71,7 @@ impl AgentBridge {
     /// Connect to a sandbox by name (resolves the socket path from SDK config).
     ///
     /// Sandbox names are limited to 128 UTF-8 bytes.
+    #[cfg(feature = "local")]
     pub async fn connect_sandbox(name: &str) -> AgentClientResult<Self> {
         let client = connect_sandbox(name).await?;
         Ok(Self::from_client(client))
@@ -77,6 +80,7 @@ impl AgentBridge {
     /// Connect to a sandbox by name with an explicit handshake timeout.
     ///
     /// Sandbox names are limited to 128 UTF-8 bytes.
+    #[cfg(feature = "local")]
     pub async fn connect_sandbox_with_timeout(
         name: &str,
         timeout: Duration,
@@ -283,31 +287,6 @@ impl AgentBridge {
 }
 
 //--------------------------------------------------------------------------------------------------
-// Trait Implementations
-//--------------------------------------------------------------------------------------------------
-
-impl std::fmt::Debug for AgentBridge {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("AgentBridge")
-            .field("next_handle", &self.next_handle.load(Ordering::Relaxed))
-            .finish_non_exhaustive()
-    }
-}
-
-//--------------------------------------------------------------------------------------------------
-// Functions
-//--------------------------------------------------------------------------------------------------
-
-// Suppress unused import lints in builds where AgentClientError is only used
-// transitively through `?`.
-#[allow(dead_code)]
-fn _assert_send_sync() {
-    fn assert<T: Send + Sync>() {}
-    assert::<AgentBridge>();
-    assert::<AgentClientError>();
-}
-
-//--------------------------------------------------------------------------------------------------
 // Tests
 //--------------------------------------------------------------------------------------------------
 
@@ -353,4 +332,25 @@ mod tests {
         assert!(matches!(result, Err(AgentClientError::Closed)));
         drop(tx);
     }
+}
+
+//--------------------------------------------------------------------------------------------------
+// Trait Implementations
+//--------------------------------------------------------------------------------------------------
+
+impl std::fmt::Debug for AgentBridge {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AgentBridge")
+            .field("next_handle", &self.next_handle.load(Ordering::Relaxed))
+            .finish_non_exhaustive()
+    }
+}
+
+// Suppress unused import lints in builds where AgentClientError is only used
+// transitively through `?`.
+#[allow(dead_code)]
+fn _assert_send_sync() {
+    fn assert<T: Send + Sync>() {}
+    assert::<AgentBridge>();
+    assert::<AgentClientError>();
 }
