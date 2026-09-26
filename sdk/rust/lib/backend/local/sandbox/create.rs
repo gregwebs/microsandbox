@@ -3757,12 +3757,12 @@ mod tests {
         config_path
     }
 
-    /// Build a local backend whose runtime pair comes from the staged stub config.
-    #[cfg(unix)]
     /// Restores `MSB_CONFIG_PATH` when dropped, so a test that points the backend
     /// at a stub runtime cannot leak it into its neighbours in this binary.
+    #[cfg(unix)]
     struct EnvRestore(Option<std::ffi::OsString>);
 
+    #[cfg(unix)]
     impl Drop for EnvRestore {
         fn drop(&mut self) {
             unsafe {
@@ -3774,6 +3774,8 @@ mod tests {
         }
     }
 
+    /// Build a local backend whose runtime pair comes from the staged stub config.
+    #[cfg(unix)]
     async fn backend_with_stub_runtime(
         temp: &std::path::Path,
         config_path: &std::path::Path,
