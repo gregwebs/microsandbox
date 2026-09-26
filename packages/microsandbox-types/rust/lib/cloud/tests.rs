@@ -6,6 +6,7 @@ use crate::domain::{
     DEFAULT_SANDBOX_CPUS, DEFAULT_SANDBOX_MEMORY_MIB, HostPattern, OciRootfsSource, RootDisk,
     RootfsSource, SecretSubstitution, SecretsConfig,
 };
+use crate::modify::SecretSource;
 use crate::snapshot::cloud_manifest::Manifest as SnapshotManifest;
 
 fn spec(name: &str) -> CloudSandboxSpec {
@@ -209,6 +210,27 @@ fn cloud_secret_twins_use_internal_tagging() {
         serde_json::to_value(CloudViolationAction::BlockAndLog).unwrap(),
         serde_json::json!({"type": "block_and_log"})
     );
+}
+
+#[test]
+fn cloud_secret_source_file_wire_form_and_round_trip() {
+    assert_eq!(
+        serde_json::to_value(CloudSecretSource::File {
+            path: "/run/creds/token".into(),
+        })
+        .unwrap(),
+        serde_json::json!({"type": "file", "path": "/run/creds/token"})
+    );
+
+    let domain = SecretSource::File {
+        path: "/run/creds/token".into(),
+    };
+    let cloud: CloudSecretSource = domain.clone().into();
+    assert!(
+        matches!(cloud, CloudSecretSource::File { ref path } if path == std::path::Path::new("/run/creds/token"))
+    );
+    let back: SecretSource = cloud.into();
+    assert_eq!(back, domain);
 }
 
 #[test]

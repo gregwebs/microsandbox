@@ -292,6 +292,9 @@ impl Socks5Credentials {
             SecretSource::Store { .. } => Err(OutboundProxyBuildError::InvalidSocks5Credentials {
                 reason: "store-backed password sources are not supported yet",
             }),
+            SecretSource::File { .. } => Err(OutboundProxyBuildError::InvalidSocks5Credentials {
+                reason: "file-backed password sources are not supported yet",
+            }),
         }
     }
 }

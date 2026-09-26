@@ -79,6 +79,14 @@ pub enum CloudSecretSource {
         /// Store-specific secret reference.
         reference: String,
     },
+    /// Read from a host file, re-read per connection. Twin of
+    /// [`SecretSource::File`].
+    File {
+        /// Absolute host path to the credential file.
+        #[cfg_attr(feature = "ts", ts(type = "string"))]
+        #[cfg_attr(feature = "utoipa", schema(value_type = String))]
+        path: std::path::PathBuf,
+    },
 }
 
 /// Host allowlist pattern for cloud secrets. Twin of [`HostPattern`], with the
@@ -182,6 +190,7 @@ impl From<SecretSource> for CloudSecretSource {
         match source {
             SecretSource::Env { var } => Self::Env { var },
             SecretSource::Store { reference } => Self::Store { reference },
+            SecretSource::File { path } => Self::File { path },
         }
     }
 }
@@ -191,6 +200,7 @@ impl From<CloudSecretSource> for SecretSource {
         match source {
             CloudSecretSource::Env { var } => Self::Env { var },
             CloudSecretSource::Store { reference } => Self::Store { reference },
+            CloudSecretSource::File { path } => Self::File { path },
         }
     }
 }

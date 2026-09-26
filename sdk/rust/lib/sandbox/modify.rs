@@ -1489,6 +1489,9 @@ fn secret_material(spec: &SecretModificationPatch) -> MicrosandboxResult<Option<
     }
     match &spec.source {
         Some(source @ SecretSource::Env { .. }) => Ok(Some(SecretMaterial::Source(source.clone()))),
+        Some(source @ SecretSource::File { .. }) => {
+            Ok(Some(SecretMaterial::Source(source.clone())))
+        }
         Some(SecretSource::Store { .. }) => Err(crate::MicrosandboxError::Custom(format!(
             "secret {}: store-backed secret sources are not supported yet",
             spec.name
@@ -1682,6 +1685,10 @@ fn resolve_secret_source_value(
         }
         Some(SecretSource::Store { .. }) => Err(crate::MicrosandboxError::Custom(format!(
             "secret {name}: store-backed secret sources are not supported yet"
+        ))),
+        Some(SecretSource::File { .. }) => Err(crate::MicrosandboxError::Custom(format!(
+            "secret {name}: file-backed secrets rotate by editing the file; \
+             control-socket rotate is not applicable"
         ))),
         None => Err(crate::MicrosandboxError::Custom(format!(
             "secret {name} needs a host-side source or value to rotate"

@@ -50,6 +50,11 @@ pub enum NetworkSecretResolveError {
     #[error("store-backed secret sources are not supported yet")]
     UnsupportedStoreSource,
 
+    /// A file-backed secret source is resolved per connection by the network
+    /// engine, not at config-resolution time.
+    #[error("file-backed secret sources are resolved per connection")]
+    UnsupportedFileSource,
+
     /// A resolver-specific source lookup failed.
     #[error("{message}")]
     ResolutionFailed {
@@ -93,6 +98,13 @@ impl NetworkConfig {
         }
 
         for secret in &mut self.secrets.secrets {
+            // File-backed secrets are resolved per connection by the network
+            // engine (`SecretsHandler::new_inner`) so a rotated file is picked
+            // up without restarting the sandbox; leave `source`/empty `value`
+            // so only the path persists and the read happens there.
+            if matches!(secret.source, Some(SecretSource::File { .. })) {
+                continue;
+            }
             if let Some(source) = &secret.source {
                 secret.value =
                     Self::resolve_source(resolver, &format!("secret {}", secret.env_var), source)?;
@@ -144,6 +156,7 @@ impl NetworkSecretResolver for EnvNetworkSecretResolver {
     ) -> Result<Zeroizing<String>, NetworkSecretResolveError> {
         match source {
             SecretSource::Store { .. } => Err(NetworkSecretResolveError::UnsupportedStoreSource),
+            SecretSource::File { .. } => Err(NetworkSecretResolveError::UnsupportedFileSource),
             SecretSource::Env { var } => {
                 let value = std::env::var(var).map_err(|_| {
                     NetworkSecretResolveError::MissingEnvironmentVariable { var: var.clone() }

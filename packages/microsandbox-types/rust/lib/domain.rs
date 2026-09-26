@@ -2268,6 +2268,10 @@ pub(crate) fn default_private() -> HostPermissions {
 /// Maximum supported secret placeholder length in bytes.
 pub const MAX_SECRET_PLACEHOLDER_BYTES: usize = 1024;
 
+/// Maximum size of a file-backed secret. Credentials are small; a larger
+/// file is treated as misconfiguration/attack and fails closed.
+pub const MAX_SECRET_FILE_BYTES: usize = 64 * 1024;
+
 /// Placeholder-based secret substitution for a sandbox's TLS-intercepted egress.
 ///
 /// The sandbox only ever sees each secret's `placeholder`; the local network
@@ -2494,6 +2498,20 @@ pub enum SecretConfigError {
         /// Index of the invalid secret entry.
         secret_index: usize,
     },
+
+    /// A `File` source's path is empty.
+    #[error("secret #{secret_index}: file source path must not be empty")]
+    FileSourcePathEmpty {
+        /// Index of the invalid secret entry.
+        secret_index: usize,
+    },
+
+    /// A `File` source's path is not absolute.
+    #[error("secret #{secret_index}: file source path must be absolute")]
+    FileSourcePathNotAbsolute {
+        /// Index of the invalid secret entry.
+        secret_index: usize,
+    },
 }
 
 impl SecretsConfig {
@@ -2531,7 +2549,23 @@ impl SecretEntry {
             return Err(SecretConfigError::MissingSubstitutionLocation { secret_index });
         }
 
-        validate_placeholder(&self.placeholder, secret_index)
+        validate_placeholder(&self.placeholder, secret_index)?;
+
+        if let Some(SecretSource::File { path }) = &self.source {
+            // Relative paths are ambiguous across the spawn (SDK) and runtime
+            // (engine) processes; the file is read on the runtime host, so it
+            // must be absolute. Existence is not checked here: the file may
+            // be created/rotated after boot, and that is a per-connection
+            // fail-closed concern handled by the network engine.
+            if path.as_os_str().is_empty() {
+                return Err(SecretConfigError::FileSourcePathEmpty { secret_index });
+            }
+            if !path.is_absolute() {
+                return Err(SecretConfigError::FileSourcePathNotAbsolute { secret_index });
+            }
+        }
+
+        Ok(())
     }
 }
 
@@ -3158,6 +3192,49 @@ mod tests {
             violation_action: None,
             require_tls_identity,
         }
+    }
+
+    fn secret_entry_with_source(source: Option<SecretSource>) -> SecretEntry {
+        SecretEntry {
+            env_var: "API_KEY".into(),
+            value: Zeroizing::new(String::new()),
+            source,
+            placeholder: "$MSB_API_KEY".into(),
+            allowed_hosts: vec![HostPattern::Exact("api.example.com".into())],
+            substitution: SecretSubstitution::default(),
+            passthrough_hosts: Vec::new(),
+            violation_action: None,
+            require_tls_identity: true,
+        }
+    }
+
+    #[test]
+    fn secret_entry_validate_rejects_empty_file_source_path() {
+        let entry = secret_entry_with_source(Some(SecretSource::File { path: "".into() }));
+        assert_eq!(
+            entry.validate(0),
+            Err(SecretConfigError::FileSourcePathEmpty { secret_index: 0 })
+        );
+    }
+
+    #[test]
+    fn secret_entry_validate_rejects_relative_file_source_path() {
+        let entry = secret_entry_with_source(Some(SecretSource::File {
+            path: "creds/token".into(),
+        }));
+        assert_eq!(
+            entry.validate(0),
+            Err(SecretConfigError::FileSourcePathNotAbsolute { secret_index: 0 })
+        );
+    }
+
+    #[test]
+    fn secret_entry_validate_accepts_absolute_file_source_path_with_empty_value() {
+        let entry = secret_entry_with_source(Some(SecretSource::File {
+            path: "/run/creds/token".into(),
+        }));
+        assert!(entry.validate(0).is_ok());
+        assert!(entry.value.is_empty());
     }
 
     fn tmpfs_mount(guest: &str) -> VolumeMount {

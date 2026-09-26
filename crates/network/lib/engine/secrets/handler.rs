@@ -14,10 +14,11 @@ use httlib_hpack::{Decoder as HpackDecoder, Encoder as HpackEncoder};
 use percent_encoding::percent_decode;
 
 use super::config::SecretsConfigExt;
+use super::file_source;
 use crate::netstack::shared::SharedState;
 use crate::policy::{EgressEvaluation, HostnameSource, NetworkPolicy, Protocol};
 use crate::secrets::config::{
-    HostPattern, MAX_SECRET_PLACEHOLDER_BYTES, SecretEntry, SecretSubstitution,
+    HostPattern, MAX_SECRET_PLACEHOLDER_BYTES, SecretEntry, SecretSource, SecretSubstitution,
     SecretViolationAction, SecretsConfig,
 };
 
@@ -661,20 +662,38 @@ impl SecretsHandler {
                 secret.placeholder.len().min(MAX_SECRET_PLACEHOLDER_BYTES),
             ));
 
-            let host_allowed =
-                !force_ineligible && secret_host_allowed(secret, sni, identity.as_ref());
+            let mut resolution_failed = false;
+            let resolved_value = match &secret.source {
+                Some(SecretSource::File { path }) => match file_source::read_file_secret(path) {
+                    Ok(value) => Some(value),
+                    Err(error) => {
+                        tracing::warn!(
+                            env_var = %secret.env_var,
+                            error = error.kind_str(),
+                            "file-backed secret unresolved; blocking placeholder on this connection"
+                        );
+                        resolution_failed = true;
+                        None
+                    }
+                },
+                _ => Some(secret.value.clone()),
+            };
+
+            let host_allowed = !force_ineligible
+                && !resolution_failed
+                && secret_host_allowed(secret, sni, identity.as_ref());
 
             // Substitution and placeholder passthrough are independent policies. An
             // allowed host can substitute enabled locations while disabled locations
             // remain protected by the violation detector below.
-            if host_allowed {
+            if host_allowed && let Some(value) = resolved_value {
                 if secret.substitution.body {
                     max_body_placeholder_len = max_body_placeholder_len
                         .max(secret.placeholder.len().min(MAX_SECRET_PLACEHOLDER_BYTES));
                 }
                 eligible_for_substitution.push(EligibleSecret {
                     placeholder: secret.placeholder.clone(),
-                    value: secret.value.clone(),
+                    value,
                     substitute_headers: secret.substitution.headers,
                     substitute_query: secret.substitution.query,
                     substitute_body: secret.substitution.body,
@@ -682,24 +701,29 @@ impl SecretsHandler {
                 });
             }
 
-            if secret
-                .passthrough_hosts
-                .iter()
-                .any(|pattern| host_pattern_allowed(pattern, sni, identity.as_ref()))
-            {
-                continue;
-            }
+            // A failed file resolution is never rescued by passthrough: an
+            // operator who configured a live credential source wants the
+            // request refused, not a dead placeholder forwarded upstream.
+            if !resolution_failed {
+                if secret
+                    .passthrough_hosts
+                    .iter()
+                    .any(|pattern| host_pattern_allowed(pattern, sni, identity.as_ref()))
+                {
+                    continue;
+                }
 
-            // A per-secret blocking action overrides the global passthrough default.
-            // Per-secret passthrough falls back to the global policy off its hosts.
-            if secret.violation_action.is_none()
-                && config.passthrough_hosts.as_ref().is_some_and(|hosts| {
-                    hosts
-                        .iter()
-                        .any(|pattern| host_pattern_allowed(pattern, sni, identity.as_ref()))
-                })
-            {
-                continue;
+                // A per-secret blocking action overrides the global passthrough default.
+                // Per-secret passthrough falls back to the global policy off its hosts.
+                if secret.violation_action.is_none()
+                    && config.passthrough_hosts.as_ref().is_some_and(|hosts| {
+                        hosts
+                            .iter()
+                            .any(|pattern| host_pattern_allowed(pattern, sni, identity.as_ref()))
+                    })
+                {
+                    continue;
+                }
             }
 
             let substitution = if host_allowed && (!secret.require_tls_identity || tls_intercepted)
@@ -3600,6 +3624,186 @@ mod tests {
         let mut secret = make_secret(placeholder, value, host);
         secret.passthrough_hosts = vec![HostPattern::Exact(host.into())];
         secret
+    }
+
+    /// A File-backed secret entry: value is empty, source names `path`. Kept
+    /// separate from [`make_secret`] rather than adding a source parameter
+    /// there, since that helper has many existing non-File callers.
+    fn make_file_secret(placeholder: &str, path: &std::path::Path, host: &str) -> SecretEntry {
+        SecretEntry {
+            env_var: "TEST_FILE_KEY".into(),
+            value: zeroize::Zeroizing::new(String::new()),
+            source: Some(SecretSource::File {
+                path: path.to_path_buf(),
+            }),
+            placeholder: placeholder.into(),
+            allowed_hosts: vec![HostPattern::Exact(host.into())],
+            substitution: SecretSubstitution::default(),
+            passthrough_hosts: Vec::new(),
+            violation_action: None,
+            require_tls_identity: true,
+        }
+    }
+
+    #[test]
+    fn file_backed_secret_substitutes_current_file_contents() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("token");
+        std::fs::write(&path, "tok-AAA\n").unwrap();
+
+        let config = make_config(vec![make_file_secret("$KEY", &path, "api.openai.com")]);
+        let mut handler = SecretsHandler::new(&config, "api.openai.com", true);
+
+        let input = b"GET / HTTP/1.1\r\nAuthorization: Bearer $KEY\r\n\r\n";
+        let output = handler.substitute(input).unwrap();
+        assert_eq!(
+            String::from_utf8(output.into_owned()).unwrap(),
+            "GET / HTTP/1.1\r\nAuthorization: Bearer tok-AAA\r\n\r\n"
+        );
+    }
+
+    /// The file is re-read per connection (per `new_inner` invocation), so a
+    /// host process rotating the file is picked up by the next connection
+    /// without a sandbox restart — no control-socket call is involved.
+    #[test]
+    fn file_backed_secret_rotation_is_picked_up_by_the_next_connection() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("token");
+        std::fs::write(&path, "tok-AAA\n").unwrap();
+
+        let config = make_config(vec![make_file_secret("$KEY", &path, "api.openai.com")]);
+        let mut first = SecretsHandler::new(&config, "api.openai.com", true);
+        let output = first
+            .substitute(b"GET / HTTP/1.1\r\nAuthorization: Bearer $KEY\r\n\r\n")
+            .unwrap();
+        assert!(
+            String::from_utf8(output.into_owned())
+                .unwrap()
+                .contains("tok-AAA")
+        );
+
+        std::fs::write(&path, "tok-BBB\n").unwrap();
+
+        let mut second = SecretsHandler::new(&config, "api.openai.com", true);
+        let output = second
+            .substitute(b"GET / HTTP/1.1\r\nAuthorization: Bearer $KEY\r\n\r\n")
+            .unwrap();
+        assert!(
+            String::from_utf8(output.into_owned())
+                .unwrap()
+                .contains("tok-BBB")
+        );
+    }
+
+    /// A File secret whose file cannot be read fails closed: the placeholder
+    /// is blocked, never substituted (and never substituted as an empty
+    /// string).
+    #[test]
+    fn file_backed_secret_missing_file_fails_closed() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("does-not-exist");
+
+        let config = make_config(vec![make_file_secret("$KEY", &path, "api.openai.com")]);
+        let mut handler = SecretsHandler::new(&config, "api.openai.com", true);
+
+        let input = b"GET / HTTP/1.1\r\nAuthorization: Bearer $KEY\r\n\r\n";
+        assert_eq!(
+            handler.substitute(input).unwrap_err(),
+            SecretViolationAction::Block
+        );
+    }
+
+    /// Even a passthrough policy for the host does not forward a File
+    /// secret's placeholder when the file failed to resolve: the operator
+    /// wanted a live credential, not a dead placeholder leaked upstream. The
+    /// failed resolution skips both passthrough `continue`s and forces an
+    /// all-false substitution scope, so the configured violation action still
+    /// applies.
+    #[test]
+    fn file_backed_secret_missing_file_blocks_even_under_passthrough() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("does-not-exist");
+
+        let mut secret = make_file_secret("$KEY", &path, "api.openai.com");
+        secret.passthrough_hosts = vec![HostPattern::Exact("api.openai.com".into())];
+        let config = make_config(vec![secret]);
+        let mut handler = SecretsHandler::new(&config, "api.openai.com", true);
+
+        let input = b"GET / HTTP/1.1\r\nAuthorization: Bearer $KEY\r\n\r\n";
+        assert_eq!(
+            handler.substitute(input).unwrap_err(),
+            SecretViolationAction::Block
+        );
+    }
+
+    /// The asymmetric boundary that separates the correct fail-closed
+    /// translation from the naive port: identical configuration, differing
+    /// only in whether the file is readable. Unreadable -> blocked even with
+    /// a matching passthrough host; readable -> substituted.
+    #[test]
+    fn file_backed_secret_readability_decides_block_versus_substitution() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("token");
+
+        let mut secret = make_file_secret("$KEY", &path, "api.openai.com");
+        secret.passthrough_hosts = vec![HostPattern::Exact("api.openai.com".into())];
+        let config = make_config(vec![secret]);
+        let input = b"GET / HTTP/1.1\r\nAuthorization: Bearer $KEY\r\n\r\n";
+
+        // Unreadable file: blocked, never forwarded.
+        let mut missing = SecretsHandler::new(&config, "api.openai.com", true);
+        assert_eq!(
+            missing.substitute(input).unwrap_err(),
+            SecretViolationAction::Block
+        );
+
+        // Same config, readable file: substituted.
+        std::fs::write(&path, "tok-AAA\n").unwrap();
+        let mut readable = SecretsHandler::new(&config, "api.openai.com", true);
+        let output = readable.substitute(input).unwrap();
+        assert_eq!(
+            String::from_utf8(output.into_owned()).unwrap(),
+            "GET / HTTP/1.1\r\nAuthorization: Bearer tok-AAA\r\n\r\n"
+        );
+    }
+
+    /// When a File secret's read fails but another rule makes the same
+    /// placeholder eligible with a readable value, the readable secret wins
+    /// (the de-dup pass in `new_inner` still drops the ineligible entry).
+    #[test]
+    fn readable_secret_wins_deduplication_over_failed_file_secret_with_same_placeholder() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing_path = dir.path().join("does-not-exist");
+
+        let mut failed_file = make_file_secret("$KEY", &missing_path, "unused.example.com");
+        failed_file.allowed_hosts = vec![HostPattern::Wildcard("*.github.com".into())];
+        let readable = make_secret("$KEY", "real-secret", "api.github.com");
+        let config = make_config(vec![readable, failed_file]);
+        let mut handler = SecretsHandler::new(&config, "api.github.com", true);
+
+        let input = b"GET / HTTP/1.1\r\nAuthorization: Bearer $KEY\r\n\r\n";
+        let output = handler.substitute(input).unwrap();
+        assert_eq!(
+            String::from_utf8(output.into_owned()).unwrap(),
+            "GET / HTTP/1.1\r\nAuthorization: Bearer real-secret\r\n\r\n"
+        );
+    }
+
+    /// The durable config for a File secret persists only the path; the
+    /// serialized bytes and the redacted `Debug` output never carry the
+    /// (in this test, absent) credential material.
+    #[test]
+    fn file_backed_secret_config_persists_path_only_no_credential_bytes() {
+        let path = std::path::Path::new("/run/creds/token");
+        let entry = make_file_secret("$KEY", path, "api.openai.com");
+
+        let json = serde_json::to_string(&entry).unwrap();
+        assert!(json.contains("/run/creds/token"));
+        assert!(json.contains("\"kind\":\"file\""));
+
+        let debug = format!("{entry:?}");
+        assert!(debug.contains("[REDACTED]"));
+        assert!(!debug.contains("tok-"));
     }
 
     fn cache_host(shared: &SharedState, host: &str, ip: Ipv4Addr) {
