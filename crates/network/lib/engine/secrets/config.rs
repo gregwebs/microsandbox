@@ -80,6 +80,7 @@ mod tests {
             passthrough_hosts: None,
             secrets: vec![secret(true, vec![HostPattern::Any])],
             violation_action: SecretViolationAction::default(),
+            ..SecretsConfig::default()
         };
         assert!(!tls_only.has_plain_http_candidates());
 
@@ -87,6 +88,7 @@ mod tests {
             passthrough_hosts: None,
             secrets: vec![secret(false, vec![HostPattern::Any])],
             violation_action: SecretViolationAction::default(),
+            ..SecretsConfig::default()
         };
         assert!(plain.has_plain_http_candidates());
     }
@@ -113,6 +115,7 @@ mod tests {
             passthrough_hosts: None,
             secrets: vec![secret(true, vec![HostPattern::Any])],
             violation_action: SecretViolationAction::default(),
+            ..SecretsConfig::default()
         };
         assert!(!any.has_host_scoped_secrets());
 
@@ -123,6 +126,7 @@ mod tests {
                 vec![HostPattern::Exact("api.example.com".into())],
             )],
             violation_action: SecretViolationAction::default(),
+            ..SecretsConfig::default()
         };
         assert!(scoped.has_host_scoped_secrets());
     }

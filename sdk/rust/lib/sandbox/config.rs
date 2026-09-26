@@ -1056,6 +1056,20 @@ pub(crate) fn ensure_tls_for_secrets(network: &mut NetworkConfig) -> bool {
     true
 }
 
+/// Whether a durable config authorizes any origin-scoped header credential.
+///
+/// The launch path probes the target runtime for the header-credential
+/// capability only when this is true, so an ordinary config pays no extra
+/// process spawn.
+pub(crate) fn has_header_credentials(config: &SandboxConfig) -> bool {
+    config
+        .spec
+        .network
+        .secrets
+        .as_ref()
+        .is_some_and(|secrets| !secrets.header_credentials.is_empty())
+}
+
 //--------------------------------------------------------------------------------------------------
 // Trait Implementations
 //--------------------------------------------------------------------------------------------------

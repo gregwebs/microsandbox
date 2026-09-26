@@ -5,6 +5,7 @@
 //! substitutes the real value only when the request goes to an allowed host.
 
 pub mod config;
+pub mod credential;
 #[cfg(feature = "engine")]
 pub use crate::engine::secrets::handle;
 #[cfg(feature = "engine")]

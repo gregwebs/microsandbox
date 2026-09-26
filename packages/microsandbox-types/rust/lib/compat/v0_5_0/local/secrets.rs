@@ -223,6 +223,7 @@ pub fn deserialize_config<'de, D: serde::Deserializer<'de>>(
             .map(EntryFields::into_current)
             .collect::<Result<_, _>>()
             .map_err(serde::de::Error::custom)?,
+        header_credentials: Vec::new(),
         violation_action: action.unwrap_or_default(),
         passthrough_hosts,
     })

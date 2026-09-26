@@ -8,8 +8,8 @@ use std::time::Duration;
 
 use ipnetwork::{Ipv4Network, Ipv6Network};
 use microsandbox_types::{
-    NetworkRateLimitDirection, NetworkRateLimiterConfig, RateLimiterConfig, ScopedUpstreamCaCert,
-    ScopedVerifyUpstream, TlsConfig, TokenBucketConfig,
+    DurableHeaderCredential, HttpsOrigin, NetworkRateLimitDirection, NetworkRateLimiterConfig,
+    RateLimiterConfig, ScopedUpstreamCaCert, ScopedVerifyUpstream, TlsConfig, TokenBucketConfig,
 };
 use microsandbox_utils::size::Bytes;
 use zeroize::Zeroizing;
@@ -63,6 +63,29 @@ pub struct SecretBuilder {
     passthrough_hosts: Vec<HostPattern>,
     violation_action: Option<SecretViolationAction>,
     require_tls_identity: bool,
+}
+
+/// Fluent builder for a single durable [`DurableHeaderCredential`].
+///
+/// There is deliberately no `.value(..)`: a caller cannot place plaintext into
+/// a config that might be persisted. The value is supplied at spawn time by a
+/// host-side `CredentialResolver` and travels only on the private launch FD.
+///
+/// ```ignore
+/// HeaderCredentialBuilder::new()
+///     .id("anthropic")
+///     .reference("anthropic-api-key")
+///     .origin("api.anthropic.com", 443)
+///     .header("x-api-key")
+///     .format("%s")
+/// ```
+pub struct HeaderCredentialBuilder {
+    id: Option<String>,
+    reference: Option<String>,
+    origin_host: Option<String>,
+    origin_port: u16,
+    header: Option<String>,
+    format: Option<String>,
 }
 
 /// Fluent builder for both directions of a [`NetworkRateLimiterConfig`].
@@ -241,6 +264,49 @@ impl NetworkBuilder {
         self
     }
 
+    /// Add an origin-scoped header credential via a closure builder.
+    ///
+    /// The credential sets (not substitutes) one named header to a formatted
+    /// value on requests to exactly one HTTPS origin. Its value is supplied at
+    /// spawn time by a host-side `CredentialResolver`, so this builder carries
+    /// only non-secret authorization metadata.
+    ///
+    /// A credential-bearing config can only be injected through TLS
+    /// interception, so this enables TLS; [`NetworkBuilder::build`] fails
+    /// closed if TLS or networking is explicitly disabled. Interception is
+    /// decided **per port**, so [`NetworkBuilder::build`] also fails closed
+    /// when the credential's origin port is not among
+    /// [`TlsConfig::intercepted_ports`] (default `[443]`) — that port must be
+    /// added explicitly, e.g. `.tls(|t| t.intercepted_ports(vec![8443]))`.
+    /// Ports are never added automatically, because doing so would intercept
+    /// unrelated traffic on them.
+    ///
+    /// ```ignore
+    /// .header_credential(|c| c
+    ///     .id("anthropic")
+    ///     .reference("anthropic-api-key")
+    ///     .origin("api.anthropic.com", 443)
+    ///     .header("x-api-key")
+    ///     .format("%s")
+    /// )
+    /// ```
+    pub fn header_credential(
+        mut self,
+        f: impl FnOnce(HeaderCredentialBuilder) -> HeaderCredentialBuilder,
+    ) -> Self {
+        // Like the other nested builders, a missing required field is pushed as
+        // a `BuildError` and surfaced by `NetworkBuilder::build`; the config is
+        // left untouched (no TLS enable, no credential) on failure.
+        match f(HeaderCredentialBuilder::new()).build() {
+            Ok(credential) => {
+                self.config.tls.enabled = true;
+                self.config.secrets.header_credentials.push(credential);
+            }
+            Err(err) => self.errors.push(err),
+        }
+        self
+    }
+
     /// Shorthand: add a secret with env var, value, placeholder, and allowed host.
     pub fn secret_env(
         mut self,
@@ -366,6 +432,24 @@ impl NetworkBuilder {
                 != self.config.tls.intercept_ca.key_path.is_some())
         {
             return Err(BuildError::IncompleteInterceptCaConfig);
+        }
+        if !self.config.secrets.header_credentials.is_empty() {
+            if !self.config.enabled {
+                return Err(BuildError::HeaderCredentialRequiresNetwork);
+            }
+            if !self.config.tls.enabled {
+                return Err(BuildError::HeaderCredentialRequiresTls);
+            }
+            // Interception is per-port, and `.intercepted_ports` can be set
+            // after `.header_credential`, so check the assembled config here
+            // rather than inside `header_credential`.
+            if let Some((credential_id, port)) = self.config.first_unintercepted_header_credential()
+            {
+                return Err(BuildError::HeaderCredentialPortNotIntercepted {
+                    credential_id: credential_id.to_owned(),
+                    port,
+                });
+            }
         }
         self.config.secrets.validate()?;
         Ok(self.config)
@@ -701,6 +785,87 @@ impl SecretBuilder {
             violation_action: self.violation_action,
             require_tls_identity: self.require_tls_identity,
         }
+    }
+}
+
+impl HeaderCredentialBuilder {
+    /// Start building a durable header credential.
+    pub fn new() -> Self {
+        Self {
+            id: None,
+            reference: None,
+            origin_host: None,
+            origin_port: 443,
+            header: None,
+            format: None,
+        }
+    }
+
+    /// Set the non-secret diagnostic label.
+    pub fn id(mut self, id: impl Into<String>) -> Self {
+        self.id = Some(id.into());
+        self
+    }
+
+    /// Set the non-secret reference the host resolver understands.
+    pub fn reference(mut self, reference: impl Into<String>) -> Self {
+        self.reference = Some(reference.into());
+        self
+    }
+
+    /// Set the exact origin. A single trailing dot is normalized away.
+    pub fn origin(mut self, host: impl Into<String>, port: u16) -> Self {
+        let mut host = host.into();
+        if host.ends_with('.') {
+            host.pop();
+        }
+        self.origin_host = Some(host);
+        self.origin_port = port;
+        self
+    }
+
+    /// Set the header name that is set (not substituted).
+    pub fn header(mut self, header: impl Into<String>) -> Self {
+        self.header = Some(header.into());
+        self
+    }
+
+    /// Set the value template with exactly one `%s`.
+    pub fn format(mut self, format: impl Into<String>) -> Self {
+        self.format = Some(format.into());
+        self
+    }
+
+    /// Consume the builder and return the credential.
+    ///
+    /// Returns [`BuildError::HeaderCredentialFieldMissing`] naming the first
+    /// required field (`id`, `reference`, `origin`, `header`, `format`) that was
+    /// not set, so a caller — including [`NetworkBuilder::header_credential`] —
+    /// surfaces a typed error instead of panicking. Real value-grammar checking
+    /// is [`SecretsConfig::validate`](microsandbox_types::SecretsConfig::validate).
+    pub fn build(self) -> Result<DurableHeaderCredential, BuildError> {
+        let miss = |field| BuildError::HeaderCredentialFieldMissing { field };
+        let id = self.id.ok_or_else(|| miss("id"))?;
+        let reference = self.reference.ok_or_else(|| miss("reference"))?;
+        let origin_host = self.origin_host.ok_or_else(|| miss("origin"))?;
+        let header = self.header.ok_or_else(|| miss("header"))?;
+        let format = self.format.ok_or_else(|| miss("format"))?;
+        Ok(DurableHeaderCredential {
+            id,
+            reference,
+            origin: HttpsOrigin {
+                host: origin_host,
+                port: self.origin_port,
+            },
+            header,
+            format,
+        })
+    }
+}
+
+impl Default for HeaderCredentialBuilder {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -1257,5 +1422,172 @@ mod tests {
             err.to_string(),
             "egress rate limiter: ops refill interval overflows u64 milliseconds"
         );
+    }
+
+    /// Adding a header credential must not change egress policy: a credential
+    /// authorizes no route, and `NetworkPolicy` stays byte-identical.
+    #[test]
+    fn header_credential_does_not_change_the_egress_policy() {
+        let baseline = NetworkBuilder::new().build().unwrap();
+        let with_credential = NetworkBuilder::new()
+            .header_credential(|c| {
+                c.id("anthropic")
+                    .reference("anthropic-api-key")
+                    .origin("api.anthropic.com", 443)
+                    .header("x-api-key")
+                    .format("%s")
+            })
+            .build()
+            .unwrap();
+
+        // `NetworkPolicy` intentionally has no `PartialEq`; compare its
+        // serialized form instead of widening the public type.
+        assert_eq!(
+            serde_json::to_string(&baseline.policy).unwrap(),
+            serde_json::to_string(&with_credential.policy).unwrap()
+        );
+        assert!(with_credential.tls.enabled);
+        assert!(with_credential.secrets.secrets.is_empty());
+        assert_eq!(with_credential.secrets.header_credentials.len(), 1);
+    }
+
+    /// A missing required field is a typed `BuildError`, not a panic.
+    #[test]
+    fn header_credential_builder_reports_a_missing_field_instead_of_panicking() {
+        let err = HeaderCredentialBuilder::new()
+            .id("anthropic")
+            .build()
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            BuildError::HeaderCredentialFieldMissing { field: "reference" }
+        ));
+    }
+
+    /// A failed `header_credential` must not mutate the config: no TLS enable
+    /// and no credential are applied, only the accumulated error.
+    #[test]
+    fn failed_header_credential_does_not_mutate_the_config() {
+        let builder = NetworkBuilder::new().header_credential(|c| c.id("anthropic"));
+        assert!(
+            !builder.config.tls.enabled,
+            "TLS must not be enabled when the credential is invalid"
+        );
+        assert!(builder.config.secrets.header_credentials.is_empty());
+        assert_eq!(builder.errors.len(), 1);
+    }
+
+    #[test]
+    fn header_credential_refuses_explicitly_disabled_tls_or_network() {
+        let err = NetworkBuilder::new()
+            .header_credential(|c| {
+                c.id("anthropic")
+                    .reference("anthropic-api-key")
+                    .origin("api.anthropic.com", 443)
+                    .header("x-api-key")
+                    .format("%s")
+            })
+            .tls(|t| t.enabled(false))
+            .build()
+            .unwrap_err();
+        assert!(matches!(err, BuildError::HeaderCredentialRequiresTls));
+
+        let err = NetworkBuilder::new()
+            .enabled(false)
+            .header_credential(|c| {
+                c.id("anthropic")
+                    .reference("anthropic-api-key")
+                    .origin("api.anthropic.com", 443)
+                    .header("x-api-key")
+                    .format("%s")
+            })
+            .build()
+            .unwrap_err();
+        assert!(matches!(err, BuildError::HeaderCredentialRequiresNetwork));
+    }
+
+    fn credential_at(
+        origin_port: u16,
+    ) -> impl FnOnce(HeaderCredentialBuilder) -> HeaderCredentialBuilder {
+        move |c| {
+            c.id("anthropic")
+                .reference("anthropic-api-key")
+                .origin("api.anthropic.com", origin_port)
+                .header("x-api-key")
+                .format("%s")
+        }
+    }
+
+    /// A credential scoped to a port that is not TLS-intercepted is rejected:
+    /// interception is per-port, so the credential could never be injected.
+    #[test]
+    fn header_credential_for_an_unintercepted_port_is_rejected() {
+        let err = NetworkBuilder::new()
+            .header_credential(credential_at(8443))
+            .build()
+            .unwrap_err();
+
+        assert!(
+            matches!(
+                err,
+                BuildError::HeaderCredentialPortNotIntercepted {
+                    ref credential_id,
+                    port: 8443,
+                } if credential_id == "anthropic"
+            ),
+            "got {err:?}"
+        );
+        let rendered = err.to_string();
+        assert!(rendered.contains("8443"), "{rendered}");
+        assert!(rendered.contains("intercepted ports"), "{rendered}");
+        assert!(rendered.contains("per-port"), "{rendered}");
+    }
+
+    #[test]
+    fn header_credential_is_accepted_once_its_port_is_intercepted() {
+        let cfg = NetworkBuilder::new()
+            .header_credential(credential_at(8443))
+            .tls(|t| t.intercepted_ports(vec![8443]))
+            .build()
+            .unwrap();
+
+        assert_eq!(cfg.tls.intercepted_ports, vec![8443]);
+        assert_eq!(cfg.secrets.header_credentials.len(), 1);
+    }
+
+    #[test]
+    fn header_credential_on_the_default_port_is_accepted() {
+        let cfg = NetworkBuilder::new()
+            .header_credential(credential_at(443))
+            .build()
+            .unwrap();
+
+        assert_eq!(cfg.tls.intercepted_ports, vec![443]);
+        assert_eq!(cfg.secrets.header_credentials.len(), 1);
+    }
+
+    #[test]
+    fn header_credential_on_443_is_rejected_when_interception_is_emptied() {
+        let err = NetworkBuilder::new()
+            .header_credential(credential_at(443))
+            .tls(|t| t.intercepted_ports(vec![]))
+            .build()
+            .unwrap_err();
+
+        assert!(matches!(
+            err,
+            BuildError::HeaderCredentialPortNotIntercepted { port: 443, .. }
+        ));
+    }
+
+    #[test]
+    fn credential_free_config_is_unaffected_by_the_interception_check() {
+        let cfg = NetworkBuilder::new()
+            .tls(|t| t.enabled(true).intercepted_ports(vec![]))
+            .build()
+            .unwrap();
+
+        assert!(cfg.secrets.header_credentials.is_empty());
+        assert!(cfg.tls.intercepted_ports.is_empty());
     }
 }

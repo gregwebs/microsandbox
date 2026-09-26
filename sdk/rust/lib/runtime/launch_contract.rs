@@ -123,6 +123,12 @@ impl LaunchContract {
         if self.patch < 17 && network.outbound_proxy.is_some() {
             return unsupported("outbound proxy");
         }
+        // `validate_network` already returns `Ok(())` for `self.machine` above,
+        // so this fires only for a selected previous contract: a previous
+        // launch wire cannot carry resolved header credentials.
+        if !network.secrets.header_credentials.is_empty() {
+            return unsupported("origin-scoped header credentials");
+        }
         let mut secrets = serde_json::to_value(&network.secrets)?;
         types_compat::v0_5_0::local::secrets::to_previous_version(
             secrets
@@ -555,6 +561,26 @@ pub(crate) async fn require_restore_backing(path: &Path) -> MicrosandboxResult<(
     Ok(())
 }
 
+/// Refuse a credential-bearing launch unless the exact binary about to be
+/// spawned advertises the capability.
+///
+/// A version comparison cannot answer this: a fork build and a stock upstream
+/// build report the same version, and an unknown additive field would be
+/// dropped (older runtimes) or rejected (`deny_unknown_fields`) rather than
+/// honoured. An absent capability, an unparsable reply, a non-zero exit, and a
+/// timeout are all refusals.
+pub(crate) async fn require_header_credentials(path: &Path) -> MicrosandboxResult<()> {
+    let output = bounded_probe(path, "__launch-protocol").await?;
+    let supported = serde_json::from_slice::<LaunchCapabilities>(&output)
+        .is_ok_and(|capabilities| capabilities.header_credentials);
+    if !supported {
+        return Err(MicrosandboxError::Runtime(upgrade_required(
+            "origin-scoped header credentials",
+        )));
+    }
+    Ok(())
+}
+
 async fn probe(path: &Path) -> MicrosandboxResult<Version> {
     parse_version(&bounded_probe(path, "--version").await?)
 }
@@ -695,6 +721,80 @@ mod tests {
             "printf '%s' '{\"protocols\":[2],\"required_restore_backing\":\"true\"}'",
         );
         assert!(require_restore_backing(&malformed).await.is_err());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn header_credentials_probe_distinguishes_old_and_capable_runtimes() {
+        let dir = tempfile::tempdir().unwrap();
+        let old = script(
+            dir.path(),
+            "old-capabilities",
+            "printf '%s' '{\"protocols\":[2,1],\"required_restore_backing\":true}'",
+        );
+        let error = require_header_credentials(&old)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("upgrade msb"));
+        assert!(error.contains("origin-scoped header credentials"));
+
+        let new = script(
+            dir.path(),
+            "new-capabilities",
+            "printf '%s' '{\"protocols\":[2,1],\"required_restore_backing\":true,\"header_credentials\":true}'",
+        );
+        require_header_credentials(&new).await.unwrap();
+
+        let malformed = script(
+            dir.path(),
+            "malformed-capabilities",
+            "printf '%s' 'not-json'",
+        );
+        assert!(require_header_credentials(&malformed).await.is_err());
+
+        let failing = script(dir.path(), "failing-capabilities", "exit 3");
+        assert!(require_header_credentials(&failing).await.is_err());
+    }
+
+    #[test]
+    fn launch_capabilities_fail_closed_when_header_credentials_absent() {
+        // The fail-closed default: an older probe omits the field.
+        let capabilities =
+            serde_json::from_str::<LaunchCapabilities>(r#"{"protocols":[2,1]}"#).unwrap();
+        assert!(!capabilities.header_credentials);
+    }
+
+    #[cfg(all(unix, feature = "net"))]
+    #[test]
+    fn previous_contract_refuses_header_credentials_before_probing() {
+        let mut config = crate::test_support::fixtures::decode(include_str!(
+            "../db/fixtures/config-0.6.18.json"
+        ))
+        .unwrap();
+        let network = microsandbox_network::config::NetworkBuilder::new()
+            .header_credential(|c| {
+                c.id("anthropic")
+                    .reference("anthropic-api-key")
+                    .origin("api.anthropic.com", 443)
+                    .header("x-api-key")
+                    .format("%s")
+            })
+            .build()
+            .unwrap();
+        config.set_local_network_config(network).unwrap();
+
+        let error = LaunchContract {
+            patch: 18,
+            machine: false,
+        }
+        .validate_launch_intent(&config)
+        .unwrap_err()
+        .to_string();
+        assert!(
+            error.contains("origin-scoped header credentials"),
+            "{error}"
+        );
     }
 
     #[cfg(unix)]

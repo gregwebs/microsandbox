@@ -332,6 +332,13 @@ pub async fn spawn_sandbox(
     // the selected executable may have changed since creation. Validate its
     // effective configuration here for both initial launch and later starts.
     launch_contract.validate_launch_intent(config)?;
+    // A credential-bearing config requires the target runtime to advertise the
+    // named capability: an unknown additive field would be dropped or rejected
+    // rather than honoured. Probing is skipped entirely for ordinary configs.
+    #[cfg(feature = "net")]
+    if crate::sandbox::config::has_header_credentials(config) {
+        launch_contract::require_header_credentials(&resolved_runtime.msb_path).await?;
+    }
     if config.checkpoint_restore.as_ref().is_some_and(|restore| {
         restore
             .external_mounts

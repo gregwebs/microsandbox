@@ -1910,6 +1910,8 @@ mod tests {
             deployment_profile: Default::default(),
             #[cfg(feature = "net")]
             sandbox_slot: 1,
+            #[cfg(feature = "net")]
+            resolved_header_credentials: Vec::new(),
             checkpoint_restore: None,
         };
         match layout {

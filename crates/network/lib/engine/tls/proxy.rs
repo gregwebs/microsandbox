@@ -103,9 +103,15 @@ impl TlsProxy {
         self
     }
 
-    /// Require the ClientHello SNI to match an HTTP CONNECT authority.
-    pub(crate) fn with_expected_sni(mut self, expected_sni: Option<String>) -> Self {
-        self.via_connect = expected_sni.is_some();
+    /// Mark this proxy as an HTTP CONNECT handoff and optionally verify its hostname authority.
+    ///
+    /// An IP-literal authority still marks the transport as CONNECT, but has no
+    /// hostname authority to verify: it therefore keeps the DNS-pin check the
+    /// direct path uses rather than being trusted outright. This is why
+    /// `via_connect` and the hostname-authority flag are separate — upstream's
+    /// single flag conflated them.
+    pub(crate) fn with_connect_authority(mut self, expected_sni: Option<String>) -> Self {
+        self.via_connect = true;
         self.expected_sni = expected_sni;
         self
     }
@@ -153,6 +159,10 @@ impl TlsProxy {
             initial_buf,
         } = self;
         let connect_dst = connect_target.primary();
+        // A hostname CONNECT authority is proven by the proxy against the
+        // CONNECT request; an IP-literal authority is not (no hostname to
+        // verify), so it keeps the existing DNS-pin check.
+        let has_connect_hostname_authority = expected_sni.is_some();
 
         // Buffer initial data to extract SNI from ClientHello. Timeout prevents a
         // slow/malicious guest from holding a proxy slot indefinitely.
@@ -239,6 +249,7 @@ impl TlsProxy {
                 connect_target,
                 &sni_name,
                 via_connect,
+                has_connect_hostname_authority,
                 initial_buf,
                 from_smoltcp,
                 to_smoltcp,
@@ -323,6 +334,7 @@ pub(crate) async fn intercept_relay(
     connect_target: UpstreamTcpTarget,
     sni_name: &str,
     via_connect: bool,
+    has_connect_hostname_authority: bool,
     initial_buf: Vec<u8>,
     mut from_smoltcp: mpsc::Receiver<Bytes>,
     to_smoltcp: mpsc::Sender<Bytes>,
@@ -334,11 +346,18 @@ pub(crate) async fn intercept_relay(
 ) -> io::Result<()> {
     // Per-connection snapshot: live secret updates apply to later connections.
     let secrets = tls_state.secrets.load();
-    let mut secrets_handler = if via_connect {
+    // `via_connect` is retained for the request-extension seam (a later commit
+    // passes it to `AuthorizedTlsRoute::new`); it is not otherwise consulted
+    // here, where the handler choice depends on hostname authority instead.
+    let _ = via_connect;
+    let mut secrets_handler = if has_connect_hostname_authority {
         SecretsHandler::new_tls_intercepted_via_connect(&secrets, sni_name)
     } else {
+        // Direct TLS, or a CONNECT to an IP-literal authority (no hostname to
+        // verify): both retain the DNS-pin check.
         SecretsHandler::new_tls_intercepted(&secrets, sni_name, guest_dst.ip(), &shared)
     }
+    .with_header_credentials(tls_state.header_credentials().to_vec())
     .with_guest_dst(guest_dst);
 
     // Get or generate per-domain certificate (includes cached ServerConfig).

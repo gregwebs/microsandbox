@@ -736,7 +736,7 @@ async fn handle_connect_tunnel(
         None,
     )
     .with_upstream(proxy_stream)
-    .with_expected_sni(expected_sni)
+    .with_connect_authority(expected_sni)
     .with_initial_buf(tls_seed)
     .try_run()
     .await

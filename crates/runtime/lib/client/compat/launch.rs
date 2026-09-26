@@ -165,6 +165,11 @@ impl PreviousLaunch {
             cpu_placement,
             #[cfg(feature = "net")]
             network,
+            // A previous-format payload cannot carry launch-only resolved
+            // header credentials; `PreviousLaunch` deliberately does not learn
+            // the field, so a selected previous contract always yields none.
+            #[cfg(feature = "net")]
+            resolved_header_credentials: Vec::new(),
             db_path: self.db_path,
             db_connect_timeout_secs: self.db_connect_timeout_secs,
             log_dir: self.log_dir,

@@ -261,6 +261,7 @@ impl From<CloudSecretsConfig> for SecretsConfig {
     fn from(config: CloudSecretsConfig) -> Self {
         Self {
             secrets: config.entries.into_iter().map(Into::into).collect(),
+            header_credentials: Vec::new(),
             passthrough_hosts: config
                 .passthrough_hosts
                 .map(|hosts| hosts.into_iter().map(Into::into).collect()),

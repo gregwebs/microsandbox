@@ -392,6 +392,12 @@ pub struct VmConfig {
     #[cfg(feature = "net")]
     pub sandbox_slot: u16,
 
+    /// Launch-only resolved header-credential values, threaded into the network
+    /// backend's host integrations. Never persisted.
+    #[cfg(feature = "net")]
+    pub resolved_header_credentials:
+        Vec<microsandbox_network::secrets::credential::ResolvedHeaderCredential>,
+
     /// Construction-only checkpoint restore source for clone/rollback activation.
     pub checkpoint_restore: Option<crate::launch::CheckpointRestoreConfig>,
 }
@@ -2537,9 +2543,15 @@ fn build_vm(
             .map_err(|err| RuntimeError::Custom(format!("invalid network secrets: {err}")))?;
         let rate_limiters = to_krun_network_rate_limiters(vm.network.config());
 
-        let mut network =
-            SmoltcpNetwork::new(vm.network.clone(), vm.sandbox_slot, vm.deployment_profile)
-                .map_err(|err| RuntimeError::Custom(format!("initialize network: {err}")))?;
+        let mut network = SmoltcpNetwork::with_host(
+            vm.network.clone(),
+            vm.sandbox_slot,
+            vm.deployment_profile,
+            microsandbox_network::network::HostIntegrations {
+                resolved_header_credentials: vm.resolved_header_credentials.clone(),
+            },
+        )
+        .map_err(|err| RuntimeError::Custom(format!("initialize network: {err}")))?;
         if let Some(restore) = &vm.checkpoint_restore {
             let gateway = restore.network_gateway_mac.ok_or_else(|| {
                 RuntimeError::Custom(

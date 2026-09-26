@@ -6,6 +6,8 @@
 //! this engine all speak one contract.
 
 pub use microsandbox_types::{
-    HostPattern, MAX_SECRET_FILE_BYTES, MAX_SECRET_PLACEHOLDER_BYTES, SecretConfigError,
-    SecretEntry, SecretSource, SecretSubstitution, SecretViolationAction, SecretsConfig,
+    DurableHeaderCredential, HostPattern, HttpsOrigin, MAX_HEADER_CREDENTIAL_FORMAT_BYTES,
+    MAX_HEADER_CREDENTIAL_VALUE_BYTES, MAX_HEADER_CREDENTIALS, MAX_SECRET_FILE_BYTES,
+    MAX_SECRET_PLACEHOLDER_BYTES, SecretConfigError, SecretEntry, SecretSource, SecretString,
+    SecretSubstitution, SecretViolationAction, SecretsConfig,
 };

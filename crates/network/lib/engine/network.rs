@@ -20,7 +20,7 @@ use microsandbox_types::{
 };
 use msb_krun::backends::net::NetBackend;
 
-use crate::config::{ConnectionLimit, ResolvedNetworkConfig};
+use crate::config::{ConnectionLimit, NetworkConfig, ResolvedNetworkConfig};
 use crate::engine::tls::state::{TlsState, TlsStateError};
 use crate::netstack::{
     backend::SmoltcpBackend,
@@ -28,6 +28,7 @@ use crate::netstack::{
     shared::{DEFAULT_QUEUE_CAPACITY, SharedState},
 };
 use crate::policy::{NetworkPolicy, NetworkProfile};
+use crate::secrets::credential::{ResolvedHeaderCredential, validate_resolved_header_credentials};
 use crate::secrets::handle::SecretsHandle;
 
 //--------------------------------------------------------------------------------------------------
@@ -84,6 +85,19 @@ struct HostRoutes {
     ipv6: bool,
 }
 
+/// Host-local integrations that are never part of serialized configuration.
+///
+/// Everything here is installed by the host process for one sandbox and is
+/// deliberately absent by default, so [`SmoltcpNetwork::new`] keeps upstream's
+/// signature and meaning. One value type rather than one constructor per
+/// feature: these extras are orthogonal and all optional.
+#[derive(Default)]
+pub struct HostIntegrations {
+    /// Launch-only resolved header credentials; must match the durable
+    /// definitions in `config.secrets.header_credentials` one-to-one.
+    pub resolved_header_credentials: Vec<ResolvedHeaderCredential>,
+}
+
 /// Errors that prevent the smoltcp network from being created safely.
 #[derive(Debug, thiserror::Error)]
 pub enum NetworkInitError {
@@ -125,6 +139,63 @@ pub enum NetworkInitError {
     /// A stored network rate limiter has neither direction configured.
     #[error("invalid network rate limiter: at least one of egress or ingress is required")]
     EmptyNetworkRateLimiter,
+
+    /// A stored secret configuration failed validation.
+    #[error("invalid network secret configuration: {source}")]
+    InvalidSecretConfig {
+        /// Underlying validation error.
+        #[source]
+        source: microsandbox_types::SecretConfigError,
+    },
+
+    /// Header credentials were configured while networking is disabled.
+    #[error("header credentials require networking to be enabled")]
+    HeaderCredentialRequiresNetwork,
+
+    /// Header credentials were configured without TLS interception.
+    #[error("header credentials require TLS interception")]
+    HeaderCredentialRequiresTls,
+
+    /// A header credential targets an origin port that is not TLS-intercepted,
+    /// so the credential could never be injected.
+    #[error(
+        "header credential `{credential_id}` targets port {port}, which is not TLS-intercepted; add {port} to the TLS intercepted ports (tls.intercepted_ports) because interception is per-port, not per-host"
+    )]
+    HeaderCredentialPortNotIntercepted {
+        /// Non-secret diagnostic `id` of the offending credential.
+        credential_id: String,
+        /// The origin port that is not intercepted.
+        port: u16,
+    },
+}
+
+/// Validate the launch-only resolved credentials against the durable
+/// definitions and require TLS + networking and per-port interception for a
+/// credential-bearing config.
+fn validate_launch_header_credentials(
+    config: &NetworkConfig,
+    resolved: &[ResolvedHeaderCredential],
+) -> Result<(), NetworkInitError> {
+    validate_resolved_header_credentials(&config.secrets.header_credentials, resolved)
+        .map_err(|source| NetworkInitError::InvalidSecretConfig { source })?;
+    if !config.secrets.header_credentials.is_empty() {
+        if !config.enabled {
+            return Err(NetworkInitError::HeaderCredentialRequiresNetwork);
+        }
+        if !config.tls.enabled {
+            return Err(NetworkInitError::HeaderCredentialRequiresTls);
+        }
+        // A stored config bypasses `NetworkBuilder::build`, so enforce the
+        // per-port interception invariant here too; interception is decided
+        // purely by port, so a mis-scoped credential would never be injected.
+        if let Some((credential_id, port)) = config.first_unintercepted_header_credential() {
+            return Err(NetworkInitError::HeaderCredentialPortNotIntercepted {
+                credential_id: credential_id.to_owned(),
+                port,
+            });
+        }
+    }
+    Ok(())
 }
 
 /// Handle for installing host-side termination behavior into the network stack.
@@ -202,13 +273,29 @@ impl SmoltcpNetwork {
         slot: u16,
         deployment_profile: DeploymentProfile,
     ) -> Result<Self, NetworkInitError> {
-        Self::build(config, slot, deployment_profile, HostRoutes::detect())
+        Self::with_host(
+            config,
+            slot,
+            deployment_profile,
+            HostIntegrations::default(),
+        )
+    }
+
+    /// Create the backend with host-local integrations installed.
+    pub fn with_host(
+        config: ResolvedNetworkConfig,
+        slot: u16,
+        deployment_profile: DeploymentProfile,
+        host: HostIntegrations,
+    ) -> Result<Self, NetworkInitError> {
+        Self::build(config, slot, deployment_profile, host, HostRoutes::detect())
     }
 
     fn build(
         mut config: ResolvedNetworkConfig,
         slot: u16,
         deployment_profile: DeploymentProfile,
+        host: HostIntegrations,
         host_routes: HostRoutes,
     ) -> Result<Self, NetworkInitError> {
         enforce_deployment_profile(&mut config, deployment_profile);
@@ -281,12 +368,20 @@ impl SmoltcpNetwork {
             })?;
         let backend = SmoltcpBackend::new(shared.clone());
 
+        // A stored config bypasses the builder, so validate the durable secret
+        // grammar and the launch-only resolved list here, independently.
+        config
+            .secrets
+            .validate()
+            .map_err(|source| NetworkInitError::InvalidSecretConfig { source })?;
+        validate_launch_header_credentials(config, &host.resolved_header_credentials)?;
+
         let secrets = SecretsHandle::new(config.secrets.clone());
         let tls_state = if config.tls.enabled {
-            Some(Arc::new(TlsState::new(
-                config.tls.clone(),
-                secrets.clone(),
-            )?))
+            Some(Arc::new(
+                TlsState::new(config.tls.clone(), secrets.clone())?
+                    .with_header_credentials(host.resolved_header_credentials),
+            ))
         } else {
             None
         };
@@ -770,6 +865,7 @@ mod tests {
             resolved(source_config),
             7,
             DeploymentProfile::SingleTenant,
+            HostIntegrations::default(),
             routes(true, true),
         )
         .unwrap();
@@ -782,6 +878,7 @@ mod tests {
                 resolved(config.clone()),
                 slot,
                 DeploymentProfile::SingleTenant,
+                HostIntegrations::default(),
                 routes(true, true),
             )
             .unwrap()
@@ -803,6 +900,7 @@ mod tests {
                 resolved(NetworkConfig::default()),
                 8,
                 DeploymentProfile::SingleTenant,
+                HostIntegrations::default(),
                 routes(true, true),
             )
             .unwrap();
@@ -819,6 +917,7 @@ mod tests {
             resolved(NetworkConfig::default()),
             0,
             DeploymentProfile::SingleTenant,
+            HostIntegrations::default(),
             routes(true, false),
         )
         .unwrap();
@@ -1094,6 +1193,7 @@ mod tests {
             resolved(NetworkConfig::default()),
             0,
             DeploymentProfile::SingleTenant,
+            HostIntegrations::default(),
             routes(true, false),
         )
         .unwrap();
@@ -1114,6 +1214,7 @@ mod tests {
             resolved(NetworkConfig::default()),
             0,
             DeploymentProfile::SingleTenant,
+            HostIntegrations::default(),
             routes(true, true),
         )
         .unwrap();
@@ -1133,6 +1234,7 @@ mod tests {
             resolved(NetworkConfig::default()),
             0,
             DeploymentProfile::SingleTenant,
+            HostIntegrations::default(),
             routes(true, false),
         )
         .unwrap();
@@ -1147,6 +1249,7 @@ mod tests {
             resolved(NetworkConfig::default()),
             0,
             DeploymentProfile::SingleTenant,
+            HostIntegrations::default(),
             routes(false, true),
         )
         .unwrap();
@@ -1166,6 +1269,7 @@ mod tests {
             resolved(config),
             0,
             DeploymentProfile::SingleTenant,
+            HostIntegrations::default(),
             routes(true, false),
         )
         .unwrap();
@@ -1184,6 +1288,7 @@ mod tests {
             resolved(NetworkConfig::default()),
             0,
             DeploymentProfile::SingleTenant,
+            HostIntegrations::default(),
             routes(false, false),
         )
         .unwrap();
@@ -1200,6 +1305,7 @@ mod tests {
             resolved(NetworkConfig::default()),
             7,
             DeploymentProfile::SingleTenant,
+            HostIntegrations::default(),
             routes(true, true),
         )
         .unwrap();
@@ -1220,6 +1326,7 @@ mod tests {
             resolved(NetworkConfig::default()),
             0,
             DeploymentProfile::SingleTenant,
+            HostIntegrations::default(),
             routes(false, false),
         )
         .unwrap();
@@ -1240,6 +1347,7 @@ mod tests {
                 resolved(config),
                 0,
                 DeploymentProfile::MultiTenant,
+                HostIntegrations::default(),
                 routes(true, false),
             );
             assert!(net.is_ok(), "large explicit cap should allow startup");
@@ -1266,6 +1374,7 @@ mod tests {
             resolved(config),
             0,
             DeploymentProfile::SingleTenant,
+            HostIntegrations::default(),
             routes(true, false),
         ) {
             Ok(_) => panic!("empty rate limiter should fail"),
@@ -1279,5 +1388,109 @@ mod tests {
                 source: RateLimitConfigError::EmptyLimiter,
             }
         ));
+    }
+
+    /// A canonical credential definition for `origin_port`, paired with its
+    /// matching resolved value, ready to feed the engine's config-level
+    /// validation (which requires a 1:1 definition/resolution mapping).
+    fn credential_definition_and_resolution(
+        origin_port: u16,
+    ) -> (
+        microsandbox_types::DurableHeaderCredential,
+        ResolvedHeaderCredential,
+    ) {
+        let definition = microsandbox_types::DurableHeaderCredential {
+            id: "anthropic".into(),
+            reference: "anthropic-api-key".into(),
+            origin: microsandbox_types::HttpsOrigin {
+                host: "api.anthropic.com".into(),
+                port: origin_port,
+            },
+            header: "x-api-key".into(),
+            format: "%s".into(),
+        };
+        let resolved = ResolvedHeaderCredential::from_definition(
+            &definition,
+            zeroize::Zeroizing::new("sk-secret".to_owned()),
+        );
+        (definition, resolved)
+    }
+
+    /// A stored config bypasses `NetworkBuilder::build`, so the engine must
+    /// re-validate the per-port interception invariant itself.
+    #[test]
+    fn validate_launch_header_credentials_rejects_an_unintercepted_port() {
+        let (definition, resolved) = credential_definition_and_resolution(443);
+        let mut config = NetworkConfig::default();
+        config.tls.enabled = true;
+        config.tls.intercepted_ports = vec![8443];
+        config.secrets.header_credentials.push(definition);
+
+        let err = validate_launch_header_credentials(&config, &[resolved]).unwrap_err();
+
+        assert!(
+            matches!(
+                err,
+                NetworkInitError::HeaderCredentialPortNotIntercepted {
+                    ref credential_id,
+                    port: 443,
+                } if credential_id == "anthropic"
+            ),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn validate_launch_header_credentials_accepts_an_intercepted_port() {
+        let (definition, resolved) = credential_definition_and_resolution(8443);
+        let mut config = NetworkConfig::default();
+        config.tls.enabled = true;
+        config.tls.intercepted_ports = vec![8443];
+        config.secrets.header_credentials.push(definition);
+
+        assert!(validate_launch_header_credentials(&config, &[resolved]).is_ok());
+    }
+
+    #[test]
+    fn validate_launch_header_credentials_requires_network_and_tls() {
+        let (definition, resolved) = credential_definition_and_resolution(443);
+
+        let mut no_network = NetworkConfig::default();
+        no_network.enabled = false;
+        no_network
+            .secrets
+            .header_credentials
+            .push(definition.clone());
+        assert!(matches!(
+            validate_launch_header_credentials(&no_network, &[resolved.clone()]).unwrap_err(),
+            NetworkInitError::HeaderCredentialRequiresNetwork
+        ));
+
+        let mut no_tls = NetworkConfig::default();
+        no_tls.tls.enabled = false;
+        no_tls.secrets.header_credentials.push(definition);
+        assert!(matches!(
+            validate_launch_header_credentials(&no_tls, &[resolved]).unwrap_err(),
+            NetworkInitError::HeaderCredentialRequiresTls
+        ));
+    }
+
+    #[test]
+    fn validate_launch_header_credentials_rejects_a_resolution_mismatch() {
+        let (definition, _resolved) = credential_definition_and_resolution(443);
+        let mut config = NetworkConfig::default();
+        config.tls.enabled = true;
+        config.secrets.header_credentials.push(definition);
+
+        // No resolved value for the declared definition.
+        assert!(matches!(
+            validate_launch_header_credentials(&config, &[]).unwrap_err(),
+            NetworkInitError::InvalidSecretConfig { .. }
+        ));
+
+        // A credential-free config needs no resolved list.
+        let mut empty = NetworkConfig::default();
+        empty.tls.enabled = true;
+        assert!(validate_launch_header_credentials(&empty, &[]).is_ok());
     }
 }

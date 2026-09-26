@@ -364,6 +364,8 @@ pub fn run(args: MachineArgs) -> ! {
         deployment_profile: launch.deployment_profile,
         #[cfg(feature = "net")]
         sandbox_slot: launch.sandbox_slot,
+        #[cfg(feature = "net")]
+        resolved_header_credentials: launch.resolved_header_credentials,
         checkpoint_restore: launch.checkpoint_restore,
     };
 
