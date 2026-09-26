@@ -233,7 +233,7 @@ See that repository's README for setup, workload descriptions, and usage.
 Pre-commit hooks are installed by `just setup`. They run automatically on every commit and check:
 
 - `cargo fmt --all --check` — formatting
-- `cargo clippy --workspace -- -D warnings` — lints
+- `cargo clippy --workspace --all-targets -- -D warnings` — lints, including test targets
 - `cargo doc` — documentation builds without warnings
 - `cargo build -p microsandbox-cli` — CLI compiles
 - Standard checks (trailing whitespace, merge conflicts, TOML/YAML validity)
@@ -252,9 +252,61 @@ If pre-commit is not installed, install it with `pip install pre-commit` (or `br
 ### Formatting and Linting
 
 ```bash
-cargo fmt --all           # Format code
-cargo clippy --workspace  # Run lints
+cargo fmt --all                        # Format code
+cargo clippy --workspace --all-targets # Run lints
 ```
+
+`--all-targets` is what CI and the pre-commit hook run: a plain `cargo clippy`
+only compiles library and binary targets, so a lint failure in a `#[cfg(test)]`
+module or an integration test stays invisible until CI catches it.
+
+This covers the test targets of the platform CI runs it on, not every target
+configuration. Code behind `cfg(windows)`, `cfg(target_os = "linux")`, or a
+non-default feature still needs the cross-target check below.
+
+### Cross-target (Windows) Check
+
+`just check-windows-target` (or `./scripts/check-windows-target.sh`) compiles and
+lints the `msb` CLI, its test targets, and its dependency graph for
+`x86_64-pc-windows-gnu` from a macOS or Linux host. No local gate compiles the
+`cfg(windows)` side otherwise, so an item used on one platform and not the other
+becomes an unused import or dead code that only the Windows CI job sees.
+
+The recipe installs the `x86_64-pc-windows-gnu` Rust target when it is missing,
+and needs [zig](https://ziglang.org/download/) (`brew install zig` on macOS) for
+the workspace's C dependencies. It mirrors the "Check msb" and "Clippy msb" steps
+of the `windows-quality` job in `.github/workflows/check.yml`:
+
+```bash
+cargo check  --no-default-features --features net,ssh -p microsandbox-cli --target x86_64-pc-windows-gnu
+cargo clippy --no-default-features --features net,ssh -p microsandbox-cli --target x86_64-pc-windows-gnu --all-targets -- -D warnings
+```
+
+CI builds the MSVC targets, which need the Windows SDK; a macOS or Linux host
+does not have one without vendoring it. This check uses the `-gnu` target
+instead, which needs only a Windows C toolchain. The check also needs a current
+`build/agentd`; run `just build-agentd` if it reports otherwise.
+
+What it does not cover:
+
+- **Linking.** `cargo check` and `cargo clippy` do not link, so linker, ABI,
+  `libkrunfw.dll` import-library, and MSVC environment problems stay out of
+  reach. The `windows-quality` and `windows-build` CI jobs remain the authority
+  for those.
+- **MSVC-only code.** The gnu target stands in for the x86_64 MSVC target CI
+  uses. It selects the same `cfg(windows)` code as long as nothing depends on
+  `target_env` or the MSVC ABI.
+- **Windows ARM64.** Only the x86_64 Windows target is checked, so
+  `cfg(target_arch = "aarch64")` code is left to the `windows-aarch64` runs of
+  the `windows-quality` job.
+- **Test code.** `--all-targets` covers the CLI's own `#[cfg(test)]` modules and
+  integration tests. Other packages' library unit tests are left to the Windows
+  unit-test steps in CI, which compile those (`--lib`). Integration tests
+  outside the CLI are not compiled for a Windows target anywhere in CI.
+
+It is deliberately not part of the pre-commit hooks: it downloads an extra
+toolchain target and takes minutes, where the existing hooks are expected to
+stay quick.
 
 ### Self-hosted CI disk space
 
@@ -280,6 +332,8 @@ Dispatch the **Release version bump** workflow (`.github/workflows/release-bump.
 - `examples/typescript/*/package.json` (`microsandbox` dependency pins)
 
 The workflow then regenerates `Cargo.lock`, the shared `packages/package-lock.json`, and the SDK npm lockfile and opens a PR titled `chore: release vX.Y.Z`.
+
+`sdk/node-ts/package-lock.json` cannot resolve the `@superradcompany/microsandbox-*` platform sub-packages until they exist on npm, so the bump PR deliberately leaves those entries unresolved and `release.yml` regenerates them after publishing. The `TypeScript and Node Quality` job fails when the committed lockfile is out of sync with `package.json` (or with a platform package that npm already serves), so this gap cannot sit unnoticed again.
 
 `microsandbox-mcp` is versioned in its own repository (the `mcp/` submodule). Bump it there and advance the `mcp/` (and, when changed, `skills/`) submodule pointers in the release PR — `release.yml` publishes whatever `microsandbox-mcp` version the submodule pointer holds.
 

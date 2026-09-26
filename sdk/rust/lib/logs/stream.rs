@@ -987,7 +987,7 @@ mod tests {
         assert!(
             entries
                 .iter()
-                .any(|e| e.data == Bytes::from("user-output".as_bytes())),
+                .any(|e| e.data == Bytes::from_static(b"user-output")),
             "missing user-output entry: {entries:?}"
         );
         assert!(

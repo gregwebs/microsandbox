@@ -374,7 +374,7 @@ struct AppendPatchInput {
 #[serde(untagged)]
 enum NetworkInput {
     Preset(NetworkPreset),
-    Object(NetworkConfigInput),
+    Object(Box<NetworkConfigInput>),
 }
 
 #[derive(Debug, Clone, Copy, Deserialize)]
@@ -515,7 +515,7 @@ impl SandboxConfigInput {
         if let Some(ports) = self.ports.take() {
             let network = self
                 .network
-                .get_or_insert_with(|| NetworkInput::Object(NetworkConfigInput::default()));
+                .get_or_insert_with(|| NetworkInput::Object(Box::default()));
             network.object_mut().ports = Some(match network.object_mut().ports.take() {
                 Some(mut nested) => {
                     nested.extend(ports);
@@ -534,16 +534,16 @@ impl NetworkInput {
                 policy: Some(policy),
                 ..NetworkConfigInput::default()
             },
-            Self::Object(input) => input,
+            Self::Object(input) => *input,
         }
     }
 
     fn object_mut(&mut self) -> &mut NetworkConfigInput {
         if let Self::Preset(policy) = self {
-            *self = Self::Object(NetworkConfigInput {
+            *self = Self::Object(Box::new(NetworkConfigInput {
                 policy: Some(*policy),
                 ..NetworkConfigInput::default()
-            });
+            }));
         }
         let Self::Object(input) = self else {
             unreachable!("preset was normalized to an object")
@@ -719,7 +719,7 @@ pub fn resolve(sources: &SandboxConfigSources) -> anyhow::Result<ResolvedSandbox
                 reject_scoped_wrapper(&source.path, "network", "--net-conf")?;
                 let network = load_typed::<NetworkConfigInput>(&source.path, "network config")?;
                 SandboxConfigInput {
-                    network: Some(NetworkInput::Object(network)),
+                    network: Some(NetworkInput::Object(Box::new(network))),
                     ..SandboxConfigInput::default()
                 }
             }

@@ -1073,7 +1073,9 @@ fn run(
         bind_identity_map,
         mut restored_agent,
         owned_directory_checkpoints,
-        auto_publish_handles,
+        // Only the `net` + unix arm below consumes this; an underscore-prefixed
+        // binding keeps the destructure valid on hosts that never reach it.
+        _auto_publish_handles,
     ) = match build_result {
         Ok(vm) => vm,
         Err(e) => {
@@ -1307,7 +1309,7 @@ fn run(
     // sockets onto host listeners. Only spawned when the sandbox opted in
     // (`NetworkConfig.auto_publish`) and a unix host made the handles available.
     #[cfg(all(feature = "net", unix))]
-    if let Some(handles) = auto_publish_handles {
+    if let Some(handles) = _auto_publish_handles {
         // Adapter so the network-agnostic poll task never imports `AgentRelay`.
         struct RelayBroadcastAdapter {
             relay_broadcast: relay::RelayBroadcast,

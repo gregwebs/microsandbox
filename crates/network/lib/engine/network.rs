@@ -1576,19 +1576,27 @@ mod tests {
     fn validate_launch_header_credentials_requires_network_and_tls() {
         let (definition, resolved) = credential_definition_and_resolution(443);
 
-        let mut no_network = NetworkConfig::default();
-        no_network.enabled = false;
+        let mut no_network = NetworkConfig {
+            enabled: false,
+            ..NetworkConfig::default()
+        };
         no_network
             .secrets
             .header_credentials
             .push(definition.clone());
         assert!(matches!(
-            validate_launch_header_credentials(&no_network, &[resolved.clone()]).unwrap_err(),
+            validate_launch_header_credentials(&no_network, std::slice::from_ref(&resolved))
+                .unwrap_err(),
             NetworkInitError::HeaderCredentialRequiresNetwork
         ));
 
-        let mut no_tls = NetworkConfig::default();
-        no_tls.tls.enabled = false;
+        let mut no_tls = NetworkConfig {
+            tls: microsandbox_types::TlsConfig {
+                enabled: false,
+                ..Default::default()
+            },
+            ..NetworkConfig::default()
+        };
         no_tls.secrets.header_credentials.push(definition);
         assert!(matches!(
             validate_launch_header_credentials(&no_tls, &[resolved]).unwrap_err(),
