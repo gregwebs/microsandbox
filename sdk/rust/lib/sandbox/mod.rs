@@ -937,7 +937,7 @@ impl Sandbox {
     /// silently stealing the first subscriber's events; drop the previous
     /// receiver before subscribing again. For multi-consumer fan-out, wrap the
     /// returned stream in a `broadcast::channel` at the call site.
-    #[cfg(feature = "net")]
+    #[cfg(all(feature = "local", feature = "net"))]
     pub async fn port_events(
         &self,
     ) -> tokio::sync::mpsc::UnboundedReceiver<microsandbox_protocol::network::PortEvent> {

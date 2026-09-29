@@ -242,11 +242,11 @@ build-msb mode="debug": build-agentd
 [linux]
 build mode="debug": (build-msb mode) _ensure-libkrunfw
 
-# Check the msb CLI and its test targets compile and lint for a Windows target. Requires: rustup and zig.
+# Check the msb CLI, the SDK, and the engine library test targets compile for a Windows target. Requires: rustup and zig.
 [linux]
 check-windows-target: _check-windows-target-unix
 
-# Check the msb CLI and its test targets compile and lint for a Windows target. Requires: rustup and zig.
+# Check the msb CLI, the SDK, and the engine library test targets compile for a Windows target. Requires: rustup and zig.
 [macos]
 check-windows-target: _check-windows-target-unix
 

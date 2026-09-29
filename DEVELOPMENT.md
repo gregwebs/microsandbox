@@ -267,25 +267,37 @@ non-default feature still needs the cross-target check below.
 ### Cross-target (Windows) Check
 
 `just check-windows-target` (or `./scripts/check-windows-target.sh`) compiles and
-lints the `msb` CLI, its test targets, and its dependency graph for
-`x86_64-pc-windows-gnu` from a macOS or Linux host. No local gate compiles the
-`cfg(windows)` side otherwise, so an item used on one platform and not the other
-becomes an unused import or dead code that only the Windows CI job sees.
+lints the `msb` CLI and its test targets, and compiles the SDK and engine library
+test targets, for `x86_64-pc-windows-gnu` from a macOS or Linux host. No other
+local gate compiles the `cfg(windows)` side, so a name that resolves on one
+platform but not the other, or an item gated to one platform and unused on the
+other, is otherwise first seen in the Windows CI job.
 
 The recipe installs the `x86_64-pc-windows-gnu` Rust target when it is missing,
 and needs [zig](https://ziglang.org/download/) (`brew install zig` on macOS) for
 the workspace's C dependencies. It mirrors the "Check msb" and "Clippy msb" steps
-of the `windows-quality` job in `.github/workflows/check.yml`:
+and the `--lib` unit-test steps of the `windows-quality` job in
+`.github/workflows/check.yml`:
 
 ```bash
-cargo check  --no-default-features --features net,ssh -p microsandbox-cli --target x86_64-pc-windows-gnu
-cargo clippy --no-default-features --features net,ssh -p microsandbox-cli --target x86_64-pc-windows-gnu --all-targets -- -D warnings
+cargo check  --no-default-features --features net,ssh    -p microsandbox-cli     --target x86_64-pc-windows-gnu
+cargo clippy --no-default-features --features net,ssh    -p microsandbox-cli     --target x86_64-pc-windows-gnu --all-targets -- -D warnings
+cargo check  --no-default-features --features local,net  -p microsandbox         --lib --profile test --target x86_64-pc-windows-gnu
+cargo check  --no-default-features --features net,runner -p microsandbox-runtime --lib --profile test --target x86_64-pc-windows-gnu
+cargo check                                               -p microsandbox-network --lib --profile test --target x86_64-pc-windows-gnu
 ```
+
+The CLI steps mirror CI's `check` plus `clippy --all-targets -- -D warnings`. The
+SDK, runtime, and network steps are `check` only, because the CI steps they stand
+in for compile those targets with `cargo test` and do not deny warnings. They
+still print the Windows-target dead-code and unused warnings for those packages,
+so read the output rather than only the exit status.
 
 CI builds the MSVC targets, which need the Windows SDK; a macOS or Linux host
 does not have one without vendoring it. This check uses the `-gnu` target
-instead, which needs only a Windows C toolchain. The check also needs a current
-`build/agentd`; run `just build-agentd` if it reports otherwise.
+instead, which needs only a Windows C toolchain. No `build/agentd` is needed:
+none of the checks enables `embed-binaries`, so the guest-agent staging in the
+`crates/filesystem` build script stays off.
 
 What it does not cover:
 
@@ -300,9 +312,13 @@ What it does not cover:
   `cfg(target_arch = "aarch64")` code is left to the `windows-aarch64` runs of
   the `windows-quality` job.
 - **Test code.** `--all-targets` covers the CLI's own `#[cfg(test)]` modules and
-  integration tests. Other packages' library unit tests are left to the Windows
-  unit-test steps in CI, which compile those (`--lib`). Integration tests
-  outside the CLI are not compiled for a Windows target anywhere in CI.
+  integration tests, and the `--lib --profile test` checks cover the SDK,
+  runtime, and network library unit tests. Other packages' library unit tests
+  and the integration tests outside the CLI are not compiled for a Windows
+  target anywhere in CI.
+- **The Go FFI crate.** `windows-build` compiles `sdk/go/native` against real
+  runtime artifacts staged in `build/`. Nothing local mirrors that, so a
+  Windows-only break there is still first seen in CI.
 
 It is deliberately not part of the pre-commit hooks: it downloads an extra
 toolchain target and takes minutes, where the existing hooks are expected to
