@@ -97,3 +97,22 @@ network:
 
 Host listeners appear as the guest binds and disappear when it closes them, and the SDK can
 observe the same events through `Sandbox::port_events`.
+
+## Interactive attach input filter (Rust SDK)
+
+`AttachOptionsBuilder::stdin_filter` installs a `StdinFilter` that sees each chunk of terminal
+input after the detach-key scan and returns the bytes to forward. It can pass them through,
+rewrite them, or drop them. The filter runs on its own task, one chunk at a time and in input
+order, so the attach loop can keep draining guest output while it waits on the guest (for example,
+writing a file with `fs().write()` before letting a key through). This is the API guarantee of the
+task boundary, **not** a claim that end-to-end liveness has been verified on every backend: local
+combined-port relay behavior is the only traced coupling; dual-port and cloud are unverified, and
+Windows interactive filtering is not yet exercised by an automated test.
+Ordinary failures and timeouts inside `filter` are entirely caller-owned: the trait returns
+`Vec<u8>`, not `Result`, and the SDK applies no timeout. A filter that can fail should bound
+its own work and return the original bytes as its fallback. An unwinding filter panic ends
+the attach session with `Runtime("stdin filter task ended")`; the guest may keep running as
+after detach. With `panic = "abort"`, no policy can intercept the process exit. With no
+filter set, attach behaves exactly as before.
+
+See [`AttachOptionsBuilder::stdin_filter()`](/sdk/rust/execution#attach_options-stdin_filter).
