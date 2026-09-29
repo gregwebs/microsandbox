@@ -135,7 +135,7 @@ pub(crate) use types::validate_volume_mounts;
 
 pub use self::credential::{CredentialResolveError, CredentialResolver};
 pub use crate::logs::{LogEntry, LogOptions, LogSource, LogStreamOptions};
-pub use attach::AttachOptionsBuilder;
+pub use attach::{AttachOptionsBuilder, StdinFilter};
 pub use branch::{BranchBuilder, BranchManyBuilder, BranchOutcome};
 pub use builder::{RegistryConfigBuilder, SandboxBuilder};
 pub use compact::{DiskCompactionBuilder, DiskCompactionDiskResult, DiskCompactionResult};

@@ -416,7 +416,7 @@ let exit_code = sb.attach_with("zsh", |a| a
 
 </Accordion>
 
-Interactive PTY attach with options. The closure receives an [`AttachOptionsBuilder`](#attachoptionsbuilder) to set args, environment variables, working directory, user, custom detach keys, and resource limits.
+Interactive PTY attach with options. The closure receives an [`AttachOptionsBuilder`](#attachoptionsbuilder) to set args, environment variables, working directory, user, custom detach keys, resource limits, and an input filter.
 
 <p className="msb-label">Parameters</p>
 
@@ -891,6 +891,50 @@ Set a resource limit with different soft and hard values for the attached proces
   <div className="msb-param">
     <div className="msb-param-key"><code>hard</code><span className="msb-type">u64</span></div>
     <div className="msb-param-desc">Hard ceiling.</div>
+  </div>
+</div>
+
+#### <span className="msb-recv">attach_options.</span><span className="msb-hn">stdin_filter()</span>
+
+```rust
+fn stdin_filter(self, filter: impl StdinFilter) -> Self
+```
+
+Transform terminal input before it reaches the guest. The filter sees each chunk of terminal input *after* the detach-key scan and returns the bytes to forward: it may pass them through, rewrite them, or return an empty `Vec` to drop the chunk. Chunks are filtered one at a time, in input order, on a task separate from the attach loop. The attach loop therefore remains able to keep draining guest output while the filter waits on the guest — for example, writing a file with `fs().write()` before letting a key through — and later chunks wait until the current one is done. That is the API guarantee of the task boundary: a filter's own await does not block the loop. It is not a claim that end-to-end relay liveness has been verified on every backend — only local combined-port relay behavior has been traced; dual-port and cloud are unverified, and Windows interactive filtering is not yet exercised by an automated test. This is available for local and cloud sandboxes; the SSH attach has no input filter. Rust SDK only.
+
+Ordinary failures and timeouts inside `filter` are entirely caller-owned: the trait returns `Vec<u8>`, not a `Result`, and the SDK applies no timeout. A filter that can fail should bound its own work (for example with `tokio::time::timeout`) and return `data.to_vec()` to forward the original bytes. An unwinding panic in `filter()` or in its future ends the attach session with `Runtime("stdin filter task ended")` and forwards no raw input; the guest may keep running as it does after detach. With `panic = "abort"` the process exits and no policy can intercept that. Input still queued or in flight when the session ends is discarded, and the filter is dropped at its current await point. The detach sequence is matched on terminal input before the filter runs, so it always works; filter-emitted bytes are not scanned for detach keys.
+
+<Accordion title="Example">
+
+```rust
+use std::future::Future;
+use std::pin::Pin;
+
+use microsandbox::sandbox::StdinFilter;
+
+struct Upper;
+
+impl StdinFilter for Upper {
+    fn filter<'a>(
+        &'a mut self,
+        data: &'a [u8],
+    ) -> Pin<Box<dyn Future<Output = Vec<u8>> + Send + 'a>> {
+        let out = data.to_ascii_uppercase();
+        Box::pin(async move { out })
+    }
+}
+
+let exit_code = sb.attach_with("sh", |a| a.stdin_filter(Upper)).await?;
+```
+
+</Accordion>
+
+<p className="msb-label">Parameters</p>
+
+<div className="msb-params">
+  <div className="msb-param">
+    <div className="msb-param-key"><code>filter</code><span className="msb-type">impl StdinFilter</span></div>
+    <div className="msb-param-desc">Filter applied to each input chunk after the detach-key scan.</div>
   </div>
 </div>
 
