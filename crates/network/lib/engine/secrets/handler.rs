@@ -8334,6 +8334,7 @@ mod tests {
                     // A domain egress rule alone installs a handler on plain
                     // TCP, with no secrets configured.
                     plain_http_policy_handler(&make_config(Vec::new())),
+                    creds_handler(vec![resolved_credential("sk-secret")], 443),
                 ];
                 for mut handler in handlers {
                     assert_eq!(
@@ -8355,22 +8356,51 @@ mod tests {
             (b":authority", b"a.example"),
             (b":path", b"/"),
         ]);
+        // The header-credential handler pins its SNI, destination and credential
+        // origin to `api.example.com`, so its valid prefix must use that
+        // authority for injection to be reached at all.
+        let credential_prefix = encode_h2_header_block(&[
+            (b":method", b"GET"),
+            (b":scheme", b"https"),
+            (b":authority", b"api.example.com"),
+            (b":path", b"/"),
+        ]);
         let mut rng = Rng(0x9e37_79b9_7f4a_7c15);
+        let mut injected_requests = 0usize;
         for _ in 0..500 {
             // Up to three requests on one connection, so later blocks decode
             // against dynamic-table entries added by earlier ones. Half of the
             // blocks start with a valid request, so they also reach the checks
             // that run after decoding.
             let mut request = HTTP2_PREFACE.to_vec();
+            let mut credential_request = HTTP2_PREFACE.to_vec();
             append_http2_frame(&mut request, 0x4, 0, 0, &[]).unwrap();
+            append_http2_frame(&mut credential_request, 0x4, 0, 0, &[]).unwrap();
             for stream_id in [1, 3, 5].into_iter().take(1 + rng.below(3)) {
+                let with_prefix = rng.below(2) == 0;
+                let random = random_block(&mut rng);
                 let mut block = Vec::new();
-                if rng.below(2) == 0 {
+                if with_prefix {
                     block.extend_from_slice(&request_prefix);
                 }
-                block.extend(random_block(&mut rng));
+                block.extend_from_slice(&random);
                 let split_at = rng.below(block.len() + 1);
                 append_h2_raw_block(&mut request, stream_id, &block, split_at);
+
+                // The same random (possibly malformed) tail behind the
+                // credential-eligible prefix, split at the same point.
+                let mut credential_block = Vec::new();
+                if with_prefix {
+                    credential_block.extend_from_slice(&credential_prefix);
+                }
+                credential_block.extend_from_slice(&random);
+                let split_at = split_at.min(credential_block.len());
+                append_h2_raw_block(
+                    &mut credential_request,
+                    stream_id,
+                    &credential_block,
+                    split_at,
+                );
             }
             let handlers = [
                 SecretsHandler::new(&config, "a.example", false),
@@ -8380,7 +8410,28 @@ mod tests {
             for mut handler in handlers {
                 let _ = handler.substitute(&request);
             }
+
+            // Coverage witness: at least some generated requests must reach the
+            // credential path, succeed, and carry the injected field with the
+            // never-indexed representation. Results are not otherwise asserted,
+            // because malformed variants are expected to fail.
+            let mut credential_handler = creds_handler(vec![resolved_credential("sk-secret")], 443);
+            if let Ok(output) = credential_handler.substitute(&credential_request) {
+                for header_block in decode_h2_header_blocks_with_flags(&output) {
+                    if header_block
+                        .iter()
+                        .any(|(name, _, _)| name.eq_ignore_ascii_case(b"x-api-key"))
+                    {
+                        assert_field_never_indexed(&header_block, b"x-api-key");
+                        injected_requests += 1;
+                    }
+                }
+            }
         }
+        assert!(
+            injected_requests > 0,
+            "the credential handler never injected a header; the credential prefix did not reach it"
+        );
     }
 
     #[test]
@@ -8518,6 +8569,51 @@ mod tests {
             } else {
                 assert_eq!(result.unwrap_err(), SecretViolationAction::Block);
             }
+        }
+    }
+
+    #[test]
+    fn header_credential_http2_output_is_unchanged_for_indexed_guest_blocks() {
+        let mut handler = creds_handler(vec![resolved_credential("sk-secret")], 443);
+
+        // The second block refers to the guest's dynamic table only.
+        let flags = HpackEncoder::WITH_INDEXING
+            | HpackEncoder::HUFFMAN_NAME
+            | HpackEncoder::HUFFMAN_VALUE
+            | HpackEncoder::BEST_FORMAT;
+        let fields: [(&[u8], &[u8]); 4] = [
+            (b":method", b"GET"),
+            (b":scheme", b"https"),
+            (b":authority", b"api.example.com"),
+            (b":path", b"/v1/models"),
+        ];
+        let mut encoder = HpackEncoder::with_dynamic_size(4096);
+        let mut request = HTTP2_PREFACE.to_vec();
+        append_http2_frame(&mut request, 0x4, 0, 0, &[]).unwrap();
+        for stream_id in [1, 3] {
+            let mut block = Vec::new();
+            for (name, value) in fields {
+                encoder
+                    .encode((name.to_vec(), value.to_vec(), flags), &mut block)
+                    .unwrap();
+            }
+            if stream_id == 3 {
+                assert!(block.iter().all(|octet| octet & 0x80 != 0), "{block:02x?}");
+            }
+            append_http2_header_frames(&mut request, stream_id, true, &block).unwrap();
+        }
+
+        let output = handler.substitute(&request).unwrap().into_owned();
+
+        let mut injected = fields.to_vec();
+        injected.push((b"x-api-key", b"sk-secret"));
+        let mut expected = HTTP2_PREFACE.to_vec();
+        append_http2_frame(&mut expected, 0x4, 0, 0, &[]).unwrap();
+        append_h2_headers(&mut expected, 1, &injected, true);
+        append_h2_headers(&mut expected, 3, &injected, true);
+        assert_eq!(output, expected);
+        for block in decode_h2_header_blocks_with_flags(&output) {
+            assert_field_never_indexed(&block, b"x-api-key");
         }
     }
 }
