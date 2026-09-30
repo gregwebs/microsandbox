@@ -131,6 +131,7 @@ imago = { package = "msb-imago", version = "0.1.7" }
 indicatif = "0.18"
 ipnetwork = { version = "0.21.0", features = ["serde"] }
 libc = "0.2"
+loona-hpack = "0.4.3"
 memmap2 = "0.9"
 nix = "0.31"
 notify = "8"
