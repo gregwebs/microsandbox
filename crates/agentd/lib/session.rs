@@ -982,6 +982,14 @@ impl ExecSession {
                 write_exec_error_and_exit(err_pipe.write_end.as_raw_fd());
             }
 
+            // Restore the default SIGPIPE disposition. The Rust runtime ignores
+            // SIGPIPE in agentd and an ignored disposition survives exec, so
+            // without this `yes | head` never terminates. `std::process::Command`
+            // does the same for the piped path.
+            unsafe {
+                libc::signal(libc::SIGPIPE, libc::SIG_DFL);
+            }
+
             // Create new session.
             if unsafe { libc::setsid() } < 0 {
                 unsafe { libc::_exit(1) };
@@ -2419,6 +2427,75 @@ mod tests {
             "expected immediate PTY write to arrive before later output; got {:?}",
             String::from_utf8_lossy(&stdout),
         );
+    }
+
+    #[tokio::test]
+    async fn test_pty_session_does_not_inherit_ignored_sigpipe() {
+        // The Rust runtime ignores SIGPIPE in agentd (and in this test harness). A PTY
+        // session must not inherit that, or `yes | head` never terminates.
+        let parent_status = std::fs::read_to_string("/proc/self/status").expect("read status");
+        assert!(
+            sigpipe_ignored(&parent_status),
+            "precondition: the test process ignores SIGPIPE"
+        );
+
+        let (tx, mut rx) = SessionOutputSender::channel();
+        let req = ExecRequest {
+            cmd: "cat".to_string(),
+            args: vec!["/proc/self/status".to_string()],
+            env: vec!["PATH=/usr/local/bin:/usr/bin:/bin".to_string()],
+            cwd: None,
+            user: None,
+            tty: true,
+            rows: 24,
+            cols: 80,
+            rlimits: Vec::new(),
+        };
+
+        let session = ExecSession::spawn(9, &req, tx, None, SecurityProfile::Default, None)
+            .expect("spawn pty session");
+        let mut stdout = Vec::new();
+        let mut exit = None;
+
+        let recv_result = time::timeout(Duration::from_secs(15), async {
+            while let Some(envelope) = rx.recv().await {
+                match envelope.output {
+                    SessionOutput::Stdout(data) => stdout.extend_from_slice(&data),
+                    SessionOutput::Exited(code) => {
+                        exit = Some(code);
+                        break;
+                    }
+                    SessionOutput::Stderr(_) | SessionOutput::Raw(_) | SessionOutput::Bulk(_) => {}
+                }
+            }
+        })
+        .await;
+
+        if recv_result.is_err() {
+            let _ = session.send_signal(libc::SIGKILL);
+            panic!("timed out waiting for PTY output");
+        }
+
+        assert_eq!(exit, Some(0));
+        let child_status = String::from_utf8_lossy(&stdout);
+        assert!(
+            child_status.contains("SigIgn:"),
+            "missing SigIgn in child status: {child_status}"
+        );
+        assert!(
+            !sigpipe_ignored(&child_status),
+            "PTY child inherited an ignored SIGPIPE: {child_status}"
+        );
+    }
+
+    /// Whether a `/proc/<pid>/status` dump reports SIGPIPE as ignored.
+    fn sigpipe_ignored(status: &str) -> bool {
+        let mask = status
+            .lines()
+            .find_map(|line| line.strip_prefix("SigIgn:"))
+            .map(|value| u64::from_str_radix(value.trim(), 16).expect("parse SigIgn"))
+            .expect("SigIgn line");
+        mask & (1 << (libc::SIGPIPE - 1)) != 0
     }
 
     #[test]
