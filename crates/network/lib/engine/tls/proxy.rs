@@ -1448,6 +1448,64 @@ mod tests {
         server.await.unwrap().unwrap();
     }
 
+    #[tokio::test]
+    async fn intercept_relay_rejects_a_truncated_h2_header_block_without_forwarding() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        // A non-empty secret makes the relay install the HTTP/2 secret handler;
+        // a truncated HPACK representation must then fail the connection closed
+        // instead of reaching httlib-hpack's out-of-bounds indexing.
+        let tls_state = test_tls_state(host_bound_secret_config());
+        let (upstream, upstream_request, server) = spawn_upstream_request_sink().await;
+        let guest_destination: SocketAddr = "203.0.113.10:443".parse().unwrap();
+        let (from_tx, from_rx) = mpsc::channel(4);
+        let (to_tx, mut to_rx) = mpsc::channel(4);
+        let mut client = guest_client(&tls_state);
+        send_client_tls_output(&mut client, &from_tx).await;
+        let relay = tokio::spawn(intercept_relay(
+            guest_destination,
+            UpstreamTcpTarget::direct(upstream),
+            "example.com",
+            true,
+            true,
+            Vec::new(),
+            from_rx,
+            to_tx,
+            Arc::new(SharedState::new(4)),
+            tls_state,
+            Arc::new(ProxyConnectState::new()),
+            NetworkExtensions::new(),
+            None,
+            None,
+        ));
+
+        complete_relay_handshake(&mut client, &from_tx, &mut to_rx).await;
+        // h2 preface + empty SETTINGS + HEADERS(stream 1, END_HEADERS|END_STREAM)
+        // whose entire header block is the truncated representation `ff`.
+        let mut payload = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n".to_vec();
+        payload.extend_from_slice(&[0, 0, 0, 0x04, 0x00, 0, 0, 0, 0]);
+        payload.extend_from_slice(&[0, 0, 1, 0x01, 0x05, 0, 0, 0, 1, 0xff]);
+        client.writer().write_all(&payload).unwrap();
+        send_client_tls_output(&mut client, &from_tx).await;
+
+        // The relay must fail closed on the malformed block...
+        let result = relay.await.unwrap();
+        assert!(
+            result.is_err(),
+            "relay must close on a truncated header block"
+        );
+        drop(from_tx);
+        // ...and the rejected flight must not reach the upstream at all.
+        let received = tokio::time::timeout(Duration::from_secs(1), upstream_request)
+            .await
+            .expect("upstream sink did not finish")
+            .expect("upstream sink task failed");
+        assert!(
+            received.is_empty(),
+            "a rejected header flight must forward nothing upstream, got {received:02x?}"
+        );
+        server.await.unwrap().unwrap();
+    }
+
     fn github_style_intercept_config() -> InterceptConfig {
         InterceptConfig {
             rules: vec![InterceptRule {
