@@ -1488,7 +1488,10 @@ mod tests {
         send_client_tls_output(&mut client, &from_tx).await;
 
         // The relay must fail closed on the malformed block...
-        let result = relay.await.unwrap();
+        let result = tokio::time::timeout(Duration::from_secs(5), relay)
+            .await
+            .expect("relay did not close after a truncated header block")
+            .unwrap();
         assert!(
             result.is_err(),
             "relay must close on a truncated header block"
