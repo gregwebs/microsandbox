@@ -18,6 +18,7 @@ use tokio::sync::mpsc;
 
 use super::sni;
 use super::state::TlsState;
+use crate::engine::policy::diagnostics::STRICT_HOSTNAME_DENIAL_GUIDANCE;
 use crate::extensions::{
     AuthorizedRouteRequestStream, AuthorizedTlsRoute, NetworkExtensions, OutboundProtocol,
     RequestAction,
@@ -231,7 +232,8 @@ impl TlsProxy {
             tracing::debug!(
                 sni = %sni_name,
                 dst = %guest_dst,
-                "TLS bypass denied by strict hostname policy",
+                "TLS bypass denied by strict hostname policy: {}",
+                STRICT_HOSTNAME_DENIAL_GUIDANCE,
             );
             proxy_connect.mark_policy_denied();
             shared.proxy_wake.wake();
