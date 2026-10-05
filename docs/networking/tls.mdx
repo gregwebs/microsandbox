@@ -20,6 +20,12 @@ When interception is enabled, microsandbox:
 
 microsandbox stores the default CA at `~/.microsandbox/tls/ca.{crt,key}` and reuses it across local sandboxes. Delete both files to generate a new CA. Use the intercept CA certificate and key settings when sandboxes should use a CA that you provide.
 
+Clients that use a separate CA bundle may need the interception CA explicitly. Inside the guest, its certificate is available at `/.msb/tls/ca.pem`. For example, after creating a sandbox named `worker` with `--tls-intercept`:
+
+```bash
+msb exec worker -- curl --cacert /.msb/tls/ca.pem https://github.com/
+```
+
 ## Enabling interception
 
 <CodeGroup>
@@ -92,6 +98,8 @@ Some clients trust a specific certificate or public key instead of the guest's t
 
 Add their hosts to the bypass list. Exact domains such as `api.example.com` and wildcards such as `*.apple.com` are supported. Bypassed traffic stays encrypted between the guest and upstream server, so content-based policy checks and secret injection do not apply.
 
+[Strict hostname policy](/networking/overview#low-level-custom-policies) is enabled by default. If the first matching allow rule targets a domain or domain suffix, bypassed HTTPS is denied because its request authority cannot be inspected, even with `--net-default allow`. Bypass alone does not make certificate-pinned clients work under those rules. Explicitly opting out with `--net-strict=false` removes the inspectable-authority requirement; it does not disable the remaining network rules.
+
 ## Upstream CA trust
 
 The proxy verifies upstream certificates with the host's root store by default. You can add:
@@ -140,7 +148,7 @@ Skipping verification is similar to using `curl -k`. Use it only for hosts you c
 ## Limits
 
 - Clients that pin certificates or public keys must be bypassed.
-- Bypassed traffic cannot use content-based policy checks or secret injection.
+- Bypassed traffic cannot use content-based policy checks or secret injection, and strict hostname allow rules deny it.
 - microsandbox does not proxy guest client certificates. Bypass hosts that require guest mTLS.
 - microsandbox does not intercept QUIC and HTTP/3 traffic.
 

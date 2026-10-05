@@ -20,6 +20,7 @@ use super::connection::ProxyConnectState;
 #[cfg(test)]
 use super::connection::ProxyConnectStatus;
 use super::upstream::UpstreamTcpTarget;
+use crate::engine::policy::diagnostics::STRICT_HOSTNAME_DENIAL_GUIDANCE;
 use crate::engine::secrets::config::SecretsConfigExt;
 use crate::engine::tls::proxy::TlsProxy;
 use crate::engine::tls::sni;
@@ -253,7 +254,8 @@ impl TcpProxy {
                         tracing::debug!(
                             sni = sni.as_deref(),
                             dst = %guest_dst,
-                            "TCP egress denied by strict hostname policy",
+                            "TCP egress denied by strict hostname policy: {}",
+                            STRICT_HOSTNAME_DENIAL_GUIDANCE,
                         );
                         proxy_connect.mark_policy_denied();
                         shared.proxy_wake.wake();
@@ -582,6 +584,10 @@ pub fn spawn_tcp_proxy(
     handle.spawn(proxy.run());
 }
 
+// Strict enforcement follows the first matching allow rule, not every allow
+// that could match. A hostname allow therefore requires inspectable request
+// authority even when default egress is Allow; rejection does not fall back to
+// that default. SNI alone cannot establish encrypted HTTP request authority.
 fn strict_hostname_allow_is_opaque(
     strict: bool,
     network_policy: &NetworkPolicy,
@@ -676,7 +682,8 @@ async fn handle_connect_tunnel(
             tracing::debug!(
                 sni = %expected_sni,
                 dst = %tunnel_dst,
-                "CONNECT tunnel denied by strict hostname policy",
+                "CONNECT tunnel denied by strict hostname policy: {}",
+                STRICT_HOSTNAME_DENIAL_GUIDANCE,
             );
             proxy_connect.mark_policy_denied();
             shared.proxy_wake.wake();

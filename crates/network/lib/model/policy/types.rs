@@ -415,6 +415,10 @@ impl NetworkPolicy {
 
     /// Return true when the first matching egress rule is an allow
     /// `Domain` / `DomainSuffix` rule for the supplied hostname source.
+    ///
+    /// A matching hostname allow takes precedence over the egress default, even
+    /// when that default is `Allow`. Strict authority enforcement uses this
+    /// result without falling back to other rules or the default on rejection.
     #[cfg(feature = "engine")]
     pub fn allows_egress_via_hostname(
         &self,
