@@ -74,6 +74,10 @@ impl HttpConnectProxyBuilder {
     }
 
     /// Sets username authentication and a host-side password source.
+    ///
+    /// The username may be empty, for proxies that authenticate with a token
+    /// alone, but must not contain `:` or control characters. The password
+    /// source must resolve to a non-empty value at launch.
     pub fn credentials(mut self, username: impl Into<String>, password: SecretSource) -> Self {
         self.credentials = Some(HttpConnectCredentials {
             username: username.into(),
@@ -96,12 +100,8 @@ impl HttpConnectCredentials {
 
     /// Validates the durable username and the host-side password source.
     pub(super) fn validate(&self) -> Result<(), OutboundProxyBuildError> {
-        let reason = if self.username.is_empty() {
-            "username must not be empty"
-        } else if self.username.contains(':') {
-            "username must not contain ':'"
-        } else if self.username.chars().any(char::is_control) {
-            "username must not contain control characters"
+        let reason = if let Err(reason) = validate_username(&self.username) {
+            reason
         } else {
             match &self.password {
                 SecretSource::Env { var } if var.is_empty() => {
@@ -132,12 +132,8 @@ impl ResolvedHttpConnectCredentials {
 
     /// Validates the resolved username and password.
     pub(super) fn validate(&self) -> Result<(), OutboundProxyBuildError> {
-        let reason = if self.username.is_empty() {
-            "username must not be empty"
-        } else if self.username.contains(':') {
-            "username must not contain ':'"
-        } else if self.username.chars().any(char::is_control) {
-            "username must not contain control characters"
+        let reason = if let Err(reason) = validate_username(&self.username) {
+            reason
         } else if self.password.is_empty() {
             "password must not be empty"
         } else {
@@ -376,6 +372,25 @@ impl fmt::Debug for ResolvedHttpConnectCredentials {
 }
 
 //--------------------------------------------------------------------------------------------------
+// Functions: Helpers
+//--------------------------------------------------------------------------------------------------
+
+/// Validates a Basic authentication username shared by the durable and resolved
+/// credentials.
+///
+/// RFC 7617 permits an empty user-id, which some proxies use for token-only
+/// authentication, but forbids `:` and control characters.
+fn validate_username(username: &str) -> Result<(), &'static str> {
+    if username.contains(':') {
+        Err("username must not contain ':'")
+    } else if username.chars().any(char::is_control) {
+        Err("username must not contain control characters")
+    } else {
+        Ok(())
+    }
+}
+
+//--------------------------------------------------------------------------------------------------
 // Tests
 //--------------------------------------------------------------------------------------------------
 
@@ -399,6 +414,7 @@ mod tests {
     };
     use crate::proxy::{
         OutboundProxy, OutboundProxyBuildError, OutboundProxyBuilder, OutboundProxyConfig,
+        ResolvedOutboundProxy,
     };
 
     const TEST_TIMEOUT: Duration = Duration::from_secs(5);
@@ -1143,6 +1159,27 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn connect_sends_empty_username_as_leading_colon() {
+        let credentials = ResolvedHttpConnectCredentials::new("", "token");
+        let (result, request) = exchange_authenticated(
+            b"HTTP/1.1 200 OK\r\n\r\n".to_vec(),
+            destination(),
+            &credentials,
+        )
+        .await;
+        result.expect("token-only tunnel");
+
+        // base64(":token"), written out so the encoding is checked independently.
+        let expected = b"Proxy-Authorization: Basic OnRva2Vu\r\n";
+        assert!(
+            request
+                .windows(expected.len())
+                .any(|window| window == expected),
+            "{request:?}"
+        );
+    }
+
+    #[tokio::test]
     async fn connect_base64_encodes_password_bytes_verbatim() {
         // Only the first ':' separates the userinfo, and the whole pair is
         // base64-encoded, so a password may contain ':', space, tab, and non-ASCII.
@@ -1230,7 +1267,6 @@ mod tests {
     #[test]
     fn builder_rejects_invalid_http_connect_credentials() {
         for (username, var) in [
-            ("", "PROXY_PASSWORD"),
             ("user:name", "PROXY_PASSWORD"),
             ("user\nname", "PROXY_PASSWORD"),
             ("user", ""),
@@ -1249,6 +1285,13 @@ mod tests {
             );
         }
 
+        // RFC 7617 permits an empty user-id for token-only proxies.
+        OutboundProxyBuilder::new()
+            .http_connect("127.0.0.1:3128")
+            .credentials("", SecretSource::env("PROXY_PASSWORD"))
+            .build()
+            .unwrap();
+
         let proxy = OutboundProxyBuilder::new()
             .http_connect("127.0.0.1:3128")
             .credentials("user", SecretSource::env("PROXY_PASSWORD"))
@@ -1261,6 +1304,26 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn resolved_unauthenticated_http_connect_omits_credentials() {
+        let resolved = ResolvedOutboundProxy::HttpConnect {
+            address: "127.0.0.1:3128".parse().unwrap(),
+            credentials: None,
+        };
+
+        // Older runtimes decode this variant without a credentials member, so an
+        // unauthenticated proxy keeps its previous launch JSON shape.
+        assert_eq!(
+            serde_json::to_value(&resolved).unwrap(),
+            serde_json::json!({"http_connect": {"address": "127.0.0.1:3128"}})
+        );
+        let restored: ResolvedOutboundProxy = serde_json::from_value(
+            serde_json::json!({"http_connect": {"address": "127.0.0.1:3128"}}),
+        )
+        .unwrap();
+        assert_eq!(restored, resolved);
     }
 
     #[test]
