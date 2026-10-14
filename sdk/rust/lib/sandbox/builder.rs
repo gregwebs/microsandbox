@@ -4998,6 +4998,9 @@ mod tests {
             "HTTP_CONNECT_PASSWORD"
         );
         assert!(json["credentials"].get("value").is_none());
+        // The password stays a source reference; no plaintext under the nested
+        // password object either.
+        assert!(json["credentials"]["password"].get("value").is_none());
     }
 
     #[cfg(feature = "net")]

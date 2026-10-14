@@ -201,11 +201,13 @@ mod tests {
         assert!(config.clone().resolve(&EnvNetworkSecretResolver).is_err());
 
         // SAFETY: this test owns a purpose-specific environment variable.
-        unsafe { std::env::set_var(PASSWORD_VAR, "password") };
+        unsafe { std::env::set_var(PASSWORD_VAR, "hunter2-socks5-sentinel") };
         let resolved = config.resolve(&EnvNetworkSecretResolver).unwrap();
         unsafe { std::env::remove_var(PASSWORD_VAR) };
 
-        assert!(format!("{resolved:?}").contains("[REDACTED]"));
+        let rendered = format!("{resolved:?}");
+        assert!(rendered.contains("[REDACTED]"), "{rendered}");
+        assert!(!rendered.contains("hunter2-socks5-sentinel"), "{rendered}");
     }
 
     #[test]
@@ -225,10 +227,15 @@ mod tests {
         assert!(config.clone().resolve(&EnvNetworkSecretResolver).is_err());
 
         // SAFETY: this test owns a purpose-specific environment variable.
-        unsafe { std::env::set_var(PASSWORD_VAR, "password") };
+        unsafe { std::env::set_var(PASSWORD_VAR, "hunter2-http-connect-sentinel") };
         let resolved = config.resolve(&EnvNetworkSecretResolver).unwrap();
         unsafe { std::env::remove_var(PASSWORD_VAR) };
 
-        assert!(format!("{resolved:?}").contains("[REDACTED]"));
+        let rendered = format!("{resolved:?}");
+        assert!(rendered.contains("[REDACTED]"), "{rendered}");
+        assert!(
+            !rendered.contains("hunter2-http-connect-sentinel"),
+            "{rendered}"
+        );
     }
 }
