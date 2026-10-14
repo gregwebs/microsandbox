@@ -59,6 +59,7 @@ pub enum ResolvedOutboundProxy {
         /// Proxy socket address.
         address: SocketAddr,
         /// Optional resolved username/password authentication credentials.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
         credentials: Option<super::http_connect::ResolvedHttpConnectCredentials>,
     },
 
