@@ -199,28 +199,45 @@ impl HttpConnectProtocol {
     /// are configured. The password is base64-encoded (standard alphabet, UTF-8
     /// bytes) into the header, and the whole request is zeroized on drop so the
     /// token does not linger in host memory.
+    ///
+    /// The request is sized exactly and written in a single pass. Growing the
+    /// buffer would reallocate and free a block that already holds the token, and
+    /// `Zeroizing` only wipes the final allocation.
     fn build_connect_request(
         authority: &str,
         credentials: Option<&ResolvedHttpConnectCredentials>,
     ) -> Zeroizing<String> {
-        let mut request = Zeroizing::new(format!(
-            "CONNECT {authority} HTTP/1.1\r\nHost: {authority}\r\n"
-        ));
-
-        if let Some(credentials) = credentials {
+        let encoded = credentials.map(|credentials| {
             let userinfo = Zeroizing::new(format!(
                 "{}:{}",
                 credentials.username,
                 credentials.password.as_str()
             ));
-            let token = Zeroizing::new(
-                base64::engine::general_purpose::STANDARD.encode(userinfo.as_bytes()),
-            );
+            Zeroizing::new(base64::engine::general_purpose::STANDARD.encode(userinfo.as_bytes()))
+        });
+        let token = encoded.as_ref().map(|encoded| encoded.as_str());
+
+        let mut capacity = "CONNECT ".len()
+            + authority.len()
+            + " HTTP/1.1\r\nHost: ".len()
+            + authority.len()
+            + "\r\n".len();
+        if let Some(token) = token {
+            capacity += "Proxy-Authorization: Basic ".len() + token.len() + "\r\n".len();
+        }
+        capacity += "\r\n".len();
+
+        let mut request = Zeroizing::new(String::with_capacity(capacity));
+        request.push_str("CONNECT ");
+        request.push_str(authority);
+        request.push_str(" HTTP/1.1\r\nHost: ");
+        request.push_str(authority);
+        request.push_str("\r\n");
+        if let Some(token) = token {
             request.push_str("Proxy-Authorization: Basic ");
-            request.push_str(&token);
+            request.push_str(token);
             request.push_str("\r\n");
         }
-
         request.push_str("\r\n");
         request
     }
@@ -1129,23 +1146,49 @@ mod tests {
     async fn connect_base64_encodes_password_bytes_verbatim() {
         // Only the first ':' separates the userinfo, and the whole pair is
         // base64-encoded, so a password may contain ':', space, tab, and non-ASCII.
-        let credentials = ResolvedHttpConnectCredentials::new("user", "p:a ss\té");
-        let (result, request) = exchange_authenticated(
-            b"HTTP/1.1 200 OK\r\n\r\n".to_vec(),
-            destination(),
-            &credentials,
-        )
-        .await;
-        result.expect("authenticated tunnel");
+        // The expected tokens are written out in full rather than re-encoded with
+        // the same library, so a wrong alphabet or padding choice cannot mask
+        // itself.
+        for (password, token) in [
+            // Identical under the URL-safe alphabet.
+            ("p:a ss\t\u{e9}", "dXNlcjpwOmEgc3MJw6k="),
+            // Contains '/' and '=', so the URL-safe and unpadded variants differ.
+            ("a\u{ff}\u{e9}", "dXNlcjphw7/DqQ=="),
+        ] {
+            let credentials = ResolvedHttpConnectCredentials::new("user", password);
+            let (result, request) = exchange_authenticated(
+                b"HTTP/1.1 200 OK\r\n\r\n".to_vec(),
+                destination(),
+                &credentials,
+            )
+            .await;
+            result.expect("authenticated tunnel");
 
-        let token = base64::engine::general_purpose::STANDARD.encode("user:p:a ss\té");
-        let expected = format!("Proxy-Authorization: Basic {token}").into_bytes();
-        assert!(
-            request
-                .windows(expected.len())
-                .any(|window| window == expected),
-            "{request:?}"
-        );
+            let expected = format!("Proxy-Authorization: Basic {token}").into_bytes();
+            assert!(
+                request
+                    .windows(expected.len())
+                    .any(|window| window == expected),
+                "password {password:?}: {request:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn build_connect_request_allocates_the_buffer_once() {
+        // Growing the request buffer would reallocate and free a block that already
+        // holds the base64 token; `Zeroizing` only wipes the final allocation.
+        let credentials = ResolvedHttpConnectCredentials::new("user", "a\u{ff}\u{e9}");
+        for authority in ["192.0.2.10:443", "[2001:db8::1]:443"] {
+            for credentials in [None, Some(&credentials)] {
+                let request = HttpConnectProtocol::build_connect_request(authority, credentials);
+                assert_eq!(
+                    request.capacity(),
+                    request.len(),
+                    "request for {authority} was not allocated in one pass"
+                );
+            }
+        }
     }
 
     #[tokio::test]
