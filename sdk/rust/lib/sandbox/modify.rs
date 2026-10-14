@@ -368,6 +368,7 @@ impl SandboxModificationBuilder {
             }
             ports::preflight(&config, active.as_ref(), &self.patch, status)?;
         }
+        let restart_required = plan_requires_restart(&plan) && running_status(status);
         if handle.local().is_some() {
             // Validate configuration serialization before stopping a VM,
             // growing a disk, or issuing any live control mutation.
@@ -375,8 +376,22 @@ impl SandboxModificationBuilder {
             apply_patch_to_config(&mut prospective, &self.patch);
             apply_secret_patch_to_config(&mut prospective, &self.patch)?;
             serde_json::to_string(&prospective)?;
+            // A restart stops the VM and persists the new configuration before the
+            // start path probes the runtime, so a runtime that cannot honor the
+            // prospective configuration is refused here instead. Editing a stopped
+            // sandbox deliberately skips this, so it needs no installed runtime.
+            if restart_required {
+                let local = self
+                    .backend
+                    .as_local()
+                    .ok_or_else(|| MicrosandboxError::local_only(Operation::SandboxModify))?;
+                crate::runtime::launch_contract::validate_runtime_config(
+                    &prospective,
+                    local.config(),
+                )
+                .await?;
+            }
         }
-        let restart_required = plan_requires_restart(&plan) && running_status(status);
         if restart_required {
             handle.stop().await?;
         }
