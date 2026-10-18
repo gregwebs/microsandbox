@@ -380,6 +380,8 @@ impl SandboxModificationBuilder {
             }
             ports::preflight(&config, active.as_ref(), &self.patch, status)?;
         }
+        let restart_required = plan_requires_restart(&plan) && running_status(status);
+
         if handle.local().is_some() {
             // Validate configuration serialization before stopping a VM,
             // growing a disk, or issuing any live control mutation.
@@ -387,8 +389,21 @@ impl SandboxModificationBuilder {
             apply_patch_to_config(&mut prospective, &self.patch);
             apply_secret_patch_to_config(&mut prospective, &self.patch)?;
             serde_json::to_string(&prospective)?;
+
+            // A restart-backed modification must be launchable on the selected
+            // runtime before the VM is stopped. Otherwise a capability gap (for
+            // example HTTP CONNECT proxy authentication) is only discovered by
+            // the start that follows `stop`, which leaves the workload down and
+            // the rejected change already persisted.
+            if restart_required && let Some(local) = self.backend.as_local() {
+                crate::runtime::launch_contract::validate_runtime_config(
+                    &prospective,
+                    local.config(),
+                )
+                .await?;
+            }
         }
-        let restart_required = plan_requires_restart(&plan) && running_status(status);
+
         if restart_required {
             handle.stop().await?;
         }
@@ -5778,6 +5793,135 @@ mod tests {
                 .unwrap();
             assert!(repeat.changes.is_empty());
         }
+    }
+
+    /// A restart-backed modification must refuse a prospective configuration the
+    /// selected runtime cannot launch before stopping the VM. Regression: the
+    /// capability check used to run only in the start that followed `stop`, which
+    /// left the workload down with the rejected change persisted.
+    #[cfg(all(unix, feature = "net"))]
+    #[tokio::test]
+    async fn restart_preflight_leaves_a_running_sandbox_untouched() {
+        use std::os::unix::fs::PermissionsExt;
+
+        use crate::config::{GlobalConfig, PathsConfig};
+
+        // Keep the home path short: the restart sequence derives Unix socket paths
+        // from it, and a long macOS temporary directory can exceed the socket limit.
+        let temp = tempfile::Builder::new()
+            .prefix("msb-restart-preflight-")
+            .tempdir_in("/tmp")
+            .unwrap();
+        let home = temp.path().join("home");
+        std::fs::create_dir_all(&home).unwrap();
+
+        // A `#!` wrapper has no embedded version metadata, so it resolves as a
+        // legacy launch contract and the pre-stop validation refuses the proxy at
+        // the legacy network gate. The auth-specific capability gate needs a real
+        // executable that also answers the capability probe, which a unit test
+        // cannot fake; `http_connect_credentials_require_runtime_support_before_launch`
+        // covers that gate, and this test covers where the gate runs.
+        let msb = temp.path().join("msb");
+        std::fs::write(
+            &msb,
+            "#!/bin/sh\n\
+             case \"$1\" in\n\
+             --version) printf 'msb 0.6.18\\n' ;;\n\
+             __launch-protocol) printf '%s' '{\"protocols\":[2,1],\"http_connect_proxy\":true}' ;;\n\
+             *) exit 1 ;;\n\
+             esac\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&msb, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let library = temp
+            .path()
+            .join(microsandbox_utils::libkrunfw_filename(std::env::consts::OS));
+        std::fs::write(&library, b"").unwrap();
+
+        let backend: Arc<dyn Backend> =
+            Arc::new(crate::test_support::local_backend(GlobalConfig {
+                home: Some(home),
+                paths: PathsConfig {
+                    msb: Some(msb),
+                    libkrunfw: Some(library),
+                    ..Default::default()
+                },
+                ..Default::default()
+            }));
+
+        let mut config = config(2, 1024);
+        config.spec.name = "restart-preflight".to_string();
+        let mut network = config.local_network_config().unwrap();
+        network.outbound_proxy = Some(
+            serde_json::from_value(serde_json::json!({
+                "protocol": "http_connect",
+                "address": "127.0.0.1:3128",
+                "credentials": {
+                    "username": "proxy-user",
+                    "password": {"kind": "env", "var": "HTTP_CONNECT_PASSWORD"}
+                }
+            }))
+            .unwrap(),
+        );
+        config.set_local_network_config(network).unwrap();
+
+        // The row has no recorded runtime, so `stop` converges the stale `Running`
+        // status instead of failing. That keeps the pre-fix ordering observable: the
+        // stop, the persisted change, and the failed start all happen for real.
+        let local = backend.as_local().unwrap();
+        let db = local.db().await.unwrap();
+        let row = sandbox_entity::ActiveModel {
+            name: Set(config.spec.name.clone()),
+            config: Set(serde_json::to_string(&config).unwrap()),
+            active_config: Set(None),
+            status: Set(SandboxStatus::Running),
+            ephemeral: Set(false),
+            ..Default::default()
+        }
+        .insert(db.write())
+        .await
+        .unwrap();
+
+        let result = SandboxModificationBuilder::new(backend.clone(), &config.spec.name)
+            .workdir("/srv")
+            .restart()
+            .apply()
+            .await;
+
+        // The workload and the durable configuration are the regression signal: a
+        // preflight that runs after the stop leaves the sandbox terminal and the
+        // rejected change already persisted, whatever the start then reports.
+        let saved = sandbox_entity::Entity::find_by_id(row.id)
+            .one(db.read())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            saved.status,
+            SandboxStatus::Running,
+            "the restart preflight must fail before stopping the workload"
+        );
+
+        let persisted: SandboxConfig = serde_json::from_str(&saved.config).unwrap();
+        assert_eq!(
+            persisted.spec.runtime.workdir, config.spec.runtime.workdir,
+            "the rejected change must not be persisted"
+        );
+        assert_eq!(
+            persisted.local_network_config().unwrap().outbound_proxy,
+            config.local_network_config().unwrap().outbound_proxy,
+            "the durable network configuration must be unchanged"
+        );
+
+        // The refusal is the launch-contract gate, not a stop or start failure. The
+        // legacy gate names the proxy feature itself, so it cannot be satisfied by
+        // the `HTTP CONNECT proxy authentication` capability refusal.
+        let error = result.expect_err("an unsupported runtime must refuse the restart");
+        assert!(
+            error.to_string().contains("HTTP CONNECT outbound proxies")
+                && error.to_string().contains("upgrade msb"),
+            "unexpected error: {error}"
+        );
     }
 
     /// The `tls` change a secret patch emits when it must turn interception on.
