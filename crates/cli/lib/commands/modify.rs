@@ -10,7 +10,7 @@ use microsandbox::sandbox::{
 };
 
 use super::common;
-use crate::ui;
+use crate::ui::{self, OutputFormat};
 
 //--------------------------------------------------------------------------------------------------
 // Types
@@ -94,8 +94,11 @@ pub struct ModifyArgs {
     pub workdir: Option<String>,
 
     /// Add or rotate a secret from a host environment variable
-    /// (`NAME@HOST[,HOST...]`).
-    #[arg(long = "secret", value_name = "NAME@HOST[,HOST...]")]
+    /// (`NAME[:OPTIONS]@HOST[,HOST...]`).
+    ///
+    /// `no-headers`, `headers=`, `query`, or `body` replace the whole
+    /// substitution rule; without them the current rule is kept.
+    #[arg(long = "secret", value_name = "NAME[:OPTIONS]@HOST[,HOST...]")]
     pub secrets: Vec<String>,
 
     /// Remove a secret by name.
@@ -123,8 +126,8 @@ pub struct ModifyArgs {
     pub restart: bool,
 
     /// Output format.
-    #[arg(long, value_name = "FORMAT", value_parser = ["json"])]
-    pub format: Option<String>,
+    #[arg(long, value_name = "FORMAT", value_enum)]
+    pub format: Option<OutputFormat>,
 }
 
 //--------------------------------------------------------------------------------------------------
@@ -133,7 +136,7 @@ pub struct ModifyArgs {
 
 /// Execute the `msb modify` command.
 pub async fn run(args: ModifyArgs) -> anyhow::Result<()> {
-    let json = args.format.as_deref() == Some("json");
+    let json = args.format == Some(OutputFormat::Json);
     let handle = Sandbox::get(&args.name).await?;
     if args.compact {
         let mut compact = handle.compact();
@@ -314,66 +317,14 @@ fn apply_secret_args(
     mut builder: SandboxModificationBuilder,
     args: &ModifyArgs,
 ) -> anyhow::Result<SandboxModificationBuilder> {
-    // Group hosts by secret name so repeated `--secret NAME@HOST[,HOST...]`
-    // flags accumulate into one declarative spec per name.
-    let mut specs: Vec<common::ParsedSecret> = Vec::new();
-    for secret in &args.secrets {
-        let parsed = common::parse_secret(secret, "modify")?;
-        match specs
-            .iter_mut()
-            .find(|existing| existing.env_var == parsed.env_var)
-        {
-            Some(existing) => {
-                for host in parsed.allowed_hosts {
-                    if !existing.allowed_hosts.contains(&host) {
-                        existing.allowed_hosts.push(host);
-                    }
-                }
-                for host in parsed.passthrough_hosts {
-                    if !existing.passthrough_hosts.contains(&host) {
-                        existing.passthrough_hosts.push(host);
-                    }
-                }
-                existing.substitute_headers &= parsed.substitute_headers;
-                if existing.substitute_headers {
-                    match common::intersect_header_fields(
-                        &existing.substitute_header_fields,
-                        &parsed.substitute_header_fields,
-                    ) {
-                        Some(merged) => existing.substitute_header_fields = merged,
-                        None => {
-                            // The scopes share no field: the empty allowlist is
-                            // equivalent to disabling header substitution and
-                            // must not fall back to substituting in every header.
-                            existing.substitute_headers = false;
-                            existing.substitute_header_fields.clear();
-                        }
-                    }
-                } else {
-                    existing.substitute_header_fields.clear();
-                }
-                existing.substitute_query |= parsed.substitute_query;
-                existing.substitute_body |= parsed.substitute_body;
-            }
-            None => specs.push(parsed),
-        }
-    }
-    for spec in specs {
+    for spec in common::merge_secrets(&args.secrets, "modify")? {
         let name = spec.env_var;
         builder = builder.secret(|mut s| {
-            s = s
-                .env(&name)
-                .source(SecretSource::Env { var: name.clone() })
-                .substitution(microsandbox_types::SecretSubstitution {
-                    headers: spec.substitute_headers,
-                    header_fields: if spec.substitute_headers {
-                        spec.substitute_header_fields.clone()
-                    } else {
-                        Vec::new()
-                    },
-                    query: spec.substitute_query,
-                    body: spec.substitute_body,
-                });
+            s = s.env(&name).source(SecretSource::Env { var: name.clone() });
+            // `None` keeps the secret's current rule.
+            if let Some(rule) = spec.substitution {
+                s = s.substitution(rule);
+            }
             for host in spec.allowed_hosts {
                 s = s.allow(host);
             }
@@ -767,9 +718,11 @@ fn replayed_args(args: &ModifyArgs) -> String {
         rendered.push(format!("--workdir {workdir}"));
     }
     for secret in &args.secrets {
-        let sanitized = common::parse_secret(secret, "modify")
-            .map(|parsed| format!("{}@{}", parsed.env_var, parsed.allowed_hosts.join(",")))
-            .unwrap_or_else(|_| "<secret>".to_string());
+        // Only accepted flags are echoed; parsing rejects inline values.
+        let sanitized = match common::parse_secret(secret, "modify") {
+            Ok(_) => common::hint_quote(secret),
+            Err(_) => "<secret>".to_string(),
+        };
         rendered.push(format!("--secret {sanitized}"));
     }
     for secret in &args.secret_remove {
@@ -964,6 +917,203 @@ mod tests {
             !err.contains("secret-value"),
             "error must not echo the value: {err}"
         );
+    }
+
+    fn merged_secrets(flags: &[&str]) -> Vec<common::ParsedSecret> {
+        let flags = flags.iter().map(ToString::to_string).collect::<Vec<_>>();
+        common::merge_secrets(&flags, "modify").unwrap()
+    }
+
+    /// `(headers, header_fields, query, body)`; `SecretSubstitution` has no `PartialEq`.
+    type Rule = (bool, Vec<String>, bool, bool);
+
+    fn sent_rule(spec: &common::ParsedSecret) -> Option<Rule> {
+        spec.substitution.as_ref().map(|rule| {
+            (
+                rule.headers,
+                rule.header_fields.clone(),
+                rule.query,
+                rule.body,
+            )
+        })
+    }
+
+    fn merged_substitution(flags: &[&str]) -> Option<Rule> {
+        let specs = merged_secrets(flags);
+        assert_eq!(specs.len(), 1);
+        sent_rule(&specs[0])
+    }
+
+    fn substitution(headers: bool, header_fields: &[&str], query: bool, body: bool) -> Rule {
+        (
+            headers,
+            header_fields.iter().map(ToString::to_string).collect(),
+            query,
+            body,
+        )
+    }
+
+    #[test]
+    fn secret_without_options_leaves_substitution_unset() {
+        assert_eq!(merged_substitution(&["API_KEY@api.example.com"]), None);
+    }
+
+    #[test]
+    fn secret_with_options_sends_whole_rule() {
+        assert_eq!(
+            merged_substitution(&["API_KEY:headers=authorization,query@h"]),
+            Some(substitution(true, &["authorization"], true, false))
+        );
+        assert_eq!(
+            merged_substitution(&["API_KEY:body@h"]),
+            Some(substitution(true, &[], false, true))
+        );
+        // `headers=*` is a stated rule, not an omission.
+        assert_eq!(
+            merged_substitution(&["API_KEY:headers=*@h"]),
+            Some(substitution(true, &[], false, false))
+        );
+    }
+
+    #[test]
+    fn passthrough_only_option_keeps_substitution_unset() {
+        let specs = merged_secrets(&["API_KEY:passthrough=logs.example.com@h"]);
+        assert_eq!(sent_rule(&specs[0]), None);
+        assert_eq!(specs[0].passthrough_hosts, vec!["logs.example.com"]);
+    }
+
+    #[test]
+    fn merged_secret_flags_keep_stated_substitution() {
+        for (stated, expected) in [
+            (
+                "API_KEY:headers=authorization@a",
+                substitution(true, &["authorization"], false, false),
+            ),
+            (
+                "API_KEY:no-headers,query@a",
+                substitution(false, &[], true, false),
+            ),
+            ("API_KEY:headers=*@a", substitution(true, &[], false, false)),
+        ] {
+            for flags in [[stated, "API_KEY@b"], ["API_KEY@b", stated]] {
+                let specs = merged_secrets(&flags);
+                assert_eq!(specs.len(), 1, "{flags:?}");
+                assert_eq!(sent_rule(&specs[0]), Some(expected.clone()), "{flags:?}");
+                let mut hosts = specs[0].allowed_hosts.clone();
+                hosts.sort();
+                assert_eq!(hosts, vec!["a", "b"], "{flags:?}");
+            }
+        }
+
+        for flags in [
+            ["API_KEY:passthrough=p@a", "API_KEY@b"],
+            ["API_KEY@b", "API_KEY:passthrough=p@a"],
+        ] {
+            let specs = merged_secrets(&flags);
+            assert_eq!(sent_rule(&specs[0]), None, "{flags:?}");
+            assert_eq!(specs[0].passthrough_hosts, vec!["p"], "{flags:?}");
+        }
+
+        assert_eq!(merged_substitution(&["API_KEY@a", "API_KEY@b"]), None);
+    }
+
+    fn restart_blocked_plan() -> SandboxModificationPlan {
+        SandboxModificationPlan {
+            sandbox: "api".to_string(),
+            status: "running".to_string(),
+            applied: false,
+            policy: microsandbox::sandbox::ModificationPolicy::NoRestart,
+            changes: vec![PlannedChange::Secret(SecretPlannedChange {
+                field: "secret".to_string(),
+                name: "API_KEY".to_string(),
+                change: SecretChangeKind::Rotated,
+                before_ref: None,
+                after_ref: None,
+                disposition: ModificationDisposition::RequiresRestart,
+                allow_hosts: Vec::new(),
+                reason: None,
+            })],
+            conflicts: Vec::new(),
+            warnings: Vec::new(),
+            resize_status: Vec::new(),
+        }
+    }
+
+    fn restart_hints(flags: &[&str]) -> Vec<String> {
+        let mut argv = vec!["api"];
+        for flag in flags {
+            argv.extend(["--secret", flag]);
+        }
+        let args = parse_modify_args(&argv);
+        let blocker = apply_blocker(&args, &restart_blocked_plan()).unwrap();
+        blocker
+            .lines
+            .into_iter()
+            .filter(|line| matches!(line.kind, BlockerLineKind::Hint))
+            .map(|line| line.text)
+            .collect()
+    }
+
+    #[test]
+    fn restart_hint_replays_secret_options() {
+        let hints = restart_hints(&["API_KEY:headers=authorization@h"]);
+        assert_eq!(
+            hints,
+            vec![
+                "no changes were applied".to_string(),
+                "run `msb modify api --secret API_KEY:headers=authorization@h --restart` to apply now"
+                    .to_string(),
+                "run `msb modify api --secret API_KEY:headers=authorization@h --next-start` to save for the next start"
+                    .to_string(),
+            ]
+        );
+
+        for (flag, posix, windows) in [
+            (
+                "API_KEY:headers=[a,b]@h",
+                "'API_KEY:headers=[a,b]@h'",
+                "\"API_KEY:headers=[a,b]@h\"",
+            ),
+            (
+                "API_KEY:headers=*@h",
+                "'API_KEY:headers=*@h'",
+                "\"API_KEY:headers=*@h\"",
+            ),
+            (
+                "API_KEY:headers=x$y@h",
+                "'API_KEY:headers=x$y@h'",
+                "\"API_KEY:headers=x$y@h\"",
+            ),
+            (
+                "API_KEY:headers=x`y@h",
+                "'API_KEY:headers=x`y@h'",
+                "\"API_KEY:headers=x`y@h\"",
+            ),
+            (
+                "API_KEY:headers=x'y@h",
+                r"'API_KEY:headers=x'\''y@h'",
+                "\"API_KEY:headers=x'y@h\"",
+            ),
+            ("API_KEY@a, b", "'API_KEY@a, b'", "\"API_KEY@a, b\""),
+        ] {
+            let quoted = if cfg!(windows) { windows } else { posix };
+            let replayed = format!("--secret {quoted} --restart");
+            let hints = restart_hints(&[flag]);
+            assert!(
+                hints.iter().any(|hint| hint.contains(&replayed)),
+                "{flag}: {hints:?}"
+            );
+        }
+
+        // An inline value fails to parse and is never echoed.
+        let hints = restart_hints(&["API_KEY=secret-value@h"]);
+        assert!(
+            hints
+                .iter()
+                .any(|hint| hint.contains("--secret <secret> --restart")),
+            "{hints:?}"
+        );
+        assert!(hints.iter().all(|hint| !hint.contains("secret-value")));
     }
 
     fn resize_entry(

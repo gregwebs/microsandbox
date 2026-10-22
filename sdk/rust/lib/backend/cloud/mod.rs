@@ -286,6 +286,12 @@ impl CloudBackendBuilder {
     /// explicitly supplied URL is empty, the HTTP client fails to construct,
     /// or user or managed configuration cannot be loaded.
     pub fn build(self) -> MicrosandboxResult<CloudBackend> {
+        let config = match self.config {
+            Some(config) => config,
+            None => Arc::new(BackendConfig::load()?),
+        };
+
+        config.require_backend(super::BackendKind::Cloud, None)?;
         let url = self.url.as_deref().unwrap_or(DEFAULT_CLOUD_API_URL);
         let url = url.trim();
         if url.is_empty() {
@@ -334,13 +340,6 @@ impl CloudBackendBuilder {
                     MicrosandboxError::InvalidConfig(format!("failed to build HTTP client: {e}"))
                 })?
         };
-
-        let config = match self.config {
-            Some(config) => config,
-            None => Arc::new(BackendConfig::load()?),
-        };
-
-        config.resolved_config().exec.validate()?;
 
         Ok(CloudBackend {
             url,
@@ -402,6 +401,30 @@ mod tests {
 
     use super::*;
     use crate::backend::BackendKind;
+
+    #[test]
+    fn cloud_construction_rejects_policy_before_credentials_or_client_setup() {
+        for managed in [false, true] {
+            let restriction =
+                crate::config::GlobalConfigPatch::new().allowed_backends(vec![BackendKind::Local]);
+            let config = if managed {
+                BackendConfig::new(Default::default(), restriction)
+            } else {
+                BackendConfig::new(restriction, Default::default())
+            };
+            let error = CloudBackend::builder()
+                .url("not a URL")
+                .config_sources(config)
+                .build()
+                .err()
+                .unwrap();
+            assert!(
+                error
+                    .to_string()
+                    .contains("cloud backend selected by programmatic is disabled")
+            );
+        }
+    }
 
     #[test]
     fn cloud_backend_keeps_captured_settings_until_replaced() {
@@ -555,41 +578,15 @@ mod tests {
     }
 
     #[test]
-    fn builder_validates_effective_exec_limit() {
-        for (user, managed, valid) in [
-            (serde_json::Value::Null, serde_json::json!({}), true),
-            (serde_json::json!(0), serde_json::json!({}), false),
-            (
-                serde_json::json!(0),
-                serde_json::json!({"exec":{"buffer_bytes":65536}}),
-                true,
-            ),
-            (
-                serde_json::json!(65536),
-                serde_json::json!({"exec":{"buffer_bytes":0}}),
-                false,
-            ),
-        ] {
-            let sources = BackendConfig::new(
-                serde_json::from_value(serde_json::json!({"exec":{"buffer_bytes":user}})).unwrap(),
-                serde_json::from_value(managed).unwrap(),
-            );
-            let result = CloudBackend::builder()
-                .url("https://example.com")
-                .api_key("test")
-                .config_sources(sources)
-                .build();
-            assert_eq!(result.is_ok(), valid);
-        }
-    }
-
-    #[test]
     fn builder_succeeds_with_url_and_key() {
         let b =
             crate::test_support::cloud_backend("https://msb.example.com", "msb_test_abc").unwrap();
         assert_eq!(b.kind(), BackendKind::Cloud);
         assert_eq!(b.url(), "https://msb.example.com");
-        assert_eq!(b.info().source, BackendSelectionSource::Programmatic);
+        assert_eq!(
+            b.info().unwrap().source,
+            BackendSelectionSource::Programmatic
+        );
     }
 
     #[test]
@@ -597,7 +594,7 @@ mod tests {
         let b =
             crate::test_support::cloud_backend("https://msb.example.com", "msb_test_super_secret")
                 .unwrap();
-        let json = serde_json::to_string(&b.info()).unwrap();
+        let json = serde_json::to_string(&b.info().unwrap()).unwrap();
 
         assert!(json.contains("https://msb.example.com"));
         assert!(!json.contains("msb_test_super_secret"));
@@ -652,7 +649,10 @@ mod tests {
         for (cloud, expected) in clouds {
             let cloud = cloud.unwrap();
             assert_eq!(cloud.url(), expected);
-            assert_eq!(cloud.info().source, BackendSelectionSource::Programmatic);
+            assert_eq!(
+                cloud.info().unwrap().source,
+                BackendSelectionSource::Programmatic
+            );
         }
     }
 

@@ -98,6 +98,8 @@ msb modify worker --label tier=web --label-rm stale
 ```
 </CodeGroup>
 
+On a running sandbox these changes apply live by default; a stopped sandbox saves them for its next start. See [Update labels](/sandboxes/tuning#update-labels) for how lists, metrics, and the `next_start` policy pick them up.
+
 ## Select in bulk
 
 This is where labels earn their keep. Find every sandbox carrying a label, from the CLI or an SDK; pass more than one label to require all of them (AND-matched):
@@ -135,11 +137,13 @@ msb ps --label app=engine --label tier=web   # only those with both
 
 On the CLI, `--label` also drives the fleet commands directly, so you act on the whole group in one call instead of listing and looping:
 
-```bash
+<CodeGroup>
+```bash Shell
 msb stop --label app=engine        # stop every match
 msb restart --label app=engine     # restart every match
 msb rm --force --label app=engine  # remove every match
 ```
+</CodeGroup>
 
 It works the same on `ps`, `ls`, `start`, `stop`, `restart`, `ping`, `touch`, and `rm`.
 
@@ -151,4 +155,4 @@ High-cardinality labels can increase the number of metric series your backend st
 
 ## Reference
 
-For exact label and sandbox-selection APIs, see [TypeScript](/sdk/typescript/sandbox), [Rust](/sdk/rust/sandbox), [Python](/sdk/python/sandbox), or [Go](/sdk/go/sandbox). For label-aware fleet commands, see [Sandbox commands](/cli/sandbox-commands).
+For exact label and sandbox-selection APIs, see [TypeScript](/sdk/typescript/sandbox), [Rust](/sdk/rust/sandbox), [Python](/sdk/python/sandbox), [Go](/sdk/go/sandbox), or [Ruby](/sdk/ruby/sandbox). For label-aware fleet commands, see [Sandbox commands](/cli/sandbox-commands).

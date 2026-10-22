@@ -180,7 +180,7 @@ pub use microsandbox_network::policy::{
     Action as NetworkAction, NetworkPolicy, NetworkProfile, Rule as NetworkRule,
 };
 #[cfg(feature = "net")]
-pub use microsandbox_network::{OutboundProxy, Socks5Credentials};
+pub use microsandbox_network::{HttpConnectCredentials, OutboundProxy, Socks5Credentials};
 #[cfg(feature = "local")]
 pub use microsandbox_runtime::control::PauseControlState as SandboxPauseState;
 pub use microsandbox_types::SandboxLogLevel as LogLevel;
@@ -1566,7 +1566,6 @@ pub(crate) fn build_exec_request(
         .collect();
 
     ExecRequest {
-        output_window: None,
         cmd,
         args,
         env,
@@ -1716,6 +1715,7 @@ pub(crate) fn validate_env(env: &[EnvVar]) -> MicrosandboxResult<()> {
                 var.key
             )));
         }
+        init::validate_env_pair("environment variable", &var.key, &var.value)?;
     }
     Ok(())
 }
