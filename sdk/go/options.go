@@ -60,6 +60,7 @@ type SandboxConfig struct {
 	MaxDuration        time.Duration
 	IdleTimeout        time.Duration
 	RegistryAuth       *RegistryAuth
+	registryAnonymous  bool
 	// RegistryInsecure pulls the image over plain HTTP instead of HTTPS.
 	RegistryInsecure bool
 	// RegistryCACerts holds PEM-encoded CA root certificates trusted when
@@ -909,6 +910,16 @@ func WithRegistryAuth(auth RegistryAuth) SandboxOption {
 	return func(o *SandboxConfig) {
 		a := auth
 		o.RegistryAuth = &a
+		o.registryAnonymous = false
+	}
+}
+
+// WithRegistryAnonymous pulls without credentials, even when the OS keyring,
+// registry configuration or Docker's credential store has some for the registry.
+func WithRegistryAnonymous() SandboxOption {
+	return func(o *SandboxConfig) {
+		o.RegistryAuth = nil
+		o.registryAnonymous = true
 	}
 }
 

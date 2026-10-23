@@ -1148,6 +1148,11 @@ struct SandboxCreateOpts {
     idle_timeout_secs: Option<u64>,
     /// Registry credentials for pulling private images.
     registry_auth: Option<RegistryAuthOpts>,
+    /// Pull without credentials, skipping the OS keyring, the registry config
+    /// and Docker's credential store. A top-level field, so libraries that
+    /// predate it reject the request instead of pulling with ambient auth.
+    #[serde(default)]
+    registry_anonymous: bool,
     /// Pull the image over plain HTTP instead of HTTPS (registry override).
     #[serde(default)]
     registry_insecure: bool,
@@ -1319,9 +1324,28 @@ enum FfiNamedMode {
     EnsureExists,
 }
 
-// ---------------------------------------------------------------------------
-// Sandbox create — helpers
-// ---------------------------------------------------------------------------
+//--------------------------------------------------------------------------------------------------
+// Functions: Helpers
+//--------------------------------------------------------------------------------------------------
+
+/// The explicit registry auth a create request asks for, if any. Without it
+/// the SDK resolves ambient credentials (keyring, config, Docker).
+fn requested_registry_auth(
+    auth: Option<RegistryAuthOpts>,
+    anonymous: bool,
+) -> Result<Option<RegistryAuth>, FfiError> {
+    match (auth, anonymous) {
+        (Some(_), true) => Err(FfiError::invalid_argument(
+            "registry_anonymous and registry_auth are mutually exclusive",
+        )),
+        (Some(auth), false) => Ok(Some(RegistryAuth::Basic {
+            username: auth.username,
+            password: auth.password,
+        })),
+        (None, true) => Ok(Some(RegistryAuth::Anonymous)),
+        (None, false) => Ok(None),
+    }
+}
 
 /// Parse the shared policy vocabulary without applying DNS, TLS, or bootstrap options.
 fn parse_custom_network_policy(
@@ -2602,16 +2626,14 @@ pub unsafe extern "C" fn msb_sandbox_create(
             }
             // `registry` overwrites insecure and ca_certs wholesale, so all
             // three overrides have to be applied in one call.
-            let registry_auth = opts.registry_auth;
+            let registry_auth =
+                requested_registry_auth(opts.registry_auth, opts.registry_anonymous)?;
             let registry_insecure = opts.registry_insecure;
             let registry_ca_certs = opts.registry_ca_certs;
             if registry_auth.is_some() || registry_insecure || !registry_ca_certs.is_empty() {
                 builder = builder.registry(|mut r| {
                     if let Some(auth) = registry_auth {
-                        r = r.auth(RegistryAuth::Basic {
-                            username: auth.username,
-                            password: auth.password,
-                        });
+                        r = r.auth(auth);
                     }
                     if registry_insecure {
                         r = r.insecure();
@@ -8190,6 +8212,33 @@ mod tests {
             serde_json::from_str(r#"{"image":"python:3.12","oci_upper_size_mib":0}"#).unwrap();
 
         assert_eq!(opts.oci_upper_size_mib, Some(0));
+    }
+
+    #[test]
+    fn sandbox_create_opts_requests_anonymous_registry_auth() {
+        let opts: SandboxCreateOpts =
+            serde_json::from_str(r#"{"image":"ghcr.io/org/public","registry_anonymous":true}"#)
+                .unwrap();
+        assert!(matches!(
+            requested_registry_auth(opts.registry_auth, opts.registry_anonymous),
+            Ok(Some(RegistryAuth::Anonymous))
+        ));
+
+        let opts: SandboxCreateOpts =
+            serde_json::from_str(r#"{"image":"ghcr.io/org/public"}"#).unwrap();
+        assert!(matches!(
+            requested_registry_auth(opts.registry_auth, opts.registry_anonymous),
+            Ok(None)
+        ));
+    }
+
+    #[test]
+    fn anonymous_and_basic_registry_auth_are_exclusive() {
+        let opts: SandboxCreateOpts = serde_json::from_str(
+            r#"{"image":"ghcr.io/org/private","registry_anonymous":true,"registry_auth":{"username":"u","password":"p"}}"#,
+        )
+        .unwrap();
+        assert!(requested_registry_auth(opts.registry_auth, opts.registry_anonymous).is_err());
     }
 
     #[test]

@@ -577,6 +577,22 @@ func TestFFIWireShape_RegistryAuth(t *testing.T) {
 	}
 }
 
+// Anonymous auth travels as a top-level field: libraries that predate it reject
+// unknown create options instead of falling back to ambient credentials.
+func TestFFIWireShape_RegistryAnonymous(t *testing.T) {
+	got := marshalCreateOptions(t,
+		WithImage("ghcr.io/org/public"),
+		WithRegistryAuth(RegistryAuth{Username: "old", Password: "old"}),
+		WithRegistryAnonymous(),
+	)
+	if got["registry_anonymous"] != true {
+		t.Fatalf("registry_anonymous = %v", got["registry_anonymous"])
+	}
+	if _, present := got["registry_auth"]; present {
+		t.Fatalf("anonymous auth also sent registry_auth: %v", got["registry_auth"])
+	}
+}
+
 func TestFFIWireShape_RegistryOverrides(t *testing.T) {
 	got := marshalCreateOptions(t,
 		WithImage("localhost:5050/img"),
@@ -1087,7 +1103,7 @@ func TestFFIWireShape_EmptyConfigOmitsOptionalFields(t *testing.T) {
 		"thp",
 		"hostname", "user", "replace", "detached", "env", "scripts",
 		"ports", "ports_udp", "vsock", "network", "secrets", "patches", "volumes",
-		"proxy", "init", "registry_auth", "registry_insecure", "registry_ca_certs", "root_disk",
+		"proxy", "init", "registry_auth", "registry_anonymous", "registry_insecure", "registry_ca_certs", "root_disk",
 	} {
 		if _, present := got[key]; present {
 			body, _ := json.Marshal(got)
