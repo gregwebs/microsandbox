@@ -439,6 +439,8 @@ async fn copy_on_write_disk_archive_preserves_replacement_target() {
     .await;
 }
 
+// Uses the networking builder surface, so this fixture is only available in net builds.
+#[cfg(feature = "net")]
 #[tokio::test]
 async fn disk_only_restore_from_full_archive_passes_admission() {
     let root = tempfile::tempdir_in("/tmp").unwrap();
