@@ -33,7 +33,7 @@ use super::checked::{
     CheckedEnd, CheckedEvent, CheckedFailure, classify_checked_message, closed_session,
     finish_with_teardown,
 };
-use super::checked_output::{CheckedOutput, Staging};
+use super::checked_output::{CheckedOutput, FlushPolicy, Staging, deliver_after_failure};
 use super::error::{AttachFailureKind, AttachSessionError, TeardownStage};
 use super::{
     AttachOptions, DetachKeys, FilteredStdin, InputRoute, STDIN_FILTER_TASK_ENDED, StdinFilter,
@@ -355,16 +355,19 @@ impl<'a> CheckedLoop<'a> {
 
     /// The session's result from the loop's.
     ///
-    /// Exactly the epilogue the loop used to run inline: a guest exit delivers
-    /// the staged output and awaits the ordered finish receipt, a spawn failure
-    /// stays typed, and a failure that ended the loop is returned as it is.
+    /// A guest exit delivers the staged output and awaits the ordered finish
+    /// receipt, a spawn failure stays typed, and a failure that ended the loop
+    /// is returned as it is. Whatever still needs to be said is said first: a
+    /// session that already failed still hands the guest's last output to the
+    /// host, so an exit's error text or a failing command's diagnostics are not
+    /// lost with the session. That delivery is what the writer thread is for;
+    /// it stops as soon as the host stops accepting, and it never joins.
     pub(super) async fn conclude(
         &mut self,
         end: Result<CheckedEnd, AttachSessionError>,
     ) -> Result<i32, CheckedFailure> {
-        match end? {
-            CheckedEnd::Failed(failure) => Err(CheckedFailure::Spawn(failure)),
-            CheckedEnd::Exited(code) => {
+        match end {
+            Ok(CheckedEnd::Exited(code)) => {
                 // A definitive exit is necessary but not sufficient: output read
                 // before the exit event is delivered first, and the ordered finish
                 // receipt then proves every earlier byte reached the host
@@ -375,6 +378,40 @@ impl<'a> CheckedLoop<'a> {
                 }
                 self.io.output.finish().await?;
                 Ok(code)
+            }
+            Ok(CheckedEnd::Failed(failure)) => {
+                // The spawn failure is the fact the caller needs and stays
+                // exactly `ExecFailed`, so a tail that cannot be delivered is
+                // only worth a debug line here.
+                if let Err(note) = deliver_after_failure(
+                    &self.io.output,
+                    &mut self.staging,
+                    FlushPolicy::AFTER_FAILURE,
+                )
+                .await
+                {
+                    tracing::debug!(
+                        "checked attach: guest output before the spawn failure was not fully \
+                         delivered: {note}"
+                    );
+                }
+                Err(CheckedFailure::Spawn(failure))
+            }
+            // The writer is dead, so there is nothing left to deliver to.
+            Err(error) if error.kind() == AttachFailureKind::Output => Err(error.into()),
+            Err(error) => {
+                let delivered = deliver_after_failure(
+                    &self.io.output,
+                    &mut self.staging,
+                    FlushPolicy::AFTER_FAILURE,
+                )
+                .await;
+                Err(match delivered {
+                    Ok(()) => error.into(),
+                    Err(note) => error
+                        .with_teardown(TeardownStage::DeliverOutput, note)
+                        .into(),
+                })
             }
         }
     }
@@ -885,7 +922,9 @@ mod tests {
     use std::time::Duration;
 
     use microsandbox_protocol::codec;
-    use microsandbox_protocol::exec::{ExecExited, ExecStdin, ExecStdout};
+    use microsandbox_protocol::exec::{
+        ExecExited, ExecFailed, ExecFailureKind, ExecStdin, ExecStdout,
+    };
     use microsandbox_protocol::message::{Message, MessageType};
     use tokio::io::{AsyncReadExt, DuplexStream};
     use tokio::sync::mpsc;
@@ -1439,5 +1478,212 @@ mod tests {
             vec![0x03],
             "host input must reach the guest while output waits for capacity"
         );
+    }
+    // -- Delivery before a failure (C12) --------------------------------------
+
+    fn spawn_failure() -> ExecFailed {
+        ExecFailed {
+            kind: ExecFailureKind::NotFound,
+            errno: Some(2),
+            errno_name: Some("ENOENT".to_string()),
+            message: "bash: not found".to_string(),
+            stage: Some("execvp".to_string()),
+        }
+    }
+
+    fn staged_chunks() -> [Vec<u8>; 3] {
+        [
+            vec![0xA1u8; CHECKED_OUTPUT_CHUNK_BYTES],
+            vec![0xA2u8; CHECKED_OUTPUT_CHUNK_BYTES],
+            vec![0xA3u8; 100],
+        ]
+    }
+
+    #[tokio::test]
+    async fn conclude_delivers_held_output_before_a_session_failure() {
+        let mut fixture = fixture(OutputPipe::Prefilled, 64 * 1024).await;
+        let queued = fill_queue(&fixture.io.as_ref().expect("the fixture's io").output).await;
+        let mut expected = fixture.prefill.clone();
+        expected.extend_from_slice(&queued);
+        let reader = fixture.screen.take().expect("an output pipe");
+        let staged = staged_chunks();
+        for chunk in &staged {
+            expected.extend_from_slice(chunk);
+        }
+
+        let mut session = fixture.session();
+        for chunk in &staged {
+            session.staging.stage(chunk.clone());
+        }
+
+        // The consumer starts draining only now: the bytes it receives are the
+        // ones the failed session still held.
+        let screen = read_screen(reader);
+        let failure = within(session.conclude(Err(AttachSessionError::new(
+            AttachFailureKind::ConnectionLost,
+            "lost",
+        ))))
+        .await
+        .expect_err("a session failure stays a failure");
+        let CheckedFailure::Session(error) = failure else {
+            panic!("a session failure stays a session failure: {failure:?}");
+        };
+        assert_eq!(error.kind(), AttachFailureKind::ConnectionLost);
+        assert_eq!(
+            error.to_string(),
+            "lost",
+            "the original failure must not gain a delivery note it did not need"
+        );
+
+        drop(session);
+        assert_eq!(
+            screen.join().expect("the screen thread"),
+            expected,
+            "guest output the session still held must reach the host before it reports the failure"
+        );
+    }
+
+    #[tokio::test]
+    async fn conclude_delivers_held_output_before_a_spawn_failure() {
+        let mut fixture = fixture(OutputPipe::Prefilled, 64 * 1024).await;
+        let queued = fill_queue(&fixture.io.as_ref().expect("the fixture's io").output).await;
+        let mut expected = fixture.prefill.clone();
+        expected.extend_from_slice(&queued);
+        let reader = fixture.screen.take().expect("an output pipe");
+        let staged = staged_chunks();
+        for chunk in &staged {
+            expected.extend_from_slice(chunk);
+        }
+
+        let mut session = fixture.session();
+        for chunk in &staged {
+            session.staging.stage(chunk.clone());
+        }
+
+        let screen = read_screen(reader);
+        let failure = within(session.conclude(Ok(CheckedEnd::Failed(spawn_failure()))))
+            .await
+            .expect_err("a spawn failure stays a failure");
+        assert!(
+            matches!(failure, CheckedFailure::Spawn(_)),
+            "a spawn failure must stay exactly matchable: {failure:?}"
+        );
+
+        drop(session);
+        assert_eq!(
+            screen.join().expect("the screen thread"),
+            expected,
+            "the command's own diagnostics must reach the host before the spawn failure"
+        );
+    }
+
+    #[tokio::test]
+    async fn conclude_serves_a_consumer_that_resumes_during_delivery() {
+        let mut fixture = fixture(OutputPipe::Prefilled, 64 * 1024).await;
+        let queued = fill_queue(&fixture.io.as_ref().expect("the fixture's io").output).await;
+        let mut expected = fixture.prefill.clone();
+        expected.extend_from_slice(&queued);
+        let reader = fixture.screen.take().expect("an output pipe");
+        let staged = staged_chunks();
+        for chunk in &staged {
+            expected.extend_from_slice(chunk);
+        }
+
+        let mut session = fixture.session();
+        for chunk in &staged {
+            session.staging.stage(chunk.clone());
+        }
+
+        // The consumer wakes while the delivery is already waiting for capacity.
+        let delayed_reader = async {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            read_screen(reader)
+        };
+        let (result, screen) = tokio::join!(
+            session.conclude(Err(AttachSessionError::new(
+                AttachFailureKind::ConnectionLost,
+                "lost",
+            ))),
+            delayed_reader
+        );
+        let failure = result.expect_err("a session failure stays a failure");
+        let CheckedFailure::Session(error) = failure else {
+            panic!("a session failure stays a session failure: {failure:?}");
+        };
+        assert_eq!(
+            error.to_string(),
+            "lost",
+            "a consumer that resumes in time leaves the failure untouched"
+        );
+
+        drop(session);
+        assert_eq!(screen.join().expect("the screen thread"), expected);
+    }
+
+    #[tokio::test]
+    async fn conclude_appends_a_note_when_the_consumer_stays_stalled() {
+        let mut fixture = fixture(OutputPipe::Prefilled, 64 * 1024).await;
+        fill_queue(&fixture.io.as_ref().expect("the fixture's io").output).await;
+        // Held, never drained: the writer cannot make progress.
+        let _screen = fixture.screen.take().expect("an output pipe");
+
+        let mut session = fixture.session();
+        for chunk in staged_chunks() {
+            session.staging.stage(chunk);
+        }
+
+        let failure = within(session.conclude(Err(AttachSessionError::new(
+            AttachFailureKind::ConnectionLost,
+            "lost",
+        ))))
+        .await
+        .expect_err("a session failure stays a failure");
+        let CheckedFailure::Session(error) = failure else {
+            panic!("a session failure stays a session failure: {failure:?}");
+        };
+        assert_eq!(
+            error.kind(),
+            AttachFailureKind::ConnectionLost,
+            "a delivery note must not replace the reason the session ended: {error}"
+        );
+        assert_eq!(
+            error.to_string(),
+            "lost; delivering guest output: the host output accepted nothing for 500ms",
+            "a delivery that gave up must be reported beside the failure"
+        );
+        assert!(
+            error.terminal_restored(),
+            "the terminal is still restored when only the delivery was lost"
+        );
+    }
+
+    #[tokio::test]
+    async fn conclude_returns_an_output_failure_at_once() {
+        // The writer is dead, so there is nothing to deliver to: the session
+        // must not spend the delivery window finding that out.
+        let mut fixture = fixture(OutputPipe::Closed, 64 * 1024).await;
+        let mut session = fixture.session();
+        for chunk in staged_chunks() {
+            session.staging.stage(chunk);
+        }
+
+        let started = std::time::Instant::now();
+        let failure = session
+            .conclude(Err(AttachSessionError::new(
+                AttachFailureKind::Output,
+                "the host descriptor is gone",
+            )))
+            .await
+            .expect_err("an output failure stays a failure");
+        // The idle window is 500 ms; this must not wait for it.
+        assert!(
+            started.elapsed() < Duration::from_millis(400),
+            "an output failure must be returned at once, not after the delivery window: {:?}",
+            started.elapsed()
+        );
+        let CheckedFailure::Session(error) = failure else {
+            panic!("an output failure stays a session failure: {failure:?}");
+        };
+        assert_eq!(error.to_string(), "the host descriptor is gone");
     }
 }

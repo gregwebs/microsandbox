@@ -4,7 +4,9 @@
 
 use std::collections::VecDeque;
 use std::os::fd::{AsRawFd, OwnedFd, RawFd};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
+use std::time::Duration;
 
 use tokio::sync::Notify;
 
@@ -42,6 +44,24 @@ pub(super) const CHECKED_STAGED_MAX_BYTES: usize = 8 * 1024 * 1024;
 /// the payload inside it is a few bytes smaller.
 const GUEST_FRAME_MAX_BYTES: usize = microsandbox_protocol::codec::MAX_FRAME_SIZE as usize;
 
+/// The most one `write(2)` hands the host descriptor at a time.
+///
+/// A blocking write returns only once it has taken *all* of what it was given,
+/// so a whole 64 KiB chunk that a slow consumer drains over a second makes the
+/// writer look stalled for that whole second. Bounding each syscall makes the
+/// accepted-byte count track what the descriptor actually takes, which is what
+/// the delivery policy below waits for. Bytes and their order are unchanged.
+const CHECKED_WRITE_SLICE_BYTES: usize = 8 * 1024;
+
+/// How long a failed session keeps offering output to a host descriptor that
+/// accepts no bytes at all.
+pub(super) const CHECKED_FAILURE_FLUSH_IDLE: Duration = Duration::from_millis(500);
+
+/// The most a failed session spends delivering held output, however slowly the
+/// host keeps accepting it: the error and the terminal restore must not wait on
+/// a crawling consumer for ever.
+pub(super) const CHECKED_FAILURE_FLUSH_LIMIT: Duration = Duration::from_secs(5);
+
 //--------------------------------------------------------------------------------------------------
 // Types
 //--------------------------------------------------------------------------------------------------
@@ -77,6 +97,10 @@ struct CheckedOutputQueueState {
 #[derive(Default)]
 struct CheckedOutputQueue {
     state: Mutex<CheckedOutputQueueState>,
+    /// Bytes the host descriptor has accepted, counted per successful
+    /// `write(2)`. Monotonic, and only ever compared, so a relaxed load is
+    /// enough.
+    accepted: AtomicU64,
     /// Wakes the writer when work arrives or the queue is closed.
     work: Condvar,
     /// Wakes capacity waiters after a write, a failure, or an abort.
@@ -91,6 +115,15 @@ struct CheckedOutputQueue {
 
 pub(super) struct CheckedOutput {
     queue: Arc<CheckedOutputQueue>,
+}
+
+/// What a failed session spends delivering output it still holds.
+#[derive(Clone, Copy)]
+pub(super) struct FlushPolicy {
+    /// Give up after this long without a single accepted byte.
+    pub(super) idle: Duration,
+    /// Give up after this long in total, however steadily the host accepts.
+    pub(super) limit: Duration,
 }
 
 /// Guest output read but not yet accepted by the writer, as writer-sized chunks.
@@ -265,6 +298,13 @@ impl CheckedOutput {
         }
     }
 
+    /// The bytes the host descriptor has accepted so far, ever.
+    ///
+    /// Monotonic: the delivery policy only compares two readings.
+    pub(super) fn accepted(&self) -> u64 {
+        self.queue.accepted.load(Ordering::Relaxed)
+    }
+
     /// Wait for the ordered finish receipt: every earlier byte has been
     /// accepted by the host descriptor (not flushed to stable storage).
     ///
@@ -290,6 +330,15 @@ impl CheckedOutput {
                 .failure_or("the terminal output writer stopped before confirming its writes")),
         }
     }
+}
+
+impl FlushPolicy {
+    /// A session that has already failed still offers what it holds for this
+    /// long, so the guest's last words are not lost with the session.
+    pub(super) const AFTER_FAILURE: Self = Self {
+        idle: CHECKED_FAILURE_FLUSH_IDLE,
+        limit: CHECKED_FAILURE_FLUSH_LIMIT,
+    };
 }
 
 impl Staging {
@@ -364,7 +413,7 @@ fn run_checked_writer(queue: Arc<CheckedOutputQueue>, output: OwnedFd) {
     while let Some(item) = queue.next() {
         match item {
             CheckedOutputItem::Data(bytes) => {
-                match write_all_fd(output.as_raw_fd(), &bytes) {
+                match write_all_fd(output.as_raw_fd(), &bytes, &queue.accepted) {
                     // The frame left the queue, so a waiting reservist may
                     // take its place.
                     Ok(()) => queue.release(bytes.len()),
@@ -391,14 +440,68 @@ fn run_checked_writer(queue: Arc<CheckedOutputQueue>, output: OwnedFd) {
     }
 }
 
+/// Best-effort delivery once the session has already failed.
+///
+/// Everything still staged is offered to the writer, then the finish receipt is
+/// awaited, while the host descriptor keeps accepting bytes: an `idle` interval
+/// in which `write(2)` took nothing, or `limit` in total, ends the attempt. The
+/// writer thread is still never joined, so cancellation is unaffected.
+///
+/// The error is the reason delivery was given up, for the caller to append to
+/// the session's own failure: an unrestored terminal or a lost relay is what the
+/// caller has to act on, and this is a note beside it.
+pub(super) async fn deliver_after_failure(
+    output: &CheckedOutput,
+    staging: &mut Staging,
+    policy: FlushPolicy,
+) -> Result<(), String> {
+    let delivery = async {
+        while let Some(chunk) = staging.front() {
+            output
+                .enqueue_chunk(chunk)
+                .await
+                .map_err(|error| error.to_string())?;
+            staging.pop_delivered();
+        }
+        output.finish().await.map_err(|error| error.to_string())
+    };
+    tokio::pin!(delivery);
+    let deadline = tokio::time::Instant::now() + policy.limit;
+    let mut seen = output.accepted();
+    loop {
+        tokio::select! {
+            result = &mut delivery => return result,
+            _ = tokio::time::sleep(policy.idle) => {
+                let now = output.accepted();
+                if now == seen {
+                    return Err(format!(
+                        "the host output accepted nothing for {:?}",
+                        policy.idle
+                    ));
+                }
+                seen = now;
+            }
+            _ = tokio::time::sleep_until(deadline) => {
+                return Err(format!(
+                    "the host output did not take the held guest output within {:?}",
+                    policy.limit
+                ));
+            }
+        }
+    }
+}
+
 /// A failure of the host's output descriptor or of its writer.
 fn output_failure(text: impl Into<String>) -> AttachSessionError {
     AttachSessionError::new(AttachFailureKind::Output, text)
 }
 
-fn write_all_fd(fd: RawFd, mut bytes: &[u8]) -> std::io::Result<()> {
+/// Write `bytes`, at most [`CHECKED_WRITE_SLICE_BYTES`] per syscall, counting
+/// what the descriptor accepted.
+fn write_all_fd(fd: RawFd, mut bytes: &[u8], accepted: &AtomicU64) -> std::io::Result<()> {
     while !bytes.is_empty() {
-        let written = unsafe { libc::write(fd, bytes.as_ptr().cast(), bytes.len()) };
+        let slice = &bytes[..bytes.len().min(CHECKED_WRITE_SLICE_BYTES)];
+        let written = unsafe { libc::write(fd, slice.as_ptr().cast(), slice.len()) };
         if written < 0 {
             let error = std::io::Error::last_os_error();
             if error.kind() == std::io::ErrorKind::Interrupted {
@@ -409,6 +512,7 @@ fn write_all_fd(fd: RawFd, mut bytes: &[u8]) -> std::io::Result<()> {
         if written == 0 {
             return Err(std::io::Error::from(std::io::ErrorKind::WriteZero));
         }
+        accepted.fetch_add(written as u64, Ordering::Relaxed);
         bytes = &bytes[written as usize..];
     }
     Ok(())
@@ -425,8 +529,8 @@ mod tests {
     //! exact ordered bytes, capacity that waits instead of failing, a
     //! non-joining abort, and a worker failure that reaches its caller.
 
-    use std::io::{Read, Seek, SeekFrom};
-    use std::os::fd::AsRawFd;
+    use std::io::{Read, Seek, SeekFrom, Write};
+    use std::os::fd::{AsRawFd, OwnedFd, RawFd};
     use std::sync::Arc;
     use std::time::Duration;
 
@@ -762,5 +866,230 @@ mod tests {
         );
         assert!(output.enqueue_chunk(b"after\n").await.is_err());
         assert!(within(output.finish()).await.is_err());
+    }
+
+    // -- Failing-session delivery (C12) ---------------------------------------
+
+    /// Set or clear `O_NONBLOCK` on one descriptor.
+    fn set_nonblocking(fd: RawFd, nonblocking: bool) -> std::io::Result<()> {
+        let current = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+        if current == -1 {
+            return Err(std::io::Error::last_os_error());
+        }
+        let flags = if nonblocking {
+            current | libc::O_NONBLOCK
+        } else {
+            current & !libc::O_NONBLOCK
+        };
+        if unsafe { libc::fcntl(fd, libc::F_SETFL, flags) } == -1 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(())
+    }
+
+    /// A pipe that already holds everything it can, with its write end left
+    /// blocking.
+    ///
+    /// The writer's first `write(2)` therefore cannot complete until the reader
+    /// drains, which is what makes "no progress" a property of the fixture
+    /// rather than of the timing.
+    fn prefilled_pipe() -> (OwnedFd, std::fs::File, Vec<u8>) {
+        let (read_end, write_end) = std::io::pipe().expect("an output pipe");
+        set_nonblocking(write_end.as_raw_fd(), true).expect("a non-blocking pipe");
+        let block = vec![0xEEu8; 4096];
+        let mut prefill = Vec::new();
+        while let Ok(written) = (&write_end).write(&block) {
+            prefill.extend_from_slice(&block[..written]);
+        }
+        // The flag lives on the shared open file description, so the writer's
+        // duplicate would otherwise see `EAGAIN` as a write failure.
+        set_nonblocking(write_end.as_raw_fd(), false).expect("a blocking pipe");
+        (
+            write_end.into(),
+            std::fs::File::from(OwnedFd::from(read_end)),
+            prefill,
+        )
+    }
+
+    /// Read whatever the pipe offers, sleep, repeat, until EOF.
+    ///
+    /// A consumer that keeps taking bytes, but slowly: the delivery policy has
+    /// to keep going while it does.
+    fn slow_reader(
+        mut reader: std::fs::File,
+        slice: usize,
+        interval: Duration,
+    ) -> std::thread::JoinHandle<Vec<u8>> {
+        std::thread::spawn(move || {
+            let mut seen = Vec::new();
+            let mut buffer = vec![0u8; slice];
+            loop {
+                match reader.read(&mut buffer) {
+                    Ok(0) => break,
+                    Ok(read) => {
+                        seen.extend_from_slice(&buffer[..read]);
+                        std::thread::sleep(interval);
+                    }
+                    Err(error) => panic!("draining the output pipe: {error}"),
+                }
+            }
+            seen
+        })
+    }
+
+    fn flush_policy(idle: Duration, limit: Duration) -> FlushPolicy {
+        FlushPolicy { idle, limit }
+    }
+
+    #[tokio::test]
+    async fn delivers_everything_to_a_live_consumer() {
+        let mut file = tempfile::tempfile().expect("a scratch output file");
+        let output = CheckedOutput::start(file.as_raw_fd()).expect("start the writer");
+        let mut staging = Staging::default();
+        let frames: Vec<Vec<u8>> = vec![
+            vec![b'a'; 100 * 1024],
+            b"b".to_vec(),
+            vec![b'c'; CHECKED_OUTPUT_CHUNK_BYTES + 3],
+        ];
+        let mut expected = Vec::new();
+        for frame in frames {
+            expected.extend_from_slice(&frame);
+            staging.stage(frame);
+        }
+
+        within(deliver_after_failure(
+            &output,
+            &mut staging,
+            FlushPolicy::AFTER_FAILURE,
+        ))
+        .await
+        .expect("a live consumer takes everything");
+        assert!(staging.is_empty(), "delivered chunks leave staging");
+
+        file.seek(SeekFrom::Start(0)).expect("rewind");
+        let mut actual = Vec::new();
+        file.read_to_end(&mut actual).expect("read back");
+        assert_eq!(actual, expected);
+    }
+
+    #[tokio::test]
+    async fn counts_partial_writes_as_progress() {
+        // The consumer drains this pipe at about 160 KiB/s, so one 64 KiB
+        // chunk-sized write takes roughly twice the idle window to complete.
+        // Progress has to be measured in bytes the descriptor accepted, not in
+        // whole chunks that finished, or a consumer that is plainly working is
+        // reported as stalled.
+        let (write_end, reader, prefill) = prefilled_pipe();
+        let output = CheckedOutput::start(write_end.as_raw_fd()).expect("start the writer");
+        drop(write_end);
+
+        let mut staging = Staging::default();
+        staging.stage(vec![b'x'; 2 * CHECKED_OUTPUT_CHUNK_BYTES]);
+        let mut expected = prefill;
+        expected.extend_from_slice(&vec![b'x'; 2 * CHECKED_OUTPUT_CHUNK_BYTES]);
+
+        let screen = slow_reader(reader, 8 * 1024, Duration::from_millis(50));
+        within(deliver_after_failure(
+            &output,
+            &mut staging,
+            flush_policy(Duration::from_millis(400), Duration::from_secs(20)),
+        ))
+        .await
+        .expect("a consumer that keeps accepting is not stalled");
+        assert!(staging.is_empty());
+
+        drop(output);
+        assert_eq!(screen.join().expect("the screen thread"), expected);
+    }
+
+    #[tokio::test]
+    async fn stops_at_its_total_limit() {
+        // A consumer that is slow but always progressing: the idle window never
+        // fires, so only the total limit can stop the attempt.
+        let (write_end, reader, _prefill) = prefilled_pipe();
+        let output = CheckedOutput::start(write_end.as_raw_fd()).expect("start the writer");
+        drop(write_end);
+
+        let mut staging = Staging::default();
+        staging.stage(vec![b'y'; 8 * CHECKED_OUTPUT_CHUNK_BYTES]);
+        let _screen = slow_reader(reader, 8 * 1024, Duration::from_millis(30));
+
+        let started = std::time::Instant::now();
+        let error = within(deliver_after_failure(
+            &output,
+            &mut staging,
+            flush_policy(Duration::from_millis(400), Duration::from_secs(1)),
+        ))
+        .await
+        .expect_err("a crawling consumer must not delay the error without limit");
+        let elapsed = started.elapsed();
+        assert!(
+            error.contains("within 1s"),
+            "the total limit must say what it was: {error}"
+        );
+        assert!(
+            elapsed >= Duration::from_secs(1),
+            "the limit must not fire early: {elapsed:?}"
+        );
+        assert!(
+            elapsed < Duration::from_secs(3),
+            "the limit must fire when it says it does: {elapsed:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn gives_up_on_a_stalled_consumer() {
+        let (write_end, reader, _prefill) = prefilled_pipe();
+        let output = CheckedOutput::start(write_end.as_raw_fd()).expect("start the writer");
+        drop(write_end);
+
+        let mut staging = Staging::default();
+        staging.stage(vec![b'q'; CHECKED_OUTPUT_CHUNK_BYTES]);
+        // Held, never read: the writer has nowhere to put the next byte.
+        let _screen = reader;
+
+        let started = std::time::Instant::now();
+        let error = within(deliver_after_failure(
+            &output,
+            &mut staging,
+            flush_policy(Duration::from_millis(100), Duration::from_secs(20)),
+        ))
+        .await
+        .expect_err("a consumer that takes nothing must end the attempt");
+        assert!(
+            error.contains("accepted nothing"),
+            "the idle window must say what it was: {error}"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "a stalled consumer must not hold the error for long: {:?}",
+            started.elapsed()
+        );
+        // The chunk left staging when the writer queued it; it is the writer's
+        // `write(2)` that is stalled, not the handover.
+        assert!(staging.is_empty());
+    }
+
+    #[tokio::test]
+    async fn reports_a_dead_writer() {
+        let (read_end, write_end) = std::io::pipe().expect("a pipe");
+        drop(read_end);
+        let output = CheckedOutput::start(write_end.as_raw_fd()).expect("start the writer");
+        drop(write_end);
+
+        let mut staging = Staging::default();
+        staging.stage(b"lost\n".to_vec());
+
+        let error = within(deliver_after_failure(
+            &output,
+            &mut staging,
+            FlushPolicy::AFTER_FAILURE,
+        ))
+        .await
+        .expect_err("an unwritable descriptor cannot be delivered to");
+        assert!(
+            error.contains("writing guest output"),
+            "the writer's own failure must be named: {error}"
+        );
     }
 }

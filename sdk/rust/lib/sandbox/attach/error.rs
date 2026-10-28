@@ -74,7 +74,10 @@ pub(crate) enum TeardownStage {
     #[cfg_attr(not(windows), allow(dead_code))]
     FlushConsoleOutput,
     /// Delivering guest output already held by a failed session.
-    #[cfg_attr(not(test), allow(dead_code))]
+    ///
+    /// Only the Unix conclusion delivers after a failure; the console writes
+    /// guest output inline, so on Windows this stage is never recorded.
+    #[cfg_attr(not(unix), allow(dead_code))]
     DeliverOutput,
 }
 
@@ -126,7 +129,11 @@ impl AttachSessionError {
     }
 
     /// What ended the session without a guest exit status.
-    #[cfg_attr(not(test), allow(dead_code))]
+    ///
+    /// Read by the Unix conclusion, which has to tell the writer's own failure
+    /// (nothing left to deliver to) from any other; Windows composes its
+    /// teardown the same way for every failure.
+    #[cfg_attr(not(unix), allow(dead_code))]
     pub(crate) fn kind(&self) -> AttachFailureKind {
         self.kind
     }

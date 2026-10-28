@@ -62,6 +62,9 @@ enum Case {
     Resize,
     /// A typed spawn failure stays typed and is not a status.
     Failed,
+    /// The guest writes a diagnostic and then fails to spawn: the failure is
+    /// still exactly `ExecFailed`, and what it already wrote is still delivered.
+    FailedAfterOutput,
     /// A malformed terminal frame is an error, not a silent skip.
     Malformed,
     /// A closed event channel without an exit is an error.
@@ -102,10 +105,11 @@ enum Case {
 }
 
 impl Case {
-    const ALL: [Case; 16] = [
+    const ALL: [Case; 17] = [
         Case::Input,
         Case::Resize,
         Case::Failed,
+        Case::FailedAfterOutput,
         Case::Malformed,
         Case::Closed,
         Case::OutputFailure,
@@ -132,6 +136,7 @@ impl Case {
             Case::Input => "input",
             Case::Resize => "resize",
             Case::Failed => "failed",
+            Case::FailedAfterOutput => "failed-after-output",
             Case::Malformed => "malformed",
             Case::Closed => "closed",
             Case::OutputFailure => "output-failure",
@@ -282,6 +287,7 @@ fn run_case(dir: &Path, case: Case) {
             master.flush().expect("flush the forwarded chunk");
         }
         Case::Failed
+        | Case::FailedAfterOutput
         | Case::Malformed
         | Case::Closed
         | Case::OutputFailure
@@ -353,6 +359,22 @@ fn run_case(dir: &Path, case: Case) {
                 case.name()
             );
         }
+        Case::FailedAfterOutput => {
+            // The spawn failure is the fact the caller needs, so it stays
+            // matchable; the guest's own diagnostic must still arrive.
+            assert_eq!(
+                outcome,
+                "err:exec-failed",
+                "case {}: {receipt}",
+                case.name()
+            );
+            assert_eq!(
+                receipt_value(&receipt, "stdout_hex"),
+                hex(b"spawn diagnostics\n"),
+                "case {}: output written before a spawn failure must be delivered: {receipt}",
+                case.name()
+            );
+        }
         Case::Malformed => {
             assert!(
                 outcome.starts_with("err:attach:Protocol:"),
@@ -364,6 +386,15 @@ fn run_case(dir: &Path, case: Case) {
             assert!(
                 outcome.starts_with("err:attach:ConnectionLost:"),
                 "case {}: a session failure must be reported: {receipt}",
+                case.name()
+            );
+            // The relay wrote this before it went away, and a live file
+            // descriptor still takes it: the guest's last output must not be
+            // dropped just because the session then failed.
+            assert_eq!(
+                receipt_value(&receipt, "stdout_hex"),
+                hex(b"partial\n"),
+                "case {}: output written before the failure must be delivered: {receipt}",
                 case.name()
             );
         }
@@ -1122,6 +1153,32 @@ async fn fake_relay(mut io: DuplexStream, dir: PathBuf, case: Case) {
                 errno: None,
                 errno_name: None,
                 stage: None,
+                message: "bash: not found".to_string(),
+            };
+            write(
+                &mut io,
+                Message::with_payload(MessageType::ExecFailed, id, &failure).unwrap(),
+            )
+            .await;
+        }
+        Case::FailedAfterOutput => {
+            write(
+                &mut io,
+                Message::with_payload(
+                    MessageType::ExecStdout,
+                    id,
+                    &ExecStdout {
+                        data: b"spawn diagnostics\n".to_vec(),
+                    },
+                )
+                .unwrap(),
+            )
+            .await;
+            let failure = ExecFailed {
+                kind: ExecFailureKind::NotFound,
+                errno: Some(2),
+                errno_name: Some("ENOENT".to_string()),
+                stage: Some("execvp".to_string()),
                 message: "bash: not found".to_string(),
             };
             write(
