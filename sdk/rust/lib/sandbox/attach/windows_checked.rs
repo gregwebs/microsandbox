@@ -1195,4 +1195,108 @@ mod tests {
         assert_eq!(conclude(Ok(end), &mut sink).expect("the guest exit"), 9);
         assert_eq!(screen.steps(), vec!["flush", "restore"]);
     }
+
+    /// The same guarantee as above, with enough queued chunks to make a broken
+    /// guard fail every run rather than one in a handful.
+    ///
+    /// `start_send` returns a lazy future, so a send is only committed to the
+    /// agent client's writer task once the loop has polled it. A loop that lets
+    /// a console event start a second send while one is already owned therefore
+    /// **drops** the send it replaces whenever the console arm is serviced
+    /// first, and the chunk that send carried is never forwarded. One queued
+    /// event leaves that to `select!`'s branch order, hence the flakiness of the
+    /// smaller test; each additional queued chunk is another such chance, so
+    /// sixteen of them make a lost chunk the expected outcome instead of a
+    /// coincidence.
+    #[tokio::test]
+    async fn a_burst_of_input_behind_one_blocked_send_arrives_once_and_in_order() {
+        let ConsoleFixture {
+            client,
+            mut relay,
+            events,
+            mut rx,
+            client_rx: _client_rx,
+            id,
+            console_tx,
+            mut console,
+            screen,
+            mut sink,
+        } = fixture(STALLED_RELAY_BYTES).await;
+        let mut run = Box::pin(checked_bridge(
+            &client,
+            id,
+            &mut rx,
+            &mut sink,
+            &mut console,
+            None,
+            None,
+        ));
+
+        // A first chunk whose send cannot finish: the relay's buffer is smaller
+        // than its frame and nothing reads the rest yet.
+        console_tx
+            .send(ConsoleEvent::Input(vec![b'a'; 64]))
+            .expect("the console");
+        let length = blocked_send(&mut relay, &mut run).await;
+
+        // Sixteen more, each distinguishable, all offered while that send is
+        // still in flight.
+        let burst: Vec<Vec<u8>> = (0u8..16).map(|index| vec![b'A' + index; 64]).collect();
+        for chunk in &burst {
+            console_tx
+                .send(ConsoleEvent::Input(chunk.clone()))
+                .expect("the console");
+        }
+
+        // Only now can the first frame finish. Reading it is also what lets the
+        // held events be taken in order.
+        let mut rest = vec![0u8; length];
+        while_running(&mut run, async {
+            relay
+                .read_exact(&mut rest)
+                .await
+                .expect("the rest of the first frame")
+        })
+        .await;
+        let first = vec![b'a'; 64];
+        assert!(
+            rest.windows(first.len()).any(|window| window == first),
+            "the first chunk must be forwarded once and unchanged"
+        );
+
+        for (index, expected) in burst.iter().enumerate() {
+            let frame = frame_while(&mut relay, &mut run).await;
+            assert_eq!(
+                frame.t,
+                MessageType::ExecStdin,
+                "chunk {index} of the burst must reach the guest as input"
+            );
+            assert_eq!(
+                &stdin_payload(&frame),
+                expected,
+                "chunk {index} of the burst must arrive once and in order"
+            );
+        }
+
+        // Nothing was sent twice: the loop is idle now, so a duplicate would
+        // arrive at once.
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), codec::read_message(&mut relay))
+                .await
+                .is_err(),
+            "a chunk held behind a send must not be forwarded twice"
+        );
+
+        events
+            .send(exited(id, 10))
+            .await
+            .expect("the event channel");
+        let end = within(&mut run)
+            .await
+            .expect("the guest exit ends the session");
+        assert!(matches!(end, CheckedEnd::Exited(10)));
+        drop(run);
+        assert_eq!(conclude(Ok(end), &mut sink).expect("the guest exit"), 10);
+        assert_eq!(screen.steps(), vec!["flush", "restore"]);
+    }
 }
