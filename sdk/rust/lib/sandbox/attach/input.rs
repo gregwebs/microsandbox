@@ -49,15 +49,15 @@ pub(crate) const STDIN_FILTER_TASK_ENDED: &str = "stdin filter task ended";
 /// `tokio::time::timeout`) and return `data.to_vec()` to forward the original bytes.
 /// An unwinding panic in `filter()` or its future ends the worker and the attach
 /// session with `Runtime("stdin filter task ended")` on the default session. A
-/// checked session ([`AttachOptionsBuilder::checked_session`]) reports it as a
-/// session failure instead; no raw input is forwarded either way.
+/// checked session ([`crate::sandbox::AttachOptionsBuilder::checked_session`])
+/// reports it as a session failure instead; no raw input is forwarded either way.
 /// The guest may keep running as it does after detach. With `panic = "abort"`,
 /// no policy can intercept the process exit.
 /// The detach sequence is matched on terminal input before the filter runs,
 /// so it always works; a session with detach disabled
-/// ([`AttachOptionsBuilder::disable_detach_keys`]) scans nothing, so every chunk
-/// reaches the filter. Emitted filter bytes are NOT scanned for detach keys
-/// (an emitted `0x1d` goes to the guest). Input still queued or in
+/// ([`crate::sandbox::AttachOptionsBuilder::disable_detach_keys`]) scans nothing,
+/// so every chunk reaches the filter. Emitted filter bytes are NOT scanned for
+/// detach keys (an emitted `0x1d` goes to the guest). Input still queued or in
 /// flight when the session ends is discarded; the filter is dropped
 /// at its current await point.
 pub trait StdinFilter: Send + 'static {
