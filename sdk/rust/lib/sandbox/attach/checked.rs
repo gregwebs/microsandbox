@@ -270,8 +270,9 @@ fn describe_stdin_error(error: &ExecStdinError) -> String {
 mod tests {
     //! Message classification and teardown composition, for both platforms.
     //!
-    //! These run on every host, so the Windows event handling is exercised here
-    //! even though only a Windows console can drive the loop itself.
+    //! These run on every host. The Windows loop itself is driven through its
+    //! console seams in `windows_checked`; this module covers what it shares
+    //! with the Unix loop.
 
     use microsandbox_protocol::exec::{ExecFailureKind, ExecStdinError};
 

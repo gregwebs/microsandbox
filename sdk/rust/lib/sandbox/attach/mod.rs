@@ -20,6 +20,10 @@ mod pty_tests;
 mod unix;
 #[cfg(windows)]
 mod windows;
+// The checked loop's seams are what let it be driven on a host with no Windows
+// console, so the module is compiled for tests everywhere.
+#[cfg(any(windows, test))]
+mod windows_checked;
 
 //--------------------------------------------------------------------------------------------------
 // Re-Exports
