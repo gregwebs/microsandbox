@@ -53,6 +53,19 @@ const GUEST_FRAME_MAX_BYTES: usize = microsandbox_protocol::codec::MAX_FRAME_SIZ
 /// the delivery policy below waits for. Bytes and their order are unchanged.
 const CHECKED_WRITE_SLICE_BYTES: usize = 8 * 1024;
 
+/// How long the writer waits for a temporary write refusal before it looks at
+/// the session again.
+///
+/// A non-blocking host descriptor (a caller whose stdout is a non-blocking pipe
+/// or socket, whose open-file-description flags the writer's duplicate shares)
+/// refuses a write with `EAGAIN` while it is full. That is pressure, not a lost
+/// session, so the writer waits for the descriptor instead of failing. `poll(2)`
+/// is the wait; the timeout exists because there is no portable primitive the
+/// session thread could use to wake this plain thread out of it, so an abort is
+/// noticed on the next recheck instead. Waiting, never spinning: each round
+/// sleeps for this whole interval.
+const CHECKED_WRITE_RECHECK: Duration = Duration::from_millis(50);
+
 /// How long a failed session keeps offering output to a host descriptor that
 /// accepts no bytes at all.
 pub(super) const CHECKED_FAILURE_FLUSH_IDLE: Duration = Duration::from_millis(500);
@@ -72,6 +85,15 @@ enum CheckedOutputItem {
     /// Enqueued after every preceding frame; its receipt is the session's
     /// success barrier.
     Finish(tokio::sync::oneshot::Sender<()>),
+}
+
+/// What one queued chunk's writes achieved.
+enum ChunkWrite {
+    /// The descriptor accepted every byte of the chunk.
+    Written,
+    /// The session ended first, so the rest of the chunk was deliberately not
+    /// written.
+    Stopped,
 }
 
 #[derive(Default)]
@@ -192,6 +214,18 @@ impl CheckedOutputQueue {
             state.reserved = state.reserved.saturating_sub(bytes);
         }
         self.capacity.notify_waiters();
+    }
+
+    /// Record bytes the descriptor accepted.
+    fn record_accepted(&self, bytes: usize) {
+        self.accepted.fetch_add(bytes as u64, Ordering::Relaxed);
+    }
+
+    /// Whether the writer has been told to stop: the session aborted, or the
+    /// writer itself recorded a failure.
+    fn stopped(&self) -> bool {
+        let state = self.lock();
+        state.aborted || state.error.is_some()
     }
 
     /// The writer's next item; `None` means it must stop.
@@ -413,10 +447,13 @@ fn run_checked_writer(queue: Arc<CheckedOutputQueue>, output: OwnedFd) {
     while let Some(item) = queue.next() {
         match item {
             CheckedOutputItem::Data(bytes) => {
-                match write_all_fd(output.as_raw_fd(), &bytes, &queue.accepted) {
+                match write_all_fd(output.as_raw_fd(), &bytes, &queue) {
                     // The frame left the queue, so a waiting reservist may
                     // take its place.
-                    Ok(()) => queue.release(bytes.len()),
+                    Ok(ChunkWrite::Written) => queue.release(bytes.len()),
+                    // The queue stopped mid-chunk (`abort` or a failure
+                    // cleared it), so there is nothing left to release.
+                    Ok(ChunkWrite::Stopped) => return,
                     Err(error) => {
                         // Closed pipe, full device: a session failure, never
                         // truncation reported as a guest success. Recorded
@@ -498,24 +535,82 @@ fn output_failure(text: impl Into<String>) -> AttachSessionError {
 
 /// Write `bytes`, at most [`CHECKED_WRITE_SLICE_BYTES`] per syscall, counting
 /// what the descriptor accepted.
-fn write_all_fd(fd: RawFd, mut bytes: &[u8], accepted: &AtomicU64) -> std::io::Result<()> {
+fn write_all_fd(
+    fd: RawFd,
+    mut bytes: &[u8],
+    queue: &CheckedOutputQueue,
+) -> std::io::Result<ChunkWrite> {
     while !bytes.is_empty() {
         let slice = &bytes[..bytes.len().min(CHECKED_WRITE_SLICE_BYTES)];
         let written = unsafe { libc::write(fd, slice.as_ptr().cast(), slice.len()) };
         if written < 0 {
+            let error = std::io::Error::last_os_error();
+            match error.kind() {
+                std::io::ErrorKind::Interrupted => continue,
+                // The writer's duplicate shares stdout's file-status flags, so
+                // a caller whose stdout is a non-blocking pipe or socket sees
+                // `EAGAIN` whenever it is momentarily full. That is transport
+                // pressure, not a lost session: wait for the descriptor and
+                // retry the *same* bytes, which keeps their order and leaves
+                // the caller's own flags alone (clearing `O_NONBLOCK` on the
+                // shared description would change them for the caller too).
+                std::io::ErrorKind::WouldBlock => {
+                    if !wait_writable(fd, queue)? {
+                        return Ok(ChunkWrite::Stopped);
+                    }
+                    continue;
+                }
+                // A closed pipe, a full device, a dead descriptor: a session
+                // failure, never truncation reported as a guest success.
+                _ => return Err(error),
+            }
+        }
+        if written == 0 {
+            return Err(std::io::Error::from(std::io::ErrorKind::WriteZero));
+        }
+        queue.record_accepted(written as usize);
+        bytes = &bytes[written as usize..];
+    }
+    Ok(ChunkWrite::Written)
+}
+
+/// Wait until the descriptor can take bytes again, or the session stops.
+///
+/// `Ok(true)` means "try the write again"; `Ok(false)` means the session ended
+/// while the writer was waiting and the rest of the chunk must not be written.
+///
+/// The wait is a bounded `poll(2)`, not a spin: the interval is
+/// [`CHECKED_WRITE_RECHECK`], and every round re-reads the queue, so an abort
+/// during the wait is observed within one interval. A readiness result that is
+/// an error condition is handed back as ready on purpose: the next `write(2)`
+/// reports the real errno (a closed pipe, a revoked descriptor) rather than
+/// this function guessing at it.
+fn wait_writable(fd: RawFd, queue: &CheckedOutputQueue) -> std::io::Result<bool> {
+    loop {
+        // Checked before sleeping, so an abort that has already happened is not
+        // followed by another whole interval of waiting.
+        if queue.stopped() {
+            return Ok(false);
+        }
+        let mut descriptor = libc::pollfd {
+            fd,
+            events: libc::POLLOUT,
+            revents: 0,
+        };
+        let timeout = CHECKED_WRITE_RECHECK.as_millis() as libc::c_int;
+        let rc = unsafe { libc::poll(&mut descriptor, 1, timeout) };
+        if rc < 0 {
             let error = std::io::Error::last_os_error();
             if error.kind() == std::io::ErrorKind::Interrupted {
                 continue;
             }
             return Err(error);
         }
-        if written == 0 {
-            return Err(std::io::Error::from(std::io::ErrorKind::WriteZero));
+        if rc > 0 {
+            return Ok(true);
         }
-        accepted.fetch_add(written as u64, Ordering::Relaxed);
-        bytes = &bytes[written as usize..];
+        // Timed out with nothing to report: recheck the session and wait again.
     }
-    Ok(())
 }
 
 //--------------------------------------------------------------------------------------------------
@@ -1090,6 +1185,199 @@ mod tests {
         assert!(
             error.contains("writing guest output"),
             "the writer's own failure must be named: {error}"
+        );
+    }
+
+    // -- A non-blocking host descriptor ---------------------------------------
+
+    /// A pipe filled to its capacity with `0xEE` and left **non-blocking**, the
+    /// way a caller whose own stdout is a non-blocking pipe or socket leaves it.
+    ///
+    /// The writer's duplicate shares the open file description, so it inherits
+    /// `O_NONBLOCK`: its first `write(2)` sees `EAGAIN`, which is pressure and
+    /// not a failure.
+    fn saturated_nonblocking_pipe() -> (OwnedFd, std::fs::File, Vec<u8>) {
+        let (read_end, write_end) = std::io::pipe().expect("an output pipe");
+        set_nonblocking(write_end.as_raw_fd(), true).expect("a non-blocking pipe");
+        let block = vec![0xEEu8; 4096];
+        let mut prefill = Vec::new();
+        while let Ok(written) = (&write_end).write(&block) {
+            prefill.extend_from_slice(&block[..written]);
+        }
+        (
+            write_end.into(),
+            std::fs::File::from(OwnedFd::from(read_end)),
+            prefill,
+        )
+    }
+
+    /// Drain a descriptor to EOF on its own thread.
+    fn read_to_end_on_thread(mut reader: std::fs::File) -> std::thread::JoinHandle<Vec<u8>> {
+        std::thread::spawn(move || {
+            let mut seen = Vec::new();
+            reader
+                .read_to_end(&mut seen)
+                .expect("drain the output pipe");
+            seen
+        })
+    }
+
+    /// Read exactly `bytes` bytes on its own thread, then stop.
+    ///
+    /// For a fixture that keeps the caller's own write end open (to inspect its
+    /// flags), so the pipe cannot reach EOF here and the count is what ends the
+    /// read.
+    fn read_exact_on_thread(
+        mut reader: std::fs::File,
+        bytes: usize,
+    ) -> std::thread::JoinHandle<Vec<u8>> {
+        std::thread::spawn(move || {
+            let mut seen = vec![0u8; bytes];
+            let mut filled = 0;
+            while filled < bytes {
+                match reader.read(&mut seen[filled..]) {
+                    Ok(0) => panic!("the output pipe closed after {filled} of {bytes} bytes"),
+                    Ok(read) => filled += read,
+                    Err(error) => panic!("draining the output pipe: {error}"),
+                }
+            }
+            seen
+        })
+    }
+
+    /// Join a drain thread under a deadline.
+    ///
+    /// The pipe only reaches EOF once the writer dropped its duplicate, so a
+    /// writer that never ended would otherwise hang the suite instead of failing
+    /// it. The message says what was being waited for.
+    fn drain_within(
+        handle: std::thread::JoinHandle<Vec<u8>>,
+        limit: Duration,
+        what: &str,
+    ) -> Vec<u8> {
+        let (done, drained) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = done.send(handle.join().expect("the drain thread"));
+        });
+        drained.recv_timeout(limit).unwrap_or_else(|_| {
+            panic!("the output pipe never reached EOF within {limit:?}: {what}")
+        })
+    }
+
+    #[tokio::test]
+    async fn temporary_pressure_on_a_nonblocking_descriptor_is_not_a_failure() {
+        let (write_end, reader, prefill) = saturated_nonblocking_pipe();
+        // Deliberately left non-blocking: the writer has to cope with the flags
+        // it inherits instead of changing the caller's.
+        let output = CheckedOutput::start(write_end.as_raw_fd()).expect("start the writer");
+        let staged = b"guest output under pressure\n".to_vec();
+        within(output.enqueue_chunk(&staged))
+            .await
+            .expect("a full descriptor is not a failure to enqueue");
+
+        // The descriptor cannot take a byte, so a writer that mistook pressure
+        // for a lost session would have reported it by now.
+        let mut failure = Box::pin(output.failure());
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(
+            futures::poll!(&mut failure).is_pending(),
+            "temporary pressure must never be reported as an output failure"
+        );
+
+        // The consumer resumes: the held bytes follow in order, and the session
+        // can finish.
+        let mut expected = prefill.clone();
+        expected.extend_from_slice(&staged);
+        let screen = read_exact_on_thread(reader, expected.len());
+        within(output.finish())
+            .await
+            .expect("the writer delivers once the descriptor drains");
+        assert_eq!(
+            drain_within(screen, Duration::from_secs(10), "the writer did not finish"),
+            expected,
+            "every byte must arrive in order once the pressure clears"
+        );
+
+        let flags = unsafe { libc::fcntl(write_end.as_raw_fd(), libc::F_GETFL) };
+        assert!(flags >= 0, "read the caller's own flags");
+        assert!(
+            flags & libc::O_NONBLOCK != 0,
+            "the writer must leave the caller's O_NONBLOCK exactly as it found it"
+        );
+    }
+
+    /// Whether every write end of a pipe is gone, without reading a byte.
+    ///
+    /// A pipe's read end reports `POLLHUP` as soon as its last write end is
+    /// closed, even while unread bytes remain, so this observes the writer
+    /// releasing its duplicate at a point where draining the pipe would be what
+    /// let the writer finish instead.
+    fn write_sides_closed(reader: RawFd, limit: Duration) -> bool {
+        let deadline = std::time::Instant::now() + limit;
+        let timeout = CHECKED_WRITE_RECHECK.as_millis() as libc::c_int;
+        loop {
+            let mut descriptor = libc::pollfd {
+                fd: reader,
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            let rc = unsafe { libc::poll(&mut descriptor, 1, timeout) };
+            if rc > 0 && descriptor.revents & libc::POLLHUP != 0 {
+                return true;
+            }
+            if std::time::Instant::now() >= deadline {
+                return false;
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn cancellation_during_a_writability_wait_stops_the_writer() {
+        let (write_end, reader, prefill) = saturated_nonblocking_pipe();
+        let output = CheckedOutput::start(write_end.as_raw_fd()).expect("start the writer");
+        // Only the writer's duplicate may hold the write end from here on, so
+        // draining to EOF proves that it released it.
+        drop(write_end);
+        let queue = Arc::clone(&output.queue);
+        let staged = b"never written\n";
+        within(output.enqueue_chunk(staged)).await.expect("enqueue");
+
+        // Nothing can be accepted while the pipe stays full and undrained, so
+        // the writer is waiting for writability, not failing.
+        let mut failure = Box::pin(output.failure());
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(
+            futures::poll!(&mut failure).is_pending(),
+            "the writer must wait for the descriptor rather than fail"
+        );
+
+        queue.abort();
+
+        // The wait must end on the abort, not on the descriptor becoming
+        // writable: the pipe is still full and nothing has drained it. `POLLHUP`
+        // appears when the writer drops its duplicate, which is the only write
+        // end left.
+        assert!(
+            write_sides_closed(reader.as_raw_fd(), Duration::from_secs(5)),
+            "an aborted writability wait must end and release the writer's duplicate"
+        );
+        let drained = drain_within(
+            read_to_end_on_thread(reader),
+            Duration::from_secs(10),
+            "the writer's duplicate must already be gone here",
+        );
+        assert!(
+            drained.starts_with(&prefill),
+            "the bytes already in the pipe must be untouched"
+        );
+        // The only bytes that may still arrive are a prefix of the chunk the
+        // writer was holding when the abort happened, in order; nothing from
+        // the queue behind it can appear.
+        let extra = &drained[prefill.len()..];
+        assert!(
+            staged.starts_with(extra),
+            "only bytes the writer already held may follow an abort: {:?}",
+            String::from_utf8_lossy(extra)
         );
     }
 }
