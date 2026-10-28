@@ -127,6 +127,34 @@ impl WindowsTerminalGuard {
         let _ = unsafe { SetConsoleMode(self.output.raw, self.output_mode) };
     }
 
+    /// Restore both console modes, reporting what failed.
+    ///
+    /// Both are attempted even when the first fails, so a console that accepts
+    /// one and rejects the other is never left half-configured. This is the
+    /// checked-session counterpart of the best-effort [`restore`](Self::restore)
+    /// that legacy callers (and `Drop`) keep using.
+    pub(crate) fn restore_checked(&mut self) -> MicrosandboxResult<()> {
+        let input = unsafe { SetConsoleMode(self.input.raw, self.input_mode) };
+        let input_error = (input == 0).then(std::io::Error::last_os_error);
+        let output = unsafe { SetConsoleMode(self.output.raw, self.output_mode) };
+        let output_error = (output == 0).then(std::io::Error::last_os_error);
+
+        match (input_error, output_error) {
+            (None, None) => Ok(()),
+            (input_error, output_error) => {
+                let describe = |error: &Option<std::io::Error>| match error {
+                    Some(error) => error.to_string(),
+                    None => "ok".to_string(),
+                };
+                Err(MicrosandboxError::Terminal(format!(
+                    "restoring the console mode: stdin {}, stdout {}",
+                    describe(&input_error),
+                    describe(&output_error)
+                )))
+            }
+        }
+    }
+
     /// Forward guest output to the console.
     ///
     /// Guest bytes are UTF-8, so they are decoded to UTF-16 and written with

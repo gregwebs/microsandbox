@@ -1540,6 +1540,21 @@ impl Sandbox {
     /// ```ignore
     /// let exit_code = sb.attach_with("zsh", |a| a.env("TERM", "xterm").detach_keys("ctrl-q")).await?;
     /// ```
+    ///
+    /// A caller that owns the process's exit status — one that must not confuse
+    /// "the guest exited with -1" with "no exit event arrived" — opts into the
+    /// checked session, and disables the escape-key interception when the guest
+    /// itself needs `Ctrl-]`:
+    ///
+    /// ```ignore
+    /// let exit_code = sb
+    ///     .attach_with("bash", |a| a.disable_detach_keys().checked_session())
+    ///     .await?;
+    /// ```
+    ///
+    /// Both are per-session builder options; every existing call keeps the
+    /// legacy defaults. See [`AttachOptionsBuilder::checked_session`] for exactly
+    /// which failures the checked session reports.
     pub async fn attach_with(
         &self,
         cmd: impl Into<String>,
