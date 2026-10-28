@@ -57,8 +57,8 @@ struct CheckedOutputQueueState {
 /// `Runtime::drop` waits for blocking tasks — so a checked session that
 /// failed while its consumer stopped draining could not report the failure at
 /// all. This thread is independent of the runtime: cancellation abandons it
-/// (the launcher exits the process afterwards), and the runtime drops
-/// immediately.
+/// (a caller that cancels is expected to exit or move on; the thread holds
+/// only its own descriptor), and the runtime drops immediately.
 #[derive(Default)]
 struct CheckedOutputQueue {
     state: Mutex<CheckedOutputQueueState>,
@@ -163,7 +163,7 @@ impl CheckedOutput {
         let queue = Arc::new(CheckedOutputQueue::default());
         let writer_queue = Arc::clone(&queue);
         std::thread::Builder::new()
-            .name("agent-vm-terminal-output".into())
+            .name("msb-attach-output".into())
             .spawn(move || run_checked_writer(writer_queue, output))
             .map_err(|error| {
                 checked_failure(format!("starting the terminal output writer: {error}"))

@@ -184,8 +184,8 @@ fn run_case(dir: &Path, case: Case) {
         }
         Case::Resize => {
             set_winsize(pty.slave.as_raw_fd(), 43, 119);
-            // The launcher is not a session leader, so the signal goes to the
-            // exact owned child rather than to a process group.
+            // The case child is not a session leader, so the signal goes to
+            // the exact owned child rather than to a process group.
             nix::sys::signal::kill(
                 nix::unistd::Pid::from_raw(child.id() as i32),
                 nix::sys::signal::Signal::SIGWINCH,
@@ -277,7 +277,7 @@ fn run_case(dir: &Path, case: Case) {
             assert_eq!(relay_value(&relay, "request_cwd"), "/workspace/project");
             assert_eq!(relay_value(&relay, "request_user"), "1000:1000");
             assert!(
-                relay_value(&relay, "request_env").contains("PATH=/opt/agent-vm-bin"),
+                relay_value(&relay, "request_env").contains("PATH=/opt/attach-test-bin"),
                 "the exec request must carry the effective PATH: {relay}"
             );
         }
@@ -630,7 +630,7 @@ async fn run_case_session(dir: &Path, case: Case) -> Outcome {
         .args(["-c", "probe"])
         .cwd("/workspace/project")
         .user("1000:1000")
-        .env("PATH", "/opt/agent-vm-bin");
+        .env("PATH", "/opt/attach-test-bin");
     // The legacy cases call neither opt-in, so this is exactly the session
     // every existing caller gets: default detach interception, best-effort
     // output and the -1 sentinel. The filter cases add `stdin_filter` on top
