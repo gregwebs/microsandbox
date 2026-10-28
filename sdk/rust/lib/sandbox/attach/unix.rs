@@ -63,6 +63,7 @@ enum CheckedEnd {
     Exited(i32),
     Failed(ExecFailed),
 }
+
 /// The host terminal's saved attributes for one checked session.
 ///
 /// Duplicates fd 0 for ownership of the snapshot only: raw mode is a
@@ -144,6 +145,7 @@ pub(crate) async fn attach(
     let client = Arc::new(super::super::fs::agent::connect_agent(backend, name).await?);
     attach_connected(client, config, cmd, opts).await
 }
+
 /// Bridge an already-connected agent.
 ///
 /// Production reaches it through [`attach`]; tests drive it over an owned
@@ -161,6 +163,7 @@ pub(super) async fn attach_connected(
         legacy_session(client, config, cmd, opts, detach_keys).await
     }
 }
+
 /// The interactive session every existing caller gets.
 async fn legacy_session(
     client: Arc<AgentClient>,
@@ -348,6 +351,7 @@ async fn legacy_session(
     }
     Ok(exit_code)
 }
+
 /// The checked session: every completion and I/O fact is either observed or
 /// an error.
 async fn checked_session(
@@ -384,6 +388,7 @@ async fn checked_session(
     let primary = checked_bridge(&client, id, &mut rx, detach_keys.as_ref(), stdin_filter).await;
     finish_checked_session(&mut raw, primary)
 }
+
 async fn checked_bridge(
     client: &Arc<AgentClient>,
     id: u32,
@@ -594,6 +599,11 @@ async fn checked_bridge(
         }
     }
 }
+
+//--------------------------------------------------------------------------------------------------
+// Functions: Helpers
+//--------------------------------------------------------------------------------------------------
+
 /// One session event: `Some` ends the session, `None` continues it.
 ///
 /// Nothing here awaits: a handler that blocked on output capacity could not
@@ -640,6 +650,7 @@ fn handle_checked_message(
         _ => Ok(None),
     }
 }
+
 /// The one exit from a checked session, so no `?` above can skip restoration.
 fn finish_checked_session(
     raw: &mut CheckedRawTerminal,
@@ -657,19 +668,23 @@ fn finish_checked_session(
         )),
     }
 }
+
 pub(super) fn checked_failure(text: impl Into<String>) -> MicrosandboxError {
     MicrosandboxError::Terminal(text.into())
 }
+
 /// A closed event channel is a lost session, never a completed one.
 fn closed_session() -> MicrosandboxError {
     checked_failure("the agent connection closed before the guest reported its exit")
 }
+
 fn guest_closed_input(error: &ExecStdinError) -> bool {
     match (error.errno_name.as_deref(), error.errno) {
         (Some(name), _) => name == "EPIPE",
         (None, errno) => errno == Some(GUEST_EPIPE),
     }
 }
+
 fn describe_stdin_error(error: &ExecStdinError) -> String {
     let errno = error
         .errno_name
@@ -678,6 +693,7 @@ fn describe_stdin_error(error: &ExecStdinError) -> String {
         .unwrap_or_else(|| "no errno".to_string());
     format!("{errno}: {}", error.message)
 }
+
 /// Host stdin's window size as `(cols, rows)`.
 ///
 /// Reads fd 0 with `TIOCGWINSZ` rather than `crossterm::terminal::size()`,
@@ -695,6 +711,7 @@ fn stdin_terminal_size() -> MicrosandboxResult<(u16, u16)> {
     }
     Ok(normalized_terminal_size((size.ws_col, size.ws_row)))
 }
+
 fn normalized_terminal_size((cols, rows): (u16, u16)) -> (u16, u16) {
     if cols == 0 || rows == 0 {
         (80, 24)
@@ -702,6 +719,7 @@ fn normalized_terminal_size((cols, rows): (u16, u16)) -> (u16, u16) {
         (cols, rows)
     }
 }
+
 fn tcgetattr(fd: RawFd) -> std::io::Result<libc::termios> {
     loop {
         let mut attributes: libc::termios = unsafe { std::mem::zeroed() };
@@ -715,6 +733,7 @@ fn tcgetattr(fd: RawFd) -> std::io::Result<libc::termios> {
         }
     }
 }
+
 fn set_attributes(fd: RawFd, attributes: &libc::termios) -> std::io::Result<()> {
     loop {
         let rc = unsafe { libc::tcsetattr(fd, libc::TCSANOW, attributes) };
@@ -727,6 +746,7 @@ fn set_attributes(fd: RawFd, attributes: &libc::termios) -> std::io::Result<()> 
         }
     }
 }
+
 /// A descriptor that the child would not inherit and that this code owns.
 pub(super) fn duplicate_cloexec(fd: RawFd) -> std::io::Result<OwnedFd> {
     let duplicate = unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 3) };

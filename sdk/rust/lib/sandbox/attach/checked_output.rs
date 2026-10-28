@@ -4,8 +4,7 @@
 
 use std::collections::VecDeque;
 use std::os::fd::{AsRawFd, OwnedFd, RawFd};
-use std::sync::Arc;
-use std::sync::{Condvar, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 
 use tokio::sync::Notify;
 
@@ -23,6 +22,7 @@ use super::unix::{checked_failure, duplicate_cloexec};
 /// backpressure stalls the session exactly as a native write to a slow
 /// terminal would; it never fails and never drops output.
 pub(super) const CHECKED_OUTPUT_MAX_PENDING_BYTES: usize = 8 * 1024 * 1024;
+
 /// Largest queued frame. A guest frame is split so one reservation can never
 /// exceed the bound above.
 pub(super) const CHECKED_OUTPUT_CHUNK_BYTES: usize = 64 * 1024;
@@ -38,6 +38,7 @@ enum CheckedOutputItem {
     /// success barrier.
     Finish(tokio::sync::oneshot::Sender<()>),
 }
+
 #[derive(Default)]
 struct CheckedOutputQueueState {
     items: VecDeque<CheckedOutputItem>,
@@ -47,6 +48,7 @@ struct CheckedOutputQueueState {
     aborted: bool,
     error: Option<String>,
 }
+
 /// The checked session's output path: an ordered queue plus the thread that
 /// owns the blocking writes.
 ///
@@ -71,6 +73,7 @@ struct CheckedOutputQueue {
     /// routed through guest progress.
     failed: Notify,
 }
+
 pub(super) struct CheckedOutput {
     queue: Arc<CheckedOutputQueue>,
 }
@@ -283,6 +286,7 @@ pub(super) fn stage_output_chunks(bytes: Vec<u8>, pending: &mut VecDeque<Vec<u8>
         pending.push_back(chunk);
     }
 }
+
 /// Owns the duplicated host stdout descriptor and every blocking write.
 fn run_checked_writer(queue: Arc<CheckedOutputQueue>, output: OwnedFd) {
     // The queue is re-read for each item instead of being held across the
@@ -316,6 +320,7 @@ fn run_checked_writer(queue: Arc<CheckedOutputQueue>, output: OwnedFd) {
         }
     }
 }
+
 fn write_all_fd(fd: RawFd, mut bytes: &[u8]) -> std::io::Result<()> {
     while !bytes.is_empty() {
         let written = unsafe { libc::write(fd, bytes.as_ptr().cast(), bytes.len()) };

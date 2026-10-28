@@ -423,6 +423,10 @@ async fn checked_bridge(
     }
 }
 
+//--------------------------------------------------------------------------------------------------
+// Functions: Helpers
+//--------------------------------------------------------------------------------------------------
+
 async fn handle_checked_message(
     message: Message,
     terminal: &mut WindowsTerminalGuard,
