@@ -25,9 +25,10 @@ use crate::{
 };
 
 use super::checked::{
-    CheckedEnd, CheckedEvent, checked_failure, classify_checked_message, closed_session,
+    CheckedEnd, CheckedEvent, CheckedFailure, classify_checked_message, closed_session,
     finish_with_teardown,
 };
+use super::error::{AttachFailureKind, AttachSessionError, TeardownStage};
 use super::{
     AttachOptions, DetachKeys, FilteredStdin, InputRoute, STDIN_FILTER_TASK_ENDED, StdinFilter,
     recv_filtered, require_filtered, route_input,
@@ -59,7 +60,9 @@ pub(super) async fn attach_connected(
 ) -> MicrosandboxResult<i32> {
     let detach_keys = opts.resolved_detach_keys()?;
     if opts.checked_session {
-        checked_session(client, config, cmd, opts, detach_keys).await
+        checked_session(client, config, cmd, opts, detach_keys)
+            .await
+            .map_err(MicrosandboxError::from)
     } else {
         legacy_session(client, config, cmd, opts, detach_keys).await
     }
@@ -220,7 +223,7 @@ async fn checked_session(
     cmd: String,
     mut opts: AttachOptions,
     detach_keys: Option<DetachKeys>,
-) -> MicrosandboxResult<i32> {
+) -> Result<i32, CheckedFailure> {
     let stdin_filter = opts.stdin_filter.take();
     // A console with no readable size is not a session failure here: the
     // console API reports "no size" as an absence, not an error, so the
@@ -239,13 +242,20 @@ async fn checked_session(
         rows,
         cols,
     );
-    let (id, mut rx) = client.stream(MessageType::ExecRequest, &req).await?;
+    let (id, mut rx) = client
+        .stream(MessageType::ExecRequest, &req)
+        .await
+        .map_err(|error| CheckedFailure::Setup(error.into()))?;
 
     // Raw console mode begins only once the exec request exists, exactly as
     // on Unix.
-    let mut terminal = WindowsTerminalGuard::enter()?;
-    let mut events = WindowsTerminalEventPump::spawn_for_guard(&terminal)?;
-    let primary = checked_bridge(
+    let mut terminal = WindowsTerminalGuard::enter()
+        .map_err(|error| AttachSessionError::host(AttachFailureKind::HostTerminal, error))?;
+    let mut events = WindowsTerminalEventPump::spawn_for_guard(&terminal)
+        .map_err(|error| AttachSessionError::host(AttachFailureKind::HostTerminal, error))?;
+    // The loop reports how the guest ended (or the failure that ended it
+    // first); the conclusion below turns that into the public-shaped result.
+    let primary = match checked_bridge(
         &client,
         id,
         &mut rx,
@@ -254,16 +264,27 @@ async fn checked_session(
         detach_keys.as_ref(),
         stdin_filter,
     )
-    .await;
+    .await
+    {
+        Ok(CheckedEnd::Exited(code)) => Ok(code),
+        Ok(CheckedEnd::Failed(failure)) => Err(CheckedFailure::Spawn(failure)),
+        Err(error) => Err(CheckedFailure::from(error)),
+    };
 
     // One epilogue: stop the event pump, flush the decoded tail, restore.
     drop(events);
     let mut teardown = Vec::new();
     if let Err(error) = terminal.finish_output() {
-        teardown.push(("flushing guest output", error));
+        teardown.push((
+            TeardownStage::FlushConsoleOutput,
+            AttachSessionError::host(AttachFailureKind::Output, error),
+        ));
     }
     if let Err(error) = terminal.restore_checked() {
-        teardown.push(("restoring the console", error));
+        teardown.push((
+            TeardownStage::RestoreConsole,
+            AttachSessionError::host(AttachFailureKind::HostTerminal, error),
+        ));
     }
     finish_with_teardown(
         primary,
@@ -280,7 +301,7 @@ async fn checked_bridge(
     events: &mut WindowsTerminalEventPump,
     detach_keys: Option<&DetachKeys>,
     stdin_filter: Option<Box<dyn StdinFilter>>,
-) -> MicrosandboxResult<i32> {
+) -> Result<CheckedEnd, AttachSessionError> {
     let mut match_pos = 0usize;
     let mut feeding_input = true;
     // Same task boundary as the legacy session and as Unix.
@@ -289,8 +310,13 @@ async fn checked_bridge(
     let end = 'session: loop {
         tokio::select! {
             event = events.recv() => {
+                // The console's event pump ends on console EOF or on its own
+                // read error, never because the agent connection closed: say
+                // what actually happened.
                 let Some(event) = event else {
-                    return Err(closed_session());
+                    return Err(host_failure(
+                        "host console input ended before the guest reported its exit",
+                    ));
                 };
                 match event {
                     WindowsTerminalEvent::Input(data) => {
@@ -304,13 +330,17 @@ async fn checked_bridge(
                             filtered_stdin.as_ref(),
                         ) {
                             InputRoute::Detach => {
-                                return Err(checked_failure(
+                                return Err(AttachSessionError::new(
+                                    AttachFailureKind::Detached,
                                     "the detach key sequence ended the session before the guest reported its exit",
                                 ));
                             }
                             InputRoute::Filtered => {}
                             InputRoute::WorkerEnded => {
-                                return Err(checked_failure(STDIN_FILTER_TASK_ENDED));
+                                return Err(AttachSessionError::new(
+                                    AttachFailureKind::StdinFilter,
+                                    STDIN_FILTER_TASK_ENDED,
+                                ));
                             }
                             InputRoute::Forward => {
                                 if feeding_input {
@@ -318,7 +348,7 @@ async fn checked_bridge(
                                         .send(id, MessageType::ExecStdin, &ExecStdin { data })
                                         .await
                                         .map_err(|error| {
-                                            checked_failure(format!(
+                                            connection_lost(format!(
                                                 "forwarding console input: {error}"
                                             ))
                                         })?;
@@ -331,24 +361,27 @@ async fn checked_bridge(
                             .send(id, MessageType::ExecResize, &ExecResize { rows, cols })
                             .await
                             .map_err(|error| {
-                                checked_failure(format!("sending a console resize: {error}"))
+                                connection_lost(format!("sending a console resize: {error}"))
                             })?;
                     }
                     WindowsTerminalEvent::Error(error) => {
-                        return Err(checked_failure(format!("reading console input: {error}")));
+                        return Err(host_failure(format!("reading console input: {error}")));
                     }
                 }
             }
 
             filtered = recv_filtered(&mut filtered_stdin), if feeding_input && filtered_stdin.is_some() => {
                 let Some(data) = filtered else {
-                    return Err(checked_failure(STDIN_FILTER_TASK_ENDED));
+                    return Err(AttachSessionError::new(
+                        AttachFailureKind::StdinFilter,
+                        STDIN_FILTER_TASK_ENDED,
+                    ));
                 };
                 client
                     .send(id, MessageType::ExecStdin, &ExecStdin { data })
                     .await
                     .map_err(|error| {
-                        checked_failure(format!("forwarding console input: {error}"))
+                        connection_lost(format!("forwarding console input: {error}"))
                     })?;
             }
 
@@ -378,10 +411,7 @@ async fn checked_bridge(
         }
     };
 
-    match end {
-        CheckedEnd::Failed(failure) => Err(MicrosandboxError::ExecFailed(failure)),
-        CheckedEnd::Exited(code) => Ok(code),
-    }
+    Ok(end)
 }
 
 //--------------------------------------------------------------------------------------------------
@@ -396,10 +426,12 @@ fn handle_checked_message(
     message: Message,
     terminal: &mut WindowsTerminalGuard,
     feeding_input: &mut bool,
-) -> MicrosandboxResult<Option<CheckedEnd>> {
+) -> Result<Option<CheckedEnd>, AttachSessionError> {
     match classify_checked_message(message)? {
         CheckedEvent::Output(data) => {
-            terminal.write_output(&data)?;
+            terminal
+                .write_output(&data)
+                .map_err(|error| AttachSessionError::host(AttachFailureKind::Output, error))?;
             Ok(None)
         }
         CheckedEvent::End(end) => Ok(Some(end)),
@@ -409,4 +441,14 @@ fn handle_checked_message(
         }
         CheckedEvent::Ignored => Ok(None),
     }
+}
+
+/// A failure of the console itself: setup, reading input, or restoring it.
+fn host_failure(text: impl Into<String>) -> AttachSessionError {
+    AttachSessionError::new(AttachFailureKind::HostTerminal, text)
+}
+
+/// A send the transport refused: the session is lost even while the guest runs.
+fn connection_lost(text: impl Into<String>) -> AttachSessionError {
+    AttachSessionError::new(AttachFailureKind::ConnectionLost, text)
 }

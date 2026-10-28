@@ -30,10 +30,11 @@ use crate::{
 };
 
 use super::checked::{
-    CheckedEnd, CheckedEvent, checked_failure, classify_checked_message, closed_session,
+    CheckedEnd, CheckedEvent, CheckedFailure, classify_checked_message, closed_session,
     finish_with_teardown,
 };
 use super::checked_output::{CheckedOutput, Staging};
+use super::error::{AttachFailureKind, AttachSessionError, TeardownStage};
 use super::{
     AttachOptions, DetachKeys, FilteredStdin, InputRoute, STDIN_FILTER_TASK_ENDED, StdinFilter,
     recv_filtered, require_filtered, route_input,
@@ -56,7 +57,7 @@ const CHECKED_INPUT_CHUNK_BYTES: usize = 1024;
 /// session. Never restarted: `AgentClient::send` may already have queued its
 /// frame before it starts awaiting the transport, so a second call for the same
 /// bytes would duplicate them.
-type GuestSend = Pin<Box<dyn Future<Output = MicrosandboxResult<()>> + Send>>;
+type GuestSend = Pin<Box<dyn Future<Output = Result<(), AttachSessionError>> + Send>>;
 
 /// The host terminal's saved attributes for one checked session.
 ///
@@ -115,20 +116,20 @@ pub(super) struct CheckedLoop<'a> {
 //--------------------------------------------------------------------------------------------------
 
 impl CheckedRawTerminal {
-    fn enter(stdin_fd: RawFd) -> MicrosandboxResult<Self> {
+    fn enter(stdin_fd: RawFd) -> Result<Self, AttachSessionError> {
         let fd = duplicate_cloexec(stdin_fd).map_err(|error| {
-            checked_failure(format!(
+            host_failure(format!(
                 "duplicating the host terminal for raw mode: {error}"
             ))
         })?;
         let saved = tcgetattr(fd.as_raw_fd())
-            .map_err(|error| checked_failure(format!("reading the host terminal: {error}")))?;
+            .map_err(|error| host_failure(format!("reading the host terminal: {error}")))?;
         let mut raw = saved;
         // SAFETY: `raw` is a valid, fully initialized `termios` that this
         // function owns; `cfmakeraw` only writes into it.
         unsafe { libc::cfmakeraw(&mut raw) };
         set_attributes(fd.as_raw_fd(), &raw)
-            .map_err(|error| checked_failure(format!("entering raw mode: {error}")))?;
+            .map_err(|error| host_failure(format!("entering raw mode: {error}")))?;
         Ok(Self {
             fd,
             saved,
@@ -141,12 +142,12 @@ impl CheckedRawTerminal {
     /// on purpose, so `Drop` makes one more bounded attempt when the session
     /// is already on its way out; the first attempt's error is what the
     /// session reports, and the retry is silent.
-    fn restore(&mut self) -> MicrosandboxResult<()> {
+    fn restore(&mut self) -> Result<(), AttachSessionError> {
         if !self.active {
             return Ok(());
         }
         set_attributes(self.fd.as_raw_fd(), &self.saved)
-            .map_err(|error| checked_failure(format!("restoring the host terminal: {error}")))?;
+            .map_err(|error| host_failure(format!("restoring the host terminal: {error}")))?;
         self.active = false;
         Ok(())
     }
@@ -182,7 +183,7 @@ impl<'a> CheckedLoop<'a> {
     /// iteration. Nothing in a handler awaits: a host consumer that stopped
     /// draining must not stop the session from reading host input, forwarding a
     /// resize, receiving the guest's exit, or reporting the writer's failure.
-    pub(super) async fn run(&mut self) -> MicrosandboxResult<CheckedEnd> {
+    pub(super) async fn run(&mut self) -> Result<CheckedEnd, AttachSessionError> {
         let mut match_pos = 0usize;
         // A guest that stopped reading its stdin (`head`, an early exit) keeps
         // its session: only feeding stops, and its own exit event still ends it.
@@ -212,7 +213,7 @@ impl<'a> CheckedLoop<'a> {
 
                 ready = self.io.input.readable(), if feeding_input && outbound.is_none() => {
                     let mut readiness = ready.map_err(|error| {
-                        checked_failure(format!("waiting for host terminal input: {error}"))
+                        host_failure(format!("waiting for host terminal input: {error}"))
                     })?;
                     let read = readiness.try_io(|inner| {
                         read_from_fd(inner.get_ref().as_raw_fd(), &mut input_buffer)
@@ -223,7 +224,9 @@ impl<'a> CheckedLoop<'a> {
                             continue;
                         }
                         Ok(Err(error)) => {
-                            return Err(checked_failure(format!("reading host terminal input: {error}")));
+                            return Err(host_failure(format!(
+                                "reading host terminal input: {error}"
+                            )));
                         }
                         // Spurious readiness: nothing to read yet.
                         Err(_would_block) => continue,
@@ -231,7 +234,7 @@ impl<'a> CheckedLoop<'a> {
                     drop(readiness);
 
                     if count == 0 {
-                        return Err(checked_failure(
+                        return Err(host_failure(
                             "host terminal input ended before the guest reported its exit",
                         ));
                     }
@@ -248,13 +251,17 @@ impl<'a> CheckedLoop<'a> {
                         self.filtered_stdin.as_ref(),
                     ) {
                         InputRoute::Detach => {
-                            return Err(checked_failure(
+                            return Err(AttachSessionError::new(
+                                AttachFailureKind::Detached,
                                 "the detach key sequence ended the session before the guest reported its exit",
                             ));
                         }
                         InputRoute::Filtered => {}
                         InputRoute::WorkerEnded => {
-                            return Err(checked_failure(STDIN_FILTER_TASK_ENDED));
+                            return Err(AttachSessionError::new(
+                                AttachFailureKind::StdinFilter,
+                                STDIN_FILTER_TASK_ENDED,
+                            ));
                         }
                         InputRoute::Forward => {
                             outbound = Some(start_send(
@@ -276,7 +283,10 @@ impl<'a> CheckedLoop<'a> {
                 // overtaking the one above.
                 filtered = recv_filtered(&mut self.filtered_stdin), if feeding_input && self.filtered_stdin.is_some() && outbound.is_none() => {
                     let Some(data) = filtered else {
-                        return Err(checked_failure(STDIN_FILTER_TASK_ENDED));
+                        return Err(AttachSessionError::new(
+                            AttachFailureKind::StdinFilter,
+                            STDIN_FILTER_TASK_ENDED,
+                        ));
                     };
                     outbound = Some(start_send(
                         self.client,
@@ -350,10 +360,10 @@ impl<'a> CheckedLoop<'a> {
     /// stays typed, and a failure that ended the loop is returned as it is.
     pub(super) async fn conclude(
         &mut self,
-        end: MicrosandboxResult<CheckedEnd>,
-    ) -> MicrosandboxResult<i32> {
+        end: Result<CheckedEnd, AttachSessionError>,
+    ) -> Result<i32, CheckedFailure> {
         match end? {
-            CheckedEnd::Failed(failure) => Err(MicrosandboxError::ExecFailed(failure)),
+            CheckedEnd::Failed(failure) => Err(CheckedFailure::Spawn(failure)),
             CheckedEnd::Exited(code) => {
                 // A definitive exit is necessary but not sufficient: output read
                 // before the exit event is delivered first, and the ordered finish
@@ -408,7 +418,9 @@ pub(super) async fn attach_connected(
 ) -> MicrosandboxResult<i32> {
     let detach_keys = opts.resolved_detach_keys()?;
     if opts.checked_session {
-        checked_session(client, config, cmd, opts, detach_keys).await
+        checked_session(client, config, cmd, opts, detach_keys)
+            .await
+            .map_err(MicrosandboxError::from)
     } else {
         legacy_session(client, config, cmd, opts, detach_keys).await
     }
@@ -604,13 +616,17 @@ async fn legacy_session(
 
 /// The checked session: every completion and I/O fact is either observed or
 /// an error.
-async fn checked_session(
+///
+/// Returns the typed failure so a test (and this module) can tell a detach from
+/// a lost relay from an unwritable descriptor; [`attach_connected`] is the one
+/// place that turns it into the public error.
+pub(super) async fn checked_session(
     client: Arc<AgentClient>,
     config: &SandboxConfig,
     cmd: String,
     mut opts: AttachOptions,
     detach_keys: Option<DetachKeys>,
-) -> MicrosandboxResult<i32> {
+) -> Result<i32, CheckedFailure> {
     // Held back from the exec request like the legacy session does, so the
     // filter is set up by the session that reads the terminal.
     let stdin_filter = opts.stdin_filter.take();
@@ -630,7 +646,10 @@ async fn checked_session(
         rows,
         cols,
     );
-    let (id, mut rx) = client.stream(MessageType::ExecRequest, &req).await?;
+    let (id, mut rx) = client
+        .stream(MessageType::ExecRequest, &req)
+        .await
+        .map_err(|error| CheckedFailure::Setup(error.into()))?;
     // Raw mode begins only here: everything above can fail without having
     // touched the host terminal, and the guard below owns restoration from
     // the first byte of host input.
@@ -645,20 +664,20 @@ async fn checked_bridge(
     rx: &mut tokio::sync::mpsc::Receiver<Message>,
     detach_keys: Option<&DetachKeys>,
     stdin_filter: Option<Box<dyn StdinFilter>>,
-) -> MicrosandboxResult<i32> {
+) -> Result<i32, CheckedFailure> {
     // A *new* description of the terminal, marked non-blocking, rather than
     // a dup of fd 0: `O_NONBLOCK` is a file-status flag shared by every
     // descriptor on one description, so duplicating fd 0 would leak it to
     // the caller.
     let tty_input_path = terminal_path_for_fd(std::io::stdin().as_raw_fd())
-        .map_err(|error| checked_failure(format!("resolving the host tty path: {error}")))?;
+        .map_err(|error| host_failure(format!("resolving the host tty path: {error}")))?;
     let tty_input = open_nonblocking_terminal_input(&tty_input_path)
-        .map_err(|error| checked_failure(format!("opening the host tty: {error}")))?;
+        .map_err(|error| host_failure(format!("opening the host tty: {error}")))?;
     let input = AsyncFd::new(tty_input)
-        .map_err(|error| checked_failure(format!("registering the host tty: {error}")))?;
+        .map_err(|error| host_failure(format!("registering the host tty: {error}")))?;
     let output = CheckedOutput::start(std::io::stdout().as_raw_fd())?;
     let resizes = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::window_change())
-        .map_err(|error| checked_failure(format!("watching terminal resizes: {error}")))?;
+        .map_err(|error| host_failure(format!("watching terminal resizes: {error}")))?;
 
     let mut session = CheckedLoop::new(
         client,
@@ -697,10 +716,14 @@ where
 {
     let client = Arc::clone(client);
     Box::pin(async move {
-        client
-            .send(id, t, &payload)
-            .await
-            .map_err(|error| checked_failure(format!("{context}: {error}")))
+        client.send(id, t, &payload).await.map_err(|error| {
+            // The transport, not the guest, refused the frame: the session is
+            // lost even though the guest may still be running.
+            AttachSessionError::new(
+                AttachFailureKind::ConnectionLost,
+                format!("{context}: {error}"),
+            )
+        })
     })
 }
 
@@ -708,7 +731,7 @@ where
 ///
 /// `select!` evaluates every arm's future expression, so the absent case has to
 /// be a future rather than an `unwrap` in the arm.
-async fn finish_send(outbound: &mut Option<GuestSend>) -> MicrosandboxResult<()> {
+async fn finish_send(outbound: &mut Option<GuestSend>) -> Result<(), AttachSessionError> {
     match outbound {
         Some(send) => send.await,
         None => std::future::pending().await,
@@ -716,7 +739,10 @@ async fn finish_send(outbound: &mut Option<GuestSend>) -> MicrosandboxResult<()>
 }
 
 /// The writer's verdict on the head of staging; never resolves when it is empty.
-async fn enqueue_front(output: &CheckedOutput, staging: &Staging) -> MicrosandboxResult<()> {
+async fn enqueue_front(
+    output: &CheckedOutput,
+    staging: &Staging,
+) -> Result<(), AttachSessionError> {
     match staging.front() {
         Some(chunk) => output.enqueue_chunk(chunk).await,
         None => std::future::pending().await,
@@ -732,7 +758,7 @@ fn handle_checked_message(
     message: Message,
     staging: &mut Staging,
     feeding_input: &mut bool,
-) -> MicrosandboxResult<Option<CheckedEnd>> {
+) -> Result<Option<CheckedEnd>, AttachSessionError> {
     match classify_checked_message(message)? {
         CheckedEvent::Output(data) => {
             staging.stage(data);
@@ -750,12 +776,12 @@ fn handle_checked_message(
 /// The one exit from a checked session, so no `?` above can skip restoration.
 fn finish_checked_session(
     raw: &mut CheckedRawTerminal,
-    primary: MicrosandboxResult<i32>,
-) -> MicrosandboxResult<i32> {
+    primary: Result<i32, CheckedFailure>,
+) -> Result<i32, CheckedFailure> {
     let teardown = raw
         .restore()
         .err()
-        .map(|error| ("restoring the host terminal", error))
+        .map(|error| (TeardownStage::RestoreTerminal, error))
         .into_iter()
         .collect();
     finish_with_teardown(
@@ -765,17 +791,22 @@ fn finish_checked_session(
     )
 }
 
+/// A failure in the host terminal itself: setup, reading input, or its size.
+fn host_failure(text: impl Into<String>) -> AttachSessionError {
+    AttachSessionError::new(AttachFailureKind::HostTerminal, text)
+}
+
 /// Host stdin's window size as `(cols, rows)`.
 ///
 /// Reads fd 0 with `TIOCGWINSZ` rather than `crossterm::terminal::size()`,
 /// whose answer may come from a different terminal (stdout's) than the one
 /// this session reads. Zero dimensions mean "no size reported" and take the
 /// legacy fallback.
-fn stdin_terminal_size() -> MicrosandboxResult<(u16, u16)> {
+fn stdin_terminal_size() -> Result<(u16, u16), AttachSessionError> {
     let mut size: libc::winsize = unsafe { std::mem::zeroed() };
     let rc = unsafe { libc::ioctl(std::io::stdin().as_raw_fd(), libc::TIOCGWINSZ, &mut size) };
     if rc == -1 {
-        return Err(checked_failure(format!(
+        return Err(host_failure(format!(
             "reading the stdin terminal size: {}",
             std::io::Error::last_os_error()
         )));
@@ -1165,12 +1196,12 @@ mod tests {
         let failure = within(session.run())
             .await
             .expect_err("a closed channel without an exit is not a completed session");
-        assert!(
-            failure
-                .to_string()
-                .contains("closed before the guest reported its exit"),
+        assert_eq!(
+            failure.kind(),
+            AttachFailureKind::ConnectionLost,
             "a closed channel must be reported as the lost session it is: {failure}"
         );
+        assert!(failure.terminal_restored());
     }
 
     #[tokio::test]
@@ -1338,6 +1369,11 @@ mod tests {
         let failure = within(&mut run)
             .await
             .expect_err("an unwritable descriptor ends the session");
+        assert_eq!(
+            failure.kind(),
+            AttachFailureKind::Output,
+            "the writer's own failure must be reported as an output failure: {failure}"
+        );
         assert!(
             failure.to_string().contains("writing guest output"),
             "the writer's own failure must be reported: {failure}"

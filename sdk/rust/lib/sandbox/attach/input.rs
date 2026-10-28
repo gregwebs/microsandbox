@@ -48,7 +48,9 @@ pub(crate) const STDIN_FILTER_TASK_ENDED: &str = "stdin filter task ended";
 /// A filter that can fail should bound its own work (for example with
 /// `tokio::time::timeout`) and return `data.to_vec()` to forward the original bytes.
 /// An unwinding panic in `filter()` or its future ends the worker and the attach
-/// session with `Runtime("stdin filter task ended")`; no raw input is forwarded.
+/// session with `Runtime("stdin filter task ended")` on the default session. A
+/// checked session ([`AttachOptionsBuilder::checked_session`]) reports it as a
+/// session failure instead; no raw input is forwarded either way.
 /// The guest may keep running as it does after detach. With `panic = "abort"`,
 /// no policy can intercept the process exit.
 /// The detach sequence is matched on terminal input before the filter runs,

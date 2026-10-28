@@ -8,9 +8,7 @@ use std::sync::{Arc, Condvar, Mutex};
 
 use tokio::sync::Notify;
 
-use crate::{MicrosandboxError, MicrosandboxResult};
-
-use super::checked::checked_failure;
+use super::error::{AttachFailureKind, AttachSessionError};
 use super::unix::duplicate_cloexec;
 
 //--------------------------------------------------------------------------------------------------
@@ -181,15 +179,15 @@ impl CheckedOutputQueue {
     }
 
     /// The writer's own message when it failed, otherwise the caller's.
-    fn failure_or(&self, fallback: &str) -> MicrosandboxError {
-        checked_failure(self.failure().unwrap_or_else(|| fallback.to_string()))
+    fn failure_or(&self, fallback: &str) -> AttachSessionError {
+        output_failure(self.failure().unwrap_or_else(|| fallback.to_string()))
     }
 }
 
 impl CheckedOutput {
-    pub(super) fn start(stdout_fd: RawFd) -> MicrosandboxResult<Self> {
+    pub(super) fn start(stdout_fd: RawFd) -> Result<Self, AttachSessionError> {
         let output = duplicate_cloexec(stdout_fd).map_err(|error| {
-            checked_failure(format!("duplicating the host terminal output: {error}"))
+            output_failure(format!("duplicating the host terminal output: {error}"))
         })?;
         let queue = Arc::new(CheckedOutputQueue::default());
         let writer_queue = Arc::clone(&queue);
@@ -197,7 +195,7 @@ impl CheckedOutput {
             .name("msb-attach-output".into())
             .spawn(move || run_checked_writer(writer_queue, output))
             .map_err(|error| {
-                checked_failure(format!("starting the terminal output writer: {error}"))
+                output_failure(format!("starting the terminal output writer: {error}"))
             })?;
         Ok(Self { queue })
     }
@@ -209,7 +207,7 @@ impl CheckedOutput {
     /// reservation from the queue push. A cancelled call therefore leaves
     /// neither a reservation nor a partial frame, so the session can put the
     /// chunk back at the head of its staging queue.
-    pub(super) async fn enqueue_chunk(&self, bytes: &[u8]) -> MicrosandboxResult<()> {
+    pub(super) async fn enqueue_chunk(&self, bytes: &[u8]) -> Result<(), AttachSessionError> {
         debug_assert!(bytes.len() <= CHECKED_OUTPUT_CHUNK_BYTES);
         self.reserve(bytes.len()).await?;
         {
@@ -229,20 +227,20 @@ impl CheckedOutput {
     /// writes one frame and then waits for input would never call them again.
     /// The notification is registered before the state is read, so a failure
     /// that races the registration is observed rather than lost.
-    pub(super) async fn failure(&self) -> MicrosandboxError {
+    pub(super) async fn failure(&self) -> AttachSessionError {
         loop {
             let signal = self.queue.failed.notified();
             tokio::pin!(signal);
             signal.as_mut().enable();
             if let Some(message) = self.queue.failure() {
-                return checked_failure(message);
+                return output_failure(message);
             }
             signal.await;
         }
     }
 
     /// Wait until `bytes` more fit under the pending bound, then reserve them.
-    async fn reserve(&self, bytes: usize) -> MicrosandboxResult<()> {
+    async fn reserve(&self, bytes: usize) -> Result<(), AttachSessionError> {
         debug_assert!(bytes <= CHECKED_OUTPUT_MAX_PENDING_BYTES);
         loop {
             // Registered before the accounting is read, so a release between
@@ -253,10 +251,10 @@ impl CheckedOutput {
             {
                 let mut state = self.queue.lock();
                 if let Some(error) = &state.error {
-                    return Err(checked_failure(error.clone()));
+                    return Err(output_failure(error.clone()));
                 }
                 if state.aborted {
-                    return Err(checked_failure("the terminal output writer was aborted"));
+                    return Err(output_failure("the terminal output writer was aborted"));
                 }
                 if state.reserved + bytes <= CHECKED_OUTPUT_MAX_PENDING_BYTES {
                     state.reserved += bytes;
@@ -272,15 +270,15 @@ impl CheckedOutput {
     ///
     /// Cancellable, like every other await in the session; the queue's abort
     /// then discards whatever the writer has not written.
-    pub(super) async fn finish(&self) -> MicrosandboxResult<()> {
+    pub(super) async fn finish(&self) -> Result<(), AttachSessionError> {
         let (receipt, receipt_wait) = tokio::sync::oneshot::channel();
         {
             let mut state = self.queue.lock();
             if let Some(error) = &state.error {
-                return Err(checked_failure(error.clone()));
+                return Err(output_failure(error.clone()));
             }
             if state.aborted {
-                return Err(checked_failure("the terminal output writer was aborted"));
+                return Err(output_failure("the terminal output writer was aborted"));
             }
             state.items.push_back(CheckedOutputItem::Finish(receipt));
         }
@@ -391,6 +389,11 @@ fn run_checked_writer(queue: Arc<CheckedOutputQueue>, output: OwnedFd) {
             }
         }
     }
+}
+
+/// A failure of the host's output descriptor or of its writer.
+fn output_failure(text: impl Into<String>) -> AttachSessionError {
+    AttachSessionError::new(AttachFailureKind::Output, text)
 }
 
 fn write_all_fd(fd: RawFd, mut bytes: &[u8]) -> std::io::Result<()> {
@@ -577,11 +580,17 @@ mod tests {
         if failure.is_none() {
             failure = within(output.finish()).await.err();
         }
-        assert!(
-            failure.is_some(),
-            "an unwritable descriptor must be reported"
+        let failure = failure.expect("an unwritable descriptor must be reported");
+        assert_eq!(
+            failure.kind(),
+            AttachFailureKind::Output,
+            "an unwritable descriptor is an output failure: {failure}"
         );
-        assert!(output.enqueue_chunk(b"more\n").await.is_err());
+        let later = output
+            .enqueue_chunk(b"more\n")
+            .await
+            .expect_err("the queue keeps refusing work after its writer failed");
+        assert_eq!(later.kind(), AttachFailureKind::Output);
     }
 
     #[tokio::test]
@@ -599,6 +608,11 @@ mod tests {
             .await
             .expect("the queue accepts the frame");
         let failure = within(output.failure()).await;
+        assert_eq!(
+            failure.kind(),
+            AttachFailureKind::Output,
+            "the session must see an output failure: {failure}"
+        );
         assert!(
             failure.to_string().contains("writing guest output"),
             "the session must see the output-specific failure: {failure}"
@@ -626,6 +640,11 @@ mod tests {
             },
             failure = output.failure() => failure,
         };
+        assert_eq!(
+            failure.kind(),
+            AttachFailureKind::Output,
+            "the capacity wait must report an output failure: {failure}"
+        );
         assert!(
             failure.to_string().contains("writing guest output"),
             "the capacity wait must report the writer's failure: {failure}"

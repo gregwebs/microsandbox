@@ -10,6 +10,8 @@
 mod checked;
 #[cfg(unix)]
 mod checked_output;
+#[cfg(any(unix, windows))]
+mod error;
 mod input;
 mod options;
 #[cfg(all(test, unix))]

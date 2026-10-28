@@ -27,6 +27,7 @@ use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, DuplexStream};
 use crate::agent::AgentClient;
 
 use super::AttachOptionsBuilder;
+use super::checked::CheckedFailure;
 use super::unix;
 use crate::SandboxConfig;
 
@@ -71,6 +72,9 @@ enum Case {
     /// A lost relay is still observed once output has filled the writer's
     /// bound.
     OutputBackpressure,
+    /// A detach in a checked session is an error, and the terminal is still
+    /// restored.
+    CheckedDetach,
     /// The guest exits while the host is not draining output: no staged chunk
     /// may be lost on the way out.
     ExitDuringBackpressure,
@@ -98,7 +102,7 @@ enum Case {
 }
 
 impl Case {
-    const ALL: [Case; 15] = [
+    const ALL: [Case; 16] = [
         Case::Input,
         Case::Resize,
         Case::Failed,
@@ -106,6 +110,7 @@ impl Case {
         Case::Closed,
         Case::OutputFailure,
         Case::OutputBackpressure,
+        Case::CheckedDetach,
         Case::ExitDuringBackpressure,
         Case::InputDuringBackpressure,
         Case::Cancel,
@@ -131,6 +136,7 @@ impl Case {
             Case::Closed => "closed",
             Case::OutputFailure => "output-failure",
             Case::OutputBackpressure => "output-backpressure",
+            Case::CheckedDetach => "checked-detach",
             Case::ExitDuringBackpressure => "exit-during-backpressure",
             Case::InputDuringBackpressure => "input-during-backpressure",
             Case::Cancel => "cancel",
@@ -237,10 +243,11 @@ fn run_case(dir: &Path, case: Case) {
             std::fs::write(dir.join("drain"), b"drain").expect("drain the output");
             std::fs::write(dir.join("finish"), b"finish").expect("finish the relay");
         }
-        Case::LegacyDetach => {
+        Case::LegacyDetach | Case::CheckedDetach => {
             // The detach sequence, typed at the terminal exactly as a user
             // types it. The relay stays open (see the relay below), so a status
-            // of -1 here cannot be the closed channel's convention.
+            // of -1 here cannot be the closed channel's convention, and a
+            // checked session's error cannot be a lost connection.
             let mut master = std::fs::File::from(pty.master.try_clone().expect("clone master"));
             master.write_all(b"\x1d").expect("type the detach sequence");
             master.flush().expect("flush the detach sequence");
@@ -288,7 +295,10 @@ fn run_case(dir: &Path, case: Case) {
     // The output-failure case keeps its relay open on purpose: the session must
     // end on the writer's own failure, so the parent releases the relay only
     // after the child has already reported its outcome.
-    if matches!(case, Case::OutputFailure | Case::LegacyDetach) {
+    if matches!(
+        case,
+        Case::OutputFailure | Case::LegacyDetach | Case::CheckedDetach
+    ) {
         std::fs::write(dir.join("release"), b"release").expect("release the relay");
     }
     child.wait_within(DEADLINE);
@@ -343,9 +353,16 @@ fn run_case(dir: &Path, case: Case) {
                 case.name()
             );
         }
-        Case::Malformed | Case::Closed => {
+        Case::Malformed => {
             assert!(
-                outcome.starts_with("err:terminal:"),
+                outcome.starts_with("err:attach:Protocol:"),
+                "case {}: a decode failure is a protocol failure: {receipt}",
+                case.name()
+            );
+        }
+        Case::Closed => {
+            assert!(
+                outcome.starts_with("err:attach:ConnectionLost:"),
                 "case {}: a session failure must be reported: {receipt}",
                 case.name()
             );
@@ -354,17 +371,36 @@ fn run_case(dir: &Path, case: Case) {
             // The relay was still open when this session ended, so the failure
             // can only be the writer's own.
             assert!(
-                outcome.contains("writing guest output"),
+                outcome.starts_with("err:attach:Output:"),
                 "case {}: an unwritable descriptor must be reported as an output \
-                 failure, not as any other terminal error: {receipt}",
+                 failure, not as any other failure: {receipt}",
+                case.name()
+            );
+            assert!(
+                outcome.contains("writing guest output"),
+                "case {}: the writer's own failure must be named: {receipt}",
                 case.name()
             );
         }
         Case::OutputBackpressure => {
             assert!(
-                outcome.contains("closed before the guest reported its exit"),
+                outcome.starts_with("err:attach:ConnectionLost:"),
                 "case {}: a relay lost while output capacity was exhausted must be \
-                 reported: {receipt}",
+                 reported as a lost connection: {receipt}",
+                case.name()
+            );
+            assert!(
+                outcome.contains("closed before the guest reported its exit"),
+                "case {}: a lost relay must say what was lost: {receipt}",
+                case.name()
+            );
+        }
+        Case::CheckedDetach => {
+            // A checked session turns the detach sequence into an error and
+            // leaves the guest running; the terminal must still be restored.
+            assert!(
+                outcome.starts_with("err:attach:Detached:"),
+                "case {}: a detach in a checked session is an error: {receipt}",
                 case.name()
             );
         }
@@ -897,6 +933,9 @@ async fn run_case_session(dir: &Path, case: Case) -> Outcome {
         Case::FilteredLegacy => builder
             .disable_detach_keys()
             .stdin_filter(TagChunks::default()),
+        // A checked session with its detach keys left at the default: the
+        // sequence must be reported, not silently forwarded or ignored.
+        Case::CheckedDetach => builder.checked_session(),
         _ if case.legacy() => builder,
         _ => builder.disable_detach_keys().checked_session(),
     }
@@ -911,19 +950,32 @@ async fn run_case_session(dir: &Path, case: Case) -> Outcome {
             Ok(client) => client,
             Err(error) => return Outcome::Error(format!("terminal:{error}")),
         };
+    let client = Arc::new(client);
 
-    let bridge = unix::attach_connected(Arc::new(client), &config, "bash".to_string(), options);
-    let outcome = match case {
-        Case::Cancel => {
-            // The relay stays open. The parent releases the case once raw
-            // mode is observed, and this side then drops the session future,
-            // which must restore the terminal without a guest exit.
-            tokio::select! {
-                result = bridge => session_outcome(result),
-                _ = released_then_settle(dir) => Outcome::Cancelled,
+    // Most checked cases call the session directly, so the failure *kind* is
+    // asserted instead of a rendered string. `Input` and `Resize` keep going
+    // through `attach_connected`, so the dispatch and the crate-boundary
+    // conversion stay covered end to end.
+    let outcome = if case.legacy() || matches!(case, Case::Input | Case::Resize) {
+        session_outcome(unix::attach_connected(client, &config, "bash".to_string(), options).await)
+    } else {
+        let detach_keys = options
+            .resolved_detach_keys()
+            .expect("the case's detach keys");
+        let session =
+            unix::checked_session(client, &config, "bash".to_string(), options, detach_keys);
+        match case {
+            Case::Cancel => {
+                // The relay stays open. The parent releases the case once raw
+                // mode is observed, and this side then drops the session
+                // future, which must restore the terminal without a guest exit.
+                tokio::select! {
+                    result = session => checked_outcome(result),
+                    _ = released_then_settle(dir) => Outcome::Cancelled,
+                }
             }
+            _ => checked_outcome(session.await),
         }
-        _ => session_outcome(bridge.await),
     };
     relay.abort();
     outcome
@@ -934,6 +986,21 @@ fn session_outcome(result: crate::MicrosandboxResult<i32>) -> Outcome {
         Ok(code) => Outcome::Exited(code),
         Err(crate::MicrosandboxError::ExecFailed(_)) => Outcome::Error("exec-failed".into()),
         Err(error) => Outcome::Error(format!("terminal:{error}")),
+    }
+}
+
+/// The outcome of a checked session, by failure kind rather than by text.
+///
+/// `attach:<kind>:<text>` is what the parent's assertions match: the kind is
+/// the interface, the text is diagnostic.
+fn checked_outcome(result: Result<i32, CheckedFailure>) -> Outcome {
+    match result {
+        Ok(code) => Outcome::Exited(code),
+        Err(CheckedFailure::Spawn(_)) => Outcome::Error("exec-failed".into()),
+        Err(CheckedFailure::Session(error)) => {
+            Outcome::Error(format!("attach:{:?}:{error}", error.kind()))
+        }
+        Err(CheckedFailure::Setup(error)) => Outcome::Error(format!("setup:{error}")),
     }
 }
 
@@ -1170,10 +1237,10 @@ async fn fake_relay(mut io: DuplexStream, dir: PathBuf, case: Case) {
             // Keep the connection open while the parent releases the case.
             tokio::time::sleep(Duration::from_secs(2)).await;
         }
-        Case::LegacyDetach => {
+        Case::LegacyDetach | Case::CheckedDetach => {
             // No guest exit and no closure: only the typed detach sequence can
-            // end this legacy session, and the parent releases the relay only
-            // after the child has reported that it did.
+            // end this session, and the parent releases the relay only after
+            // the child has reported how it ended.
             wait_for_dir(&dir, "release").await;
         }
         Case::Filtered | Case::FilteredLegacy => {
