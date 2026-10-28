@@ -621,11 +621,19 @@ pub(crate) mod agent {
     /// Memory accounting only. A full queue waits for the consumer, so guest
     /// backpressure stalls the session exactly as a native write to a slow
     /// terminal would; it never fails and never drops output.
-    const CHECKED_OUTPUT_MAX_PENDING_BYTES: usize = 8 * 1024 * 1024;
+    pub(super) const CHECKED_OUTPUT_MAX_PENDING_BYTES: usize = 8 * 1024 * 1024;
 
     /// Largest queued frame. A guest frame is split so one reservation can never
     /// exceed the bound above.
     const CHECKED_OUTPUT_CHUNK_BYTES: usize = 64 * 1024;
+
+    /// Most staged chunks one session may hold read but not yet queued.
+    ///
+    /// Staging is what keeps failure observation live across a capacity wait, so
+    /// it is bounded like the writer's own queue rather than growing with a
+    /// flooding guest.
+    const CHECKED_STAGED_CHUNKS: usize =
+        CHECKED_OUTPUT_MAX_PENDING_BYTES / CHECKED_OUTPUT_CHUNK_BYTES;
 
     /// Host terminal read size: one `read(2)`, one `ExecStdin` frame.
     const CHECKED_INPUT_CHUNK_BYTES: usize = 1024;
@@ -914,7 +922,7 @@ pub(crate) mod agent {
             .map_err(|error| checked_failure(format!("opening the host tty: {error}")))?;
         let input = AsyncFd::new(tty_input)
             .map_err(|error| checked_failure(format!("registering the host tty: {error}")))?;
-        let mut output = CheckedOutput::start(std::io::stdout().as_raw_fd())?;
+        let output = CheckedOutput::start(std::io::stdout().as_raw_fd())?;
         let mut sigwinch =
             tokio::signal::unix::signal(tokio::signal::unix::SignalKind::window_change())
                 .map_err(|error| checked_failure(format!("watching terminal resizes: {error}")))?;
@@ -924,77 +932,83 @@ pub(crate) mod agent {
         // its session: only feeding stops, and its own exit event still ends it.
         let mut feeding_input = true;
         let mut input_buffer = [0u8; CHECKED_INPUT_CHUNK_BYTES];
+        // Guest output read but not yet handed to the writer. Keeping it here
+        // instead of awaiting capacity inside the message handler is what makes a
+        // capacity wait interruptible: a closed guest channel or a dead writer
+        // still ends the session while the host consumer is not draining.
+        let mut pending: VecDeque<Vec<u8>> = VecDeque::new();
         // A filter runs on its own task here exactly as it does for a legacy
         // caller: `push` never blocks this loop, and its output is drained by the
         // arm below, in the order the filter produced it.
         let mut filtered_stdin = stdin_filter.map(FilteredStdin::spawn);
 
         let end = 'session: loop {
-            tokio::select! {
-                ready = input.readable(), if feeding_input => {
-                    let mut readiness = ready.map_err(|error| {
-                        checked_failure(format!("waiting for host terminal input: {error}"))
-                    })?;
-                    let read = readiness.try_io(|inner| {
-                        read_from_fd(inner.get_ref().as_raw_fd(), &mut input_buffer)
-                    });
-                    let count = match read {
-                        Ok(Ok(count)) => count,
-                        Ok(Err(error)) if error.kind() == std::io::ErrorKind::Interrupted => {
-                            continue;
-                        }
-                        Ok(Err(error)) => {
-                            return Err(checked_failure(format!("reading host terminal input: {error}")));
-                        }
-                        // Spurious readiness: nothing to read yet.
-                        Err(_would_block) => continue,
-                    };
-                    drop(readiness);
+            let Some(chunk) = pending.pop_front() else {
+                tokio::select! {
+                    ready = input.readable(), if feeding_input => {
+                        let mut readiness = ready.map_err(|error| {
+                            checked_failure(format!("waiting for host terminal input: {error}"))
+                        })?;
+                        let read = readiness.try_io(|inner| {
+                            read_from_fd(inner.get_ref().as_raw_fd(), &mut input_buffer)
+                        });
+                        let count = match read {
+                            Ok(Ok(count)) => count,
+                            Ok(Err(error)) if error.kind() == std::io::ErrorKind::Interrupted => {
+                                continue;
+                            }
+                            Ok(Err(error)) => {
+                                return Err(checked_failure(format!("reading host terminal input: {error}")));
+                            }
+                            // Spurious readiness: nothing to read yet.
+                            Err(_would_block) => continue,
+                        };
+                        drop(readiness);
 
-                    if count == 0 {
-                        return Err(checked_failure(
-                            "host terminal input ended before the guest reported its exit",
-                        ));
-                    }
-
-                    // Routing is shared with the legacy session, so a filter sees
-                    // every chunk the same way and in the same order; only what a
-                    // detach, an ended worker or a failed send *mean* is stricter
-                    // here. The whole chunk, including any escape byte, reaches the
-                    // guest unchanged when nothing detaches.
-                    match route_input(
-                        &input_buffer[..count],
-                        detach_keys,
-                        &mut match_pos,
-                        filtered_stdin.as_ref(),
-                    ) {
-                        InputRoute::Detach => {
+                        if count == 0 {
                             return Err(checked_failure(
-                                "the detach key sequence ended the session before the guest reported its exit",
+                                "host terminal input ended before the guest reported its exit",
                             ));
                         }
-                        InputRoute::Filtered => {}
-                        InputRoute::WorkerEnded => {
-                            return Err(checked_failure(STDIN_FILTER_TASK_ENDED));
-                        }
-                        InputRoute::Forward => {
-                            client
-                                .send(
-                                    id,
-                                    MessageType::ExecStdin,
-                                    &ExecStdin {
-                                        data: input_buffer[..count].to_vec(),
-                                    },
-                                )
-                                .await
-                                .map_err(|error| {
-                                    checked_failure(format!(
-                                        "forwarding host terminal input: {error}"
-                                    ))
-                                })?;
+
+                        // Routing is shared with the legacy session, so a filter sees
+                        // every chunk the same way and in the same order; only what a
+                        // detach, an ended worker or a failed send *mean* is stricter
+                        // here. The whole chunk, including any escape byte, reaches the
+                        // guest unchanged when nothing detaches.
+                        match route_input(
+                            &input_buffer[..count],
+                            detach_keys,
+                            &mut match_pos,
+                            filtered_stdin.as_ref(),
+                        ) {
+                            InputRoute::Detach => {
+                                return Err(checked_failure(
+                                    "the detach key sequence ended the session before the guest reported its exit",
+                                ));
+                            }
+                            InputRoute::Filtered => {}
+                            InputRoute::WorkerEnded => {
+                                return Err(checked_failure(STDIN_FILTER_TASK_ENDED));
+                            }
+                            InputRoute::Forward => {
+                                client
+                                    .send(
+                                        id,
+                                        MessageType::ExecStdin,
+                                        &ExecStdin {
+                                            data: input_buffer[..count].to_vec(),
+                                        },
+                                    )
+                                    .await
+                                    .map_err(|error| {
+                                        checked_failure(format!(
+                                            "forwarding host terminal input: {error}"
+                                        ))
+                                    })?;
+                            }
                         }
                     }
-                }
 
                 // Filtered bytes reach the guest only here, one produced chunk at
                 // a time: the worker is the only thing that ever holds a chunk
@@ -1017,7 +1031,7 @@ pub(crate) mod agent {
                         return Err(closed_session());
                     };
                     if let Some(end) =
-                        handle_checked_message(message, &mut output, &mut feeding_input).await?
+                        handle_checked_message(message, &mut pending, &mut feeding_input)?
                     {
                         break 'session end;
                     }
@@ -1029,8 +1043,7 @@ pub(crate) mod agent {
                         match rx.try_recv() {
                             Ok(next) => {
                                 drained =
-                                    handle_checked_message(next, &mut output, &mut feeding_input)
-                                        .await?;
+                                    handle_checked_message(next, &mut pending, &mut feeding_input)?;
                             }
                             // A disconnected channel is reported by the next
                             // receive as the closed session it is.
@@ -1042,6 +1055,11 @@ pub(crate) mod agent {
                     }
                 }
 
+                // The writer's own verdict, selectable without an enqueue or a
+                // finish: an unwritable host descriptor ends the session even
+                // while the guest sits at a prompt.
+                failure = output.failure() => return Err(failure),
+
                 _ = sigwinch.recv() => {
                     let (cols, rows) = stdin_terminal_size()?;
                     client
@@ -1051,15 +1069,47 @@ pub(crate) mod agent {
                             checked_failure(format!("sending a terminal resize to the guest: {error}"))
                         })?;
                 }
+                }
+                continue;
+            };
+
+            // One staged chunk waits for output capacity. Only session-ending
+            // events may interrupt it: `enqueue_chunk` is cancel-safe for a single
+            // chunk, and a chunk it did not take goes back to the front of the
+            // queue so the byte stream keeps its order.
+            let mut delivered = false;
+            tokio::select! {
+                result = output.enqueue_chunk(&chunk) => {
+                    result?;
+                    delivered = true;
+                }
+                message = rx.recv(), if pending.len() < CHECKED_STAGED_CHUNKS => {
+                    let Some(message) = message else {
+                        return Err(closed_session());
+                    };
+                    if let Some(end) =
+                        handle_checked_message(message, &mut pending, &mut feeding_input)?
+                    {
+                        break 'session end;
+                    }
+                }
+                failure = output.failure() => return Err(failure),
+            }
+            if !delivered {
+                pending.push_front(chunk);
             }
         };
 
         match end {
             CheckedEnd::Failed(failure) => Err(MicrosandboxError::ExecFailed(failure)),
             CheckedEnd::Exited(code) => {
-                // A definitive exit is necessary but not sufficient: the ordered
-                // finish receipt is what proves every earlier output byte reached
-                // the host descriptor before the terminal is restored.
+                // A definitive exit is necessary but not sufficient: output read
+                // before the exit event is delivered first, and the ordered finish
+                // receipt then proves every earlier byte reached the host
+                // descriptor before the terminal is restored.
+                while let Some(chunk) = pending.pop_front() {
+                    output.enqueue_chunk(&chunk).await?;
+                }
                 output.finish().await?;
                 Ok(code)
             }
@@ -1067,9 +1117,12 @@ pub(crate) mod agent {
     }
 
     /// One session event: `Some` ends the session, `None` continues it.
-    async fn handle_checked_message(
+    ///
+    /// Nothing here awaits: a handler that blocked on output capacity could not
+    /// receive a guest channel closing behind that output.
+    fn handle_checked_message(
         message: Message,
-        output: &mut CheckedOutput,
+        pending: &mut VecDeque<Vec<u8>>,
         feeding_input: &mut bool,
     ) -> MicrosandboxResult<Option<CheckedEnd>> {
         match message.t {
@@ -1077,7 +1130,7 @@ pub(crate) mod agent {
                 let frame: ExecStdout = message.payload().map_err(|error| {
                     checked_failure(format!("decoding guest terminal output: {error}"))
                 })?;
-                output.enqueue(frame.data).await?;
+                stage_output_chunks(frame.data, pending);
                 Ok(None)
             }
             MessageType::ExecExited => {
@@ -1271,6 +1324,16 @@ pub(crate) mod agent {
         Ok(unsafe { OwnedFd::from_raw_fd(duplicate) })
     }
 
+    /// Split one guest output frame into the bounded chunks the writer accepts.
+    fn stage_output_chunks(bytes: Vec<u8>, pending: &mut VecDeque<Vec<u8>>) {
+        let mut remaining = bytes;
+        while !remaining.is_empty() {
+            let mut chunk = remaining;
+            remaining = chunk.split_off(chunk.len().min(CHECKED_OUTPUT_CHUNK_BYTES));
+            pending.push_back(chunk);
+        }
+    }
+
     /// One unit of the checked output queue.
     enum CheckedOutputItem {
         Data(Vec<u8>),
@@ -1306,6 +1369,12 @@ pub(crate) mod agent {
         work: Condvar,
         /// Wakes capacity waiters after a write, a failure, or an abort.
         capacity: Notify,
+        /// Wakes a session that is waiting only for the writer's verdict.
+        ///
+        /// Deliberately separate from `capacity`: a writer failure has to reach
+        /// its session even when nothing is being enqueued, so it must not be
+        /// routed through guest progress.
+        failed: Notify,
     }
 
     impl CheckedOutputQueue {
@@ -1347,6 +1416,7 @@ pub(crate) mod agent {
             }
             self.work.notify_all();
             self.capacity.notify_waiters();
+            self.failed.notify_waiters();
         }
 
         fn release(&self, bytes: usize) {
@@ -1446,22 +1516,43 @@ pub(crate) mod agent {
             Ok(Self { queue })
         }
 
-        /// Split one guest frame into bounded, ordered chunks and enqueue them,
-        /// waiting for capacity between chunks.
-        async fn enqueue(&mut self, bytes: Vec<u8>) -> MicrosandboxResult<()> {
-            let mut remaining = bytes;
-            while !remaining.is_empty() {
-                let mut frame = remaining;
-                let tail = frame.split_off(frame.len().min(CHECKED_OUTPUT_CHUNK_BYTES));
-                remaining = tail;
-                self.reserve(frame.len()).await?;
-                {
-                    let mut state = self.queue.lock();
-                    state.items.push_back(CheckedOutputItem::Data(frame));
-                }
-                self.queue.work.notify_one();
+        /// Reserve capacity for one staged chunk, then queue it.
+        ///
+        /// Cancel-safe: the only suspension point is `reserve`, which has queued
+        /// nothing when it is dropped, and no await separates a successful
+        /// reservation from the queue push. A cancelled call therefore leaves
+        /// neither a reservation nor a partial frame, so the session can put the
+        /// chunk back at the head of its staging queue.
+        async fn enqueue_chunk(&self, bytes: &[u8]) -> MicrosandboxResult<()> {
+            debug_assert!(bytes.len() <= CHECKED_OUTPUT_CHUNK_BYTES);
+            self.reserve(bytes.len()).await?;
+            {
+                let mut state = self.queue.lock();
+                state
+                    .items
+                    .push_back(CheckedOutputItem::Data(bytes.to_vec()));
             }
+            self.queue.work.notify_one();
             Ok(())
+        }
+
+        /// The writer's own failure, as a future the session can select on.
+        ///
+        /// Waiting for capacity and waiting for the finish receipt both report a
+        /// stored failure, but only when the session calls them; a guest that
+        /// writes one frame and then waits for input would never call them again.
+        /// The notification is registered before the state is read, so a failure
+        /// that races the registration is observed rather than lost.
+        async fn failure(&self) -> MicrosandboxError {
+            loop {
+                let signal = self.queue.failed.notified();
+                tokio::pin!(signal);
+                signal.as_mut().enable();
+                if let Some(message) = self.queue.failure() {
+                    return checked_failure(message);
+                }
+                signal.await;
+            }
         }
 
         /// Wait until `bytes` more fit under the pending bound, then reserve them.
@@ -1495,7 +1586,7 @@ pub(crate) mod agent {
         ///
         /// Cancellable, like every other await in the session; the queue's abort
         /// then discards whatever the writer has not written.
-        async fn finish(&mut self) -> MicrosandboxResult<()> {
+        async fn finish(&self) -> MicrosandboxResult<()> {
             let (receipt, receipt_wait) = tokio::sync::oneshot::channel();
             {
                 let mut state = self.queue.lock();
@@ -1546,7 +1637,7 @@ pub(crate) mod agent {
         #[tokio::test]
         async fn every_queued_byte_reaches_the_descriptor_in_order() {
             let mut file = tempfile::tempfile().expect("a scratch output file");
-            let mut output = CheckedOutput::start(file.as_raw_fd()).expect("start the writer");
+            let output = CheckedOutput::start(file.as_raw_fd()).expect("start the writer");
 
             let mut expected = Vec::new();
             let frames: Vec<Vec<u8>> = vec![
@@ -1558,9 +1649,21 @@ pub(crate) mod agent {
                     .collect(),
                 b"tail\n".to_vec(),
             ];
+            let mut pending = VecDeque::new();
             for frame in frames {
                 expected.extend_from_slice(&frame);
-                within(output.enqueue(frame)).await.expect("enqueue");
+                stage_output_chunks(frame, &mut pending);
+            }
+            // Staging is where a frame is split, so no reservation can exceed the
+            // queue's chunk bound.
+            assert!(
+                pending
+                    .iter()
+                    .all(|chunk| !chunk.is_empty() && chunk.len() <= CHECKED_OUTPUT_CHUNK_BYTES),
+                "a staged chunk exceeded the queue's chunk bound"
+            );
+            while let Some(chunk) = pending.pop_front() {
+                within(output.enqueue_chunk(&chunk)).await.expect("enqueue");
             }
             within(output.finish()).await.expect("finish");
 
@@ -1577,7 +1680,7 @@ pub(crate) mod agent {
         ///
         /// The pipe's own buffer absorbs a little, so the count is discovered
         /// rather than assumed; a queue that failed instead of waiting panics.
-        async fn fill_until_blocked(output: &mut CheckedOutput) -> usize {
+        async fn fill_until_blocked(output: &CheckedOutput) -> usize {
             let mut queued = 0usize;
             loop {
                 // Slack for what the descriptor itself absorbed: the point is
@@ -1587,7 +1690,8 @@ pub(crate) mod agent {
                     "the queue never reached its pending bound"
                 );
                 let frame = vec![b'x'; CHECKED_OUTPUT_CHUNK_BYTES];
-                match tokio::time::timeout(Duration::from_millis(500), output.enqueue(frame)).await
+                match tokio::time::timeout(Duration::from_millis(500), output.enqueue_chunk(&frame))
+                    .await
                 {
                     Ok(Ok(())) => queued += CHECKED_OUTPUT_CHUNK_BYTES,
                     Ok(Err(error)) => {
@@ -1604,10 +1708,10 @@ pub(crate) mod agent {
             // reservations reach the bound, and the next enqueue must wait rather
             // than fail or drop bytes.
             let (mut read_end, write_end) = std::io::pipe().expect("a pipe");
-            let mut output = CheckedOutput::start(write_end.as_raw_fd()).expect("start the writer");
+            let output = CheckedOutput::start(write_end.as_raw_fd()).expect("start the writer");
             drop(write_end);
 
-            let queued = fill_until_blocked(&mut output).await;
+            let queued = fill_until_blocked(&output).await;
 
             // The consumer resumes: everything already queued still arrives, and
             // the session can finish after it.
@@ -1630,14 +1734,16 @@ pub(crate) mod agent {
             // The consumer never reads, so the writer stays blocked in `write(2)`
             // and the next sender waits for capacity.
             let (_read_end, write_end) = std::io::pipe().expect("a pipe");
-            let mut output = CheckedOutput::start(write_end.as_raw_fd()).expect("start the writer");
+            let output = CheckedOutput::start(write_end.as_raw_fd()).expect("start the writer");
             drop(write_end);
 
-            fill_until_blocked(&mut output).await;
+            fill_until_blocked(&output).await;
 
             let queue = Arc::clone(&output.queue);
             let blocked = tokio::spawn(async move {
-                output.enqueue(vec![b'z'; CHECKED_OUTPUT_CHUNK_BYTES]).await
+                output
+                    .enqueue_chunk(&[b'z'; CHECKED_OUTPUT_CHUNK_BYTES])
+                    .await
             });
             tokio::time::sleep(Duration::from_millis(200)).await;
             assert!(
@@ -1662,9 +1768,9 @@ pub(crate) mod agent {
             // The read end of a pipe cannot be written, so the worker's first
             // write fails and that failure must reach the session.
             let (read_end, _write_end) = std::io::pipe().expect("a pipe");
-            let mut output = CheckedOutput::start(read_end.as_raw_fd()).expect("start the writer");
+            let output = CheckedOutput::start(read_end.as_raw_fd()).expect("start the writer");
 
-            let mut failure = output.enqueue(b"lost\n".to_vec()).await.err();
+            let mut failure = output.enqueue_chunk(b"lost\n").await.err();
             if failure.is_none() {
                 failure = within(output.finish()).await.err();
             }
@@ -1672,16 +1778,64 @@ pub(crate) mod agent {
                 failure.is_some(),
                 "an unwritable descriptor must be reported"
             );
-            assert!(output.enqueue(b"more\n".to_vec()).await.is_err());
+            assert!(output.enqueue_chunk(b"more\n").await.is_err());
+        }
+
+        #[tokio::test]
+        async fn a_writer_failure_wakes_a_session_that_is_not_enqueueing() {
+            // The session has one frame in flight and then waits for input, as a
+            // live terminal session does while the guest sits at a prompt. The
+            // writer's failure has to reach that wait on its own: nothing else
+            // calls `enqueue_chunk` or `finish` again.
+            let (read_end, write_end) = std::io::pipe().expect("a pipe");
+            let output = CheckedOutput::start(write_end.as_raw_fd()).expect("start the writer");
+            drop(write_end);
+            drop(read_end);
+
+            within(output.enqueue_chunk(b"one frame\n"))
+                .await
+                .expect("the queue accepts the frame");
+            let failure = within(output.failure()).await;
+            assert!(
+                failure.to_string().contains("writing guest output"),
+                "the session must see the output-specific failure: {failure}"
+            );
+        }
+
+        #[tokio::test]
+        async fn a_writer_failure_reaches_a_session_stuck_on_capacity() {
+            // The consumer never reads, so the writer is blocked inside `write(2)`
+            // and a staged chunk cannot be delivered. The consumer then disappears:
+            // the session must learn that while it is still waiting for capacity,
+            // not only if it ever calls `enqueue_chunk` or `finish` again.
+            let (read_end, write_end) = std::io::pipe().expect("a pipe");
+            let output = CheckedOutput::start(write_end.as_raw_fd()).expect("start the writer");
+            drop(write_end);
+
+            fill_until_blocked(&output).await;
+            drop(read_end);
+
+            let staged = vec![b'q'; CHECKED_OUTPUT_CHUNK_BYTES];
+            let failure = tokio::select! {
+                result = output.enqueue_chunk(&staged) => match result {
+                    Ok(()) => panic!("the queue accepted a chunk past its bound"),
+                    Err(error) => error,
+                },
+                failure = output.failure() => failure,
+            };
+            assert!(
+                failure.to_string().contains("writing guest output"),
+                "the capacity wait must report the writer's failure: {failure}"
+            );
         }
 
         #[tokio::test]
         async fn an_idle_writer_aborts_without_waiting() {
             let file = tempfile::tempfile().expect("a scratch output file");
-            let mut output = CheckedOutput::start(file.as_raw_fd()).expect("start the writer");
+            let output = CheckedOutput::start(file.as_raw_fd()).expect("start the writer");
             // A shared queue handle stands in for the session that cancels.
             let queue = Arc::clone(&output.queue);
-            within(output.enqueue(b"queued\n".to_vec()))
+            within(output.enqueue_chunk(b"queued\n"))
                 .await
                 .expect("enqueue");
 
@@ -1691,7 +1845,7 @@ pub(crate) mod agent {
                 started.elapsed() < Duration::from_secs(1),
                 "abort must not wait for the worker"
             );
-            assert!(output.enqueue(b"after\n".to_vec()).await.is_err());
+            assert!(output.enqueue_chunk(b"after\n").await.is_err());
             assert!(within(output.finish()).await.is_err());
         }
     }
@@ -2243,20 +2397,25 @@ mod pty_tests {
         Malformed,
         /// A closed event channel without an exit is an error.
         Closed,
-        /// An unwritable output descriptor is an error.
+        /// An unwritable output descriptor is an error the session reports on
+        /// its own, while the relay is still alive.
         OutputFailure,
+        /// A lost relay is still observed once output has filled the writer's
+        /// bound.
+        OutputBackpressure,
         /// Dropping the session future restores the terminal.
         Cancel,
     }
 
     impl Case {
-        const ALL: [Case; 7] = [
+        const ALL: [Case; 8] = [
             Case::Input,
             Case::Resize,
             Case::Failed,
             Case::Malformed,
             Case::Closed,
             Case::OutputFailure,
+            Case::OutputBackpressure,
             Case::Cancel,
         ];
 
@@ -2268,6 +2427,7 @@ mod pty_tests {
                 Case::Malformed => "malformed",
                 Case::Closed => "closed",
                 Case::OutputFailure => "output-failure",
+                Case::OutputBackpressure => "output-backpressure",
                 Case::Cancel => "cancel",
             }
         }
@@ -2341,11 +2501,22 @@ mod pty_tests {
                 )
                 .expect("send SIGWINCH");
             }
-            Case::Failed | Case::Malformed | Case::Closed | Case::OutputFailure | Case::Cancel => {}
+            Case::Failed
+            | Case::Malformed
+            | Case::Closed
+            | Case::OutputFailure
+            | Case::OutputBackpressure
+            | Case::Cancel => {}
         }
         std::fs::write(dir.join("go"), b"go").expect("release the child");
 
         let receipt = wait_for_receipt(dir);
+        // The output-failure case keeps its relay open on purpose: the session must
+        // end on the writer's own failure, so the parent releases the relay only
+        // after the child has already reported its outcome.
+        if case == Case::OutputFailure {
+            std::fs::write(dir.join("release"), b"release").expect("release the relay");
+        }
         wait_for_exit(&mut child);
 
         // A terminal that is not restored is the defect this whole path exists to
@@ -2398,10 +2569,28 @@ mod pty_tests {
                     case.name()
                 );
             }
-            Case::Malformed | Case::Closed | Case::OutputFailure => {
+            Case::Malformed | Case::Closed => {
                 assert!(
                     outcome.starts_with("err:terminal:"),
                     "case {}: a session failure must be reported: {receipt}",
+                    case.name()
+                );
+            }
+            Case::OutputFailure => {
+                // The relay was still open when this session ended, so the failure
+                // can only be the writer's own.
+                assert!(
+                    outcome.contains("writing guest output"),
+                    "case {}: an unwritable descriptor must be reported as an output \
+                     failure, not as any other terminal error: {receipt}",
+                    case.name()
+                );
+            }
+            Case::OutputBackpressure => {
+                assert!(
+                    outcome.contains("closed before the guest reported its exit"),
+                    "case {}: a relay lost while output capacity was exhausted must be \
+                     reported: {receipt}",
                     case.name()
                 );
             }
@@ -2592,10 +2781,18 @@ mod pty_tests {
         // duplicates fd 1, so nothing libtest prints can be mistaken for a guest
         // byte. The output-failure case instead points fd 1 at a pipe whose read
         // end is already closed.
+        // A held read end keeps an output pipe open but undrained, so the writer
+        // blocks on capacity instead of failing on a closed descriptor.
+        let mut held_read_end: Option<std::os::fd::OwnedFd> = None;
         let capture: std::os::fd::OwnedFd = match case {
             Case::OutputFailure => {
                 let (read_end, write_end) = std::io::pipe().expect("an output pipe");
                 drop(read_end);
+                write_end.into()
+            }
+            Case::OutputBackpressure => {
+                let (read_end, write_end) = std::io::pipe().expect("an output pipe");
+                held_read_end = Some(read_end.into());
                 write_end.into()
             }
             _ => std::fs::OpenOptions::new()
@@ -2621,6 +2818,7 @@ mod pty_tests {
 
         assert_eq!(unsafe { libc::dup2(saved_stdout, 1) }, 1);
         unsafe { libc::close(saved_stdout) };
+        drop(held_read_end);
         drop(capture);
         outcome
     }
@@ -2838,8 +3036,35 @@ mod pty_tests {
                     .unwrap(),
                 )
                 .await;
-                // No exit: the unwritable descriptor is the session's failure.
-                tokio::time::sleep(Duration::from_secs(2)).await;
+                append(&dir, &["stage=output-sent".to_string()]);
+                // No exit and no closure: the unwritable descriptor alone has to end
+                // the session. The parent releases this barrier only after the child
+                // has reported its outcome.
+                wait_for_dir(&dir, "release").await;
+            }
+            Case::OutputBackpressure => {
+                // The host descriptor takes one pipe buffer and is then never read
+                // again, so the writer blocks and the session's outstanding output
+                // reaches its bound. The relay then closes with output still owed
+                // and no exit event: capacity backpressure must not hide that.
+                let frame = vec![b'x'; 256 * 1024];
+                let frames = agent::CHECKED_OUTPUT_MAX_PENDING_BYTES / frame.len() + 2;
+                for _ in 0..frames {
+                    write(
+                        &mut io,
+                        Message::with_payload(
+                            MessageType::ExecStdout,
+                            id,
+                            &ExecStdout {
+                                data: frame.clone(),
+                            },
+                        )
+                        .unwrap(),
+                    )
+                    .await;
+                }
+                append(&dir, &["stage=output-flooded".to_string()]);
+                drop(io);
             }
             Case::Cancel => {
                 // Keep the connection open while the parent releases the case.
