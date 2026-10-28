@@ -2421,10 +2421,20 @@ mod pty_tests {
         /// The no-options legacy session still reports `Ok(-1)` for a channel
         /// that closed without a guest exit.
         LegacyClosed,
+        /// A filter set beside `checked_session()` is honoured, one chunk at a
+        /// time and in input order: the guest sees the filter's tags, not raw
+        /// input.
+        Filtered,
+        /// A filtered chunk that produces no bytes is swallowed rather than
+        /// forwarded raw, and the session still completes.
+        FilteredSwallow,
+        /// The same filter without `checked_session()`: a checked session must not
+        /// change what the filter sees.
+        FilteredLegacy,
     }
 
     impl Case {
-        const ALL: [Case; 10] = [
+        const ALL: [Case; 13] = [
             Case::Input,
             Case::Resize,
             Case::Failed,
@@ -2435,6 +2445,9 @@ mod pty_tests {
             Case::Cancel,
             Case::LegacyDetach,
             Case::LegacyClosed,
+            Case::Filtered,
+            Case::FilteredSwallow,
+            Case::FilteredLegacy,
         ];
 
         /// Whether this case drives the untouched default session instead of the
@@ -2455,6 +2468,9 @@ mod pty_tests {
                 Case::Cancel => "cancel",
                 Case::LegacyDetach => "legacy-detach",
                 Case::LegacyClosed => "legacy-closed",
+                Case::Filtered => "filtered",
+                Case::FilteredSwallow => "filtered-swallow",
+                Case::FilteredLegacy => "filtered-legacy",
             }
         }
 
@@ -2532,6 +2548,35 @@ mod pty_tests {
                 let mut master = std::fs::File::from(pty.master.try_clone().expect("clone master"));
                 master.write_all(b"\x1d").expect("type the detach sequence");
                 master.flush().expect("flush the detach sequence");
+            }
+            Case::Filtered | Case::FilteredLegacy => {
+                // Released before typing, unlike the input case: the relay has to
+                // be reading frames for the parent to step one chunk at a time.
+                std::fs::write(dir.join("go"), b"go").expect("release the relay");
+                let mut master = std::fs::File::from(pty.master.try_clone().expect("clone master"));
+                // Each chunk is typed only after the filter's tag for the previous
+                // one reached the guest, so the frames are per chunk and ordered by
+                // construction rather than by a sleep.
+                for (typed, tag) in [
+                    (b'a', "stdin_frame=30"),
+                    (b'b', "stdin_frame=31"),
+                    (b'c', "stdin_frame=32"),
+                ] {
+                    master.write_all(&[typed]).expect("type at the terminal");
+                    master.flush().expect("flush the terminal input");
+                    wait_for(dir, tag);
+                }
+            }
+            Case::FilteredSwallow => {
+                std::fs::write(dir.join("go"), b"go").expect("release the relay");
+                let mut master = std::fs::File::from(pty.master.try_clone().expect("clone master"));
+                // The first chunk produces no bytes at all; the filter only sees the
+                // second one after it. Nothing may reach the guest for the first.
+                master.write_all(b"a").expect("type the swallowed chunk");
+                master.flush().expect("flush the swallowed chunk");
+                std::thread::sleep(Duration::from_millis(200));
+                master.write_all(b"b").expect("type the forwarded chunk");
+                master.flush().expect("flush the forwarded chunk");
             }
             Case::Failed
             | Case::Malformed
@@ -2641,6 +2686,28 @@ mod pty_tests {
             Case::Cancel => {
                 assert_eq!(outcome, "cancelled", "case {}: {receipt}", case.name());
             }
+            Case::Filtered | Case::FilteredLegacy => {
+                // Identical frames and status for both sessions: `checked_session`
+                // changes what a failure means, never what the filter sees.
+                assert_eq!(outcome, "ok:0", "case {}: {receipt}", case.name());
+                assert_eq!(
+                    stdin_frames(dir),
+                    ["30", "31", "32"],
+                    "case {}: every chunk must reach the guest as exactly the filter's \
+                     bytes, one frame at a time and in input order",
+                    case.name()
+                );
+            }
+            Case::FilteredSwallow => {
+                assert_eq!(outcome, "ok:0", "case {}: {receipt}", case.name());
+                assert_eq!(
+                    stdin_frames(dir),
+                    ["62"],
+                    "case {}: the swallowed chunk must not be forwarded raw, and the \
+                     session must still complete",
+                    case.name()
+                );
+            }
         }
         drain_stdout.join().expect("drain child stdout");
         drain_stderr.join().expect("drain child stderr");
@@ -2741,6 +2808,14 @@ mod pty_tests {
 
     fn wait_for_receipt(dir: &Path) -> String {
         wait_for_receipt_file(dir, "child.receipt")
+    }
+
+    /// Every `ExecStdin` frame the relay recorded, in arrival order.
+    fn stdin_frames(dir: &Path) -> Vec<String> {
+        wait_for_receipt_file(dir, "relay.receipt")
+            .lines()
+            .filter_map(|line| line.strip_prefix("stdin_frame=").map(str::to_owned))
+            .collect()
     }
 
     /// The case child, killed and reaped if this parent panics.
@@ -2907,11 +2982,22 @@ mod pty_tests {
             .env("PATH", "/opt/agent-vm-bin");
         // The legacy cases call neither opt-in, so this is exactly the session
         // every existing caller gets: default detach interception, best-effort
-        // output and the -1 sentinel.
-        let options = if case.legacy() {
-            builder
-        } else {
-            builder.disable_detach_keys().checked_session()
+        // output and the -1 sentinel. The filter cases add `stdin_filter` on top
+        // of the checked session, which is the composition under test.
+        let options = match case {
+            Case::Filtered => builder
+                .disable_detach_keys()
+                .checked_session()
+                .stdin_filter(TagChunks::default()),
+            Case::FilteredSwallow => builder
+                .disable_detach_keys()
+                .checked_session()
+                .stdin_filter(SwallowA),
+            Case::FilteredLegacy => builder
+                .disable_detach_keys()
+                .stdin_filter(TagChunks::default()),
+            _ if case.legacy() => builder,
+            _ => builder.disable_detach_keys().checked_session(),
         }
         .build()
         .expect("session options");
@@ -3158,6 +3244,46 @@ mod pty_tests {
                 // after the child has reported that it did.
                 wait_for_dir(&dir, "release").await;
             }
+            Case::Filtered | Case::FilteredLegacy => {
+                // One frame per filtered chunk: a chunk queued behind a busy filter
+                // may not overtake it, so the tags have to arrive in order.
+                let mut seen = 0;
+                while seen < 3 {
+                    let Some(message) = read(&mut io).await else {
+                        break;
+                    };
+                    if message.t != MessageType::ExecStdin {
+                        continue;
+                    }
+                    let frame: ExecStdin = message.payload().expect("stdin payload");
+                    append(&dir, &[format!("stdin_frame={}", hex(&frame.data))]);
+                    seen += 1;
+                }
+                write(
+                    &mut io,
+                    Message::with_payload(MessageType::ExecExited, id, &ExecExited { code: 0 })
+                        .unwrap(),
+                )
+                .await;
+            }
+            Case::FilteredSwallow => {
+                // The swallowed chunk produces no frame; the first frame the guest
+                // sees must therefore come from the second chunk.
+                while let Some(message) = read(&mut io).await {
+                    if message.t != MessageType::ExecStdin {
+                        continue;
+                    }
+                    let frame: ExecStdin = message.payload().expect("stdin payload");
+                    append(&dir, &[format!("stdin_frame={}", hex(&frame.data))]);
+                    break;
+                }
+                write(
+                    &mut io,
+                    Message::with_payload(MessageType::ExecExited, id, &ExecExited { code: 0 })
+                        .unwrap(),
+                )
+                .await;
+            }
             Case::LegacyClosed => {
                 write(
                     &mut io,
@@ -3224,6 +3350,46 @@ mod pty_tests {
             writeln!(file, "{line}").expect("write the relay receipt");
         }
         file.flush().expect("flush the relay receipt");
+    }
+
+    // The filters the two filter cases install.
+
+    /// Replaces each chunk with the next tag byte, slowly.
+    ///
+    /// The delay is what makes an implementation that forwarded a raw chunk, or
+    /// that let a later chunk overtake a busy filter, visible in the relay's
+    /// frames rather than merely slow: no raw byte can appear, and no tag can be
+    /// duplicated or reordered.
+    #[derive(Default)]
+    struct TagChunks {
+        next: u8,
+    }
+
+    impl super::StdinFilter for TagChunks {
+        fn filter<'a>(
+            &'a mut self,
+            _data: &'a [u8],
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Vec<u8>> + Send + 'a>> {
+            let tag = b'0' + self.next;
+            self.next += 1;
+            Box::pin(async move {
+                tokio::time::sleep(Duration::from_millis(150)).await;
+                vec![tag]
+            })
+        }
+    }
+
+    /// Swallows every `a`, forwards the rest: a filter that emits nothing.
+    struct SwallowA;
+
+    impl super::StdinFilter for SwallowA {
+        fn filter<'a>(
+            &'a mut self,
+            data: &'a [u8],
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Vec<u8>> + Send + 'a>> {
+            let out: Vec<u8> = data.iter().copied().filter(|byte| *byte != b'a').collect();
+            Box::pin(async move { out })
+        }
     }
 }
 
