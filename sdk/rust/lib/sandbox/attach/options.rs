@@ -126,7 +126,7 @@ impl AttachOptionsBuilder {
         self
     }
 
-    /// Key sequence to detach from the session without stopping it.
+    /// Key sequence that ends the session when typed.
     /// Uses Docker-style syntax: `"ctrl-]"` (default), `"ctrl-p,ctrl-q"`,
     /// or a single character like `"q"`.
     ///
@@ -193,7 +193,11 @@ impl AttachOptionsBuilder {
     ///   sequence is host input and waits behind the same send;
     /// * **detach is an error here.** With detach keys enabled (the default, or
     ///   [`detach_keys`](Self::detach_keys)), typing the sequence ends the
-    ///   session with an error and leaves the guest running. Use
+    ///   session with an error instead of reporting a status. The SDK ends the
+    ///   session; the local VM runtime then kills that session's guest
+    ///   processes when the client disconnects, so a detached command is not
+    ///   left running (only a process that left the session, such as one
+    ///   started with `setsid`, survives it). Use
     ///   [`disable_detach_keys`](Self::disable_detach_keys) for a session that
     ///   only the guest can end;
     /// * the host terminal's raw state is restored explicitly on both the normal

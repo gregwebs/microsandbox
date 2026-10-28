@@ -306,7 +306,7 @@ msb exec -t worker -e DEBUG=1 -w /app -- python
 </CodeGroup>
 
 <Tip>
-  Press `Ctrl+]` (or your configured detach keys) to detach from the session without stopping the process. The process keeps running inside the VM and you can reattach later via its session ID.
+  Press `Ctrl+]` (or your configured detach keys) to detach from the session. Detaching ends the session, and the runtime then kills that session's processes when the client disconnects, so the command does not keep running inside the VM. The sandbox itself keeps running.
 </Tip>
 
 ## Write stdin

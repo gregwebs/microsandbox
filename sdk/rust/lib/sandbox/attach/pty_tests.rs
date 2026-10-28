@@ -816,8 +816,11 @@ fn run_case(dir: &Path, case: Case) {
             );
         }
         Case::CheckedDetach => {
-            // A checked session turns the detach sequence into an error and
-            // leaves the guest running; the terminal must still be restored.
+            // A checked session turns the detach sequence into an error. What
+            // the guest process does afterwards is the runtime's business and
+            // not observable here: the runtime kills the session's guest
+            // processes once the client disconnects. The terminal must still
+            // be restored.
             assert!(
                 outcome.starts_with("err:attach:Detached:"),
                 "case {}: a detach in a checked session is an error: {receipt}",

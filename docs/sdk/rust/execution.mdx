@@ -371,7 +371,7 @@ let exit_code = sb.attach("bash", ["-l"]).await?;
 
 </Accordion>
 
-Bridge your terminal directly to a process inside the sandbox for a fully interactive PTY session. The host terminal is put into raw mode and its stdin, stdout, and window-size changes are wired to the guest process. Press the detach key (default `Ctrl+]`) to disconnect without stopping the process; it keeps running in the guest. Returns when the process exits or you detach.
+Bridge your terminal directly to a process inside the sandbox for a fully interactive PTY session. The host terminal is put into raw mode and its stdin, stdout, and window-size changes are wired to the guest process. Press the detach key (default `Ctrl+]`) to end the session and return to your shell. Detaching does not leave the command running: the SDK ends the session, and the local VM runtime then kills that session's guest processes, so only a process that left the session (for example one started with `setsid`) survives it. Returns when the process exits or you detach.
 
 <p className="msb-label">Parameters</p>
 
@@ -837,7 +837,7 @@ Set multiple environment variables for the attached session at once.
 fn detach_keys(self, keys: impl Into<String>) -> Self
 ```
 
-Set the key sequence that detaches from the session without stopping the process. Docker-style syntax: `"ctrl-]"` (default), `"ctrl-p,ctrl-q"` for a multi-key sequence, or a single character like `"q"`.
+Set the key sequence that ends the session when typed. Docker-style syntax: `"ctrl-]"` (default), `"ctrl-p,ctrl-q"` for a multi-key sequence, or a single character like `"q"`.
 
 <p className="msb-label">Parameters</p>
 
@@ -874,7 +874,7 @@ With the checked session:
 - malformed output/exit/failure payloads, host input read errors, every input and resize send, output write/flush errors, a closed event channel, and host input EOF before the guest exits are errors;
 - a guest `EPIPE` or `EIO` for stdin is expected: the guest closed its input, or its PTY is gone because it is exiting. Feeding stops and the session still waits for the guest's exit; any other stdin error is an error;
 - at most one send to the guest is in flight at a time, on both platforms. Host input, filtered input and resizes wait behind it: they are forwarded once, in order, and never restarted part-way, so a chunk cannot be duplicated or overtaken. The guest's exit, its output and a writer failure are not held back by that send, so a stalled relay cannot keep the session raw once an exit or a channel closure can be received. How much of them a session can receive is limited separately: on Unix by the output retention bound below, and on Windows by how fast the console accepts inline writes. Until one of them can be received the session stays raw, and detaching does not help, because the detach sequence is host input and waits behind the same send;
-- detach is an error here. With detach keys enabled (the default, or `detach_keys()`), the sequence ends the session with an error and leaves the guest running. Use [`disable_detach_keys()`](#attach_options-disable_detach_keys) for a session that only the guest can end;
+- detach is an error here. With detach keys enabled (the default, or `detach_keys()`), the sequence ends the session with an error instead of reporting a status. The SDK ends the session and the local VM runtime then kills that session's guest processes when the client disconnects, so a detached command is not left running; only a process that left the session (for example one started with `setsid`) survives it. Use [`disable_detach_keys()`](#attach_options-disable_detach_keys) for a session that only the guest can end;
 - the host terminal is restored explicitly on both normal and error returns, and a restoration failure is reported rather than hidden (a device that has gone away cannot be guaranteed restorable);
 - after a failure, guest output the session already holds is still delivered while the host accepts it. Delivery stops after 500 ms without progress or 5 s in total, so a stalled or crawling consumer cannot delay the error and the terminal restore for ever;
 - on Unix, guest output is written by a dedicated thread over a duplicated stdout descriptor. Guest output backpressure waits for the consumer and bytes are never dropped. Retention inside the session is bounded by two queues, each measured by allocation: up to 8 MiB of staged chunks read ahead of the writer, plus up to 8 MiB queued for the writer or in flight in it. That bound covers those two queues only: it excludes transient allocations (decoding holds a frame beside its encoded message, and staging copies a frame into chunks before dropping it) as well as the agent client's own buffers upstream of the session. A genuinely unwritable descriptor (closed pipe) or runtime loss is an error. The writer's failure is its own session event, so an unwritable descriptor ends the session even while the host consumer is stalled. Losing the guest channel is *not* observable that way: while the host is not draining, a closed relay sits behind guest output the session has not been able to receive (see the list below). Cancellation aborts without joining that thread, so a write already in progress may reach the descriptor or keep it until the process exits, and no Tokio blocking task is left for `Runtime::drop` to wait on;
