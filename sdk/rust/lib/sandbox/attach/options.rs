@@ -7,7 +7,7 @@ use microsandbox_types::EnvVar;
 use crate::MicrosandboxResult;
 use crate::sandbox::exec::{Rlimit, RlimitResource, validate_rlimits};
 
-use super::DetachKeys;
+use super::{DetachKeys, StdinFilter};
 
 //--------------------------------------------------------------------------------------------------
 // Types
@@ -364,188 +364,190 @@ impl fmt::Debug for DetachPolicyDebug<'_> {
 // Tests
 //--------------------------------------------------------------------------------------------------
 
-use super::*;
-
-#[test]
-fn the_default_builder_still_intercepts_ctrl_bracket() {
-    let options = AttachOptionsBuilder::default().build().unwrap();
-    let keys = options
-        .resolved_detach_keys()
-        .unwrap()
-        .expect("an unset sequence means the default, not no interception");
-    assert_eq!(keys.sequence(), &[0x1d]);
-    assert!(!options.checked_session, "checked completion stays opt-in");
-}
-
-#[test]
-fn a_custom_sequence_is_unchanged_and_the_last_setter_wins() {
-    let custom = AttachOptionsBuilder::default()
-        .detach_keys("ctrl-p,ctrl-q")
-        .build()
-        .unwrap();
-    assert_eq!(
-        custom.resolved_detach_keys().unwrap().unwrap().sequence(),
-        &[0x10, 0x11]
-    );
-
-    // disable then set: interception comes back with that sequence.
-    let reenabled = AttachOptionsBuilder::default()
-        .disable_detach_keys()
-        .detach_keys("ctrl-a")
-        .build()
-        .unwrap();
-    assert_eq!(
-        reenabled
-            .resolved_detach_keys()
-            .unwrap()
-            .unwrap()
-            .sequence(),
-        &[0x01]
-    );
-
-    // set then disable: interception is off for this session.
-    let disabled = AttachOptionsBuilder::default()
-        .detach_keys("ctrl-a")
-        .disable_detach_keys()
-        .build()
-        .unwrap();
-    assert!(disabled.resolved_detach_keys().unwrap().is_none());
-}
-
-#[test]
-fn disabling_interception_is_per_session() {
-    let disabled = AttachOptionsBuilder::default()
-        .disable_detach_keys()
-        .build()
-        .unwrap();
-    assert!(disabled.resolved_detach_keys().unwrap().is_none());
-    // A later default builder is unaffected: nothing global changed.
-    let next = AttachOptionsBuilder::default().build().unwrap();
-    assert_eq!(
-        next.resolved_detach_keys().unwrap().unwrap().sequence(),
-        &[0x1d]
-    );
-}
-
-#[test]
-fn checked_completion_and_detach_disable_are_independent() {
-    let checked_only = AttachOptionsBuilder::default()
-        .checked_session()
-        .build()
-        .unwrap();
-    assert!(checked_only.checked_session);
-    assert_eq!(
-        checked_only
-            .resolved_detach_keys()
-            .unwrap()
-            .expect("checked alone does not disable interception")
-            .sequence(),
-        &[0x1d]
-    );
-
-    let disabled_only = AttachOptionsBuilder::default()
-        .disable_detach_keys()
-        .build()
-        .unwrap();
-    assert!(!disabled_only.checked_session);
-    assert!(disabled_only.resolved_detach_keys().unwrap().is_none());
-}
-
-/// The checked-session error summary names this exception: an option that does
-/// not validate fails before a session exists, so the caller sees the builder's
-/// own public variant and never `Terminal`.
-#[test]
-fn an_invalid_option_keeps_the_public_configuration_variant() {
+#[cfg(test)]
+mod tests {
     use crate::MicrosandboxError;
-    use crate::sandbox::exec::RlimitResource;
 
-    let error = AttachOptionsBuilder::default()
-        .rlimit_range(RlimitResource::Nofile, 2, 1)
-        .build()
-        .expect_err("a soft limit above the hard limit is not a valid option set");
-    assert!(
-        matches!(error, MicrosandboxError::InvalidConfig(_)),
-        "validation keeps its own variant instead of becoming a terminal error: {error}"
-    );
-}
+    use super::*;
 
-#[test]
-fn detach_policy_is_one_field() {
-    // The last setter wins by construction: one value, not a flag beside a
-    // sequence that has to be kept in step with it.
-    let disabled_last = AttachOptionsBuilder::default()
-        .detach_keys("ctrl-a")
-        .disable_detach_keys()
-        .build()
-        .unwrap();
-    assert!(matches!(disabled_last.detach, DetachPolicy::Disabled));
+    #[test]
+    fn the_default_builder_still_intercepts_ctrl_bracket() {
+        let options = AttachOptionsBuilder::default().build().unwrap();
+        let keys = options
+            .resolved_detach_keys()
+            .unwrap()
+            .expect("an unset sequence means the default, not no interception");
+        assert_eq!(keys.sequence(), &[0x1d]);
+        assert!(!options.checked_session, "checked completion stays opt-in");
+    }
 
-    let custom_last = AttachOptionsBuilder::default()
-        .disable_detach_keys()
-        .detach_keys("ctrl-a")
-        .build()
-        .unwrap();
-    assert!(matches!(
-        &custom_last.detach,
-        DetachPolicy::Custom(keys) if keys == "ctrl-a"
-    ));
-}
+    #[test]
+    fn a_custom_sequence_is_unchanged_and_the_last_setter_wins() {
+        let custom = AttachOptionsBuilder::default()
+            .detach_keys("ctrl-p,ctrl-q")
+            .build()
+            .unwrap();
+        assert_eq!(
+            custom.resolved_detach_keys().unwrap().unwrap().sequence(),
+            &[0x10, 0x11]
+        );
 
-/// `build()` is public, so this rendering is part of the option surface even
-/// though `AttachOptions` cannot be named outside the crate.
-///
-/// The two strings were captured from the release that predates this option
-/// set's additions (`fd74d1a8`): a builder that could have been written then
-/// must print exactly what it printed then.
-#[test]
-fn debug_output_matches_main_for_legacy_builders() {
-    assert_eq!(
-        format!("{:?}", AttachOptionsBuilder::default().build().unwrap()),
-        "AttachOptions { args: [], env: [], cwd: None, user: None, detach_keys: None, rlimits: \
-         [], stdin_filter: None }"
-    );
-    assert_eq!(
-        format!(
-            "{:?}",
-            AttachOptionsBuilder::default()
-                .detach_keys("ctrl-q")
-                .args(["-c"])
-                .build()
+        // disable then set: interception comes back with that sequence.
+        let reenabled = AttachOptionsBuilder::default()
+            .disable_detach_keys()
+            .detach_keys("ctrl-a")
+            .build()
+            .unwrap();
+        assert_eq!(
+            reenabled
+                .resolved_detach_keys()
                 .unwrap()
-        ),
-        "AttachOptions { args: [\"-c\"], env: [], cwd: None, user: None, detach_keys: \
-         Some(\"ctrl-q\"), rlimits: [], stdin_filter: None }"
-    );
-}
+                .unwrap()
+                .sequence(),
+            &[0x01]
+        );
 
-#[test]
-fn debug_output_shows_only_the_new_opt_ins_that_were_set() {
-    let disabled = AttachOptionsBuilder::default()
-        .disable_detach_keys()
-        .build()
-        .unwrap();
-    assert!(
-        format!("{disabled:?}").ends_with("detach: Disabled }"),
-        "a disabled interception must be named: {disabled:?}"
-    );
+        // set then disable: interception is off for this session.
+        let disabled = AttachOptionsBuilder::default()
+            .detach_keys("ctrl-a")
+            .disable_detach_keys()
+            .build()
+            .unwrap();
+        assert!(disabled.resolved_detach_keys().unwrap().is_none());
+    }
 
-    let checked = AttachOptionsBuilder::default()
-        .checked_session()
-        .build()
-        .unwrap();
-    assert!(
-        format!("{checked:?}").ends_with("checked_session: true }"),
-        "a checked session must be named: {checked:?}"
-    );
+    #[test]
+    fn disabling_interception_is_per_session() {
+        let disabled = AttachOptionsBuilder::default()
+            .disable_detach_keys()
+            .build()
+            .unwrap();
+        assert!(disabled.resolved_detach_keys().unwrap().is_none());
+        // A later default builder is unaffected: nothing global changed.
+        let next = AttachOptionsBuilder::default().build().unwrap();
+        assert_eq!(
+            next.resolved_detach_keys().unwrap().unwrap().sequence(),
+            &[0x1d]
+        );
+    }
 
-    // A custom sequence is the field every earlier release had, so it is not
-    // repeated as a policy.
-    let custom = AttachOptionsBuilder::default()
-        .detach_keys("ctrl-q")
-        .build()
-        .unwrap();
-    assert!(
-        !format!("{custom:?}").contains("detach:"),
-        "a custom sequence renders in its own field: {custom:?}"
-    );
+    #[test]
+    fn checked_completion_and_detach_disable_are_independent() {
+        let checked_only = AttachOptionsBuilder::default()
+            .checked_session()
+            .build()
+            .unwrap();
+        assert!(checked_only.checked_session);
+        assert_eq!(
+            checked_only
+                .resolved_detach_keys()
+                .unwrap()
+                .expect("checked alone does not disable interception")
+                .sequence(),
+            &[0x1d]
+        );
+
+        let disabled_only = AttachOptionsBuilder::default()
+            .disable_detach_keys()
+            .build()
+            .unwrap();
+        assert!(!disabled_only.checked_session);
+        assert!(disabled_only.resolved_detach_keys().unwrap().is_none());
+    }
+
+    /// The checked-session error summary names this exception: an option that does
+    /// not validate fails before a session exists, so the caller sees the builder's
+    /// own public variant and never `Terminal`.
+    #[test]
+    fn an_invalid_option_keeps_the_public_configuration_variant() {
+        let error = AttachOptionsBuilder::default()
+            .rlimit_range(RlimitResource::Nofile, 2, 1)
+            .build()
+            .expect_err("a soft limit above the hard limit is not a valid option set");
+        assert!(
+            matches!(error, MicrosandboxError::InvalidConfig(_)),
+            "validation keeps its own variant instead of becoming a terminal error: {error}"
+        );
+    }
+
+    #[test]
+    fn detach_policy_is_one_field() {
+        // The last setter wins by construction: one value, not a flag beside a
+        // sequence that has to be kept in step with it.
+        let disabled_last = AttachOptionsBuilder::default()
+            .detach_keys("ctrl-a")
+            .disable_detach_keys()
+            .build()
+            .unwrap();
+        assert!(matches!(disabled_last.detach, DetachPolicy::Disabled));
+
+        let custom_last = AttachOptionsBuilder::default()
+            .disable_detach_keys()
+            .detach_keys("ctrl-a")
+            .build()
+            .unwrap();
+        assert!(matches!(
+            &custom_last.detach,
+            DetachPolicy::Custom(keys) if keys == "ctrl-a"
+        ));
+    }
+
+    /// `build()` is public, so this rendering is part of the option surface even
+    /// though `AttachOptions` cannot be named outside the crate.
+    ///
+    /// The two strings were captured from the release that predates this option
+    /// set's additions (`fd74d1a8`): a builder that could have been written then
+    /// must print exactly what it printed then.
+    #[test]
+    fn debug_output_matches_main_for_legacy_builders() {
+        assert_eq!(
+            format!("{:?}", AttachOptionsBuilder::default().build().unwrap()),
+            "AttachOptions { args: [], env: [], cwd: None, user: None, detach_keys: None, rlimits: \
+             [], stdin_filter: None }"
+        );
+        assert_eq!(
+            format!(
+                "{:?}",
+                AttachOptionsBuilder::default()
+                    .detach_keys("ctrl-q")
+                    .args(["-c"])
+                    .build()
+                    .unwrap()
+            ),
+            "AttachOptions { args: [\"-c\"], env: [], cwd: None, user: None, detach_keys: \
+             Some(\"ctrl-q\"), rlimits: [], stdin_filter: None }"
+        );
+    }
+
+    #[test]
+    fn debug_output_shows_only_the_new_opt_ins_that_were_set() {
+        let disabled = AttachOptionsBuilder::default()
+            .disable_detach_keys()
+            .build()
+            .unwrap();
+        assert!(
+            format!("{disabled:?}").ends_with("detach: Disabled }"),
+            "a disabled interception must be named: {disabled:?}"
+        );
+
+        let checked = AttachOptionsBuilder::default()
+            .checked_session()
+            .build()
+            .unwrap();
+        assert!(
+            format!("{checked:?}").ends_with("checked_session: true }"),
+            "a checked session must be named: {checked:?}"
+        );
+
+        // A custom sequence is the field every earlier release had, so it is not
+        // repeated as a policy.
+        let custom = AttachOptionsBuilder::default()
+            .detach_keys("ctrl-q")
+            .build()
+            .unwrap();
+        assert!(
+            !format!("{custom:?}").contains("detach:"),
+            "a custom sequence renders in its own field: {custom:?}"
+        );
+    }
 }
