@@ -15,15 +15,20 @@
 //! * 12 MiB delivered byte for byte, more than the session's read-ahead bound,
 //!   with the guest's own status preserved;
 //! * `Ctrl-]` reaching the guest unchanged when detach keys are disabled;
-//! * a detach in a checked session reported as an error while the guest keeps
-//!   running;
+//! * a detach in a checked session reported as an error, with the terminal
+//!   restored;
 //! * the legacy session, with no options set at all, still detaching with
-//!   `Ok(-1)`.
+//!   `Ok(-1)`;
+//! * a cancelled session: dropping the future mid-session restores the terminal,
+//!   does not block, leaks no descriptor and leaves the runtime usable;
+//! * a relay lost while the host is stalled behind backpressure: the session
+//!   drains what it holds and then reports the loss as an error, not a status.
 //!
 //! Every case compares the PTY's attributes before and after the session, so a
 //! session that leaves the terminal raw fails even when its verdict is right.
 //!
-//! Needs a working local VM backend. Run with (from the repository root):
+//! Seven cases, each with its own sandbox, all `#[ignore]`d by `#[msb_test]`:
+//! a working local VM backend is required. Run with (from the repository root):
 //!
 //! ```text
 //! MSB_HOME=$(mktemp -d /tmp/msb-XXXX) MSB_PATH=$PWD/build/msb \
@@ -67,6 +72,11 @@ const CLEANUP_TIMEOUT: Duration = Duration::from_secs(15);
 /// pipe fills and the session has to hold guest output instead of writing it
 /// straight through.
 const STALL: Duration = Duration::from_millis(1500);
+
+/// How long a lost relay must stay invisible to a session whose host consumer
+/// is shut, before the consumer is released: the documented "waits for the host"
+/// behaviour, asserted as an absence of a result.
+const LOSS_VISIBILITY: Duration = Duration::from_millis(500);
 
 /// The bytes the `Ctrl-]` case types at the terminal: an ordinary byte, the
 /// default detach sequence, and another ordinary byte, so a passthrough has to
@@ -122,6 +132,12 @@ struct Case<'a> {
     /// A command run in the same sandbox after the session ended, to observe
     /// whether the guest survived the session.
     probe: Option<&'a str>,
+    /// End the session by dropping its future once the guest is ready, the way
+    /// a caller's own timeout or `select!` branch would.
+    cancel: bool,
+    /// Take the relay away during the stall, while the host consumer is still
+    /// shut, by stopping the sandbox out from under the live session.
+    lose_relay: bool,
 }
 
 /// What a session returned, rendered for an assertion message.
@@ -131,6 +147,8 @@ enum Verdict {
     Status(i32),
     /// The session returned this error.
     Failed(String),
+    /// The case dropped the session's future instead of waiting for a result.
+    Cancelled,
 }
 
 /// Everything one case observed.
@@ -149,6 +167,14 @@ struct Observation {
     /// released. False means the consumer was never the bottleneck, so a
     /// backpressure case would be vacuous.
     session_open_when_released: bool,
+    /// How long dropping the session's future blocked, for a cancelled case.
+    cancel_drop: Option<Duration>,
+    /// The terminal's attributes while the session was live, for a cancelled
+    /// case: it must differ from the reference, or nothing was restored.
+    terminal_while_live: Option<String>,
+    /// Whether the capture pipe reached end-of-file. False means something the
+    /// session left behind is still holding the descriptor.
+    drained: bool,
 }
 
 /// The host terminal: fd 0 on a fresh PTY slave, fd 1 on the case's capture.
@@ -289,16 +315,19 @@ impl Capture {
     /// The caller restores fd 1 first; that plus this drop closes every write
     /// end this process owns, and the session closed its own duplicate when it
     /// returned, so the reader reaches end-of-file instead of being cut off by
-    /// a timeout.
-    fn finish(mut self) -> Vec<u8> {
+    /// a timeout. The boolean reports whether it really did: `false` means some
+    /// descriptor the session owned is still open, i.e. the session leaked one.
+    fn finish(mut self) -> (Vec<u8>, bool) {
         drop(self.write_end);
         let deadline = Instant::now() + DRAIN_TIMEOUT;
+        let mut drained = true;
         while !self.drain.as_ref().is_none_or(|drain| drain.is_finished()) {
             if Instant::now() >= deadline {
                 // Leave the thread alone rather than join a read that may never
                 // return: the buffer is shared, so the bytes so far are enough
                 // for the assertion to describe the failure.
                 self.drain = None;
+                drained = false;
                 break;
             }
             std::thread::sleep(Duration::from_millis(5));
@@ -306,7 +335,7 @@ impl Capture {
         if let Some(drain) = self.drain.take() {
             let _ = drain.join();
         }
-        self.buffer.lock().unwrap().clone()
+        (self.buffer.lock().unwrap().clone(), drained)
     }
 }
 
@@ -336,7 +365,8 @@ impl Case<'_> {
         let script = self.script.to_string();
         let attach_sandbox = sandbox.clone();
         let session = self.session;
-        let mut attach = Box::pin(async move {
+        // `Some` so a cancelling case can move the future out and drop it.
+        let mut attach = Some(Box::pin(async move {
             match session {
                 Session::CheckedDefaultDetach => {
                     attach_sandbox
@@ -361,7 +391,7 @@ impl Case<'_> {
                         .await
                 }
             }
-        });
+        }));
 
         // The session is a lazy future: nothing here happens unless it is
         // polled, so the input and stall steps race it instead of awaiting it.
@@ -375,7 +405,7 @@ impl Case<'_> {
         if let Some(input) = self.input {
             let typed = tokio::select! {
                 ready = capture.wait_for(b"READY", STEP_TIMEOUT) => ready,
-                result = &mut attach => {
+                result = attach.as_mut().expect("the session is live") => {
                     panic!(
                         "{}: the session ended before the guest was ready: {:?}",
                         self.name,
@@ -392,18 +422,78 @@ impl Case<'_> {
         if verdict.is_none() && !self.stall.is_zero() {
             tokio::select! {
                 _ = tokio::time::sleep(self.stall) => {}
-                result = &mut attach => verdict = Some(render(result)),
+                result = attach.as_mut().expect("the session is live") => {
+                    verdict = Some(render(result))
+                }
             }
         }
         let session_open_when_released = !self.stall.is_zero() && verdict.is_none();
+
+        // Take the relay away while the host consumer is still shut, so the
+        // loss happens behind output the session has not been able to receive.
+        if self.lose_relay && verdict.is_none() {
+            note(self.name, "stopping the sandbox under the live session");
+            let stopped = tokio::time::timeout(STEP_TIMEOUT, sandbox.stop()).await;
+            note(self.name, format!("stop returned {stopped:?}"));
+
+            // The documented behaviour of a loss behind backpressure: while the
+            // host has not drained, the session cannot see the closure and keeps
+            // waiting. Give it this long to prove it is still waiting.
+            tokio::select! {
+                _ = tokio::time::sleep(LOSS_VISIBILITY) => {}
+                result = attach.as_mut().expect("the session is live") => panic!(
+                    "{}: the session reported the loss while the host was still stalled: {:?}",
+                    self.name,
+                    render(result)
+                ),
+            }
+            note(
+                self.name,
+                "the session is still waiting for the host to drain",
+            );
+        }
+
+        // Cancel the way a caller does: drop the future and see what it left
+        // behind, with no second chance to finish the session.
+        let mut cancel_drop = None;
+        let mut terminal_while_live = None;
+        if self.cancel {
+            let ready = tokio::select! {
+                ready = capture.wait_for(b"READY", STEP_TIMEOUT) => ready,
+                result = attach.as_mut().expect("the session is live") => {
+                    panic!(
+                        "{}: the session ended before it could be cancelled: {:?}",
+                        self.name,
+                        render(result)
+                    )
+                }
+            };
+            assert!(ready, "{}: the guest never printed READY", self.name);
+            // Record the state the session was in while it was live, so the
+            // restoration assertion afterwards cannot be vacuous.
+            terminal_while_live = Some(terminal.state());
+            note(self.name, "the guest is ready, dropping the session future");
+            let dropped = attach.take();
+            let started = Instant::now();
+            drop(dropped);
+            cancel_drop = Some(started.elapsed());
+            verdict = Some(Verdict::Cancelled);
+            note(
+                self.name,
+                format!("dropping the future took {:?}", started.elapsed()),
+            );
+        }
         capture.release();
 
         let verdict = match verdict {
             Some(verdict) => verdict,
-            None => match tokio::time::timeout(SESSION_TIMEOUT, &mut attach).await {
-                Ok(result) => render(result),
-                Err(_) => panic!("{}: the attach session did not finish", self.name),
-            },
+            None => {
+                let session = attach.as_mut().expect("the session is live");
+                match tokio::time::timeout(SESSION_TIMEOUT, session).await {
+                    Ok(result) => render(result),
+                    Err(_) => panic!("{}: the attach session did not finish", self.name),
+                }
+            }
         };
         note(self.name, format!("the session returned {verdict:?}"));
 
@@ -429,7 +519,7 @@ impl Case<'_> {
         // Put fd 1 back before draining: that plus the capture's own drop gives
         // the reader end-of-file.
         terminal.restore();
-        let output = capture.finish();
+        let (output, drained) = capture.finish();
         let after = terminal.state();
         let before = std::mem::take(&mut terminal.before);
 
@@ -443,6 +533,9 @@ impl Case<'_> {
             terminal_after: after,
             probe,
             session_open_when_released,
+            cancel_drop,
+            terminal_while_live,
+            drained,
         }
     }
 }
@@ -467,15 +560,26 @@ impl Observation {
         );
     }
 
+    /// Nothing the session owned may still hold the capture descriptor: the
+    /// reader reaches end-of-file only when every write end is closed.
+    fn assert_no_leaked_descriptor(&self, case: &str) {
+        assert!(
+            self.drained,
+            "{case}: the capture pipe never reached end-of-file, so a descriptor the session \
+             owned is still open"
+        );
+    }
+
     /// Report what the follow-up command observed.
     ///
     /// It is deliberately not an assertion: on the local VM backend the runtime
     /// kills the session's process group when the attach client disconnects
     /// (`crates/runtime/lib/runner/relay.rs`, "Client disconnected — send
     /// SIGKILL for each active session"), so the guest's attached process does
-    /// not outlive a detach even though the docs say it keeps running. The
-    /// probe stays here so the observation is reproducible; see the printed
-    /// line in the test log.
+    /// not outlive a detach. That is pre-existing runtime behaviour, not part of
+    /// this session's contract, so the probe stays here to make the observation
+    /// reproducible instead of pinning it; see the printed line in the test
+    /// log.
     fn report_guest_survival(&self, case: &str) {
         let (_, detail) = self
             .probe
@@ -630,6 +734,8 @@ async fn checked_session_keeps_its_held_output_when_the_guest_exits_during_a_sta
         stall: STALL,
         input: None,
         probe: None,
+        cancel: false,
+        lose_relay: false,
     }
     .run()
     .await;
@@ -665,6 +771,8 @@ async fn checked_session_delivers_twelve_mebibytes_byte_exactly_to_a_stalled_hos
         stall: STALL,
         input: None,
         probe: None,
+        cancel: false,
+        lose_relay: false,
     }
     .run()
     .await;
@@ -697,6 +805,8 @@ async fn checked_session_forwards_ctrl_right_bracket_to_the_guest() {
         stall: Duration::ZERO,
         input: Some(CTRL_RIGHT_BRACKET_INPUT),
         probe: None,
+        cancel: false,
+        lose_relay: false,
     }
     .run()
     .await;
@@ -718,11 +828,11 @@ async fn checked_session_forwards_ctrl_right_bracket_to_the_guest() {
 /// A detach in a checked session is an error that names itself, and the host
 /// terminal still comes back.
 ///
-/// The case also records whether the guest outlived the session: on this
-/// backend it does not (the runtime kills the session's process group when the
-/// client disconnects), which contradicts the documented "leaves the guest
-/// running". That observation is reported, not asserted — see
-/// [`Observation::report_guest_survival`].
+/// The case also records what the guest did after the session ended. On this
+/// backend the runtime kills the session's process group when the client
+/// disconnects, so the beacon stops at the detach; that observation is
+/// reported, not asserted, because it belongs to the runtime rather than to the
+/// session — see [`Observation::report_guest_survival`].
 #[msb_test]
 async fn checked_session_reports_a_detach_as_an_error() {
     let case = "checked-detach-live";
@@ -733,6 +843,8 @@ async fn checked_session_reports_a_detach_as_an_error() {
         stall: Duration::ZERO,
         input: Some(b"\x1d"),
         probe: Some(BEACON_PROBE),
+        cancel: false,
+        lose_relay: false,
     }
     .run()
     .await;
@@ -760,6 +872,8 @@ async fn legacy_session_still_detaches_with_minus_one() {
         stall: Duration::ZERO,
         input: Some(b"\x1d"),
         probe: Some(BEACON_PROBE),
+        cancel: false,
+        lose_relay: false,
     }
     .run()
     .await;
@@ -771,4 +885,105 @@ async fn legacy_session_still_detaches_with_minus_one() {
         "{case}: the legacy detach convention is Ok(-1)"
     );
     observation.report_guest_survival(case);
+}
+
+/// Cancelling a live checked session, the way a caller's own timeout or
+/// `select!` branch does, must restore the host terminal, must not block in
+/// `drop`, and must leave nothing running: no descriptor on the host side and a
+/// runtime that still serves the sandbox.
+#[msb_test]
+async fn cancelled_checked_session_restores_the_terminal_and_leaves_nothing_behind() {
+    let case = "checked-cancel-live";
+    let observation = Case {
+        name: case,
+        script: "echo READY; while :; do sleep 1; done",
+        session: Session::CheckedNoDetach,
+        stall: Duration::ZERO,
+        input: None,
+        // A command in the same sandbox afterwards: if the cancelled session had
+        // wedged the relay or leaked a task holding it, this would not answer.
+        probe: Some("echo alive"),
+        cancel: true,
+        lose_relay: false,
+    }
+    .run()
+    .await;
+
+    assert_eq!(
+        observation.verdict,
+        Verdict::Cancelled,
+        "{case}: the session must have been cancelled, not finished on its own"
+    );
+    let during = observation
+        .terminal_while_live
+        .as_deref()
+        .unwrap_or_else(|| panic!("{case}: the case did not record the live terminal state"));
+    assert_ne!(
+        during, observation.terminal_before,
+        "{case}: the session was not holding the terminal raw when it was cancelled, so this \
+         case proves nothing about restoration"
+    );
+    observation.assert_terminal_restored(case);
+    let drop_time = observation
+        .cancel_drop
+        .unwrap_or_else(|| panic!("{case}: the case did not cancel the session"));
+    assert!(
+        drop_time < Duration::from_secs(2),
+        "{case}: dropping the session future blocked for {drop_time:?}"
+    );
+    let (alive, detail) = observation
+        .probe
+        .as_ref()
+        .unwrap_or_else(|| panic!("{case}: the follow-up command did not run"));
+    assert!(
+        *alive && detail.contains("alive"),
+        "{case}: the sandbox did not answer after the cancelled session: {detail}"
+    );
+    observation.assert_no_leaked_descriptor(case);
+}
+
+/// A relay that goes away while the host consumer is stalled is reported only
+/// once the host drains, and then as an error rather than a status.
+///
+/// This is the accepted limitation of this design, asserted where it is actually
+/// observable: the session waits for the consumer exactly as a native writer
+/// would, delivers what it still holds, and only then reports the loss. It does
+/// **not** claim the loss is noticed before the host drains — while output is
+/// stalled behind a full read-ahead, nothing in the session can see it.
+#[msb_test]
+async fn checked_session_reports_a_relay_lost_behind_backpressure_as_an_error() {
+    let case = "checked-relay-loss-behind-backpressure";
+    let observation = Case {
+        name: case,
+        // Never exits: with the host shut, the guest blocks on its own output,
+        // so the loss cannot be mistaken for a guest exit.
+        script: "dd if=/dev/zero bs=65536 2>/dev/null | tr '\\0' w",
+        session: Session::CheckedNoDetach,
+        stall: STALL,
+        input: None,
+        probe: None,
+        cancel: false,
+        lose_relay: true,
+    }
+    .run()
+    .await;
+
+    observation.assert_terminal_restored(case);
+    observation.assert_host_was_the_bottleneck(case);
+    observation.assert_no_leaked_descriptor(case);
+    let error = match &observation.verdict {
+        Verdict::Failed(error) => error,
+        other => {
+            panic!("{case}: a lost relay must not be reported as an exit status, got {other:?}")
+        }
+    };
+    assert!(
+        error.contains("closed before the guest reported its exit"),
+        "{case}: the error must say the relay was lost before an exit: {error}"
+    );
+    assert!(
+        !observation.output.is_empty() && observation.output.iter().all(|byte| *byte == b'w'),
+        "{case}: the bytes held at the time of the loss must still arrive in order ({} bytes)",
+        observation.output.len()
+    );
 }
