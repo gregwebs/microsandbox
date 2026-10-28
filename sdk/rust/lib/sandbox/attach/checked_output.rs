@@ -541,6 +541,15 @@ fn write_all_fd(
     queue: &CheckedOutputQueue,
 ) -> std::io::Result<ChunkWrite> {
     while !bytes.is_empty() {
+        // The session may have ended since the previous slice: at most the
+        // syscall already in flight may still complete, never the rest of the
+        // chunk. Checking here (and not only at the chunk boundary) is what
+        // keeps an abort to one 8 KiB slice, and it also gates the retry that
+        // follows a writability wait, so a descriptor that becomes writable
+        // just as the session ends writes nothing more.
+        if queue.stopped() {
+            return Ok(ChunkWrite::Stopped);
+        }
         let slice = &bytes[..bytes.len().min(CHECKED_WRITE_SLICE_BYTES)];
         let written = unsafe { libc::write(fd, slice.as_ptr().cast(), slice.len()) };
         if written < 0 {
@@ -1329,6 +1338,58 @@ mod tests {
                 return false;
             }
         }
+    }
+
+    #[tokio::test]
+    async fn an_abort_between_write_slices_stops_the_rest_of_the_chunk() {
+        // A blocking pipe that already holds everything it can: the writer's
+        // first 8 KiB slice is blocked by construction, so one slice is in
+        // flight and 56 KiB of the same chunk have not been started when the
+        // session ends.
+        let (write_end, reader, prefill) = prefilled_pipe();
+        let output = CheckedOutput::start(write_end.as_raw_fd()).expect("start the writer");
+        // Only the writer's duplicate may hold the write end, so the pipe's EOF
+        // later proves that it released it.
+        drop(write_end);
+        let queue = Arc::clone(&output.queue);
+        let chunk = vec![b'M'; CHECKED_OUTPUT_CHUNK_BYTES];
+        within(output.enqueue_chunk(&chunk))
+            .await
+            .expect("enqueue one chunk");
+
+        // The descriptor cannot accept a byte while nothing drains, so the
+        // writer cannot have started a second slice.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(
+            output.accepted(),
+            0,
+            "the prefilled pipe cannot have accepted anything yet"
+        );
+
+        queue.abort();
+
+        // Only now may the consumer drain: whatever arrived after the abort is
+        // what the writer was still willing to write.
+        let drained = drain_within(
+            read_to_end_on_thread(reader),
+            Duration::from_secs(10),
+            "the aborted writer must release its duplicate",
+        );
+        assert!(
+            drained.starts_with(&prefill),
+            "the bytes already in the pipe must be untouched"
+        );
+        let after_abort = &drained[prefill.len()..];
+        assert!(
+            after_abort.len() <= CHECKED_WRITE_SLICE_BYTES,
+            "an abort may complete only the slice already in flight, not the rest of the \
+             chunk: {} bytes followed it",
+            after_abort.len()
+        );
+        assert!(
+            after_abort.iter().all(|byte| *byte == b'M'),
+            "only the chunk the writer held may appear"
+        );
     }
 
     #[tokio::test]
