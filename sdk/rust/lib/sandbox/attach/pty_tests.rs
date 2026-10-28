@@ -44,6 +44,10 @@ const CASE_NAME: &str = "MSB_ATTACH_PTY_CASE";
 /// The full name the parent re-runs this binary with.
 const CHILD_TEST: &str = "sandbox::attach::pty_tests::checked_bridge_pty_case";
 
+/// The `TERM` the child inherits, so the value the session injects into a TTY
+/// exec request is a fixed string rather than whatever this host's is.
+const CASE_TERM: &str = "attach-pty-term";
+
 /// Every wait in this harness is bounded: a stuck case must fail, not hang.
 const DEADLINE: Duration = Duration::from_secs(30);
 
@@ -116,12 +120,16 @@ enum Case {
     GuestInputEio,
     /// Dropping the session future restores the terminal.
     Cancel,
-    /// The *no-options* legacy session still detaches on Ctrl-] while the
-    /// relay stays open, i.e. the default interception is intact.
+    /// A legacy session with its detach policy left at the default still
+    /// detaches on Ctrl-] while the relay stays open.
     LegacyDetach,
-    /// The no-options legacy session still reports `Ok(-1)` for a channel
-    /// that closed without a guest exit.
+    /// A legacy session still reports `Ok(-1)` for a channel that closed
+    /// without a guest exit.
     LegacyClosed,
+    /// A legacy session built with `AttachOptionsBuilder::default()` and no
+    /// setter at all: the decoded request carries exactly the defaults, and
+    /// Ctrl-] still returns `Ok(-1)` while the relay stays open.
+    LegacyDefaults,
     /// A filter set beside `checked_session()` is honoured, one chunk at a
     /// time and in input order: the guest sees the filter's tags, not raw
     /// input.
@@ -221,7 +229,7 @@ struct SwallowA;
 //--------------------------------------------------------------------------------------------------
 
 impl Case {
-    const ALL: [Case; 22] = [
+    const ALL: [Case; 23] = [
         Case::Input,
         Case::Resize,
         Case::Failed,
@@ -240,6 +248,7 @@ impl Case {
         Case::Cancel,
         Case::LegacyDetach,
         Case::LegacyClosed,
+        Case::LegacyDefaults,
         Case::Filtered,
         Case::FilteredSwallow,
         Case::FilteredLegacy,
@@ -249,7 +258,10 @@ impl Case {
     /// Whether this case drives the untouched default session instead of the
     /// checked one. The legacy conventions are the reason both exist.
     fn legacy(self) -> bool {
-        matches!(self, Case::LegacyDetach | Case::LegacyClosed)
+        matches!(
+            self,
+            Case::LegacyDetach | Case::LegacyClosed | Case::LegacyDefaults
+        )
     }
 
     fn name(self) -> &'static str {
@@ -272,6 +284,7 @@ impl Case {
             Case::Cancel => "cancel",
             Case::LegacyDetach => "legacy-detach",
             Case::LegacyClosed => "legacy-closed",
+            Case::LegacyDefaults => "legacy-defaults",
             Case::Filtered => "filtered",
             Case::FilteredSwallow => "filtered-swallow",
             Case::FilteredLegacy => "filtered-legacy",
@@ -504,6 +517,7 @@ fn run_case(dir: &Path, case: Case) {
         .arg("--test-threads=1")
         .env(CASE_DIR, dir)
         .env(CASE_NAME, case.name())
+        .env("TERM", CASE_TERM)
         .stdin(Stdio::from(child_slave))
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
@@ -619,7 +633,7 @@ fn run_case(dir: &Path, case: Case) {
             )
             .expect("send SIGWINCH");
         }
-        Case::LegacyDetach | Case::CheckedDetach => {
+        Case::LegacyDetach | Case::CheckedDetach | Case::LegacyDefaults => {
             // The detach sequence, typed at the terminal exactly as a user
             // types it. The relay stays open (see the relay below), so a status
             // of -1 here cannot be the closed channel's convention, and a
@@ -676,7 +690,7 @@ fn run_case(dir: &Path, case: Case) {
     // after the child has already reported its outcome.
     if matches!(
         case,
-        Case::OutputFailure | Case::LegacyDetach | Case::CheckedDetach
+        Case::OutputFailure | Case::LegacyDetach | Case::CheckedDetach | Case::LegacyDefaults
     ) {
         std::fs::write(dir.join("release"), b"release").expect("release the relay");
     }
@@ -943,6 +957,83 @@ fn run_case(dir: &Path, case: Case) {
                 outcome,
                 "ok:-1",
                 "case {}: the legacy session must keep its Ok(-1) convention: {receipt}",
+                case.name()
+            );
+        }
+        Case::LegacyDefaults => {
+            // No setter was called for this case, so the exec request it sent
+            // is what a caller who wrote `AttachOptionsBuilder::default()` and
+            // nothing else gets: no arguments, no limits, the config's own
+            // working directory and user, and only the environment the session
+            // itself adds. The terminal attributes have already been compared
+            // with the ones taken before the spawn.
+            assert_eq!(
+                outcome,
+                "ok:-1",
+                "case {}: a session with no options set still detaches with the -1 \
+                 sentinel while the relay is open: {receipt}",
+                case.name()
+            );
+            // The relay for this case reads the request and then only waits for
+            // the parent's post-receipt `release`, so it cannot drop the
+            // connection while the session runs: the `-1` above is the detach
+            // sentinel, not the closed channel's convention.
+            let relay = wait_for_receipt_file(dir, "relay.receipt");
+            assert_eq!(
+                relay_value(&relay, "request_cmd"),
+                "bash",
+                "case {}: the command still comes from the caller: {relay}",
+                case.name()
+            );
+            assert_eq!(
+                relay_value(&relay, "request_args"),
+                "",
+                "case {}: an unset builder adds no argument: {relay}",
+                case.name()
+            );
+            assert_eq!(
+                relay_value(&relay, "request_rlimits"),
+                "",
+                "case {}: an unset builder adds no resource limit: {relay}",
+                case.name()
+            );
+            assert_eq!(
+                relay_value(&relay, "request_cwd"),
+                "/",
+                "case {}: the working directory is the config's, not the empty \
+                 default's: {relay}",
+                case.name()
+            );
+            assert_eq!(
+                relay_value(&relay, "request_user"),
+                "",
+                "case {}: an unset builder leaves the user to the config, which \
+                 names none: {relay}",
+                case.name()
+            );
+            assert_eq!(
+                relay_value(&relay, "request_env"),
+                format!("TERM={CASE_TERM}"),
+                "case {}: the only environment entry is the TERM a TTY session \
+                 injects: {relay}",
+                case.name()
+            );
+            assert_eq!(
+                relay_value(&relay, "request_tty"),
+                "true",
+                "case {}: an attach session is a TTY session: {relay}",
+                case.name()
+            );
+            assert_eq!(
+                relay_value(&relay, "request_rows"),
+                "24",
+                "case {}: the geometry comes from stdin's terminal: {relay}",
+                case.name()
+            );
+            assert_eq!(
+                relay_value(&relay, "request_cols"),
+                "80",
+                "case {}: the geometry comes from stdin's terminal: {relay}",
                 case.name()
             );
         }
@@ -1231,35 +1322,48 @@ fn output_matches(dir: &Path, output: &[u8], case: Case) -> Option<bool> {
 }
 
 async fn run_case_session(dir: &Path, case: Case) -> Outcome {
-    let builder = AttachOptionsBuilder::default()
-        .args(["-c", "probe"])
-        .cwd("/workspace/project")
-        .user("1000:1000")
-        .env("PATH", "/opt/attach-test-bin");
-    // The legacy cases call neither opt-in, so this is exactly the session
-    // every existing caller gets: default detach interception, best-effort
-    // output and the -1 sentinel. The filter cases add `stdin_filter` on top
-    // of the checked session, which is the composition under test.
     let options = match case {
-        Case::Filtered => builder
-            .disable_detach_keys()
-            .checked_session()
-            .stdin_filter(TagChunks::default()),
-        Case::FilteredSwallow => builder
-            .disable_detach_keys()
-            .checked_session()
-            .stdin_filter(SwallowA),
-        Case::FilteredLegacy => builder
-            .disable_detach_keys()
-            .stdin_filter(TagChunks::default()),
-        // A checked session with its detach keys left at the default: the
-        // sequence must be reported, not silently forwarded or ignored.
-        Case::CheckedDetach => builder.checked_session(),
-        _ if case.legacy() => builder,
-        _ => builder.disable_detach_keys().checked_session(),
-    }
-    .build()
-    .expect("session options");
+        // No setter is called at all, so this case sees the options an
+        // existing caller already builds. The shared builder below sets
+        // arguments, a working directory, a user and an environment entry,
+        // which is why this case cannot use it.
+        Case::LegacyDefaults => AttachOptionsBuilder::default()
+            .build()
+            .expect("the default session options"),
+        _ => {
+            let builder = AttachOptionsBuilder::default()
+                .args(["-c", "probe"])
+                .cwd("/workspace/project")
+                .user("1000:1000")
+                .env("PATH", "/opt/attach-test-bin");
+            // The legacy cases call neither opt-in, so this is exactly the
+            // session every existing caller gets: default detach interception,
+            // best-effort output and the -1 sentinel. The filter cases add
+            // `stdin_filter` on top of the checked session, which is the
+            // composition under test.
+            match case {
+                Case::Filtered => builder
+                    .disable_detach_keys()
+                    .checked_session()
+                    .stdin_filter(TagChunks::default()),
+                Case::FilteredSwallow => builder
+                    .disable_detach_keys()
+                    .checked_session()
+                    .stdin_filter(SwallowA),
+                Case::FilteredLegacy => builder
+                    .disable_detach_keys()
+                    .stdin_filter(TagChunks::default()),
+                // A checked session with its detach keys left at the default:
+                // the sequence must be reported, not silently forwarded or
+                // ignored.
+                Case::CheckedDetach => builder.checked_session(),
+                _ if case.legacy() => builder,
+                _ => builder.disable_detach_keys().checked_session(),
+            }
+            .build()
+            .expect("session options")
+        }
+    };
     let config = SandboxConfig::default();
 
     let (client_io, server_io) = tokio::io::duplex(512 * 1024);
@@ -1395,6 +1499,15 @@ async fn fake_relay(mut io: DuplexStream, dir: PathBuf, case: Case) {
         &dir,
         &[
             format!("request_cmd={}", exec.cmd),
+            format!("request_args={}", exec.args.join(",")),
+            format!(
+                "request_rlimits={}",
+                exec.rlimits
+                    .iter()
+                    .map(|limit| format!("{}:{}:{}", limit.resource, limit.soft, limit.hard))
+                    .collect::<Vec<_>>()
+                    .join(",")
+            ),
             format!("request_tty={}", exec.tty),
             format!("request_rows={}", exec.rows),
             format!("request_cols={}", exec.cols),
@@ -1674,7 +1787,7 @@ async fn fake_relay(mut io: DuplexStream, dir: PathBuf, case: Case) {
             // Keep the connection open while the parent releases the case.
             tokio::time::sleep(Duration::from_secs(2)).await;
         }
-        Case::LegacyDetach | Case::CheckedDetach => {
+        Case::LegacyDetach | Case::CheckedDetach | Case::LegacyDefaults => {
             // No guest exit and no closure: only the typed detach sequence can
             // end this session, and the parent releases the relay only after
             // the child has reported how it ended.
