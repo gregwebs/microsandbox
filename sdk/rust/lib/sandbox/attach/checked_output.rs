@@ -18,14 +18,30 @@ use super::unix::{checked_failure, duplicate_cloexec};
 
 /// Outstanding bytes one checked session may have queued or in flight.
 ///
-/// Memory accounting only. A full queue waits for the consumer, so guest
-/// backpressure stalls the session exactly as a native write to a slow
-/// terminal would; it never fails and never drops output.
+/// Allocation accounting only, and one of the session's two bounds: the other
+/// is [`CHECKED_STAGED_MAX_BYTES`] of read-ahead. A full queue waits for the
+/// consumer, so guest backpressure stalls the session exactly as a native write
+/// to a slow terminal would; it never fails and never drops output.
 pub(super) const CHECKED_OUTPUT_MAX_PENDING_BYTES: usize = 8 * 1024 * 1024;
 
 /// Largest queued frame. A guest frame is split so one reservation can never
 /// exceed the bound above.
 pub(super) const CHECKED_OUTPUT_CHUNK_BYTES: usize = 64 * 1024;
+
+/// Allocation bound on guest output read ahead of the writer.
+///
+/// Together with [`CHECKED_OUTPUT_MAX_PENDING_BYTES`] this bounds what one
+/// checked session holds: at most 8 MiB of chunks waiting for the writer and
+/// 8 MiB queued for it, measured by allocation, not by length.
+pub(super) const CHECKED_STAGED_MAX_BYTES: usize = 8 * 1024 * 1024;
+
+/// Largest guest frame the session may receive.
+///
+/// A receive is allowed only while a frame this size still fits under
+/// [`CHECKED_STAGED_MAX_BYTES`], so staging never has to drop or split a frame
+/// it cannot hold. The frame is an upper bound for a control message's body;
+/// the payload inside it is a few bytes smaller.
+const GUEST_FRAME_MAX_BYTES: usize = microsandbox_protocol::codec::MAX_FRAME_SIZE as usize;
 
 //--------------------------------------------------------------------------------------------------
 // Types
@@ -76,6 +92,20 @@ struct CheckedOutputQueue {
 
 pub(super) struct CheckedOutput {
     queue: Arc<CheckedOutputQueue>,
+}
+
+/// Guest output read but not yet accepted by the writer, as writer-sized chunks.
+///
+/// Invariant: `held` is the sum of the chunks' *capacities* and stays at most
+/// [`CHECKED_STAGED_MAX_BYTES`] as long as callers stage only while
+/// [`has_room_for_frame`](Self::has_room_for_frame). Each chunk is an
+/// exact-size copy, never a `split_off` head of its frame: a head keeps the
+/// whole frame's allocation alive, which for a 4 MiB frame staged as 64 chunks
+/// would retain about 130 MiB instead of 4 MiB.
+#[derive(Default)]
+pub(super) struct Staging {
+    chunks: VecDeque<Vec<u8>>,
+    held: usize,
 }
 
 //--------------------------------------------------------------------------------------------------
@@ -263,6 +293,57 @@ impl CheckedOutput {
     }
 }
 
+impl Staging {
+    /// Whether one largest-possible guest frame still fits under the bound.
+    pub(super) fn has_room_for_frame(&self) -> bool {
+        self.held + GUEST_FRAME_MAX_BYTES <= CHECKED_STAGED_MAX_BYTES
+    }
+
+    /// Split one guest output frame into writer-sized chunks and hold them.
+    pub(super) fn stage(&mut self, frame: Vec<u8>) {
+        for chunk in frame.chunks(CHECKED_OUTPUT_CHUNK_BYTES) {
+            let chunk = chunk.to_vec();
+            self.held += chunk.capacity();
+            self.chunks.push_back(chunk);
+        }
+        // `frame` is dropped here, so its allocation is not retained.
+    }
+
+    /// The head chunk, which the writer is offered next.
+    pub(super) fn front(&self) -> Option<&[u8]> {
+        self.chunks.front().map(Vec::as_slice)
+    }
+
+    /// The head chunk left staging: the writer accepted it.
+    pub(super) fn pop_delivered(&mut self) {
+        if let Some(chunk) = self.chunks.pop_front() {
+            self.held = self.held.saturating_sub(chunk.capacity());
+        }
+    }
+
+    pub(super) fn is_empty(&self) -> bool {
+        self.chunks.is_empty()
+    }
+
+    /// The staged chunks, for a test that asserts order and chunk boundaries.
+    #[cfg(test)]
+    pub(super) fn chunks(&self) -> impl Iterator<Item = &[u8]> {
+        self.chunks.iter().map(Vec::as_slice)
+    }
+
+    /// Each staged chunk's allocation, for a test that checks the accounting.
+    #[cfg(test)]
+    pub(super) fn capacities(&self) -> impl Iterator<Item = usize> {
+        self.chunks.iter().map(Vec::capacity)
+    }
+
+    /// Every held byte, counted by allocation.
+    #[cfg(test)]
+    pub(super) fn held(&self) -> usize {
+        self.held
+    }
+}
+
 //--------------------------------------------------------------------------------------------------
 // Trait Implementations
 //--------------------------------------------------------------------------------------------------
@@ -276,16 +357,6 @@ impl Drop for CheckedOutput {
 //--------------------------------------------------------------------------------------------------
 // Functions
 //--------------------------------------------------------------------------------------------------
-
-/// Split one guest output frame into the bounded chunks the writer accepts.
-pub(super) fn stage_output_chunks(bytes: Vec<u8>, pending: &mut VecDeque<Vec<u8>>) {
-    let mut remaining = bytes;
-    while !remaining.is_empty() {
-        let mut chunk = remaining;
-        remaining = chunk.split_off(chunk.len().min(CHECKED_OUTPUT_CHUNK_BYTES));
-        pending.push_back(chunk);
-    }
-}
 
 /// Owns the duplicated host stdout descriptor and every blocking write.
 fn run_checked_writer(queue: Arc<CheckedOutputQueue>, output: OwnedFd) {
@@ -379,21 +450,22 @@ mod tests {
                 .collect(),
             b"tail\n".to_vec(),
         ];
-        let mut pending = VecDeque::new();
+        let mut staging = Staging::default();
         for frame in frames {
             expected.extend_from_slice(&frame);
-            stage_output_chunks(frame, &mut pending);
+            staging.stage(frame);
         }
         // Staging is where a frame is split, so no reservation can exceed the
         // queue's chunk bound.
         assert!(
-            pending
-                .iter()
+            staging
+                .chunks()
                 .all(|chunk| !chunk.is_empty() && chunk.len() <= CHECKED_OUTPUT_CHUNK_BYTES),
             "a staged chunk exceeded the queue's chunk bound"
         );
-        while let Some(chunk) = pending.pop_front() {
-            within(output.enqueue_chunk(&chunk)).await.expect("enqueue");
+        while let Some(chunk) = staging.front() {
+            within(output.enqueue_chunk(chunk)).await.expect("enqueue");
+            staging.pop_delivered();
         }
         within(output.finish()).await.expect("finish");
 
@@ -557,6 +629,99 @@ mod tests {
             failure.to_string().contains("writing guest output"),
             "the capacity wait must report the writer's failure: {failure}"
         );
+    }
+
+    #[test]
+    fn staging_holds_exact_size_chunks() {
+        let mut staging = Staging::default();
+        staging.stage(vec![0x5A; GUEST_FRAME_MAX_BYTES]);
+
+        assert!(!staging.is_empty());
+        for chunk in staging.chunks() {
+            assert!(!chunk.is_empty(), "an empty chunk would loop the writer");
+            assert!(
+                chunk.len() <= CHECKED_OUTPUT_CHUNK_BYTES,
+                "a staged chunk held more bytes than the writer's own frame bound"
+            );
+        }
+        for capacity in staging.capacities() {
+            assert!(
+                capacity <= CHECKED_OUTPUT_CHUNK_BYTES,
+                "a staged chunk retained its frame's whole allocation"
+            );
+        }
+        assert_eq!(
+            staging.held(),
+            staging.capacities().sum::<usize>(),
+            "the accounting must be the sum of the allocations"
+        );
+        assert!(
+            staging.held() <= GUEST_FRAME_MAX_BYTES,
+            "one frame must cost one frame, not a retained header per chunk"
+        );
+        assert!(staging.held() <= CHECKED_STAGED_MAX_BYTES);
+    }
+
+    #[test]
+    fn staging_never_exceeds_its_allocation_bound() {
+        let mut staging = Staging::default();
+        let frames = [
+            vec![b'a'; GUEST_FRAME_MAX_BYTES],
+            vec![b'b'; 1],
+            vec![b'c'; CHECKED_OUTPUT_CHUNK_BYTES + 7],
+            vec![b'd'; GUEST_FRAME_MAX_BYTES],
+            vec![b'e'; 3 * CHECKED_OUTPUT_CHUNK_BYTES],
+        ];
+        let mut delivered = 0usize;
+        for frame in frames {
+            // Receive only while a largest frame still fits, exactly as the
+            // session's receive arm does.
+            while !staging.has_room_for_frame() {
+                assert!(!staging.is_empty(), "staging can never make room again");
+                staging.pop_delivered();
+                delivered += 1;
+                assert_eq!(
+                    staging.held(),
+                    staging.capacities().sum::<usize>(),
+                    "the accounting must follow a delivery"
+                );
+            }
+            staging.stage(frame);
+            assert_eq!(
+                staging.held(),
+                staging.capacities().sum::<usize>(),
+                "the accounting must follow the allocations"
+            );
+            assert!(
+                staging.held() <= CHECKED_STAGED_MAX_BYTES,
+                "staging grew past its allocation bound"
+            );
+        }
+        assert!(
+            delivered > 0,
+            "the bound must have forced a delivery during this run"
+        );
+    }
+
+    #[test]
+    fn staging_reopens_after_delivery() {
+        let mut staging = Staging::default();
+        while staging.has_room_for_frame() {
+            staging.stage(vec![b'q'; GUEST_FRAME_MAX_BYTES]);
+        }
+        assert!(
+            !staging.has_room_for_frame(),
+            "a full staging must stop the session receiving"
+        );
+
+        let mut delivered = 0usize;
+        while !staging.has_room_for_frame() {
+            assert!(!staging.is_empty(), "staging never made room again");
+            staging.pop_delivered();
+            delivered += 1;
+        }
+        assert!(delivered > 0);
+        assert!(staging.held() + GUEST_FRAME_MAX_BYTES <= CHECKED_STAGED_MAX_BYTES);
     }
 
     #[tokio::test]

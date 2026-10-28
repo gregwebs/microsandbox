@@ -7,7 +7,6 @@
 //! observable and must not change. The checked session is an opt-in for a
 //! caller that owns the process's exit status: a direct command launch has to
 
-use std::collections::VecDeque;
 use std::future::Future;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::pin::Pin;
@@ -31,10 +30,7 @@ use crate::{
 };
 
 use super::checked::checked_epilogue_error;
-use super::checked_output::{
-    CHECKED_OUTPUT_CHUNK_BYTES, CHECKED_OUTPUT_MAX_PENDING_BYTES, CheckedOutput,
-    stage_output_chunks,
-};
+use super::checked_output::{CheckedOutput, Staging};
 use super::{
     AttachOptions, DetachKeys, FilteredStdin, InputRoute, STDIN_FILTER_TASK_ENDED, StdinFilter,
     recv_filtered, require_filtered, route_input,
@@ -44,12 +40,6 @@ use super::{
 // Constants
 //--------------------------------------------------------------------------------------------------
 
-/// Most staged chunks one session may hold read but not yet queued.
-///
-/// Staging is what keeps failure observation live across a capacity wait, so
-/// it is bounded like the writer's own queue rather than growing with a
-/// flooding guest.
-const CHECKED_STAGED_CHUNKS: usize = CHECKED_OUTPUT_MAX_PENDING_BYTES / CHECKED_OUTPUT_CHUNK_BYTES;
 /// Host terminal read size: one `read(2)`, one `ExecStdin` frame.
 const CHECKED_INPUT_CHUNK_BYTES: usize = 1024;
 /// The guest's `EPIPE`. agentd reports the errno it observed inside the
@@ -123,8 +113,9 @@ pub(super) struct CheckedLoop<'a> {
     /// writer accepted it, so a capacity wait holds nothing back and every
     /// other arm stays live: a closed guest channel, a dead writer or the
     /// guest's own exit still ends the session while the host consumer is not
-    /// draining.
-    pending: VecDeque<Vec<u8>>,
+    /// draining. Its bound is by allocation, so a flooding guest cannot grow
+    /// the session's memory with retained chunk headers.
+    staging: Staging,
 }
 
 //--------------------------------------------------------------------------------------------------
@@ -188,7 +179,7 @@ impl<'a> CheckedLoop<'a> {
             // drained by the arm below, in the order the filter produced it.
             filtered_stdin: stdin_filter.map(FilteredStdin::spawn),
             io,
-            pending: VecDeque::new(),
+            staging: Staging::default(),
         }
     }
 
@@ -215,9 +206,9 @@ impl<'a> CheckedLoop<'a> {
             tokio::select! {
                 // The head chunk leaves staging only once the writer accepted
                 // it, so the chunk a session ends with is still its own.
-                result = enqueue_front(&self.io.output, &self.pending), if !self.pending.is_empty() => {
+                result = enqueue_front(&self.io.output, &self.staging), if !self.staging.is_empty() => {
                     result?;
-                    self.pending.pop_front();
+                    self.staging.pop_delivered();
                 }
 
                 // The in-flight send's verdict. A rejected send is a lost
@@ -318,12 +309,12 @@ impl<'a> CheckedLoop<'a> {
                     ));
                 }
 
-                message = self.rx.recv(), if self.pending.len() < CHECKED_STAGED_CHUNKS => {
+                message = self.rx.recv(), if self.staging.has_room_for_frame() => {
                     let Some(message) = message else {
                         return Err(closed_session());
                     };
                     if let Some(end) =
-                        handle_checked_message(message, &mut self.pending, &mut feeding_input)?
+                        handle_checked_message(message, &mut self.staging, &mut feeding_input)?
                     {
                         break 'session end;
                     }
@@ -331,12 +322,12 @@ impl<'a> CheckedLoop<'a> {
                     // terminal event batched behind guest output is handled by
                     // exactly the same code, and it stops for the same reason.
                     let mut drained = None;
-                    while drained.is_none() && self.pending.len() < CHECKED_STAGED_CHUNKS {
+                    while drained.is_none() && self.staging.has_room_for_frame() {
                         match self.rx.try_recv() {
                             Ok(next) => {
                                 drained = handle_checked_message(
                                     next,
-                                    &mut self.pending,
+                                    &mut self.staging,
                                     &mut feeding_input,
                                 )?;
                             }
@@ -376,8 +367,9 @@ impl<'a> CheckedLoop<'a> {
                 // before the exit event is delivered first, and the ordered finish
                 // receipt then proves every earlier byte reached the host
                 // descriptor before the terminal is restored.
-                while let Some(chunk) = self.pending.pop_front() {
-                    self.io.output.enqueue_chunk(&chunk).await?;
+                while let Some(chunk) = self.staging.front() {
+                    self.io.output.enqueue_chunk(chunk).await?;
+                    self.staging.pop_delivered();
                 }
                 self.io.output.finish().await?;
                 Ok(code)
@@ -732,11 +724,8 @@ async fn finish_send(outbound: &mut Option<GuestSend>) -> MicrosandboxResult<()>
 }
 
 /// The writer's verdict on the head of staging; never resolves when it is empty.
-async fn enqueue_front(
-    output: &CheckedOutput,
-    pending: &VecDeque<Vec<u8>>,
-) -> MicrosandboxResult<()> {
-    match pending.front() {
+async fn enqueue_front(output: &CheckedOutput, staging: &Staging) -> MicrosandboxResult<()> {
+    match staging.front() {
         Some(chunk) => output.enqueue_chunk(chunk).await,
         None => std::future::pending().await,
     }
@@ -748,7 +737,7 @@ async fn enqueue_front(
 /// receive a guest channel closing behind that output.
 fn handle_checked_message(
     message: Message,
-    pending: &mut VecDeque<Vec<u8>>,
+    staging: &mut Staging,
     feeding_input: &mut bool,
 ) -> MicrosandboxResult<Option<CheckedEnd>> {
     match message.t {
@@ -756,7 +745,7 @@ fn handle_checked_message(
             let frame: ExecStdout = message.payload().map_err(|error| {
                 checked_failure(format!("decoding guest terminal output: {error}"))
             })?;
-            stage_output_chunks(frame.data, pending);
+            staging.stage(frame.data);
             Ok(None)
         }
         MessageType::ExecExited => {
@@ -1262,7 +1251,7 @@ mod tests {
 
         let mut session = fixture.session();
         for chunk in &staged {
-            session.pending.push_back(chunk.clone());
+            session.staging.stage(chunk.clone());
         }
 
         let end = within(session.run())
@@ -1273,8 +1262,8 @@ mod tests {
             "the loop must report the guest's own status"
         );
         assert_eq!(
-            session.pending,
-            VecDeque::from(staged.to_vec()),
+            session.staging.chunks().collect::<Vec<_>>(),
+            staged.iter().map(Vec::as_slice).collect::<Vec<_>>(),
             "a chunk taken for a capacity wait must be back at the head of staging"
         );
 
@@ -1445,7 +1434,7 @@ mod tests {
             vec![0xB1u8; CHECKED_OUTPUT_CHUNK_BYTES],
             vec![0xB2u8; CHECKED_OUTPUT_CHUNK_BYTES],
         ] {
-            session.pending.push_back(chunk);
+            session.staging.stage(chunk);
         }
 
         let mut keyboard = keyboard;

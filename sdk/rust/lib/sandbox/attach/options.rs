@@ -168,7 +168,10 @@ impl AttachOptionsBuilder {
     ///   terminal error when the session otherwise succeeded);
     /// * on Unix the guest's output is written by a dedicated thread over a
     ///   duplicated stdout descriptor. Guest backpressure waits for the consumer
-    ///   (memory is bounded, bytes are never dropped); a genuinely unwritable
+    ///   and bytes are never dropped. The session holds at most 16 MiB of guest
+    ///   output: up to 8 MiB read ahead and 8 MiB queued for the writer, measured
+    ///   by allocation. The agent client buffers at most a few frames more per
+    ///   stream, upstream of the session. A genuinely unwritable
     ///   output descriptor or runtime loss is an error; and cancellation aborts
     ///   without joining that thread, so a write already in progress may reach
     ///   the descriptor or keep the descriptor until the process exits. There is
