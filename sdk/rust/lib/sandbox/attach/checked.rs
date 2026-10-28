@@ -1,17 +1,23 @@
 //! Checked-session pieces both platform loops share: how one guest event is
 //! classified, how a session's own failure is composed with the failures of its
-//! epilogue, and which guest input failures mean "the guest closed its input".
+//! epilogue, how a send to the guest is owned and polled, and which guest input
+//! failures mean "the guest closed its input".
 //!
 //! The platform modules keep only what actually differs: how host output reaches
 //! a descriptor (a writer thread on Unix, the console on Windows) and how host
 //! input is read.
 
+use std::future::Future;
+use std::pin::Pin;
+use std::sync::Arc;
+
 use microsandbox_protocol::{
     exec::{ExecExited, ExecFailed, ExecStdinError, ExecStdout},
     message::{Message, MessageType},
 };
+use serde::Serialize;
 
-use crate::MicrosandboxError;
+use crate::{MicrosandboxError, agent::AgentClient};
 
 use super::error::{AttachFailureKind, AttachSessionError, TeardownStage};
 
@@ -28,6 +34,14 @@ const GUEST_EIO: i32 = 5;
 //--------------------------------------------------------------------------------------------------
 // Types
 //--------------------------------------------------------------------------------------------------
+
+/// A send to the guest that has started.
+///
+/// Owned across loop iterations and polled as its own arm, or dropped with the
+/// session. Never restarted: `AgentClient::send` may already have queued its
+/// frame before it starts awaiting the transport, so a second call for the same
+/// bytes would duplicate them.
+pub(super) type GuestSend = Pin<Box<dyn Future<Output = Result<(), AttachSessionError>> + Send>>;
 
 /// How a checked session ended. Only a definitive guest event ends one; a
 /// transport observation never stands in for an exit.
@@ -209,6 +223,47 @@ pub(super) fn closed_session() -> AttachSessionError {
 //--------------------------------------------------------------------------------------------------
 // Functions: Helpers
 //--------------------------------------------------------------------------------------------------
+
+/// Start one send to the guest, with the context its failure is reported in.
+///
+/// Started, never awaited by its caller: a loop owns it as a [`GuestSend`] and
+/// polls it as its own arm, so an unresponsive transport cannot stop the session
+/// from observing anything else.
+pub(super) fn start_send<T>(
+    client: &Arc<AgentClient>,
+    id: u32,
+    t: MessageType,
+    payload: T,
+    context: &'static str,
+) -> GuestSend
+where
+    T: Serialize + Send + Sync + 'static,
+{
+    let client = Arc::clone(client);
+    Box::pin(async move {
+        client.send(id, t, &payload).await.map_err(|error| {
+            // The transport, not the guest, refused the frame: the session is
+            // lost even though the guest may still be running.
+            AttachSessionError::new(
+                AttachFailureKind::ConnectionLost,
+                format!("{context}: {error}"),
+            )
+        })
+    })
+}
+
+/// The in-flight send's result; never resolves when there is none.
+///
+/// `select!` evaluates every arm's future expression, so the absent case has to
+/// be a future rather than an `unwrap` in the arm.
+pub(super) async fn finish_send(
+    outbound: &mut Option<GuestSend>,
+) -> Result<(), AttachSessionError> {
+    match outbound {
+        Some(send) => send.await,
+        None => std::future::pending().await,
+    }
+}
 
 /// A guest payload the session could not decode.
 fn protocol_failure(text: impl Into<String>) -> AttachSessionError {

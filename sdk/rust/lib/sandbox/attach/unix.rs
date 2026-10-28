@@ -9,16 +9,13 @@
 //! tell the guest's own exit apart from a session that was lost, so it waits for
 //! a reported guest exit instead of accepting a lost session as a completion.
 
-use std::future::Future;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
-use std::pin::Pin;
 use std::sync::Arc;
 
 use microsandbox_protocol::{
     exec::{ExecExited, ExecResize, ExecStdin, ExecStdout},
     message::{Message, MessageType},
 };
-use serde::Serialize;
 use tokio::io::AsyncWriteExt;
 use tokio::io::unix::AsyncFd;
 
@@ -32,8 +29,8 @@ use crate::{
 };
 
 use super::checked::{
-    CheckedEnd, CheckedEvent, CheckedFailure, classify_checked_message, closed_session,
-    finish_with_teardown,
+    CheckedEnd, CheckedEvent, CheckedFailure, GuestSend, classify_checked_message, closed_session,
+    finish_send, finish_with_teardown, start_send,
 };
 use super::checked_output::{CheckedOutput, FlushPolicy, Staging, deliver_after_failure};
 use super::error::{AttachFailureKind, AttachSessionError, TeardownStage};
@@ -52,14 +49,6 @@ const CHECKED_INPUT_CHUNK_BYTES: usize = 1024;
 //--------------------------------------------------------------------------------------------------
 // Types
 //--------------------------------------------------------------------------------------------------
-
-/// A send to the guest that has started.
-///
-/// Owned across loop iterations and polled as its own arm, or dropped with the
-/// session. Never restarted: `AgentClient::send` may already have queued its
-/// frame before it starts awaiting the transport, so a second call for the same
-/// bytes would duplicate them.
-type GuestSend = Pin<Box<dyn Future<Output = Result<(), AttachSessionError>> + Send>>;
 
 /// The host terminal's saved attributes for one checked session.
 ///
@@ -740,45 +729,6 @@ async fn checked_bridge(
 //--------------------------------------------------------------------------------------------------
 // Functions: Helpers
 //--------------------------------------------------------------------------------------------------
-
-/// Start one send to the guest, with the context its failure is reported in.
-///
-/// Started, never awaited here: the loop owns it as a `GuestSend` and polls it
-/// as its own arm, so an unresponsive transport cannot stop the session from
-/// observing anything else.
-fn start_send<T>(
-    client: &Arc<AgentClient>,
-    id: u32,
-    t: MessageType,
-    payload: T,
-    context: &'static str,
-) -> GuestSend
-where
-    T: Serialize + Send + Sync + 'static,
-{
-    let client = Arc::clone(client);
-    Box::pin(async move {
-        client.send(id, t, &payload).await.map_err(|error| {
-            // The transport, not the guest, refused the frame: the session is
-            // lost even though the guest may still be running.
-            AttachSessionError::new(
-                AttachFailureKind::ConnectionLost,
-                format!("{context}: {error}"),
-            )
-        })
-    })
-}
-
-/// The in-flight send's result; never resolves when there is none.
-///
-/// `select!` evaluates every arm's future expression, so the absent case has to
-/// be a future rather than an `unwrap` in the arm.
-async fn finish_send(outbound: &mut Option<GuestSend>) -> Result<(), AttachSessionError> {
-    match outbound {
-        Some(send) => send.await,
-        None => std::future::pending().await,
-    }
-}
 
 /// The writer's verdict on the head of staging; never resolves when it is empty.
 async fn enqueue_front(

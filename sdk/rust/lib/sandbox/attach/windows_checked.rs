@@ -19,8 +19,8 @@ use tokio::sync::mpsc;
 use crate::{MicrosandboxResult, agent::AgentClient};
 
 use super::checked::{
-    CheckedEnd, CheckedEvent, CheckedFailure, classify_checked_message, closed_session,
-    finish_with_teardown,
+    CheckedEnd, CheckedEvent, CheckedFailure, GuestSend, classify_checked_message, closed_session,
+    finish_send, finish_with_teardown, start_send,
 };
 use super::error::{AttachFailureKind, AttachSessionError, TeardownStage};
 use super::{
@@ -94,13 +94,34 @@ where
     W: ConsoleSink,
 {
     let mut match_pos = 0usize;
+    // A guest that stopped reading its stdin (`EPIPE`, or `EIO` because its PTY
+    // is gone while it exits) keeps its session: only feeding stops, and its own
+    // exit event still ends it.
     let mut feeding_input = true;
     // Same task boundary as the legacy session and as Unix.
     let mut filtered_stdin = stdin_filter.map(FilteredStdin::spawn);
+    // At most one send to the guest is in flight. A handler only *starts* one;
+    // this loop polls it to completion as its own arm, so a transport that
+    // stopped accepting bytes cannot hold the guest's exit, its output or its
+    // channel closure hostage — nor leave the console raw until the caller gives
+    // up. Holding console input and resizes until the send finishes keeps them
+    // in order and never restarts a frame that may already be on its way.
+    let mut outbound: Option<GuestSend> = None;
 
     let end = 'session: loop {
         tokio::select! {
-            event = events.recv() => {
+            // The in-flight send's verdict. A rejected send is a lost session:
+            // the transport, not the guest, refused the frame.
+            result = finish_send(&mut outbound), if outbound.is_some() => {
+                outbound = None;
+                result?;
+            }
+
+            // Console input and resizes wait behind that one send. The pump's
+            // channel is unbounded and the console delivers its events in order,
+            // so nothing typed or resized meanwhile is lost, duplicated or
+            // overtaken while they wait.
+            event = events.recv(), if outbound.is_none() => {
                 // The console's event pump ends on console EOF or on its own
                 // read error, never because the agent connection closed: say
                 // what actually happened.
@@ -111,9 +132,6 @@ where
                 };
                 match event {
                     ConsoleEvent::Input(data) => {
-                        if !feeding_input {
-                            continue;
-                        }
                         // The guest closed its input: `EPIPE`, or `EIO` because
                         // its PTY is gone while it exits. The console keeps
                         // reading keystrokes, because the pump also carries
@@ -122,6 +140,9 @@ where
                         // filter's unbounded input queue would grow for as long
                         // as the guest stays alive, and `Ctrl-]` would report a
                         // detach instead of waiting for the guest's own exit.
+                        if !feeding_input {
+                            continue;
+                        }
                         // Shared routing: a filter sees the same chunks, one at a
                         // time and in order, as it would without the checked
                         // session; only the failure conventions differ.
@@ -145,24 +166,28 @@ where
                                 ));
                             }
                             InputRoute::Forward => {
-                                client
-                                    .send(id, MessageType::ExecStdin, &ExecStdin { data })
-                                    .await
-                                    .map_err(|error| {
-                                        connection_lost(format!(
-                                            "forwarding console input: {error}"
-                                        ))
-                                    })?;
+                                outbound = Some(start_send(
+                                    client,
+                                    id,
+                                    MessageType::ExecStdin,
+                                    ExecStdin { data },
+                                    "forwarding console input",
+                                ));
                             }
                         }
                     }
                     ConsoleEvent::Resize { cols, rows } => {
-                        client
-                            .send(id, MessageType::ExecResize, &ExecResize { rows, cols })
-                            .await
-                            .map_err(|error| {
-                                connection_lost(format!("sending a console resize: {error}"))
-                            })?;
+                        // A resize that arrives while a send is in flight is
+                        // recorded by the console's pump and forwarded once that
+                        // send completes, so the geometry the guest ends up with
+                        // is the latest one.
+                        outbound = Some(start_send(
+                            client,
+                            id,
+                            MessageType::ExecResize,
+                            ExecResize { rows, cols },
+                            "sending a console resize to the guest",
+                        ));
                     }
                     ConsoleEvent::Error(error) => {
                         return Err(host_failure(format!("reading console input: {error}")));
@@ -170,21 +195,28 @@ where
                 }
             }
 
-            filtered = recv_filtered(&mut filtered_stdin), if feeding_input && filtered_stdin.is_some() => {
+            // Filtered bytes reach the guest only here, one produced chunk at a
+            // time: the worker is the only thing that holds a chunk back, so
+            // input order is preserved without this arm ever overtaking the one
+            // above, and it waits behind the same single send.
+            filtered = recv_filtered(&mut filtered_stdin), if feeding_input && filtered_stdin.is_some() && outbound.is_none() => {
                 let Some(data) = filtered else {
                     return Err(AttachSessionError::new(
                         AttachFailureKind::StdinFilter,
                         STDIN_FILTER_TASK_ENDED,
                     ));
                 };
-                client
-                    .send(id, MessageType::ExecStdin, &ExecStdin { data })
-                    .await
-                    .map_err(|error| {
-                        connection_lost(format!("forwarding console input: {error}"))
-                    })?;
+                outbound = Some(start_send(
+                    client,
+                    id,
+                    MessageType::ExecStdin,
+                    ExecStdin { data },
+                    "forwarding console input",
+                ));
             }
 
+            // Never held back by a send: the guest's own exit, its output and a
+            // closed channel are all observed while one waits.
             message = rx.recv() => {
                 let Some(message) = message else {
                     return Err(closed_session());
@@ -287,11 +319,6 @@ fn host_failure(text: impl Into<String>) -> AttachSessionError {
     AttachSessionError::new(AttachFailureKind::HostTerminal, text)
 }
 
-/// A send the transport refused: the session is lost even while the guest runs.
-fn connection_lost(text: impl Into<String>) -> AttachSessionError {
-    AttachSessionError::new(AttachFailureKind::ConnectionLost, text)
-}
-
 //--------------------------------------------------------------------------------------------------
 // Tests
 //--------------------------------------------------------------------------------------------------
@@ -314,7 +341,7 @@ mod tests {
     use microsandbox_protocol::codec;
     use microsandbox_protocol::core::Ready;
     use microsandbox_protocol::exec::{ExecExited, ExecStdin, ExecStdinError, ExecStdout};
-    use tokio::io::{AsyncWriteExt, DuplexStream};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt, DuplexStream};
     use tokio::sync::mpsc;
 
     use crate::agent::AgentClient;
@@ -328,6 +355,10 @@ mod tests {
 
     /// The relay's buffer for the cases that never want a send to stall.
     const OPEN_RELAY_BYTES: usize = 64 * 1024;
+
+    /// The relay's buffer, in bytes: smaller than one frame, so every send the
+    /// loop starts stays in flight until the test reads what it wrote.
+    const STALLED_RELAY_BYTES: usize = 16;
 
     //----------------------------------------------------------------------------------------------
     // Types
@@ -358,6 +389,10 @@ mod tests {
     struct TaggingFilter {
         seen: mpsc::UnboundedSender<Vec<u8>>,
     }
+
+    /// Replaces every host chunk with `n` bytes of `b'z'`, one frame larger than
+    /// the stalled relay's buffer.
+    struct Expand(usize);
 
     /// A checked loop over a relay this test owns, a console it drives and a
     /// screen it reads.
@@ -460,6 +495,16 @@ mod tests {
                 let _ = seen.send(chunk);
                 vec![b'f']
             })
+        }
+    }
+
+    impl StdinFilter for Expand {
+        fn filter<'a>(
+            &'a mut self,
+            _data: &'a [u8],
+        ) -> Pin<Box<dyn Future<Output = Vec<u8>> + Send + 'a>> {
+            let expanded = vec![b'z'; self.0];
+            Box::pin(async move { expanded })
         }
     }
 
@@ -567,6 +612,32 @@ mod tests {
                 .expect("the session must send a frame")
         })
         .await
+    }
+
+    /// Prove a send started without letting it finish, and report its length.
+    ///
+    /// Reading the frame's length prefix is what proves the loop *started* the
+    /// send; the frame is larger than the relay's buffer and nothing reads the
+    /// rest, so the send stays in flight for as long as the test needs it to.
+    /// The length is the frame body's, so a caller can read the rest itself.
+    async fn blocked_send<F>(relay: &mut DuplexStream, session: &mut Pin<Box<F>>) -> usize
+    where
+        F: Future<Output = Result<CheckedEnd, AttachSessionError>>,
+    {
+        let mut length = [0u8; 4];
+        while_running(session, async {
+            relay
+                .read_exact(&mut length)
+                .await
+                .expect("the loop must start its send")
+        })
+        .await;
+        let length = u32::from_be_bytes(length) as usize;
+        assert!(
+            length > STALLED_RELAY_BYTES,
+            "the frame must be larger than the relay's buffer, or the send cannot be in flight"
+        );
+        length
     }
 
     fn stdout(id: u32, data: &[u8]) -> Message {
@@ -854,5 +925,274 @@ mod tests {
                 .is_err(),
             "the detach byte must not be forwarded after the guest closed its input"
         );
+    }
+
+    #[tokio::test]
+    async fn an_exit_ends_the_session_while_a_direct_input_send_is_blocked() {
+        let ConsoleFixture {
+            client,
+            mut relay,
+            events,
+            mut rx,
+            client_rx: _client_rx,
+            id,
+            console_tx,
+            mut console,
+            screen,
+            mut sink,
+        } = fixture(STALLED_RELAY_BYTES).await;
+        let mut run = Box::pin(checked_bridge(
+            &client,
+            id,
+            &mut rx,
+            &mut sink,
+            &mut console,
+            None,
+            None,
+        ));
+
+        console_tx
+            .send(ConsoleEvent::Input(vec![b'A'; 64]))
+            .expect("the console");
+        blocked_send(&mut relay, &mut run).await;
+
+        // The guest's exit is available while that send still waits for the
+        // transport, and it has to end the session.
+        events.send(exited(id, 4)).await.expect("the event channel");
+        let end = within(&mut run)
+            .await
+            .expect("the guest exit ends the session even with a send in flight");
+        assert!(matches!(end, CheckedEnd::Exited(4)));
+        drop(run);
+        assert_eq!(conclude(Ok(end), &mut sink).expect("the guest exit"), 4);
+        assert_eq!(screen.steps(), vec!["flush", "restore"]);
+    }
+
+    #[tokio::test]
+    async fn an_exit_ends_the_session_while_a_filtered_send_is_blocked() {
+        let ConsoleFixture {
+            client,
+            mut relay,
+            events,
+            mut rx,
+            client_rx: _client_rx,
+            id,
+            console_tx,
+            mut console,
+            screen,
+            mut sink,
+        } = fixture(STALLED_RELAY_BYTES).await;
+        let filter: Box<dyn StdinFilter> = Box::new(Expand(64));
+        let mut run = Box::pin(checked_bridge(
+            &client,
+            id,
+            &mut rx,
+            &mut sink,
+            &mut console,
+            None,
+            Some(filter),
+        ));
+
+        console_tx
+            .send(ConsoleEvent::Input(vec![b'a']))
+            .expect("the console");
+        blocked_send(&mut relay, &mut run).await;
+
+        events.send(exited(id, 5)).await.expect("the event channel");
+        let end = within(&mut run)
+            .await
+            .expect("the guest exit ends the session even with a send in flight");
+        assert!(matches!(end, CheckedEnd::Exited(5)));
+        drop(run);
+        assert_eq!(conclude(Ok(end), &mut sink).expect("the guest exit"), 5);
+        assert_eq!(screen.steps(), vec!["flush", "restore"]);
+    }
+
+    #[tokio::test]
+    async fn an_exit_ends_the_session_while_a_resize_send_is_blocked() {
+        let ConsoleFixture {
+            client,
+            mut relay,
+            events,
+            mut rx,
+            client_rx: _client_rx,
+            id,
+            console_tx,
+            mut console,
+            screen,
+            mut sink,
+        } = fixture(STALLED_RELAY_BYTES).await;
+        let mut run = Box::pin(checked_bridge(
+            &client,
+            id,
+            &mut rx,
+            &mut sink,
+            &mut console,
+            None,
+            None,
+        ));
+
+        console_tx
+            .send(ConsoleEvent::Resize {
+                cols: 120,
+                rows: 50,
+            })
+            .expect("the console");
+        blocked_send(&mut relay, &mut run).await;
+
+        events.send(exited(id, 6)).await.expect("the event channel");
+        let end = within(&mut run)
+            .await
+            .expect("the guest exit ends the session even with a send in flight");
+        assert!(matches!(end, CheckedEnd::Exited(6)));
+        drop(run);
+        assert_eq!(conclude(Ok(end), &mut sink).expect("the guest exit"), 6);
+        assert_eq!(screen.steps(), vec!["flush", "restore"]);
+    }
+
+    #[tokio::test]
+    async fn a_closed_channel_is_reported_while_a_send_is_blocked() {
+        let ConsoleFixture {
+            client,
+            mut relay,
+            events,
+            mut rx,
+            client_rx: _client_rx,
+            id,
+            console_tx,
+            mut console,
+            screen,
+            mut sink,
+        } = fixture(STALLED_RELAY_BYTES).await;
+        let mut run = Box::pin(checked_bridge(
+            &client,
+            id,
+            &mut rx,
+            &mut sink,
+            &mut console,
+            None,
+            None,
+        ));
+
+        console_tx
+            .send(ConsoleEvent::Input(vec![b'C'; 64]))
+            .expect("the console");
+        blocked_send(&mut relay, &mut run).await;
+        // The connection's event channel closes while the send still waits.
+        drop(events);
+
+        let failure = within(&mut run)
+            .await
+            .expect_err("a closed channel is a lost session, send in flight or not");
+        assert_eq!(
+            failure.kind(),
+            AttachFailureKind::ConnectionLost,
+            "a closed channel must be reported as the lost session it is: {failure}"
+        );
+        drop(run);
+        let failure =
+            conclude(Err(failure), &mut sink).expect_err("a lost session is not a completed one");
+        let CheckedFailure::Session(error) = failure else {
+            panic!("a lost session stays a session failure: {failure:?}");
+        };
+        assert!(
+            error.terminal_restored(),
+            "the console is still put back when the channel closed during a send"
+        );
+        assert_eq!(screen.steps(), vec!["flush", "restore"]);
+    }
+
+    #[tokio::test]
+    async fn input_and_resize_pending_behind_a_send_are_neither_duplicated_nor_reordered() {
+        let ConsoleFixture {
+            client,
+            mut relay,
+            events,
+            mut rx,
+            client_rx: _client_rx,
+            id,
+            console_tx,
+            mut console,
+            screen,
+            mut sink,
+        } = fixture(STALLED_RELAY_BYTES).await;
+        let mut run = Box::pin(checked_bridge(
+            &client,
+            id,
+            &mut rx,
+            &mut sink,
+            &mut console,
+            None,
+            None,
+        ));
+
+        // A first chunk whose send cannot finish: the relay's buffer is smaller
+        // than its frame and nothing reads the rest yet.
+        console_tx
+            .send(ConsoleEvent::Input(vec![b'a'; 64]))
+            .expect("the console");
+        let length = blocked_send(&mut relay, &mut run).await;
+
+        // Both are offered while that send is still in flight. The loop must
+        // hold them until it finishes, not drop, duplicate or reorder them.
+        console_tx
+            .send(ConsoleEvent::Input(vec![b'b'; 64]))
+            .expect("the console");
+        console_tx
+            .send(ConsoleEvent::Resize {
+                cols: 132,
+                rows: 43,
+            })
+            .expect("the console");
+
+        // Only now can the first frame finish. Reading it is also what lets the
+        // held events be taken in order.
+        let mut rest = vec![0u8; length];
+        while_running(&mut run, async {
+            relay
+                .read_exact(&mut rest)
+                .await
+                .expect("the rest of the first frame")
+        })
+        .await;
+        let first = vec![b'a'; 64];
+        assert!(
+            rest.windows(first.len()).any(|window| window == first),
+            "the first chunk must be forwarded once and unchanged"
+        );
+
+        let frame = frame_while(&mut relay, &mut run).await;
+        assert_eq!(frame.t, MessageType::ExecStdin);
+        assert_eq!(
+            stdin_payload(&frame),
+            vec![b'b'; 64],
+            "the chunk typed during a send must be forwarded once, unchanged"
+        );
+        let frame = frame_while(&mut relay, &mut run).await;
+        assert_eq!(frame.t, MessageType::ExecResize);
+        let resize: ExecResize = frame.payload().expect("a resize payload");
+        assert_eq!(
+            (resize.rows, resize.cols),
+            (43, 132),
+            "the resize held behind the send must follow it, unchanged"
+        );
+
+        // Nothing was sent twice: the loop is idle now, so a duplicate would
+        // arrive at once.
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), codec::read_message(&mut relay))
+                .await
+                .is_err(),
+            "a chunk held behind a send must not be forwarded twice"
+        );
+
+        events.send(exited(id, 9)).await.expect("the event channel");
+        let end = within(&mut run)
+            .await
+            .expect("the guest exit ends the session");
+        assert!(matches!(end, CheckedEnd::Exited(9)));
+        drop(run);
+        assert_eq!(conclude(Ok(end), &mut sink).expect("the guest exit"), 9);
+        assert_eq!(screen.steps(), vec!["flush", "restore"]);
     }
 }
