@@ -19,10 +19,12 @@ use std::time::{Duration, Instant};
 use microsandbox_protocol::codec;
 use microsandbox_protocol::core::Ready;
 use microsandbox_protocol::exec::{
-    ExecExited, ExecFailed, ExecFailureKind, ExecRequest, ExecResize, ExecStdin, ExecStdout,
+    ExecExited, ExecFailed, ExecFailureKind, ExecRequest, ExecResize, ExecStdin, ExecStdinError,
+    ExecStdout,
 };
 use microsandbox_protocol::message::{Message, MessageType};
-use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, DuplexStream};
+use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, DuplexStream, ReadHalf, WriteHalf};
+use tokio::sync::Notify;
 
 use crate::agent::AgentClient;
 
@@ -46,6 +48,12 @@ const DEADLINE: Duration = Duration::from_secs(30);
 /// so the guest is always ahead of the host consumer.
 const FLOOD_FRAMES: usize = 40;
 const FLOOD_FRAME_BYTES: usize = 256 * 1024;
+
+/// How the flood watches for saturation: a flood that has completed no frame
+/// for `SATURATION_QUIET`, checked every `SATURATION_POLL`, has filled every
+/// bound the session holds, so its receive arm is off.
+const SATURATION_QUIET: Duration = Duration::from_millis(300);
+const SATURATION_POLL: Duration = Duration::from_millis(50);
 
 /// Input the parent types at the terminal for the input case.
 const CASE_INPUT: &[u8] = b"A\x1dB";
@@ -84,6 +92,17 @@ enum Case {
     /// Host input and a resize still reach the guest while guest output is
     /// waiting for a consumer that has stopped.
     InputDuringBackpressure,
+    /// A relay that goes away entirely while the guest is flooding and the host
+    /// consumer is stalled: the loss sits behind output the session cannot
+    /// receive, so only the next keystroke's rejected send can carry it.
+    InputBehindStalledRelay,
+    /// A relay that closed only its sending side: the loss is behind guest
+    /// output the host has not taken yet, so it is reported once the host
+    /// drains and not before.
+    HalfClosedRelayWaitsForDrain,
+    /// The guest closed its input, so the session reads no keystrokes at all:
+    /// only a resize can carry a relay lost behind unconsumed output.
+    InputClosedRelayLoss,
     /// Dropping the session future restores the terminal.
     Cancel,
     /// The *no-options* legacy session still detaches on Ctrl-] while the
@@ -105,7 +124,7 @@ enum Case {
 }
 
 impl Case {
-    const ALL: [Case; 17] = [
+    const ALL: [Case; 20] = [
         Case::Input,
         Case::Resize,
         Case::Failed,
@@ -117,6 +136,9 @@ impl Case {
         Case::CheckedDetach,
         Case::ExitDuringBackpressure,
         Case::InputDuringBackpressure,
+        Case::InputBehindStalledRelay,
+        Case::HalfClosedRelayWaitsForDrain,
+        Case::InputClosedRelayLoss,
         Case::Cancel,
         Case::LegacyDetach,
         Case::LegacyClosed,
@@ -144,6 +166,9 @@ impl Case {
             Case::CheckedDetach => "checked-detach",
             Case::ExitDuringBackpressure => "exit-during-backpressure",
             Case::InputDuringBackpressure => "input-during-backpressure",
+            Case::InputBehindStalledRelay => "input-behind-stalled-relay",
+            Case::HalfClosedRelayWaitsForDrain => "half-closed-relay-waits-for-drain",
+            Case::InputClosedRelayLoss => "input-closed-relay-loss",
             Case::Cancel => "cancel",
             Case::LegacyDetach => "legacy-detach",
             Case::LegacyClosed => "legacy-closed",
@@ -247,6 +272,53 @@ fn run_case(dir: &Path, case: Case) {
             wait_for_prefix(dir, "stage=input-seen");
             std::fs::write(dir.join("drain"), b"drain").expect("drain the output");
             std::fs::write(dir.join("finish"), b"finish").expect("finish the relay");
+        }
+        Case::InputBehindStalledRelay => {
+            // The relay is already gone when the keystroke is typed: nothing
+            // can receive it, so the send itself has to report the loss.
+            std::fs::write(dir.join("go"), b"go").expect("release the relay");
+            wait_for(dir, "stage=relay-lost");
+            let mut master = std::fs::File::from(pty.master.try_clone().expect("clone master"));
+            master.write_all(b"x").expect("type at the terminal");
+            master.flush().expect("flush the terminal input");
+        }
+        Case::HalfClosedRelayWaitsForDrain => {
+            // The relay still reads, so this keystroke is accepted: the loss of
+            // its sending side is not what the parent is told, and nothing is
+            // reported until the host gives the session room to receive.
+            std::fs::write(dir.join("go"), b"go").expect("release the relay");
+            wait_for(dir, "stage=relay-lost");
+            let mut master = std::fs::File::from(pty.master.try_clone().expect("clone master"));
+            master.write_all(b"x").expect("type at the terminal");
+            master.flush().expect("flush the terminal input");
+            wait_for(dir, "stdin_frame=78");
+            std::thread::sleep(SATURATION_QUIET);
+            assert!(
+                !dir.join("child.receipt").exists(),
+                "a relay that only stopped sending must not be reported while the host still \
+                 holds guest output it has not taken"
+            );
+            std::fs::write(dir.join("drain"), b"drain").expect("drain the output");
+        }
+        Case::InputClosedRelayLoss => {
+            // The guest already closed its input, so this keystroke is never
+            // read; only the resize can report the loss.
+            std::fs::write(dir.join("go"), b"go").expect("release the relay");
+            wait_for(dir, "stage=relay-lost");
+            let mut master = std::fs::File::from(pty.master.try_clone().expect("clone master"));
+            master.write_all(b"x").expect("type at the terminal");
+            master.flush().expect("flush the terminal input");
+            std::thread::sleep(SATURATION_QUIET);
+            assert!(
+                !dir.join("child.receipt").exists(),
+                "a keystroke must not even be read after the guest closed its input"
+            );
+            set_winsize(pty.slave.as_raw_fd(), 30, 100);
+            nix::sys::signal::kill(
+                nix::unistd::Pid::from_raw(child.id() as i32),
+                nix::sys::signal::Signal::SIGWINCH,
+            )
+            .expect("send SIGWINCH");
         }
         Case::LegacyDetach | Case::CheckedDetach => {
             // The detach sequence, typed at the terminal exactly as a user
@@ -479,6 +551,81 @@ fn run_case(dir: &Path, case: Case) {
                 receipt_value(&receipt, "output_ok"),
                 "true",
                 "case {}: the output must arrive complete, in order and unaltered: {receipt}",
+                case.name()
+            );
+        }
+        Case::InputBehindStalledRelay => {
+            // The one row of the observability table in which the loss is
+            // reported promptly: the transport rejected a send, and the send
+            // was ours.
+            assert!(
+                outcome.starts_with("err:attach:ConnectionLost:"),
+                "case {}: a rejected send is a lost connection: {receipt}",
+                case.name()
+            );
+            assert!(
+                outcome.contains("forwarding host terminal input"),
+                "case {}: the rejected send must be the keystroke's own: {receipt}",
+                case.name()
+            );
+            // The consumer is still stalled, so the held output cannot be
+            // delivered: the session gives up and says so rather than waiting.
+            assert!(
+                outcome.contains("delivering guest output"),
+                "case {}: a delivery that gave up must be reported with the failure: {receipt}",
+                case.name()
+            );
+        }
+        Case::HalfClosedRelayWaitsForDrain => {
+            // A relay that stopped sending is only visible once the session can
+            // receive again, which is after the host takes output. Its own
+            // keystroke was accepted, so the send proves nothing.
+            assert!(
+                outcome.starts_with("err:attach:ConnectionLost:"),
+                "case {}: a relay that closed its sending side is a lost session, not a \
+                 completed one: {receipt}",
+                case.name()
+            );
+            assert!(
+                outcome.contains("closed before the guest reported its exit"),
+                "case {}: a lost relay must say what was lost: {receipt}",
+                case.name()
+            );
+            assert!(
+                !outcome.contains("delivering guest output"),
+                "case {}: the host drained, so every held byte must have been delivered: \
+                 {receipt}",
+                case.name()
+            );
+            let relay = wait_for_receipt_file(dir, "relay.receipt");
+            let frames: usize = relay_value(&relay, "relay_frames")
+                .parse()
+                .expect("the relay's completed frame count");
+            assert_eq!(
+                receipt_value(&receipt, "output_len"),
+                (frames * FLOOD_FRAME_BYTES).to_string(),
+                "case {}: every frame the relay completed must be delivered: {receipt}",
+                case.name()
+            );
+            assert_eq!(
+                receipt_value(&receipt, "output_ok"),
+                "true",
+                "case {}: the output must arrive complete, in order and unaltered: {receipt}",
+                case.name()
+            );
+        }
+        Case::InputClosedRelayLoss => {
+            // Keystrokes are deliberately not read once the guest closed its
+            // input, so the resize is the only forward that can carry the loss.
+            assert!(
+                outcome.starts_with("err:attach:ConnectionLost:"),
+                "case {}: a lost relay is a lost connection: {receipt}",
+                case.name()
+            );
+            assert!(
+                outcome.contains("sending a terminal resize"),
+                "case {}: after the guest closed its input, only a resize can report the \
+                 loss: {receipt}",
                 case.name()
             );
         }
@@ -811,7 +958,11 @@ impl Capture {
                     held: read_end.into(),
                 }
             }
-            Case::ExitDuringBackpressure | Case::InputDuringBackpressure => {
+            Case::ExitDuringBackpressure
+            | Case::InputDuringBackpressure
+            | Case::InputBehindStalledRelay
+            | Case::HalfClosedRelayWaitsForDrain
+            | Case::InputClosedRelayLoss => {
                 let (read_end, write_end) = std::io::pipe().expect("an output pipe");
                 Self::Stalled {
                     fd: write_end.into(),
@@ -907,6 +1058,16 @@ fn run_bridge_case(dir: &Path, case: Case) -> Outcome {
     // plain thread, not a Tokio blocking task.
     drop(runtime);
 
+    // These two cases keep their output consumer stalled for the whole session,
+    // because an undrained consumer is the point of them. Releasing it here is
+    // what lets the drain thread finish before the receipt is written.
+    if matches!(
+        case,
+        Case::InputBehindStalledRelay | Case::InputClosedRelayLoss
+    ) {
+        std::fs::write(dir.join("drain"), b"drain").expect("drain the captured output");
+    }
+
     assert_eq!(unsafe { libc::dup2(saved_stdout, 1) }, 1);
     unsafe { libc::close(saved_stdout) };
     capture.finish();
@@ -933,7 +1094,7 @@ fn output_matches(dir: &Path, output: &[u8], case: Case) -> Option<bool> {
         Case::ExitDuringBackpressure => Some(output == flood_bytes(FLOOD_FRAMES)),
         // The relay floods until the session stops taking output, so the count
         // is only known from its own receipt.
-        Case::InputDuringBackpressure => {
+        Case::InputDuringBackpressure | Case::HalfClosedRelayWaitsForDrain => {
             let relay = std::fs::read_to_string(dir.join("relay.receipt")).ok()?;
             let frames: usize = receipt_line(&relay, "relay_frames")?.parse().ok()?;
             Some(frames > 0 && output == flood_bytes(frames))
@@ -1290,6 +1451,49 @@ async fn fake_relay(mut io: DuplexStream, dir: PathBuf, case: Case) {
             append(&dir, &["stage=exit-sent".to_string()]);
         }
         Case::InputDuringBackpressure => input_during_backpressure(io, &dir, id).await,
+        Case::InputBehindStalledRelay => {
+            // The connection goes away entirely, while the guest is flooding and
+            // the host consumer is stalled. No receive is possible, so the loss
+            // can only be reported by a send the transport rejects.
+            let mut flood = flood_until_saturated(io, &dir, id).await;
+            flood.lose(&dir, Close::Full).await;
+        }
+        Case::HalfClosedRelayWaitsForDrain => {
+            // Only the relay's sending side closes. The loss sits behind guest
+            // output the host has not taken, so it cannot be seen yet; this half
+            // keeps reading, which is why the session's next keystroke is
+            // accepted and proves nothing.
+            let mut flood = flood_until_saturated(io, &dir, id).await;
+            flood.lose(&dir, Close::WriteHalf).await;
+            while let Some(message) = read(flood.reader()).await {
+                if message.t != MessageType::ExecStdin {
+                    continue;
+                }
+                let frame: ExecStdin = message.payload().expect("stdin payload");
+                append(&dir, &[format!("stdin_frame={}", hex(&frame.data))]);
+            }
+        }
+        Case::InputClosedRelayLoss => {
+            // The guest closed its input before the flood, so the session stops
+            // reading keystrokes: a resize is the only forward left that can
+            // carry a relay lost behind unconsumed output.
+            write(
+                &mut io,
+                Message::with_payload(
+                    MessageType::ExecStdinError,
+                    id,
+                    &ExecStdinError {
+                        errno: Some(32),
+                        errno_name: Some("EPIPE".to_string()),
+                        message: "Broken pipe (os error 32)".to_string(),
+                    },
+                )
+                .unwrap(),
+            )
+            .await;
+            let mut flood = flood_until_saturated(io, &dir, id).await;
+            flood.lose(&dir, Close::Full).await;
+        }
         Case::Cancel => {
             // Keep the connection open while the parent releases the case.
             tokio::time::sleep(Duration::from_secs(2)).await;
@@ -1359,25 +1563,117 @@ async fn fake_relay(mut io: DuplexStream, dir: PathBuf, case: Case) {
     }
 }
 
-/// Flood guest output until the session stops taking any, then record what the
-/// session forwarded while the host consumer was stalled, and let the guest
-/// exit.
+/// Which halves of the relay's connection are gone.
+#[derive(Clone, Copy)]
+enum Close {
+    /// The relay went away entirely: nothing is read and nothing is written.
+    Full,
+    /// Only the sending side closed, like a peer that shut down its write half
+    /// and still expects ours.
+    WriteHalf,
+}
+
+/// A running flood of guest output, and the relay's own handle to the
+/// connection it floods over.
+///
+/// A case decides when and how the connection is lost, so a loss happens at the
+/// point the case chose rather than whenever a producer happened to finish.
+struct Flood {
+    /// The relay's reading half. `Close::Full` drops it, so it is optional.
+    reader: Option<ReadHalf<DuplexStream>>,
+    /// Ends the flood between frames.
+    stop: Arc<AtomicBool>,
+    /// Ends the flood inside the frame in flight.
+    cut: Arc<Notify>,
+    /// Frames the peer received whole.
+    frames: Arc<AtomicUsize>,
+    producer: Option<tokio::task::JoinHandle<WriteHalf<DuplexStream>>>,
+}
+
+impl Flood {
+    /// The relay's reading half. Panics once the connection is fully gone.
+    fn reader(&mut self) -> &mut ReadHalf<DuplexStream> {
+        self.reader.as_mut().expect("the relay still reads")
+    }
+
+    /// Stop the flood between frames, and hand back the write half.
+    ///
+    /// A frame already in flight completes first, so the peer reads whole frames
+    /// only. A flood that stalls on a full connection therefore finishes when
+    /// the session takes output again.
+    async fn stop(&mut self) -> WriteHalf<DuplexStream> {
+        self.stop.store(true, Ordering::Relaxed);
+        self.producer
+            .take()
+            .expect("the flood producer is running")
+            .await
+            .expect("the flood producer")
+    }
+
+    /// Lose the connection: cut the frame in flight, then close what `how` says.
+    ///
+    /// A cut frame is never counted, and the peer reads a truncated frame and
+    /// then EOF exactly like the relay that died mid-frame would.
+    async fn lose(&mut self, dir: &Path, how: Close) {
+        self.stop.store(true, Ordering::Relaxed);
+        self.cut.notify_waiters();
+        let mut writer = self
+            .producer
+            .take()
+            .expect("the flood producer is running")
+            .await
+            .expect("the flood producer");
+        match how {
+            Close::Full => {
+                drop(writer);
+                self.reader = None;
+            }
+            // `tokio::io::split` keeps the connection alive until its last half
+            // is gone, so shutting this half down is what the peer sees as EOF
+            // while its own writes still arrive.
+            Close::WriteHalf => writer
+                .shutdown()
+                .await
+                .expect("close the relay's write side"),
+        }
+        append(
+            dir,
+            &[
+                format!("relay_frames={}", self.frames.load(Ordering::Relaxed)),
+                "stage=relay-lost".to_string(),
+            ],
+        );
+    }
+}
+
+/// Flood guest output until the session stops taking any, then hand the
+/// connection back to the case.
 ///
 /// The harness assumes the session holds two bounds, so the flood has to keep
 /// going until *no frame completes* rather than for a fixed count: only then is
 /// the session's read-ahead necessarily full and its receive arm necessarily
-/// off.
-async fn input_during_backpressure(io: DuplexStream, dir: &Path, id: u32) {
-    let (mut reader, mut writer) = tokio::io::split(io);
+/// off. `stage=saturated` only times the relay's next step; no assertion depends
+/// on how full any queue is.
+async fn flood_until_saturated(io: DuplexStream, dir: &Path, id: u32) -> Flood {
+    let (reader, mut writer) = tokio::io::split(io);
     let frames = Arc::new(AtomicUsize::new(0));
     let stop = Arc::new(AtomicBool::new(false));
+    let cut = Arc::new(Notify::new());
 
     let producer = {
         let frames = Arc::clone(&frames);
         let stop = Arc::clone(&stop);
+        let cut = Arc::clone(&cut);
         tokio::spawn(async move {
+            // Registered before the first frame, so a cut that lands while this
+            // task waits for capacity is never lost.
+            let cut = cut.notified();
+            tokio::pin!(cut);
             let mut index = 0usize;
-            while !stop.load(Ordering::Relaxed) {
+            loop {
+                if stop.load(Ordering::Relaxed) {
+                    break;
+                }
                 let message = Message::with_payload(
                     MessageType::ExecStdout,
                     id,
@@ -1386,19 +1682,20 @@ async fn input_during_backpressure(io: DuplexStream, dir: &Path, id: u32) {
                     },
                 )
                 .expect("a guest output frame");
-                write(&mut writer, message).await;
-                frames.fetch_add(1, Ordering::Relaxed);
+                tokio::select! {
+                    biased;
+                    _ = &mut cut => break,
+                    () = write(&mut writer, message) => {
+                        frames.fetch_add(1, Ordering::Relaxed);
+                    }
+                }
                 index += 1;
             }
-            // The frame in progress when the parent said `finish` completes once
-            // the session takes output again, which is what `drain` is for.
             writer
         })
     };
 
-    // `stage=saturated` only times the parent's next step: it says no frame has
-    // completed for a while, so the session is holding as much output as it can.
-    tokio::spawn({
+    let saturated = tokio::spawn({
         let dir = dir.to_path_buf();
         let frames = Arc::clone(&frames);
         async move {
@@ -1406,23 +1703,44 @@ async fn input_during_backpressure(io: DuplexStream, dir: &Path, id: u32) {
                 tokio::time::sleep(Duration::from_millis(2)).await;
             }
             let mut last = frames.load(Ordering::Relaxed);
+            let mut quiet_since = Instant::now();
             loop {
-                tokio::time::sleep(Duration::from_millis(50)).await;
+                tokio::time::sleep(SATURATION_POLL).await;
                 let now = frames.load(Ordering::Relaxed);
-                if now == last {
+                if now != last {
+                    last = now;
+                    quiet_since = Instant::now();
+                    continue;
+                }
+                if quiet_since.elapsed() >= SATURATION_QUIET {
                     append(&dir, &["stage=saturated".to_string()]);
                     return;
                 }
-                last = now;
             }
         }
     });
+    saturated.await.expect("the saturation watch");
+
+    Flood {
+        reader: Some(reader),
+        stop,
+        cut,
+        frames,
+        producer: Some(producer),
+    }
+}
+
+/// Flood guest output until the session stops taking any, then record what the
+/// session forwarded while the host consumer was stalled, and let the guest
+/// exit.
+async fn input_during_backpressure(io: DuplexStream, dir: &Path, id: u32) {
+    let mut flood = flood_until_saturated(io, dir, id).await;
 
     let mut seen_stdin = false;
     let mut seen_resize = false;
     loop {
         tokio::select! {
-            message = read(&mut reader) => {
+            message = read(flood.reader()) => {
                 let Some(message) = message else { break };
                 match message.t {
                     MessageType::ExecStdin => {
@@ -1455,10 +1773,12 @@ async fn input_during_backpressure(io: DuplexStream, dir: &Path, id: u32) {
         }
     }
 
-    stop.store(true, Ordering::Relaxed);
-    let mut writer = producer.await.expect("the flood producer");
-    let count = frames.load(Ordering::Relaxed);
-    append(dir, &[format!("relay_frames={count}")]);
+    // The count is read after the producer stopped: the frame it was writing
+    // when the parent said `finish` completes once the session takes output
+    // again, which is what `drain` is for, and that frame is delivered too.
+    let mut writer = flood.stop().await;
+    let frames = flood.frames.load(Ordering::Relaxed);
+    append(dir, &[format!("relay_frames={frames}")]);
     write(
         &mut writer,
         Message::with_payload(MessageType::ExecExited, id, &ExecExited { code: 0 })
