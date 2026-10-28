@@ -74,6 +74,28 @@ pub(super) enum CheckedEvent {
 }
 
 //--------------------------------------------------------------------------------------------------
+// Trait Implementations
+//--------------------------------------------------------------------------------------------------
+
+impl From<AttachSessionError> for CheckedFailure {
+    fn from(error: AttachSessionError) -> Self {
+        Self::Session(error)
+    }
+}
+
+/// The one conversion out of the crate: every checked failure becomes the
+/// public result a caller already knows how to match.
+impl From<CheckedFailure> for MicrosandboxError {
+    fn from(failure: CheckedFailure) -> Self {
+        match failure {
+            CheckedFailure::Spawn(failure) => MicrosandboxError::ExecFailed(failure),
+            CheckedFailure::Setup(error) => error,
+            CheckedFailure::Session(error) => MicrosandboxError::Terminal(error.to_string()),
+        }
+    }
+}
+
+//--------------------------------------------------------------------------------------------------
 // Functions
 //--------------------------------------------------------------------------------------------------
 
@@ -238,28 +260,6 @@ fn describe_stdin_error(error: &ExecStdinError) -> String {
         .or_else(|| error.errno.map(|errno| errno.to_string()))
         .unwrap_or_else(|| "no errno".to_string());
     format!("{errno}: {}", error.message)
-}
-
-//--------------------------------------------------------------------------------------------------
-// Trait Implementations
-//--------------------------------------------------------------------------------------------------
-
-impl From<AttachSessionError> for CheckedFailure {
-    fn from(error: AttachSessionError) -> Self {
-        Self::Session(error)
-    }
-}
-
-/// The one conversion out of the crate: every checked failure becomes the
-/// public result a caller already knows how to match.
-impl From<CheckedFailure> for MicrosandboxError {
-    fn from(failure: CheckedFailure) -> Self {
-        match failure {
-            CheckedFailure::Spawn(failure) => MicrosandboxError::ExecFailed(failure),
-            CheckedFailure::Setup(error) => error,
-            CheckedFailure::Session(error) => MicrosandboxError::Terminal(error.to_string()),
-        }
-    }
 }
 
 //--------------------------------------------------------------------------------------------------
