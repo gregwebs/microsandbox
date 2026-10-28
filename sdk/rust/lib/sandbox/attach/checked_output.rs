@@ -17,10 +17,15 @@ use super::unix::duplicate_cloexec;
 // Constants
 //--------------------------------------------------------------------------------------------------
 
-/// Outstanding bytes one checked session may have queued or in flight.
+/// Outstanding bytes one checked session may have queued for its writer or in
+/// flight in it.
 ///
-/// Allocation accounting only, and one of the session's two bounds: the other
-/// is [`CHECKED_STAGED_MAX_BYTES`] of read-ahead. A full queue waits for the
+/// Allocation accounting only, and one of the session's two retained bounds: the
+/// other is [`CHECKED_STAGED_MAX_BYTES`] of staged read-ahead. Together they say
+/// what one session retains — up to 8 MiB of staged chunks plus up to 8 MiB here
+/// — and nothing more: a decoded frame is a transient allocation held beside its
+/// encoded message, staging copies a frame into chunks before dropping it, and
+/// the agent client buffers its own frames upstream. A full queue waits for the
 /// consumer, so guest backpressure stalls the session exactly as a native write
 /// to a slow terminal would; it never fails and never drops output.
 pub(super) const CHECKED_OUTPUT_MAX_PENDING_BYTES: usize = 8 * 1024 * 1024;
@@ -29,11 +34,14 @@ pub(super) const CHECKED_OUTPUT_MAX_PENDING_BYTES: usize = 8 * 1024 * 1024;
 /// exceed the bound above.
 pub(super) const CHECKED_OUTPUT_CHUNK_BYTES: usize = 64 * 1024;
 
-/// Allocation bound on guest output read ahead of the writer.
+/// Allocation bound on guest output staged ahead of the writer.
 ///
-/// Together with [`CHECKED_OUTPUT_MAX_PENDING_BYTES`] this bounds what one
-/// checked session holds: at most 8 MiB of chunks waiting for the writer and
-/// 8 MiB queued for it, measured by allocation, not by length.
+/// One of the session's two retained bounds, both measured by allocation rather
+/// than by length: this many bytes of staged chunks, and
+/// [`CHECKED_OUTPUT_MAX_PENDING_BYTES`] queued for the writer or in flight in it.
+/// Allocations outside those two queues — a frame being decoded beside its
+/// encoded message, the chunk copies staging makes before dropping the frame, and
+/// the agent client's own buffers — are not part of the bound.
 pub(super) const CHECKED_STAGED_MAX_BYTES: usize = 8 * 1024 * 1024;
 
 /// Largest guest frame the session may receive.
