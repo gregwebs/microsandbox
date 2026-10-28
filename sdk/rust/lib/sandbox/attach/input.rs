@@ -334,6 +334,7 @@ mod tests {
     use tokio::sync::oneshot;
 
     use super::super::AttachOptionsBuilder;
+    use super::super::options::DetachPolicy;
     use super::*;
 
     #[test]
@@ -905,7 +906,11 @@ mod tests {
         );
         assert_eq!(opts.args, vec!["-c".to_string()]);
         assert_eq!(opts.cwd.as_deref(), Some("/tmp"));
-        assert_eq!(opts.detach_keys.as_deref(), Some("ctrl-q"));
+        assert!(
+            matches!(&opts.detach, DetachPolicy::Custom(keys) if keys == "ctrl-q"),
+            "stdin_filter wiped detach_keys: {:?}",
+            opts.detach
+        );
 
         let opts = AttachOptionsBuilder::default()
             .args(["-c".to_string()])
@@ -920,10 +925,10 @@ mod tests {
         );
         assert_eq!(opts.args, vec!["-c".to_string()], "stdin_filter wiped args");
         assert_eq!(opts.cwd.as_deref(), Some("/tmp"), "stdin_filter wiped cwd");
-        assert_eq!(
-            opts.detach_keys.as_deref(),
-            Some("ctrl-q"),
-            "stdin_filter wiped detach_keys"
+        assert!(
+            matches!(&opts.detach, DetachPolicy::Custom(keys) if keys == "ctrl-q"),
+            "stdin_filter wiped detach_keys: {:?}",
+            opts.detach
         );
     }
 

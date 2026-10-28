@@ -1,5 +1,7 @@
 //! Attach session options: the per-session builder and its resolved state.
 
+use std::fmt;
+
 use microsandbox_types::EnvVar;
 
 use crate::MicrosandboxResult;
@@ -16,7 +18,7 @@ use super::DetachKeys;
 /// The host terminal is set to raw mode for the duration of the attach session.
 /// The guest process runs in a PTY, enabling terminal features (colors, line
 /// editing, Ctrl+C → SIGINT).
-#[derive(Debug, Default)]
+#[derive(Default)]
 pub struct AttachOptions {
     /// Arguments.
     pub(crate) args: Vec<String>,
@@ -30,16 +32,10 @@ pub struct AttachOptions {
     /// Guest user override for the attached command.
     pub(crate) user: Option<String>,
 
-    /// Detach key sequence (default: `"ctrl-]"`).
-    ///
-    /// Uses Docker-style syntax: `"ctrl-<char>"` for control keys,
-    /// comma-separated for multi-key sequences (e.g., `"ctrl-p,ctrl-q"`).
-    pub(crate) detach_keys: Option<String>,
-
-    /// Interception is off for this session; see
-    /// [`AttachOptionsBuilder::disable_detach_keys`]. Unset means "use the
-    /// `detach_keys` sequence, or the default", not "no interception".
-    pub(crate) detach_disabled: bool,
+    /// How this session treats the detach key sequence; see
+    /// [`AttachOptionsBuilder::detach_keys`] and
+    /// [`AttachOptionsBuilder::disable_detach_keys`].
+    pub(crate) detach: DetachPolicy,
 
     /// Strict session completion; see [`AttachOptionsBuilder::checked_session`].
     pub(crate) checked_session: bool,
@@ -51,6 +47,25 @@ pub struct AttachOptions {
     /// sent to the guest. `None` forwards input unchanged.
     pub(crate) stdin_filter: Option<Box<dyn StdinFilter>>,
 }
+
+/// How one attach session treats the detach key sequence.
+///
+/// One field, so "the last setter wins" is structural rather than something two
+/// fields have to be kept in step about: a name, a custom sequence, or nothing
+/// to intercept.
+#[derive(Debug, Default)]
+pub(crate) enum DetachPolicy {
+    /// Intercept the default `Ctrl-]`.
+    #[default]
+    Default,
+    /// Intercept this Docker-style sequence (parsed when the session starts).
+    Custom(String),
+    /// Intercept nothing; every byte reaches the guest.
+    Disabled,
+}
+
+/// A [`DetachPolicy`] as the option surface renders it: a bare variant name.
+struct DetachPolicyDebug<'a>(&'a DetachPolicy);
 
 /// Builder for `AttachOptions`.
 #[derive(Default)]
@@ -118,8 +133,7 @@ impl AttachOptionsBuilder {
     /// Setting a sequence also re-enables interception after
     /// [`disable_detach_keys`](Self::disable_detach_keys): the last setter wins.
     pub fn detach_keys(mut self, keys: impl Into<String>) -> Self {
-        self.options.detach_keys = Some(keys.into());
-        self.options.detach_disabled = false;
+        self.options.detach = DetachPolicy::Custom(keys.into());
         self
     }
 
@@ -138,7 +152,7 @@ impl AttachOptionsBuilder {
     /// unaffected either way: it sees every chunk, `Ctrl-]` included, because it
     /// runs after the scan that interception would have performed.
     pub fn disable_detach_keys(mut self) -> Self {
-        self.options.detach_disabled = true;
+        self.options.detach = DetachPolicy::Disabled;
         self
     }
 
@@ -242,12 +256,61 @@ impl AttachOptions {
     /// user-supplied sequence fails before the session starts and before the
     /// host terminal is touched.
     pub(super) fn resolved_detach_keys(&self) -> MicrosandboxResult<Option<DetachKeys>> {
-        if self.detach_disabled {
-            return Ok(None);
+        match &self.detach {
+            DetachPolicy::Default => Ok(Some(DetachKeys::default_keys())),
+            DetachPolicy::Custom(spec) => Ok(Some(DetachKeys::parse(spec)?)),
+            DetachPolicy::Disabled => Ok(None),
         }
-        match self.detach_keys.as_deref() {
-            Some(spec) => Ok(Some(DetachKeys::parse(spec)?)),
-            None => Ok(Some(DetachKeys::default_keys())),
+    }
+
+    /// The detach sequence as the option surface shows it: `Some` only for a
+    /// custom sequence, exactly as the field rendered before the policy was one
+    /// value.
+    fn debug_detach_keys(&self) -> Option<&str> {
+        match &self.detach {
+            DetachPolicy::Custom(spec) => Some(spec),
+            DetachPolicy::Default | DetachPolicy::Disabled => None,
+        }
+    }
+}
+
+//--------------------------------------------------------------------------------------------------
+// Trait Implementations
+//--------------------------------------------------------------------------------------------------
+
+/// `build()` is public and returns this type, so its rendering is observable
+/// outside the crate even though the type cannot be named.
+///
+/// It renders the fields every builder had before this option set grew, in
+/// their original order, so a builder written against an earlier release prints
+/// exactly what it printed then. The new opt-ins appear only when they are set.
+impl fmt::Debug for AttachOptions {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let mut options = f.debug_struct("AttachOptions");
+        options
+            .field("args", &self.args)
+            .field("env", &self.env)
+            .field("cwd", &self.cwd)
+            .field("user", &self.user)
+            .field("detach_keys", &self.debug_detach_keys())
+            .field("rlimits", &self.rlimits)
+            .field("stdin_filter", &self.stdin_filter);
+        if matches!(self.detach, DetachPolicy::Disabled) {
+            options.field("detach", &DetachPolicyDebug(&self.detach));
+        }
+        if self.checked_session {
+            options.field("checked_session", &true);
+        }
+        options.finish()
+    }
+}
+
+impl fmt::Debug for DetachPolicyDebug<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self.0 {
+            DetachPolicy::Default => f.write_str("Default"),
+            DetachPolicy::Custom(spec) => write!(f, "Custom({spec:?})"),
+            DetachPolicy::Disabled => f.write_str("Disabled"),
         }
     }
 }
@@ -341,4 +404,85 @@ fn checked_completion_and_detach_disable_are_independent() {
         .unwrap();
     assert!(!disabled_only.checked_session);
     assert!(disabled_only.resolved_detach_keys().unwrap().is_none());
+}
+
+#[test]
+fn detach_policy_is_one_field() {
+    // The last setter wins by construction: one value, not a flag beside a
+    // sequence that has to be kept in step with it.
+    let disabled_last = AttachOptionsBuilder::default()
+        .detach_keys("ctrl-a")
+        .disable_detach_keys()
+        .build()
+        .unwrap();
+    assert!(matches!(disabled_last.detach, DetachPolicy::Disabled));
+
+    let custom_last = AttachOptionsBuilder::default()
+        .disable_detach_keys()
+        .detach_keys("ctrl-a")
+        .build()
+        .unwrap();
+    assert!(matches!(
+        &custom_last.detach,
+        DetachPolicy::Custom(keys) if keys == "ctrl-a"
+    ));
+}
+
+/// `build()` is public, so this rendering is part of the option surface even
+/// though `AttachOptions` cannot be named outside the crate.
+///
+/// The two strings were captured from the release that predates this option
+/// set's additions (`fd74d1a8`): a builder that could have been written then
+/// must print exactly what it printed then.
+#[test]
+fn debug_output_matches_main_for_legacy_builders() {
+    assert_eq!(
+        format!("{:?}", AttachOptionsBuilder::default().build().unwrap()),
+        "AttachOptions { args: [], env: [], cwd: None, user: None, detach_keys: None, rlimits: \
+         [], stdin_filter: None }"
+    );
+    assert_eq!(
+        format!(
+            "{:?}",
+            AttachOptionsBuilder::default()
+                .detach_keys("ctrl-q")
+                .args(["-c"])
+                .build()
+                .unwrap()
+        ),
+        "AttachOptions { args: [\"-c\"], env: [], cwd: None, user: None, detach_keys: \
+         Some(\"ctrl-q\"), rlimits: [], stdin_filter: None }"
+    );
+}
+
+#[test]
+fn debug_output_shows_only_the_new_opt_ins_that_were_set() {
+    let disabled = AttachOptionsBuilder::default()
+        .disable_detach_keys()
+        .build()
+        .unwrap();
+    assert!(
+        format!("{disabled:?}").ends_with("detach: Disabled }"),
+        "a disabled interception must be named: {disabled:?}"
+    );
+
+    let checked = AttachOptionsBuilder::default()
+        .checked_session()
+        .build()
+        .unwrap();
+    assert!(
+        format!("{checked:?}").ends_with("checked_session: true }"),
+        "a checked session must be named: {checked:?}"
+    );
+
+    // A custom sequence is the field every earlier release had, so it is not
+    // repeated as a policy.
+    let custom = AttachOptionsBuilder::default()
+        .detach_keys("ctrl-q")
+        .build()
+        .unwrap();
+    assert!(
+        !format!("{custom:?}").contains("detach:"),
+        "a custom sequence renders in its own field: {custom:?}"
+    );
 }
