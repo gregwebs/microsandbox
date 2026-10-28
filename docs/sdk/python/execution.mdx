@@ -285,7 +285,7 @@ code = await sandbox.attach("bash", cwd="/app", env={"EDITOR": "vim"})
 
 </Accordion>
 
-Bridge your terminal directly to a process inside the sandbox for a fully interactive PTY session. Press the configured detach key sequence (default `Ctrl+]`) to disconnect without stopping the process. Returns the process exit code.
+Bridge your terminal directly to a process inside the sandbox for a fully interactive PTY session. Press the configured detach key sequence (default `Ctrl+]`) to end the session and return to your shell. Detaching does not leave the command running: the SDK ends the session, and the local VM runtime then kills that session's guest processes, so only a process that left the session (for example one started with `setsid`) survives it. Returns the process exit code, or `-1` when you detached before it exited.
 
 <p className="msb-label">Parameters</p>
 
