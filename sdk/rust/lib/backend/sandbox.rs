@@ -371,7 +371,7 @@ pub trait SandboxBackend: Send + Sync {
         opts: crate::sandbox::AttachOptionsBuilder,
     ) -> BoxFuture<'a, MicrosandboxResult<i32>> {
         Box::pin(async move {
-            crate::sandbox::attach::agent::attach(backend.as_ref(), name, config, cmd, opts).await
+            crate::sandbox::attach::attach(backend.as_ref(), name, config, cmd, opts).await
         })
     }
 
