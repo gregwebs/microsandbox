@@ -1570,15 +1570,21 @@ pub(crate) mod agent {
         while let Some(item) = queue.next() {
             match item {
                 CheckedOutputItem::Data(bytes) => {
-                    let written = write_all_fd(output.as_raw_fd(), &bytes);
-                    queue.release(bytes.len());
-                    if let Err(error) = written {
-                        // Closed pipe, full device: a session failure, never
-                        // truncation reported as a guest success.
-                        queue.fail(format!(
-                            "writing guest output to the host terminal: {error}"
-                        ));
-                        return;
+                    match write_all_fd(output.as_raw_fd(), &bytes) {
+                        // The frame left the queue, so a waiting reservist may
+                        // take its place.
+                        Ok(()) => queue.release(bytes.len()),
+                        Err(error) => {
+                            // Closed pipe, full device: a session failure, never
+                            // truncation reported as a guest success. Recorded
+                            // before any capacity is released, because a caller
+                            // woken by a release must never find a dead queue that
+                            // still accepts work; `fail` clears the accounting.
+                            queue.fail(format!(
+                                "writing guest output to the host terminal: {error}"
+                            ));
+                            return;
+                        }
                     }
                 }
                 CheckedOutputItem::Finish(receipt) => {
