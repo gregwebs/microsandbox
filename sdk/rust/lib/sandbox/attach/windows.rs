@@ -8,7 +8,7 @@
 use std::sync::Arc;
 
 use microsandbox_protocol::{
-    exec::{ExecExited, ExecFailed, ExecResize, ExecStdin, ExecStdinError, ExecStdout},
+    exec::{ExecExited, ExecResize, ExecStdin, ExecStdout},
     message::{Message, MessageType},
 };
 
@@ -24,28 +24,14 @@ use crate::{
     },
 };
 
-use super::checked::checked_epilogue_error;
+use super::checked::{
+    CheckedEnd, CheckedEvent, checked_failure, classify_checked_message, closed_session,
+    finish_with_teardown,
+};
 use super::{
     AttachOptions, DetachKeys, FilteredStdin, InputRoute, STDIN_FILTER_TASK_ENDED, StdinFilter,
     recv_filtered, require_filtered, route_input,
 };
-
-//--------------------------------------------------------------------------------------------------
-// Constants
-//--------------------------------------------------------------------------------------------------
-
-/// The guest's `EPIPE`, as agentd reports the errno it observed inside the
-/// guest.
-const GUEST_EPIPE: i32 = 32;
-
-//--------------------------------------------------------------------------------------------------
-// Types
-//--------------------------------------------------------------------------------------------------
-
-enum CheckedEnd {
-    Exited(i32),
-    Failed(ExecFailed),
-}
 
 //--------------------------------------------------------------------------------------------------
 // Functions
@@ -272,43 +258,18 @@ async fn checked_session(
 
     // One epilogue: stop the event pump, flush the decoded tail, restore.
     drop(events);
-    let finish = terminal.finish_output();
-    let restore = terminal.restore_checked();
-    match primary {
-        Ok(code) => {
-            let mut later = Vec::new();
-            if let Err(error) = finish {
-                later.push(("flushing guest output", error));
-            }
-            if let Err(error) = restore {
-                later.push(("restoring the console", error));
-            }
-            if later.is_empty() {
-                Ok(code)
-            } else {
-                Err(checked_epilogue_error(
-                    checked_failure(
-                        "the guest reported its exit but the console session did not finish cleanly",
-                    ),
-                    later,
-                ))
-            }
-        }
-        Err(primary) => {
-            let mut later = Vec::new();
-            if let Err(error) = finish {
-                later.push(("flushing guest output", error));
-            }
-            if let Err(error) = restore {
-                later.push(("restoring the console", error));
-            }
-            if later.is_empty() {
-                Err(primary)
-            } else {
-                Err(checked_epilogue_error(primary, later))
-            }
-        }
+    let mut teardown = Vec::new();
+    if let Err(error) = terminal.finish_output() {
+        teardown.push(("flushing guest output", error));
     }
+    if let Err(error) = terminal.restore_checked() {
+        teardown.push(("restoring the console", error));
+    }
+    finish_with_teardown(
+        primary,
+        teardown,
+        "the guest reported its exit but the console session did not finish cleanly",
+    )
 }
 
 async fn checked_bridge(
@@ -396,7 +357,7 @@ async fn checked_bridge(
                     return Err(closed_session());
                 };
                 if let Some(end) =
-                    handle_checked_message(message, terminal, &mut feeding_input).await?
+                    handle_checked_message(message, terminal, &mut feeding_input)?
                 {
                     break 'session end;
                 }
@@ -405,7 +366,7 @@ async fn checked_bridge(
                     match rx.try_recv() {
                         Ok(next) => {
                             drained =
-                                handle_checked_message(next, terminal, &mut feeding_input).await?;
+                                handle_checked_message(next, terminal, &mut feeding_input)?;
                         }
                         Err(_) => break,
                     }
@@ -427,69 +388,25 @@ async fn checked_bridge(
 // Functions: Helpers
 //--------------------------------------------------------------------------------------------------
 
-async fn handle_checked_message(
+/// One session event: `Some` ends the session, `None` continues it.
+///
+/// Decoding is shared with the Unix loop; the console is this platform's own
+/// sink for guest output.
+fn handle_checked_message(
     message: Message,
     terminal: &mut WindowsTerminalGuard,
     feeding_input: &mut bool,
 ) -> MicrosandboxResult<Option<CheckedEnd>> {
-    match message.t {
-        MessageType::ExecStdout => {
-            let frame: ExecStdout = message.payload().map_err(|error| {
-                checked_failure(format!("decoding guest console output: {error}"))
-            })?;
-            terminal.write_output(&frame.data)?;
+    match classify_checked_message(message)? {
+        CheckedEvent::Output(data) => {
+            terminal.write_output(&data)?;
             Ok(None)
         }
-        MessageType::ExecExited => {
-            let exited: ExecExited = message.payload().map_err(|error| {
-                checked_failure(format!("decoding the guest exit event: {error}"))
-            })?;
-            Ok(Some(CheckedEnd::Exited(exited.code)))
+        CheckedEvent::End(end) => Ok(Some(end)),
+        CheckedEvent::InputClosed => {
+            *feeding_input = false;
+            Ok(None)
         }
-        MessageType::ExecFailed => {
-            let failed: ExecFailed = message.payload().map_err(|error| {
-                checked_failure(format!("decoding the guest spawn failure: {error}"))
-            })?;
-            Ok(Some(CheckedEnd::Failed(failed)))
-        }
-        MessageType::ExecStdinError => {
-            let error: ExecStdinError = message.payload().map_err(|error| {
-                checked_failure(format!("decoding a console input failure: {error}"))
-            })?;
-            if guest_closed_input(&error) {
-                *feeding_input = false;
-                Ok(None)
-            } else {
-                Err(checked_failure(format!(
-                    "forwarding console input failed in the guest: {}",
-                    describe_stdin_error(&error)
-                )))
-            }
-        }
-        _ => Ok(None),
+        CheckedEvent::Ignored => Ok(None),
     }
-}
-
-fn checked_failure(text: impl Into<String>) -> MicrosandboxError {
-    MicrosandboxError::Terminal(text.into())
-}
-
-fn closed_session() -> MicrosandboxError {
-    checked_failure("the agent connection closed before the guest reported its exit")
-}
-
-fn guest_closed_input(error: &ExecStdinError) -> bool {
-    match (error.errno_name.as_deref(), error.errno) {
-        (Some(name), _) => name == "EPIPE",
-        (None, errno) => errno == Some(GUEST_EPIPE),
-    }
-}
-
-fn describe_stdin_error(error: &ExecStdinError) -> String {
-    let errno = error
-        .errno_name
-        .clone()
-        .or_else(|| error.errno.map(|errno| errno.to_string()))
-        .unwrap_or_else(|| "no errno".to_string());
-    format!("{errno}: {}", error.message)
 }

@@ -10,7 +10,8 @@ use tokio::sync::Notify;
 
 use crate::{MicrosandboxError, MicrosandboxResult};
 
-use super::unix::{checked_failure, duplicate_cloexec};
+use super::checked::checked_failure;
+use super::unix::duplicate_cloexec;
 
 //--------------------------------------------------------------------------------------------------
 // Constants

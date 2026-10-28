@@ -13,7 +13,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 
 use microsandbox_protocol::{
-    exec::{ExecExited, ExecFailed, ExecResize, ExecStdin, ExecStdinError, ExecStdout},
+    exec::{ExecExited, ExecResize, ExecStdin, ExecStdout},
     message::{Message, MessageType},
 };
 use serde::Serialize;
@@ -29,7 +29,10 @@ use crate::{
     },
 };
 
-use super::checked::checked_epilogue_error;
+use super::checked::{
+    CheckedEnd, CheckedEvent, checked_failure, classify_checked_message, closed_session,
+    finish_with_teardown,
+};
 use super::checked_output::{CheckedOutput, Staging};
 use super::{
     AttachOptions, DetachKeys, FilteredStdin, InputRoute, STDIN_FILTER_TASK_ENDED, StdinFilter,
@@ -42,21 +45,10 @@ use super::{
 
 /// Host terminal read size: one `read(2)`, one `ExecStdin` frame.
 const CHECKED_INPUT_CHUNK_BYTES: usize = 1024;
-/// The guest's `EPIPE`. agentd reports the errno it observed inside the
-/// guest, so this is not the host's `libc::EPIPE`.
-const GUEST_EPIPE: i32 = 32;
 
 //--------------------------------------------------------------------------------------------------
 // Types
 //--------------------------------------------------------------------------------------------------
-
-/// How a checked session ended. Only a definitive guest event ends one; a
-/// transport observation never stands in for an exit.
-#[derive(Debug)]
-pub(super) enum CheckedEnd {
-    Exited(i32),
-    Failed(ExecFailed),
-}
 
 /// A send to the guest that has started.
 ///
@@ -734,47 +726,24 @@ async fn enqueue_front(output: &CheckedOutput, staging: &Staging) -> Microsandbo
 /// One session event: `Some` ends the session, `None` continues it.
 ///
 /// Nothing here awaits: a handler that blocked on output capacity could not
-/// receive a guest channel closing behind that output.
+/// receive a guest channel closing behind that output. Decoding is shared with
+/// the Windows loop; only the sink for guest output is this platform's own.
 fn handle_checked_message(
     message: Message,
     staging: &mut Staging,
     feeding_input: &mut bool,
 ) -> MicrosandboxResult<Option<CheckedEnd>> {
-    match message.t {
-        MessageType::ExecStdout => {
-            let frame: ExecStdout = message.payload().map_err(|error| {
-                checked_failure(format!("decoding guest terminal output: {error}"))
-            })?;
-            staging.stage(frame.data);
+    match classify_checked_message(message)? {
+        CheckedEvent::Output(data) => {
+            staging.stage(data);
             Ok(None)
         }
-        MessageType::ExecExited => {
-            let exited: ExecExited = message.payload().map_err(|error| {
-                checked_failure(format!("decoding the guest exit event: {error}"))
-            })?;
-            Ok(Some(CheckedEnd::Exited(exited.code)))
+        CheckedEvent::End(end) => Ok(Some(end)),
+        CheckedEvent::InputClosed => {
+            *feeding_input = false;
+            Ok(None)
         }
-        MessageType::ExecFailed => {
-            let failed: ExecFailed = message.payload().map_err(|error| {
-                checked_failure(format!("decoding the guest spawn failure: {error}"))
-            })?;
-            Ok(Some(CheckedEnd::Failed(failed)))
-        }
-        MessageType::ExecStdinError => {
-            let error: ExecStdinError = message.payload().map_err(|error| {
-                checked_failure(format!("decoding a terminal input failure: {error}"))
-            })?;
-            if guest_closed_input(&error) {
-                *feeding_input = false;
-                Ok(None)
-            } else {
-                Err(checked_failure(format!(
-                    "forwarding host terminal input failed in the guest: {}",
-                    describe_stdin_error(&error)
-                )))
-            }
-        }
-        _ => Ok(None),
+        CheckedEvent::Ignored => Ok(None),
     }
 }
 
@@ -783,42 +752,17 @@ fn finish_checked_session(
     raw: &mut CheckedRawTerminal,
     primary: MicrosandboxResult<i32>,
 ) -> MicrosandboxResult<i32> {
-    match (primary, raw.restore()) {
-        (Ok(code), Ok(())) => Ok(code),
-        (Ok(_), Err(restore)) => Err(checked_failure(format!(
-            "the guest reported its exit but the host terminal could not be restored: {restore}"
-        ))),
-        (Err(primary), Ok(())) => Err(primary),
-        (Err(primary), Err(restore)) => Err(checked_epilogue_error(
-            primary,
-            [("restoring the host terminal", restore)],
-        )),
-    }
-}
-
-pub(super) fn checked_failure(text: impl Into<String>) -> MicrosandboxError {
-    MicrosandboxError::Terminal(text.into())
-}
-
-/// A closed event channel is a lost session, never a completed one.
-fn closed_session() -> MicrosandboxError {
-    checked_failure("the agent connection closed before the guest reported its exit")
-}
-
-fn guest_closed_input(error: &ExecStdinError) -> bool {
-    match (error.errno_name.as_deref(), error.errno) {
-        (Some(name), _) => name == "EPIPE",
-        (None, errno) => errno == Some(GUEST_EPIPE),
-    }
-}
-
-fn describe_stdin_error(error: &ExecStdinError) -> String {
-    let errno = error
-        .errno_name
-        .clone()
-        .or_else(|| error.errno.map(|errno| errno.to_string()))
-        .unwrap_or_else(|| "no errno".to_string());
-    format!("{errno}: {}", error.message)
+    let teardown = raw
+        .restore()
+        .err()
+        .map(|error| ("restoring the host terminal", error))
+        .into_iter()
+        .collect();
+    finish_with_teardown(
+        primary,
+        teardown,
+        "the guest reported its exit but the host terminal could not be restored",
+    )
 }
 
 /// Host stdin's window size as `(cols, rows)`.
