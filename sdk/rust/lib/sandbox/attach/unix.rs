@@ -328,6 +328,7 @@ impl<'a> CheckedLoop<'a> {
             // chunk, and a chunk it did not take goes back to the front of the
             // queue so the byte stream keeps its order.
             let mut delivered = false;
+            let mut ended = None;
             tokio::select! {
                 result = self.io.output.enqueue_chunk(&chunk) => {
                     result?;
@@ -337,16 +338,20 @@ impl<'a> CheckedLoop<'a> {
                     let Some(message) = message else {
                         return Err(closed_session());
                     };
-                    if let Some(end) =
-                        handle_checked_message(message, &mut self.pending, &mut feeding_input)?
-                    {
-                        break 'session end;
-                    }
+                    // Recorded, not acted on: the chunk below is still the
+                    // session's to deliver, so the loop may only end after it is
+                    // back at the head of `pending`.
+                    ended = handle_checked_message(message, &mut self.pending, &mut feeding_input)?;
                 }
                 failure = self.io.output.failure() => return Err(failure),
             }
             if !delivered {
+                // Back at the head: `handle_checked_message` only appends, so the
+                // order the guest wrote is preserved.
                 self.pending.push_front(chunk);
+            }
+            if let Some(end) = ended {
+                break 'session end;
             }
         };
 
@@ -887,12 +892,7 @@ mod tests {
     }
 
     /// Which output pipe a fixture starts its writer on.
-    ///
-    /// `Prefilled` and `Closed` are exercised by the regression tests for the
-    /// session-ending paths; they are part of the fixture so that seam and its
-    /// users land against one definition.
     #[derive(Clone, Copy)]
-    #[allow(dead_code)]
     enum OutputPipe {
         /// An empty pipe, read by whoever the test hands the read end to.
         Open,
@@ -900,6 +900,7 @@ mod tests {
         /// `write(2)` blocks and nothing it is given is ever released.
         Prefilled,
         /// A pipe whose read end is closed, so the writer's first write fails.
+        #[allow(dead_code)] // used by the output-failure regression test
         Closed,
     }
 
@@ -1038,7 +1039,6 @@ mod tests {
     /// reservation is released only after a *whole* chunk is written: every
     /// chunk of the bound therefore stays reserved, and the next enqueue has to
     /// wait. That is what makes a blocked enqueue deterministic.
-    #[allow(dead_code)]
     async fn fill_queue(output: &CheckedOutput) -> Vec<u8> {
         let mut queued = Vec::new();
         let chunk = vec![b'q'; CHECKED_OUTPUT_CHUNK_BYTES];
@@ -1165,6 +1165,65 @@ mod tests {
                 .to_string()
                 .contains("closed before the guest reported its exit"),
             "a closed channel must be reported as the lost session it is: {failure}"
+        );
+    }
+
+    #[tokio::test]
+    async fn exit_during_a_blocked_enqueue_keeps_the_staged_chunk() {
+        let mut fixture = fixture(OutputPipe::Prefilled, 64 * 1024).await;
+        // The writer's queue is full by construction from here on, so nothing
+        // can be accepted until the test starts draining the screen.
+        let queued = fill_queue(&fixture.io.as_ref().expect("the fixture's io").output).await;
+        let prefill = fixture.prefill.clone();
+        // Held, not drained: the loop must end while the consumer is stalled.
+        let reader = fixture.screen.take().expect("an output pipe");
+
+        let staged = [
+            vec![0xA1u8; CHECKED_OUTPUT_CHUNK_BYTES],
+            vec![0xA2u8; CHECKED_OUTPUT_CHUNK_BYTES],
+            vec![0xA3u8; 100],
+        ];
+        // Injected before the loop is polled at all: `enqueue` cannot be ready
+        // while the writer is blocked, so the receive arm is the only one that
+        // can run, and the exit is what interrupts the capacity wait.
+        fixture.inject(exited(fixture.id, 5)).await;
+
+        let mut session = fixture.session();
+        for chunk in &staged {
+            session.pending.push_back(chunk.clone());
+        }
+
+        let end = within(session.run())
+            .await
+            .expect("the exit event itself ends the loop");
+        assert!(
+            matches!(end, CheckedEnd::Exited(5)),
+            "the loop must report the guest's own status"
+        );
+        assert_eq!(
+            session.pending,
+            VecDeque::from(staged.to_vec()),
+            "a chunk taken for a capacity wait must be back at the head of staging"
+        );
+
+        // Only now may a consumer drain: nothing the loop did depended on it.
+        let screen = read_screen(reader);
+        assert_eq!(
+            within(session.conclude(Ok(end)))
+                .await
+                .expect("the guest exit is the session's result"),
+            5
+        );
+        let mut expected = prefill;
+        expected.extend_from_slice(&queued);
+        for chunk in &staged {
+            expected.extend_from_slice(chunk);
+        }
+        drop(session);
+        assert_eq!(
+            screen.join().expect("the screen thread"),
+            expected,
+            "every byte the guest wrote must reach the descriptor, in order"
         );
     }
 }

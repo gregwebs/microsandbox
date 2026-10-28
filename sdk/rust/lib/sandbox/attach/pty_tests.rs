@@ -9,7 +9,7 @@
 //! recorded before the spawn with the attributes after the child exits.
 
 use std::io::{Read, Write};
-use std::os::fd::{AsRawFd, RawFd};
+use std::os::fd::{AsRawFd, OwnedFd, RawFd};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::Arc;
@@ -39,6 +39,12 @@ const CHILD_TEST: &str = "sandbox::attach::pty_tests::checked_bridge_pty_case";
 /// Every wait in this harness is bounded: a stuck case must fail, not hang.
 const DEADLINE: Duration = Duration::from_secs(30);
 
+/// Frames the output-flood cases send, at `FLOOD_FRAME_BYTES` each: 10 MiB,
+/// more than the writer's queue and the session's read-ahead can hold together,
+/// so the guest is always ahead of the host consumer.
+const FLOOD_FRAMES: usize = 40;
+const FLOOD_FRAME_BYTES: usize = 256 * 1024;
+
 /// Input the parent types at the terminal for the input case.
 const CASE_INPUT: &[u8] = b"A\x1dB";
 
@@ -64,6 +70,9 @@ enum Case {
     /// A lost relay is still observed once output has filled the writer's
     /// bound.
     OutputBackpressure,
+    /// The guest exits while the host is not draining output: no staged chunk
+    /// may be lost on the way out.
+    ExitDuringBackpressure,
     /// Dropping the session future restores the terminal.
     Cancel,
     /// The *no-options* legacy session still detaches on Ctrl-] while the
@@ -85,7 +94,7 @@ enum Case {
 }
 
 impl Case {
-    const ALL: [Case; 13] = [
+    const ALL: [Case; 14] = [
         Case::Input,
         Case::Resize,
         Case::Failed,
@@ -93,6 +102,7 @@ impl Case {
         Case::Closed,
         Case::OutputFailure,
         Case::OutputBackpressure,
+        Case::ExitDuringBackpressure,
         Case::Cancel,
         Case::LegacyDetach,
         Case::LegacyClosed,
@@ -116,6 +126,7 @@ impl Case {
             Case::Closed => "closed",
             Case::OutputFailure => "output-failure",
             Case::OutputBackpressure => "output-backpressure",
+            Case::ExitDuringBackpressure => "exit-during-backpressure",
             Case::Cancel => "cancel",
             Case::LegacyDetach => "legacy-detach",
             Case::LegacyClosed => "legacy-closed",
@@ -191,6 +202,15 @@ fn run_case(dir: &Path, case: Case) {
                 nix::sys::signal::Signal::SIGWINCH,
             )
             .expect("send SIGWINCH");
+        }
+        Case::ExitDuringBackpressure => {
+            // The relay floods output and then reports the guest's exit, all
+            // while the host is not draining. Release the raw barrier first,
+            // then wait for that exit to be sent, and only then start draining:
+            // the session must end during a capacity wait.
+            std::fs::write(dir.join("go"), b"go").expect("release the relay");
+            wait_for(dir, "stage=exit-sent");
+            std::fs::write(dir.join("drain"), b"drain").expect("drain the output");
         }
         Case::LegacyDetach => {
             // The detach sequence, typed at the terminal exactly as a user
@@ -320,6 +340,24 @@ fn run_case(dir: &Path, case: Case) {
                 outcome.contains("closed before the guest reported its exit"),
                 "case {}: a relay lost while output capacity was exhausted must be \
                  reported: {receipt}",
+                case.name()
+            );
+        }
+        Case::ExitDuringBackpressure => {
+            // A guest exit is a definitive end: every byte the guest wrote
+            // before it must reach the descriptor, in order, even though the
+            // host consumer was stalled throughout.
+            assert_eq!(outcome, "ok:5", "case {}: {receipt}", case.name());
+            assert_eq!(
+                receipt_value(&receipt, "output_len"),
+                (FLOOD_FRAMES * FLOOD_FRAME_BYTES).to_string(),
+                "case {}: a guest exit during a capacity wait must not lose output: {receipt}",
+                case.name()
+            );
+            assert_eq!(
+                receipt_value(&receipt, "output_ok"),
+                "true",
+                "case {}: the output must arrive complete, in order and unaltered: {receipt}",
                 case.name()
             );
         }
@@ -544,10 +582,24 @@ fn checked_bridge_pty_case() {
     let case = Case::parse(&std::env::var(CASE_NAME).expect("a case name"));
     let dir = PathBuf::from(dir);
     let outcome = run_bridge_case(&dir, case);
+    let output = capture_output(&dir);
+    // A flood's hex would be 20 MiB of receipt. Those cases compare the bytes
+    // here and report a verdict instead.
+    let stdout_hex = if output.len() <= 64 * 1024 {
+        hex(&output)
+    } else {
+        String::new()
+    };
+    let output_ok = match output_matches(&output, case) {
+        Some(ok) => ok.to_string(),
+        None => "n/a".to_string(),
+    };
     let receipt = format!(
-        "outcome={}\nstdout_hex={}\ntermios={}\n",
+        "outcome={}\nstdout_hex={}\noutput_len={}\noutput_ok={}\ntermios={}\n",
         outcome.describe(),
-        hex(&capture_output(&dir)),
+        stdout_hex,
+        output.len(),
+        output_ok,
         terminal_state(std::io::stdin().as_raw_fd())
     );
     // Written aside and renamed: the parent polls for the receipt's
@@ -578,36 +630,131 @@ impl Outcome {
     }
 }
 
+/// Where a case's host stdout goes, and what has to happen to it once the
+/// session has ended.
+///
+/// Guest output is captured here only: the checked writer duplicates fd 1, so
+/// nothing libtest prints can be mistaken for a guest byte.
+enum Capture {
+    /// A file: the writer's bytes land there and the parent reads them back.
+    File { fd: OwnedFd },
+    /// A pipe whose read end is already closed, so the writer's first write
+    /// fails.
+    Closed { fd: OwnedFd },
+    /// A pipe whose read end is held open but never drained, so the writer
+    /// blocks once the pipe's own buffer is full.
+    Held { fd: OwnedFd, held: OwnedFd },
+    /// A pipe drained by this child once the parent writes `drain`: the session
+    /// runs with an output consumer that is not consuming.
+    Stalled {
+        fd: OwnedFd,
+        drain: std::thread::JoinHandle<()>,
+    },
+}
+
+impl Capture {
+    fn start(dir: &Path, case: Case) -> Self {
+        match case {
+            Case::OutputFailure => {
+                let (read_end, write_end) = std::io::pipe().expect("an output pipe");
+                drop(read_end);
+                Self::Closed {
+                    fd: write_end.into(),
+                }
+            }
+            Case::OutputBackpressure => {
+                let (read_end, write_end) = std::io::pipe().expect("an output pipe");
+                Self::Held {
+                    fd: write_end.into(),
+                    held: read_end.into(),
+                }
+            }
+            Case::ExitDuringBackpressure => {
+                let (read_end, write_end) = std::io::pipe().expect("an output pipe");
+                Self::Stalled {
+                    fd: write_end.into(),
+                    drain: spawn_drain(dir.to_path_buf(), read_end),
+                }
+            }
+            _ => Self::File {
+                fd: std::fs::OpenOptions::new()
+                    .create(true)
+                    .write(true)
+                    .truncate(true)
+                    .open(dir.join("output.bin"))
+                    .expect("the output capture file")
+                    .into(),
+            },
+        }
+    }
+
+    fn fd(&self) -> RawFd {
+        let owned = match self {
+            Self::File { fd }
+            | Self::Closed { fd }
+            | Self::Held { fd, .. }
+            | Self::Stalled { fd, .. } => fd,
+        };
+        owned.as_raw_fd()
+    }
+
+    /// Close this child's last write end and wait for a drain thread to finish.
+    ///
+    /// The drain thread writes `output.bin`, so the receipt is only written
+    /// after this returns.
+    fn finish(self) {
+        match self {
+            Self::File { fd } | Self::Closed { fd } => drop(fd),
+            Self::Held { fd, held } => {
+                drop(fd);
+                drop(held);
+            }
+            Self::Stalled { fd, drain } => {
+                drop(fd);
+                drain.join().expect("drain the captured output");
+            }
+        }
+    }
+}
+
+/// Copy the output pipe to `output.bin`, but only once the parent says
+/// `drain`.
+///
+/// Reading nothing until then is what keeps the writer blocked while the case
+/// runs; reading everything afterwards is what proves the bytes were still
+/// there.
+fn spawn_drain(dir: PathBuf, reader: std::io::PipeReader) -> std::thread::JoinHandle<()> {
+    std::thread::spawn(move || {
+        let deadline = Instant::now() + DEADLINE;
+        while !dir.join("drain").exists() {
+            assert!(
+                Instant::now() < deadline,
+                "the parent never drained the output"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let mut screen = std::fs::File::from(OwnedFd::from(reader));
+        let mut captured =
+            std::fs::File::create(dir.join("output.bin")).expect("the output capture file");
+        let mut buffer = vec![0u8; 64 * 1024];
+        loop {
+            match screen.read(&mut buffer) {
+                Ok(0) => break,
+                Ok(read) => captured
+                    .write_all(&buffer[..read])
+                    .expect("write the captured output"),
+                Err(error) => panic!("draining the output pipe: {error}"),
+            }
+        }
+        captured.flush().expect("flush the captured output");
+    })
+}
+
 fn run_bridge_case(dir: &Path, case: Case) -> Outcome {
-    // Guest output is captured on this file only: the checked writer
-    // duplicates fd 1, so nothing libtest prints can be mistaken for a guest
-    // byte. The output-failure case instead points fd 1 at a pipe whose read
-    // end is already closed.
-    // A held read end keeps an output pipe open but undrained, so the writer
-    // blocks on capacity instead of failing on a closed descriptor.
-    let mut held_read_end: Option<std::os::fd::OwnedFd> = None;
-    let capture: std::os::fd::OwnedFd = match case {
-        Case::OutputFailure => {
-            let (read_end, write_end) = std::io::pipe().expect("an output pipe");
-            drop(read_end);
-            write_end.into()
-        }
-        Case::OutputBackpressure => {
-            let (read_end, write_end) = std::io::pipe().expect("an output pipe");
-            held_read_end = Some(read_end.into());
-            write_end.into()
-        }
-        _ => std::fs::OpenOptions::new()
-            .create(true)
-            .write(true)
-            .truncate(true)
-            .open(dir.join("output.bin"))
-            .expect("the output capture file")
-            .into(),
-    };
+    let capture = Capture::start(dir, case);
     let saved_stdout = unsafe { libc::dup(1) };
     assert!(saved_stdout >= 0, "duplicate stdout");
-    assert_eq!(unsafe { libc::dup2(capture.as_raw_fd(), 1) }, 1);
+    assert_eq!(unsafe { libc::dup2(capture.fd(), 1) }, 1);
 
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -620,9 +767,30 @@ fn run_bridge_case(dir: &Path, case: Case) -> Outcome {
 
     assert_eq!(unsafe { libc::dup2(saved_stdout, 1) }, 1);
     unsafe { libc::close(saved_stdout) };
-    drop(held_read_end);
-    drop(capture);
+    capture.finish();
     outcome
+}
+
+/// One flood frame: a single byte value repeated.
+///
+/// Frame `i` uses `(i % 251)`, so a lost or reordered 64 KiB chunk changes the
+/// content and not only the length.
+fn flood_frame(index: usize) -> Vec<u8> {
+    vec![(index % 251) as u8; FLOOD_FRAME_BYTES]
+}
+
+/// The bytes a flood of `frames` frames must produce, exactly.
+fn flood_bytes(frames: usize) -> Vec<u8> {
+    (0..frames).flat_map(flood_frame).collect()
+}
+
+/// Whether the captured output is exactly what the case's relay sent, for the
+/// cases that know their own expectation.
+fn output_matches(output: &[u8], case: Case) -> Option<bool> {
+    match case {
+        Case::ExitDuringBackpressure => Some(output == flood_bytes(FLOOD_FRAMES)),
+        _ => None,
+    }
 }
 
 async fn run_case_session(dir: &Path, case: Case) -> Outcome {
@@ -887,6 +1055,33 @@ async fn fake_relay(mut io: DuplexStream, dir: PathBuf, case: Case) {
             }
             append(&dir, &["stage=output-flooded".to_string()]);
             drop(io);
+        }
+        Case::ExitDuringBackpressure => {
+            // Flood output and then report the guest's exit, all before the
+            // host has consumed anything. The connection stays open: the exit,
+            // not a lost relay, has to end this session, and every byte the
+            // guest wrote before that exit still has to arrive.
+            for index in 0..FLOOD_FRAMES {
+                write(
+                    &mut io,
+                    Message::with_payload(
+                        MessageType::ExecStdout,
+                        id,
+                        &ExecStdout {
+                            data: flood_frame(index),
+                        },
+                    )
+                    .unwrap(),
+                )
+                .await;
+            }
+            write(
+                &mut io,
+                Message::with_payload(MessageType::ExecExited, id, &ExecExited { code: 5 })
+                    .unwrap(),
+            )
+            .await;
+            append(&dir, &["stage=exit-sent".to_string()]);
         }
         Case::Cancel => {
             // Keep the connection open while the parent releases the case.
