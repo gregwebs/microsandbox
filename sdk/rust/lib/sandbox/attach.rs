@@ -216,9 +216,10 @@ impl AttachOptionsBuilder {
     /// guest instead of intercepting an escape sequence.
     ///
     /// For this builder only: the option is per session, so other attaches keep
-    /// their default detach behavior. Leaving `detach_keys` unset is *not* a
-    /// way to disable interception (unset means the default `Ctrl-]`), and an
-    /// empty sequence is not a disable mechanism (it parses back to the default).
+    /// their default detach behavior. Leaving `detach_keys` unset is *not* a way
+    /// to disable interception (unset means the default `Ctrl-]`), and an empty
+    /// sequence is not a disable mechanism either: `DetachKeys::parse` rejects an
+    /// empty spec rather than falling back to the default.
     ///
     /// Without the escape key a session ends only when the guest exits, so a
     /// caller that wants a detach must set its own `detach_keys` again (which
@@ -621,12 +622,15 @@ pub(crate) mod agent {
     /// Memory accounting only. A full queue waits for the consumer, so guest
     /// backpressure stalls the session exactly as a native write to a slow
     /// terminal would; it never fails and never drops output.
-    pub(super) const CHECKED_OUTPUT_MAX_PENDING_BYTES: usize = 8 * 1024 * 1024;
 
+    //--------------------------------------------------------------------------------------------------
+    // Constants
+    //--------------------------------------------------------------------------------------------------
+
+    pub(super) const CHECKED_OUTPUT_MAX_PENDING_BYTES: usize = 8 * 1024 * 1024;
     /// Largest queued frame. A guest frame is split so one reservation can never
     /// exceed the bound above.
     const CHECKED_OUTPUT_CHUNK_BYTES: usize = 64 * 1024;
-
     /// Most staged chunks one session may hold read but not yet queued.
     ///
     /// Staging is what keeps failure observation live across a capacity wait, so
@@ -634,13 +638,319 @@ pub(crate) mod agent {
     /// flooding guest.
     const CHECKED_STAGED_CHUNKS: usize =
         CHECKED_OUTPUT_MAX_PENDING_BYTES / CHECKED_OUTPUT_CHUNK_BYTES;
-
     /// Host terminal read size: one `read(2)`, one `ExecStdin` frame.
     const CHECKED_INPUT_CHUNK_BYTES: usize = 1024;
-
     /// The guest's `EPIPE`. agentd reports the errno it observed inside the
     /// guest, so this is not the host's `libc::EPIPE`.
     const GUEST_EPIPE: i32 = 32;
+
+    //--------------------------------------------------------------------------------------------------
+    // Types
+    //--------------------------------------------------------------------------------------------------
+
+    /// How a checked session ended. Only a definitive guest event ends one; a
+    /// transport observation never stands in for an exit.
+    enum CheckedEnd {
+        Exited(i32),
+        Failed(ExecFailed),
+    }
+    /// The host terminal's saved attributes for one checked session.
+    ///
+    /// Duplicates fd 0 for ownership of the snapshot only: raw mode is a
+    /// terminal attribute, so no file-status flag of the caller's shared
+    /// description changes. Restoration is explicit on every ordinary return and
+    /// still attempted from `Drop` for cancellation or panic; an observation is
+    /// reported, never assumed, because a disconnected device cannot be
+    /// guaranteed restorable.
+    struct CheckedRawTerminal {
+        fd: OwnedFd,
+        saved: libc::termios,
+        active: bool,
+    }
+    /// One unit of the checked output queue.
+    enum CheckedOutputItem {
+        Data(Vec<u8>),
+        /// Enqueued after every preceding frame; its receipt is the session's
+        /// success barrier.
+        Finish(tokio::sync::oneshot::Sender<()>),
+    }
+    #[derive(Default)]
+    struct CheckedOutputQueueState {
+        items: VecDeque<CheckedOutputItem>,
+        /// Bytes enqueued but not yet accepted by the host descriptor,
+        /// including an in-flight write.
+        reserved: usize,
+        aborted: bool,
+        error: Option<String>,
+    }
+    /// The checked session's output path: an ordered queue plus the thread that
+    /// owns the blocking writes.
+    ///
+    /// A dedicated thread, not `tokio::io::stdout()`. Dropping a Tokio stdout
+    /// write future cannot cancel a blocking write it already dispatched, and
+    /// `Runtime::drop` waits for blocking tasks — so a checked session that
+    /// failed while its consumer stopped draining could not report the failure at
+    /// all. This thread is independent of the runtime: cancellation abandons it
+    /// (the launcher exits the process afterwards), and the runtime drops
+    /// immediately.
+    #[derive(Default)]
+    struct CheckedOutputQueue {
+        state: Mutex<CheckedOutputQueueState>,
+        /// Wakes the writer when work arrives or the queue is closed.
+        work: Condvar,
+        /// Wakes capacity waiters after a write, a failure, or an abort.
+        capacity: Notify,
+        /// Wakes a session that is waiting only for the writer's verdict.
+        ///
+        /// Deliberately separate from `capacity`: a writer failure has to reach
+        /// its session even when nothing is being enqueued, so it must not be
+        /// routed through guest progress.
+        failed: Notify,
+    }
+    struct CheckedOutput {
+        queue: Arc<CheckedOutputQueue>,
+    }
+
+    //--------------------------------------------------------------------------------------------------
+    // Methods
+    //--------------------------------------------------------------------------------------------------
+
+    impl CheckedRawTerminal {
+        fn enter(stdin_fd: RawFd) -> MicrosandboxResult<Self> {
+            let fd = duplicate_cloexec(stdin_fd).map_err(|error| {
+                checked_failure(format!(
+                    "duplicating the host terminal for raw mode: {error}"
+                ))
+            })?;
+            let saved = tcgetattr(fd.as_raw_fd())
+                .map_err(|error| checked_failure(format!("reading the host terminal: {error}")))?;
+            let mut raw = saved;
+            // SAFETY: `raw` is a valid, fully initialized `termios` that this
+            // function owns; `cfmakeraw` only writes into it.
+            unsafe { libc::cfmakeraw(&mut raw) };
+            set_attributes(fd.as_raw_fd(), &raw)
+                .map_err(|error| checked_failure(format!("entering raw mode: {error}")))?;
+            Ok(Self {
+                fd,
+                saved,
+                active: true,
+            })
+        }
+
+        /// Idempotent per attempt: a successful restore clears `active` so the
+        /// snapshot is never re-applied. A *failed* restore leaves `active` set
+        /// on purpose, so `Drop` makes one more bounded attempt when the session
+        /// is already on its way out; the first attempt's error is what the
+        /// session reports, and the retry is silent.
+        fn restore(&mut self) -> MicrosandboxResult<()> {
+            if !self.active {
+                return Ok(());
+            }
+            set_attributes(self.fd.as_raw_fd(), &self.saved).map_err(|error| {
+                checked_failure(format!("restoring the host terminal: {error}"))
+            })?;
+            self.active = false;
+            Ok(())
+        }
+    }
+    impl CheckedOutputQueue {
+        fn lock(&self) -> std::sync::MutexGuard<'_, CheckedOutputQueueState> {
+            // Every mutation is a single field update under this lock, so a panic
+            // elsewhere cannot leave the accounting inconsistent.
+            self.state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+        }
+
+        fn failure(&self) -> Option<String> {
+            self.lock().error.clone()
+        }
+
+        /// Stop the writer and release everything it has not written.
+        ///
+        /// The writer may be blocked in a write; it is never joined, and its
+        /// in-flight prefix may already have reached the descriptor.
+        fn abort(&self) {
+            {
+                let mut state = self.lock();
+                state.aborted = true;
+                state.items.clear();
+                state.reserved = 0;
+            }
+            self.work.notify_all();
+            self.capacity.notify_waiters();
+        }
+
+        fn fail(&self, message: String) {
+            {
+                let mut state = self.lock();
+                if state.error.is_none() {
+                    state.error = Some(message);
+                }
+                state.items.clear();
+                state.reserved = 0;
+            }
+            self.work.notify_all();
+            self.capacity.notify_waiters();
+            self.failed.notify_waiters();
+        }
+
+        fn release(&self, bytes: usize) {
+            {
+                let mut state = self.lock();
+                state.reserved = state.reserved.saturating_sub(bytes);
+            }
+            self.capacity.notify_waiters();
+        }
+
+        /// The writer's next item; `None` means it must stop.
+        fn next(&self) -> Option<CheckedOutputItem> {
+            let mut state = self.lock();
+            loop {
+                if state.aborted || state.error.is_some() {
+                    return None;
+                }
+                if let Some(item) = state.items.pop_front() {
+                    return Some(item);
+                }
+                state = self
+                    .work
+                    .wait(state)
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+            }
+        }
+
+        /// The writer's own message when it failed, otherwise the caller's.
+        fn failure_or(&self, fallback: &str) -> MicrosandboxError {
+            checked_failure(self.failure().unwrap_or_else(|| fallback.to_string()))
+        }
+    }
+    impl CheckedOutput {
+        fn start(stdout_fd: RawFd) -> MicrosandboxResult<Self> {
+            let output = duplicate_cloexec(stdout_fd).map_err(|error| {
+                checked_failure(format!("duplicating the host terminal output: {error}"))
+            })?;
+            let queue = Arc::new(CheckedOutputQueue::default());
+            let writer_queue = Arc::clone(&queue);
+            std::thread::Builder::new()
+                .name("agent-vm-terminal-output".into())
+                .spawn(move || run_checked_writer(writer_queue, output))
+                .map_err(|error| {
+                    checked_failure(format!("starting the terminal output writer: {error}"))
+                })?;
+            Ok(Self { queue })
+        }
+
+        /// Reserve capacity for one staged chunk, then queue it.
+        ///
+        /// Cancel-safe: the only suspension point is `reserve`, which has queued
+        /// nothing when it is dropped, and no await separates a successful
+        /// reservation from the queue push. A cancelled call therefore leaves
+        /// neither a reservation nor a partial frame, so the session can put the
+        /// chunk back at the head of its staging queue.
+        async fn enqueue_chunk(&self, bytes: &[u8]) -> MicrosandboxResult<()> {
+            debug_assert!(bytes.len() <= CHECKED_OUTPUT_CHUNK_BYTES);
+            self.reserve(bytes.len()).await?;
+            {
+                let mut state = self.queue.lock();
+                state
+                    .items
+                    .push_back(CheckedOutputItem::Data(bytes.to_vec()));
+            }
+            self.queue.work.notify_one();
+            Ok(())
+        }
+
+        /// The writer's own failure, as a future the session can select on.
+        ///
+        /// Waiting for capacity and waiting for the finish receipt both report a
+        /// stored failure, but only when the session calls them; a guest that
+        /// writes one frame and then waits for input would never call them again.
+        /// The notification is registered before the state is read, so a failure
+        /// that races the registration is observed rather than lost.
+        async fn failure(&self) -> MicrosandboxError {
+            loop {
+                let signal = self.queue.failed.notified();
+                tokio::pin!(signal);
+                signal.as_mut().enable();
+                if let Some(message) = self.queue.failure() {
+                    return checked_failure(message);
+                }
+                signal.await;
+            }
+        }
+
+        /// Wait until `bytes` more fit under the pending bound, then reserve them.
+        async fn reserve(&self, bytes: usize) -> MicrosandboxResult<()> {
+            debug_assert!(bytes <= CHECKED_OUTPUT_MAX_PENDING_BYTES);
+            loop {
+                // Registered before the accounting is read, so a release between
+                // the check and the wait cannot be lost.
+                let capacity = self.queue.capacity.notified();
+                tokio::pin!(capacity);
+                capacity.as_mut().enable();
+                {
+                    let mut state = self.queue.lock();
+                    if let Some(error) = &state.error {
+                        return Err(checked_failure(error.clone()));
+                    }
+                    if state.aborted {
+                        return Err(checked_failure("the terminal output writer was aborted"));
+                    }
+                    if state.reserved + bytes <= CHECKED_OUTPUT_MAX_PENDING_BYTES {
+                        state.reserved += bytes;
+                        return Ok(());
+                    }
+                }
+                capacity.await;
+            }
+        }
+
+        /// Wait for the ordered finish receipt: every earlier byte has been
+        /// accepted by the host descriptor (not flushed to stable storage).
+        ///
+        /// Cancellable, like every other await in the session; the queue's abort
+        /// then discards whatever the writer has not written.
+        async fn finish(&self) -> MicrosandboxResult<()> {
+            let (receipt, receipt_wait) = tokio::sync::oneshot::channel();
+            {
+                let mut state = self.queue.lock();
+                if let Some(error) = &state.error {
+                    return Err(checked_failure(error.clone()));
+                }
+                if state.aborted {
+                    return Err(checked_failure("the terminal output writer was aborted"));
+                }
+                state.items.push_back(CheckedOutputItem::Finish(receipt));
+            }
+            self.queue.work.notify_one();
+            match receipt_wait.await {
+                Ok(()) => Ok(()),
+                Err(_) => Err(self
+                    .queue
+                    .failure_or("the terminal output writer stopped before confirming its writes")),
+            }
+        }
+    }
+
+    //--------------------------------------------------------------------------------------------------
+    // Trait Implementations
+    //--------------------------------------------------------------------------------------------------
+
+    impl Drop for CheckedRawTerminal {
+        fn drop(&mut self) {
+            let _ = self.restore();
+        }
+    }
+    impl Drop for CheckedOutput {
+        fn drop(&mut self) {
+            self.queue.abort();
+        }
+    }
+
+    //--------------------------------------------------------------------------------------------------
+    // Functions
+    //--------------------------------------------------------------------------------------------------
 
     pub(crate) async fn attach(
         backend: &dyn crate::backend::Backend,
@@ -653,7 +963,6 @@ pub(crate) mod agent {
         let client = Arc::new(super::super::fs::agent::connect_agent(backend, name).await?);
         attach_connected(client, config, cmd, opts).await
     }
-
     /// Bridge an already-connected agent.
     ///
     /// Production reaches it through [`attach`]; tests drive it over an owned
@@ -671,7 +980,6 @@ pub(crate) mod agent {
             legacy_session(client, config, cmd, opts, detach_keys).await
         }
     }
-
     /// The interactive session every existing caller gets.
     async fn legacy_session(
         client: Arc<AgentClient>,
@@ -859,7 +1167,6 @@ pub(crate) mod agent {
         }
         Ok(exit_code)
     }
-
     /// The checked session: every completion and I/O fact is either observed or
     /// an error.
     async fn checked_session(
@@ -897,14 +1204,6 @@ pub(crate) mod agent {
             checked_bridge(&client, id, &mut rx, detach_keys.as_ref(), stdin_filter).await;
         finish_checked_session(&mut raw, primary)
     }
-
-    /// How a checked session ended. Only a definitive guest event ends one; a
-    /// transport observation never stands in for an exit.
-    enum CheckedEnd {
-        Exited(i32),
-        Failed(ExecFailed),
-    }
-
     async fn checked_bridge(
         client: &Arc<AgentClient>,
         id: u32,
@@ -1115,7 +1414,6 @@ pub(crate) mod agent {
             }
         }
     }
-
     /// One session event: `Some` ends the session, `None` continues it.
     ///
     /// Nothing here awaits: a handler that blocked on output capacity could not
@@ -1162,7 +1460,6 @@ pub(crate) mod agent {
             _ => Ok(None),
         }
     }
-
     /// The one exit from a checked session, so no `?` above can skip restoration.
     fn finish_checked_session(
         raw: &mut CheckedRawTerminal,
@@ -1180,23 +1477,19 @@ pub(crate) mod agent {
             )),
         }
     }
-
     fn checked_failure(text: impl Into<String>) -> MicrosandboxError {
         MicrosandboxError::Terminal(text.into())
     }
-
     /// A closed event channel is a lost session, never a completed one.
     fn closed_session() -> MicrosandboxError {
         checked_failure("the agent connection closed before the guest reported its exit")
     }
-
     fn guest_closed_input(error: &ExecStdinError) -> bool {
         match (error.errno_name.as_deref(), error.errno) {
             (Some(name), _) => name == "EPIPE",
             (None, errno) => errno == Some(GUEST_EPIPE),
         }
     }
-
     fn describe_stdin_error(error: &ExecStdinError) -> String {
         let errno = error
             .errno_name
@@ -1205,7 +1498,6 @@ pub(crate) mod agent {
             .unwrap_or_else(|| "no errno".to_string());
         format!("{errno}: {}", error.message)
     }
-
     /// Host stdin's window size as `(cols, rows)`.
     ///
     /// Reads fd 0 with `TIOCGWINSZ` rather than `crossterm::terminal::size()`,
@@ -1223,7 +1515,6 @@ pub(crate) mod agent {
         }
         Ok(normalized_terminal_size((size.ws_col, size.ws_row)))
     }
-
     fn normalized_terminal_size((cols, rows): (u16, u16)) -> (u16, u16) {
         if cols == 0 || rows == 0 {
             (80, 24)
@@ -1231,63 +1522,6 @@ pub(crate) mod agent {
             (cols, rows)
         }
     }
-
-    /// The host terminal's saved attributes for one checked session.
-    ///
-    /// Duplicates fd 0 for ownership of the snapshot only: raw mode is a
-    /// terminal attribute, so no file-status flag of the caller's shared
-    /// description changes. Restoration is explicit on every ordinary return and
-    /// still attempted from `Drop` for cancellation or panic; an observation is
-    /// reported, never assumed, because a disconnected device cannot be
-    /// guaranteed restorable.
-    struct CheckedRawTerminal {
-        fd: OwnedFd,
-        saved: libc::termios,
-        active: bool,
-    }
-
-    impl CheckedRawTerminal {
-        fn enter(stdin_fd: RawFd) -> MicrosandboxResult<Self> {
-            let fd = duplicate_cloexec(stdin_fd).map_err(|error| {
-                checked_failure(format!(
-                    "duplicating the host terminal for raw mode: {error}"
-                ))
-            })?;
-            let saved = tcgetattr(fd.as_raw_fd())
-                .map_err(|error| checked_failure(format!("reading the host terminal: {error}")))?;
-            let mut raw = saved;
-            // SAFETY: `raw` is a valid, fully initialized `termios` that this
-            // function owns; `cfmakeraw` only writes into it.
-            unsafe { libc::cfmakeraw(&mut raw) };
-            set_attributes(fd.as_raw_fd(), &raw)
-                .map_err(|error| checked_failure(format!("entering raw mode: {error}")))?;
-            Ok(Self {
-                fd,
-                saved,
-                active: true,
-            })
-        }
-
-        /// Idempotent: a session that already restored (or failed to) reports
-        /// once and never re-applies a stale snapshot.
-        fn restore(&mut self) -> MicrosandboxResult<()> {
-            if !self.active {
-                return Ok(());
-            }
-            set_attributes(self.fd.as_raw_fd(), &self.saved).map_err(|error| {
-                checked_failure(format!("restoring the host terminal: {error}"))
-            })?;
-            self.active = false;
-            Ok(())
-        }
-    }
-
-    impl Drop for CheckedRawTerminal {
-        fn drop(&mut self) {
-            let _ = self.restore();
-        }
-    }
-
     fn tcgetattr(fd: RawFd) -> std::io::Result<libc::termios> {
         loop {
             let mut attributes: libc::termios = unsafe { std::mem::zeroed() };
@@ -1301,7 +1535,6 @@ pub(crate) mod agent {
             }
         }
     }
-
     fn set_attributes(fd: RawFd, attributes: &libc::termios) -> std::io::Result<()> {
         loop {
             let rc = unsafe { libc::tcsetattr(fd, libc::TCSANOW, attributes) };
@@ -1314,7 +1547,6 @@ pub(crate) mod agent {
             }
         }
     }
-
     /// A descriptor that the child would not inherit and that this code owns.
     fn duplicate_cloexec(fd: RawFd) -> std::io::Result<OwnedFd> {
         let duplicate = unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 3) };
@@ -1323,7 +1555,6 @@ pub(crate) mod agent {
         }
         Ok(unsafe { OwnedFd::from_raw_fd(duplicate) })
     }
-
     /// Split one guest output frame into the bounded chunks the writer accepts.
     fn stage_output_chunks(bytes: Vec<u8>, pending: &mut VecDeque<Vec<u8>>) {
         let mut remaining = bytes;
@@ -1333,123 +1564,6 @@ pub(crate) mod agent {
             pending.push_back(chunk);
         }
     }
-
-    /// One unit of the checked output queue.
-    enum CheckedOutputItem {
-        Data(Vec<u8>),
-        /// Enqueued after every preceding frame; its receipt is the session's
-        /// success barrier.
-        Finish(tokio::sync::oneshot::Sender<()>),
-    }
-
-    #[derive(Default)]
-    struct CheckedOutputQueueState {
-        items: VecDeque<CheckedOutputItem>,
-        /// Bytes enqueued but not yet accepted by the host descriptor,
-        /// including an in-flight write.
-        reserved: usize,
-        aborted: bool,
-        error: Option<String>,
-    }
-
-    /// The checked session's output path: an ordered queue plus the thread that
-    /// owns the blocking writes.
-    ///
-    /// A dedicated thread, not `tokio::io::stdout()`. Dropping a Tokio stdout
-    /// write future cannot cancel a blocking write it already dispatched, and
-    /// `Runtime::drop` waits for blocking tasks — so a checked session that
-    /// failed while its consumer stopped draining could not report the failure at
-    /// all. This thread is independent of the runtime: cancellation abandons it
-    /// (the launcher exits the process afterwards), and the runtime drops
-    /// immediately.
-    #[derive(Default)]
-    struct CheckedOutputQueue {
-        state: Mutex<CheckedOutputQueueState>,
-        /// Wakes the writer when work arrives or the queue is closed.
-        work: Condvar,
-        /// Wakes capacity waiters after a write, a failure, or an abort.
-        capacity: Notify,
-        /// Wakes a session that is waiting only for the writer's verdict.
-        ///
-        /// Deliberately separate from `capacity`: a writer failure has to reach
-        /// its session even when nothing is being enqueued, so it must not be
-        /// routed through guest progress.
-        failed: Notify,
-    }
-
-    impl CheckedOutputQueue {
-        fn lock(&self) -> std::sync::MutexGuard<'_, CheckedOutputQueueState> {
-            // Every mutation is a single field update under this lock, so a panic
-            // elsewhere cannot leave the accounting inconsistent.
-            self.state
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-        }
-
-        fn failure(&self) -> Option<String> {
-            self.lock().error.clone()
-        }
-
-        /// Stop the writer and release everything it has not written.
-        ///
-        /// The writer may be blocked in a write; it is never joined, and its
-        /// in-flight prefix may already have reached the descriptor.
-        fn abort(&self) {
-            {
-                let mut state = self.lock();
-                state.aborted = true;
-                state.items.clear();
-                state.reserved = 0;
-            }
-            self.work.notify_all();
-            self.capacity.notify_waiters();
-        }
-
-        fn fail(&self, message: String) {
-            {
-                let mut state = self.lock();
-                if state.error.is_none() {
-                    state.error = Some(message);
-                }
-                state.items.clear();
-                state.reserved = 0;
-            }
-            self.work.notify_all();
-            self.capacity.notify_waiters();
-            self.failed.notify_waiters();
-        }
-
-        fn release(&self, bytes: usize) {
-            {
-                let mut state = self.lock();
-                state.reserved = state.reserved.saturating_sub(bytes);
-            }
-            self.capacity.notify_waiters();
-        }
-
-        /// The writer's next item; `None` means it must stop.
-        fn next(&self) -> Option<CheckedOutputItem> {
-            let mut state = self.lock();
-            loop {
-                if state.aborted || state.error.is_some() {
-                    return None;
-                }
-                if let Some(item) = state.items.pop_front() {
-                    return Some(item);
-                }
-                state = self
-                    .work
-                    .wait(state)
-                    .unwrap_or_else(|poisoned| poisoned.into_inner());
-            }
-        }
-
-        /// The writer's own message when it failed, otherwise the caller's.
-        fn failure_or(&self, fallback: &str) -> MicrosandboxError {
-            checked_failure(self.failure().unwrap_or_else(|| fallback.to_string()))
-        }
-    }
-
     /// Owns the duplicated host stdout descriptor and every blocking write.
     fn run_checked_writer(queue: Arc<CheckedOutputQueue>, output: OwnedFd) {
         // The queue is re-read for each item instead of being held across the
@@ -1477,7 +1591,6 @@ pub(crate) mod agent {
             }
         }
     }
-
     fn write_all_fd(fd: RawFd, mut bytes: &[u8]) -> std::io::Result<()> {
         while !bytes.is_empty() {
             let written = unsafe { libc::write(fd, bytes.as_ptr().cast(), bytes.len()) };
@@ -1496,123 +1609,9 @@ pub(crate) mod agent {
         Ok(())
     }
 
-    struct CheckedOutput {
-        queue: Arc<CheckedOutputQueue>,
-    }
-
-    impl CheckedOutput {
-        fn start(stdout_fd: RawFd) -> MicrosandboxResult<Self> {
-            let output = duplicate_cloexec(stdout_fd).map_err(|error| {
-                checked_failure(format!("duplicating the host terminal output: {error}"))
-            })?;
-            let queue = Arc::new(CheckedOutputQueue::default());
-            let writer_queue = Arc::clone(&queue);
-            std::thread::Builder::new()
-                .name("agent-vm-terminal-output".into())
-                .spawn(move || run_checked_writer(writer_queue, output))
-                .map_err(|error| {
-                    checked_failure(format!("starting the terminal output writer: {error}"))
-                })?;
-            Ok(Self { queue })
-        }
-
-        /// Reserve capacity for one staged chunk, then queue it.
-        ///
-        /// Cancel-safe: the only suspension point is `reserve`, which has queued
-        /// nothing when it is dropped, and no await separates a successful
-        /// reservation from the queue push. A cancelled call therefore leaves
-        /// neither a reservation nor a partial frame, so the session can put the
-        /// chunk back at the head of its staging queue.
-        async fn enqueue_chunk(&self, bytes: &[u8]) -> MicrosandboxResult<()> {
-            debug_assert!(bytes.len() <= CHECKED_OUTPUT_CHUNK_BYTES);
-            self.reserve(bytes.len()).await?;
-            {
-                let mut state = self.queue.lock();
-                state
-                    .items
-                    .push_back(CheckedOutputItem::Data(bytes.to_vec()));
-            }
-            self.queue.work.notify_one();
-            Ok(())
-        }
-
-        /// The writer's own failure, as a future the session can select on.
-        ///
-        /// Waiting for capacity and waiting for the finish receipt both report a
-        /// stored failure, but only when the session calls them; a guest that
-        /// writes one frame and then waits for input would never call them again.
-        /// The notification is registered before the state is read, so a failure
-        /// that races the registration is observed rather than lost.
-        async fn failure(&self) -> MicrosandboxError {
-            loop {
-                let signal = self.queue.failed.notified();
-                tokio::pin!(signal);
-                signal.as_mut().enable();
-                if let Some(message) = self.queue.failure() {
-                    return checked_failure(message);
-                }
-                signal.await;
-            }
-        }
-
-        /// Wait until `bytes` more fit under the pending bound, then reserve them.
-        async fn reserve(&self, bytes: usize) -> MicrosandboxResult<()> {
-            debug_assert!(bytes <= CHECKED_OUTPUT_MAX_PENDING_BYTES);
-            loop {
-                // Registered before the accounting is read, so a release between
-                // the check and the wait cannot be lost.
-                let capacity = self.queue.capacity.notified();
-                tokio::pin!(capacity);
-                capacity.as_mut().enable();
-                {
-                    let mut state = self.queue.lock();
-                    if let Some(error) = &state.error {
-                        return Err(checked_failure(error.clone()));
-                    }
-                    if state.aborted {
-                        return Err(checked_failure("the terminal output writer was aborted"));
-                    }
-                    if state.reserved + bytes <= CHECKED_OUTPUT_MAX_PENDING_BYTES {
-                        state.reserved += bytes;
-                        return Ok(());
-                    }
-                }
-                capacity.await;
-            }
-        }
-
-        /// Wait for the ordered finish receipt: every earlier byte has been
-        /// accepted by the host descriptor (not flushed to stable storage).
-        ///
-        /// Cancellable, like every other await in the session; the queue's abort
-        /// then discards whatever the writer has not written.
-        async fn finish(&self) -> MicrosandboxResult<()> {
-            let (receipt, receipt_wait) = tokio::sync::oneshot::channel();
-            {
-                let mut state = self.queue.lock();
-                if let Some(error) = &state.error {
-                    return Err(checked_failure(error.clone()));
-                }
-                if state.aborted {
-                    return Err(checked_failure("the terminal output writer was aborted"));
-                }
-                state.items.push_back(CheckedOutputItem::Finish(receipt));
-            }
-            self.queue.work.notify_one();
-            match receipt_wait.await {
-                Ok(()) => Ok(()),
-                Err(_) => Err(self
-                    .queue
-                    .failure_or("the terminal output writer stopped before confirming its writes")),
-            }
-        }
-    }
-
-    impl Drop for CheckedOutput {
-        fn drop(&mut self) {
-            self.queue.abort();
-        }
-    }
+    //--------------------------------------------------------------------------------------------------
+    // Tests
+    //--------------------------------------------------------------------------------------------------
 
     #[cfg(test)]
     mod checked_output {
@@ -1885,9 +1884,26 @@ pub(crate) mod agent {
         checked_epilogue_error, recv_filtered, require_filtered, route_input,
     };
 
+    //--------------------------------------------------------------------------------------------------
+    // Constants
+    //--------------------------------------------------------------------------------------------------
+
     /// The guest's `EPIPE`, as agentd reports the errno it observed inside the
     /// guest.
     const GUEST_EPIPE: i32 = 32;
+
+    //--------------------------------------------------------------------------------------------------
+    // Types
+    //--------------------------------------------------------------------------------------------------
+
+    enum CheckedEnd {
+        Exited(i32),
+        Failed(ExecFailed),
+    }
+
+    //--------------------------------------------------------------------------------------------------
+    // Functions
+    //--------------------------------------------------------------------------------------------------
 
     pub(crate) async fn attach(
         backend: &dyn Backend,
@@ -2146,11 +2162,6 @@ pub(crate) mod agent {
         }
     }
 
-    enum CheckedEnd {
-        Exited(i32),
-        Failed(ExecFailed),
-    }
-
     async fn checked_bridge(
         client: &Arc<crate::agent::AgentClient>,
         id: u32,
@@ -2332,9 +2343,11 @@ pub(crate) mod agent {
 }
 
 //--------------------------------------------------------------------------------------------------
-// Module: PTY tests (Unix)
+// Tests
 //--------------------------------------------------------------------------------------------------
 
+/// Both sessions over a real host terminal and an owned fake relay: the checked
+/// session, the untouched no-options legacy session, and their failure paths.
 #[cfg(all(test, unix))]
 mod pty_tests {
     //! Both sessions over a real host terminal and an owned fake relay.
@@ -2456,9 +2469,7 @@ mod pty_tests {
         }
     }
 
-    //---------------------------------------------------------------------------------------------
-    // Parent
-    //---------------------------------------------------------------------------------------------
+    // The parent: allocates the terminal, drives the case, compares attributes.
 
     #[test]
     fn checked_bridge_over_a_real_terminal() {
@@ -2484,12 +2495,12 @@ mod pty_tests {
             .stdin(Stdio::from(child_slave))
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
-        let mut child = command.spawn().expect("spawn the case child");
+        let mut child = CaseChild::new(command.spawn().expect("spawn the case child"));
 
         // Both pipes are drained concurrently: a child that logs must never block
         // on a full pipe while the parent waits for its receipt.
-        let mut child_stdout = child.stdout.take().expect("child stdout");
-        let mut child_stderr = child.stderr.take().expect("child stderr");
+        let mut child_stdout = child.get().stdout.take().expect("child stdout");
+        let mut child_stderr = child.get().stderr.take().expect("child stderr");
         let drain_stdout = std::thread::spawn(move || {
             let mut sink = Vec::new();
             let _ = child_stdout.read_to_end(&mut sink);
@@ -2542,7 +2553,7 @@ mod pty_tests {
         if matches!(case, Case::OutputFailure | Case::LegacyDetach) {
             std::fs::write(dir.join("release"), b"release").expect("release the relay");
         }
-        wait_for_exit(&mut child);
+        child.wait_within(DEADLINE);
 
         // A terminal that is not restored is the defect this whole path exists to
         // prevent, so it is compared before anything else is asserted.
@@ -2735,14 +2746,48 @@ mod pty_tests {
         wait_for_receipt_file(dir, "child.receipt")
     }
 
-    fn wait_for_exit(child: &mut std::process::Child) {
-        let deadline = Instant::now() + DEADLINE;
-        loop {
-            if child.try_wait().expect("query the child").is_some() {
-                return;
+    /// The case child, killed and reaped if this parent panics.
+    ///
+    /// Every parent wait is bounded, but an assertion that panicked first used to
+    /// leave the child (and its fake relay) running for the rest of the suite.
+    struct CaseChild {
+        child: Option<std::process::Child>,
+    }
+
+    impl CaseChild {
+        fn new(child: std::process::Child) -> Self {
+            Self { child: Some(child) }
+        }
+
+        fn id(&self) -> u32 {
+            self.child.as_ref().expect("the child is still owned").id()
+        }
+
+        fn get(&mut self) -> &mut std::process::Child {
+            self.child.as_mut().expect("the child is still owned")
+        }
+
+        /// Wait for the child under a parent-side deadline, then reap it.
+        fn wait_within(&mut self, deadline: Duration) {
+            let limit = Instant::now() + deadline;
+            loop {
+                let owned = self.child.as_mut().expect("the child is still owned");
+                if owned.try_wait().expect("query the child").is_some() {
+                    self.child = None;
+                    return;
+                }
+                assert!(Instant::now() < limit, "the case child did not exit");
+                std::thread::sleep(Duration::from_millis(5));
             }
-            assert!(Instant::now() < deadline, "the case child did not exit");
-            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    impl Drop for CaseChild {
+        fn drop(&mut self) {
+            if let Some(child) = self.child.as_mut() {
+                let _ = child.kill();
+                let _ = child.wait();
+            }
         }
     }
 
@@ -2762,9 +2807,7 @@ mod pty_tests {
             .find_map(|line| line.strip_prefix(&prefix).map(str::to_owned))
     }
 
-    //---------------------------------------------------------------------------------------------
-    // Child
-    //---------------------------------------------------------------------------------------------
+    // The child: one case behind its own token, in a process with a real PTY.
 
     /// One PTY case, in the child process the parent spawned.
     ///
@@ -3187,10 +3230,8 @@ mod pty_tests {
     }
 }
 
-//--------------------------------------------------------------------------------------------------
-// Tests
-//--------------------------------------------------------------------------------------------------
-
+// The platform-independent unit tests: builder defaults, detach parsing and the
+// shared input-forwarding decision.
 #[cfg(test)]
 mod tests {
     use std::sync::{
