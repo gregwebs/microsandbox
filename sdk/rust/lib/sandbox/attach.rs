@@ -2089,8 +2089,11 @@ pub(crate) mod agent {
         detach_keys: Option<DetachKeys>,
     ) -> MicrosandboxResult<i32> {
         let stdin_filter = opts.stdin_filter.take();
-        let (cols, rows) = current_terminal_size()
-            .map_err(|error| checked_failure(format!("reading the console size: {error}")))?;
+        // A console with no readable size is not a session failure here: the
+        // console API reports "no size" as an absence, not an error, so the
+        // legacy fallback is the only information available and inventing an
+        // error would fail a session the legacy path runs.
+        let (cols, rows) = current_terminal_size().unwrap_or((80, 24));
         let req = build_exec_request(
             config,
             cmd,
