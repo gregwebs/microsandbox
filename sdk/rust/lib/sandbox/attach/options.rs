@@ -180,6 +180,17 @@ impl AttachOptionsBuilder {
     ///   errno) is expected and stops feeding input while the session still
     ///   waits for the guest's exit: the guest closed its input, or its PTY is
     ///   gone because it is exiting. Any other stdin error is an error;
+    /// * at most one send to the guest is in flight at a time, on both
+    ///   platforms. Host input, filtered input and resizes wait behind it: they
+    ///   are forwarded once, in order, and never restarted part-way, so a chunk
+    ///   cannot be duplicated or overtaken. The guest's exit, its output and a
+    ///   writer failure are not held back by that send, so a stalled relay
+    ///   cannot keep the session raw once an exit or a channel closure can be
+    ///   received. How much of them a session can receive is limited separately:
+    ///   on Unix by the output retention bound below, and on Windows by how fast
+    ///   the console accepts inline writes. Until one of them can be received
+    ///   the session stays raw, and detaching does not help, because the detach
+    ///   sequence is host input and waits behind the same send;
     /// * **detach is an error here.** With detach keys enabled (the default, or
     ///   [`detach_keys`](Self::detach_keys)), typing the sequence ends the
     ///   session with an error and leaves the guest running. Use
@@ -212,8 +223,9 @@ impl AttachOptionsBuilder {
     /// What a session can observe about a lost relay:
     ///
     /// * a relay that rejects a send is reported on the next keystroke or
-    ///   resize the transport refuses. After the guest closed its input,
-    ///   keystrokes are deliberately not read, so only a resize can carry it;
+    ///   resize the transport refuses. After the guest closed its input, only a
+    ///   resize can carry it: Unix stops reading keystrokes, and the Windows
+    ///   console keeps reading them but no longer routes or forwards them;
     /// * a relay that closed without refusing a send is reported as soon as the
     ///   host accepts output again. While output is stalled and the session's
     ///   read-ahead is full, that loss is behind guest output the host has not

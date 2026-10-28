@@ -57,9 +57,11 @@ const DEADLINE: Duration = Duration::from_secs(30);
 const FLOOD_FRAMES: usize = 40;
 const FLOOD_FRAME_BYTES: usize = 256 * 1024;
 
-/// How the flood watches for saturation: a flood that has completed no frame
-/// for `SATURATION_QUIET`, checked every `SATURATION_POLL`, has filled every
-/// bound the session holds, so its receive arm is off.
+/// How the flood watches for saturation: a heuristic, not a proof. A flood that
+/// has completed no frame for `SATURATION_QUIET`, checked every
+/// `SATURATION_POLL`, has very likely filled every bound the session holds, so
+/// its receive arm is off. It is a quiet-period guess: a single frame that takes
+/// longer than that to arrive would read the same way.
 const SATURATION_QUIET: Duration = Duration::from_millis(300);
 const SATURATION_POLL: Duration = Duration::from_millis(50);
 

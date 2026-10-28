@@ -95,13 +95,14 @@ pub(super) struct CheckedLoop<'a> {
     ///
     /// The loop only *offers* the head to the writer and removes it once the
     /// writer accepted it, so a capacity wait holds nothing back: the writer's
-    /// own failure or the guest's own exit still ends the session while the
-    /// host consumer is not draining. Reception is not exempt, though. This
-    /// staging's bound is what keeps one session's memory finite, and the
-    /// receive arm is off while it has no room for a largest frame, so a guest
-    /// channel that closed behind unconsumed output is only observed once the
-    /// host takes enough of it. The bound is by allocation, so a flooding guest
-    /// cannot grow the session's memory with retained chunk headers either.
+    /// own failure or an exit the loop has already received still ends the
+    /// session while the host consumer is not draining. Reception is not
+    /// exempt, though. This staging's bound is what keeps one session's memory
+    /// finite, and the receive arm is off while it has no room for a largest
+    /// frame, so a guest channel that closed behind unconsumed output is only
+    /// observed once the host takes enough of it. The bound is by allocation, so
+    /// a flooding guest cannot grow the session's memory with retained chunk
+    /// headers either.
     staging: Staging,
 }
 
