@@ -26,7 +26,9 @@ mod windows;
 //--------------------------------------------------------------------------------------------------
 
 pub use input::StdinFilter;
-#[cfg(feature = "ssh")]
+// The SSH attach scans for the detach sequence in its Windows console input
+// loop only, so on Unix nothing in the crate names this.
+#[cfg(all(feature = "ssh", windows))]
 pub(crate) use input::input_contains_detach_sequence;
 pub(crate) use input::{
     DetachKeys, FilteredStdin, InputRoute, STDIN_FILTER_TASK_ENDED, recv_filtered,
