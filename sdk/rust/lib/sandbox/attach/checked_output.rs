@@ -1081,6 +1081,32 @@ mod tests {
         FlushPolicy { idle, limit }
     }
 
+    /// Wait until the descriptor has accepted exactly `bytes` bytes.
+    ///
+    /// The fixtures here are built so the room a test opens is the only room the
+    /// writer ever gets, which makes the accepted count an exact, observable
+    /// event rather than a sample of the clock. Only the waiting is bounded, so
+    /// a writer that never gets there fails the test instead of hanging it.
+    async fn wait_for_accepted(queue: &CheckedOutputQueue, bytes: u64) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let accepted = queue.accepted.load(Ordering::Relaxed);
+            if accepted == bytes {
+                return;
+            }
+            assert!(
+                accepted < bytes,
+                "the descriptor accepted more than the fixture made room for: \
+                 {accepted} of {bytes} bytes"
+            );
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the writer accepted {accepted} of {bytes} bytes"
+            );
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    }
+
     #[tokio::test]
     async fn delivers_everything_to_a_live_consumer() {
         let mut file = tempfile::tempfile().expect("a scratch output file");
@@ -1145,10 +1171,18 @@ mod tests {
     #[tokio::test]
     async fn one_late_byte_of_progress_does_not_buy_a_second_idle_window() {
         // A consumer that takes one bufferful and then stops: the descriptor
-        // accepts bytes just after delivery starts and nothing afterwards. The
-        // idle deadline has to run from that last accepted byte, so the attempt
-        // ends one interval later — not two, which is what sampling the accepted
+        // accepts bytes after delivery starts and nothing afterwards. The idle
+        // deadline has to run from that last accepted byte, so the attempt ends
+        // one interval later — not two, which is what sampling the accepted
         // counter once per interval produces.
+        //
+        // Both halves of the fixture are facts rather than guesses about
+        // timing. The pipe is prefilled to capacity and then read exactly once,
+        // so the room this test opens is the only room the writer ever gets and
+        // the accepted count stops for good at that size; and the idle window is
+        // an order of magnitude wider than the scheduling delay this test can be
+        // exposed to, so the policy dominates the measurement instead of jitter.
+        const IDLE: Duration = Duration::from_secs(1);
         let (write_end, reader, _prefill) = prefilled_pipe();
         let output = CheckedOutput::start(write_end.as_raw_fd()).expect("start the writer");
         drop(write_end);
@@ -1156,72 +1190,58 @@ mod tests {
 
         let mut staging = Staging::default();
         staging.stage(vec![b'p'; 8 * CHECKED_OUTPUT_CHUNK_BYTES]);
-        let policy = flush_policy(Duration::from_millis(300), Duration::from_secs(20));
+        let policy = flush_policy(IDLE, Duration::from_secs(20));
 
         let delivery =
             tokio::spawn(async move { deliver_after_failure(&output, &mut staging, policy).await });
 
-        // Let the writer fill the pipe and block, then free room for one more
-        // accepted write. The descriptor stays open and is never read again, so
-        // that write is the last progress there is.
-        tokio::time::sleep(Duration::from_millis(50)).await;
-        let screenful = within(tokio::task::spawn_blocking(move || {
-            let mut screen = reader;
-            let mut buffer = vec![0u8; 8 * 1024];
-            screen
-                .read_exact(&mut buffer)
-                .expect("the pipe's first bytes");
-            (screen, buffer)
-        }))
-        .await
-        .expect("the read task");
-        let _screen = screenful.0;
+        // The writer fills the pipe and blocks. Open room for one more accepted
+        // write a third of the way into the window: an implementation that
+        // measured the window from the *start* of delivery instead would end two
+        // thirds of a window from here, short of the lower bound below.
+        tokio::time::sleep(IDLE / 3).await;
+        let mut screen = reader;
+        let mut buffer = vec![0u8; 8 * 1024];
+        screen
+            .read_exact(&mut buffer)
+            .expect("the pipe's prefilled bytes");
+        let opened = std::time::Instant::now();
+        // Held open and never read again: no room follows the one just opened,
+        // and closing it would turn the stalled consumer into a broken pipe.
+        let _screen = screen;
 
-        // Measure from the last byte the descriptor accepted, exactly as the
-        // policy does.
-        let mut last = queue.accepted.load(Ordering::Relaxed);
-        assert!(
-            last > 0,
-            "the writer must have delivered what the prefilled pipe held"
-        );
-        let mut last_progress = std::time::Instant::now();
-        loop {
-            tokio::time::sleep(Duration::from_millis(2)).await;
-            let now = queue.accepted.load(Ordering::Relaxed);
-            if now != last {
-                assert!(now > last, "the accepted count is monotonic");
-                last = now;
-                last_progress = std::time::Instant::now();
-                continue;
-            }
-            // Half an idle window without a byte is enough to know the consumer
-            // stopped; the deadline itself is still half an interval away.
-            if last_progress.elapsed() >= policy.idle / 2 {
-                break;
-            }
-            assert!(
-                last_progress.elapsed() < policy.idle,
-                "the consumer never stopped accepting bytes"
-            );
-        }
+        // Synchronise on the write that room allowed, instead of sleeping and
+        // hoping it landed before the deadline. It is the last accepted byte
+        // there is, and the assertion after the measurement proves the count
+        // never moved again.
+        wait_for_accepted(&queue, buffer.len() as u64).await;
 
         let error = within(delivery)
             .await
             .expect("the delivery task")
             .expect_err("a consumer that stops taking bytes ends the attempt");
-        let since_progress = last_progress.elapsed();
+        // Measured from the moment room appeared: no byte can be accepted
+        // before it, and the wait above is what proves one was accepted after
+        // it, so the policy's own last-progress instant is this one plus the
+        // writer's wake-up.
+        let since_last_byte = opened.elapsed();
         assert!(
             error.contains("accepted nothing"),
             "the idle window must say what it was: {error}"
         );
         assert!(
-            since_progress >= policy.idle * 3 / 4,
+            since_last_byte >= IDLE * 3 / 4,
             "the attempt must not end before one idle interval without progress: \
-             {since_progress:?}"
+             {since_last_byte:?}"
         );
         assert!(
-            since_progress < policy.idle * 3 / 2,
-            "one idle interval after the last accepted byte, not two: {since_progress:?}"
+            since_last_byte < IDLE * 3 / 2,
+            "one idle interval after the last accepted byte, not two: {since_last_byte:?}"
+        );
+        assert_eq!(
+            queue.accepted.load(Ordering::Relaxed),
+            buffer.len() as u64,
+            "nothing follows the last accepted byte: the pipe was not read again"
         );
     }
 
