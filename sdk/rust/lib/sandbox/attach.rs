@@ -2405,10 +2405,16 @@ mod pty_tests {
         OutputBackpressure,
         /// Dropping the session future restores the terminal.
         Cancel,
+        /// The *no-options* legacy session still detaches on Ctrl-] while the
+        /// relay stays open, i.e. the default interception is intact.
+        LegacyDetach,
+        /// The no-options legacy session still reports `Ok(-1)` for a channel
+        /// that closed without a guest exit.
+        LegacyClosed,
     }
 
     impl Case {
-        const ALL: [Case; 8] = [
+        const ALL: [Case; 10] = [
             Case::Input,
             Case::Resize,
             Case::Failed,
@@ -2417,7 +2423,15 @@ mod pty_tests {
             Case::OutputFailure,
             Case::OutputBackpressure,
             Case::Cancel,
+            Case::LegacyDetach,
+            Case::LegacyClosed,
         ];
+
+        /// Whether this case drives the untouched default session instead of the
+        /// checked one. The legacy conventions are the reason both exist.
+        fn legacy(self) -> bool {
+            matches!(self, Case::LegacyDetach | Case::LegacyClosed)
+        }
 
         fn name(self) -> &'static str {
             match self {
@@ -2429,6 +2443,8 @@ mod pty_tests {
                 Case::OutputFailure => "output-failure",
                 Case::OutputBackpressure => "output-backpressure",
                 Case::Cancel => "cancel",
+                Case::LegacyDetach => "legacy-detach",
+                Case::LegacyClosed => "legacy-closed",
             }
         }
 
@@ -2501,12 +2517,21 @@ mod pty_tests {
                 )
                 .expect("send SIGWINCH");
             }
+            Case::LegacyDetach => {
+                // The detach sequence, typed at the terminal exactly as a user
+                // types it. The relay stays open (see the relay below), so a status
+                // of -1 here cannot be the closed channel's convention.
+                let mut master = std::fs::File::from(pty.master.try_clone().expect("clone master"));
+                master.write_all(b"\x1d").expect("type the detach sequence");
+                master.flush().expect("flush the detach sequence");
+            }
             Case::Failed
             | Case::Malformed
             | Case::Closed
             | Case::OutputFailure
             | Case::OutputBackpressure
-            | Case::Cancel => {}
+            | Case::Cancel
+            | Case::LegacyClosed => {}
         }
         std::fs::write(dir.join("go"), b"go").expect("release the child");
 
@@ -2514,7 +2539,7 @@ mod pty_tests {
         // The output-failure case keeps its relay open on purpose: the session must
         // end on the writer's own failure, so the parent releases the relay only
         // after the child has already reported its outcome.
-        if case == Case::OutputFailure {
+        if matches!(case, Case::OutputFailure | Case::LegacyDetach) {
             std::fs::write(dir.join("release"), b"release").expect("release the relay");
         }
         wait_for_exit(&mut child);
@@ -2591,6 +2616,17 @@ mod pty_tests {
                     outcome.contains("closed before the guest reported its exit"),
                     "case {}: a relay lost while output capacity was exhausted must be \
                      reported: {receipt}",
+                    case.name()
+                );
+            }
+            Case::LegacyDetach | Case::LegacyClosed => {
+                // The legacy conventions, unchanged by the checked session: a
+                // detach and a closed channel both end with the -1 sentinel rather
+                // than a guest status.
+                assert_eq!(
+                    outcome,
+                    "ok:-1",
+                    "case {}: the legacy session must keep its Ok(-1) convention: {receipt}",
                     case.name()
                 );
             }
@@ -2824,15 +2860,21 @@ mod pty_tests {
     }
 
     async fn run_case_session(dir: &Path, case: Case) -> Outcome {
-        let options = AttachOptionsBuilder::default()
+        let builder = AttachOptionsBuilder::default()
             .args(["-c", "probe"])
             .cwd("/workspace/project")
             .user("1000:1000")
-            .env("PATH", "/opt/agent-vm-bin")
-            .disable_detach_keys()
-            .checked_session()
-            .build()
-            .expect("session options");
+            .env("PATH", "/opt/agent-vm-bin");
+        // The legacy cases call neither opt-in, so this is exactly the session
+        // every existing caller gets: default detach interception, best-effort
+        // output and the -1 sentinel.
+        let options = if case.legacy() {
+            builder
+        } else {
+            builder.disable_detach_keys().checked_session()
+        }
+        .build()
+        .expect("session options");
         let config = SandboxConfig::default();
 
         let (client_io, server_io) = tokio::io::duplex(512 * 1024);
@@ -3069,6 +3111,28 @@ mod pty_tests {
             Case::Cancel => {
                 // Keep the connection open while the parent releases the case.
                 tokio::time::sleep(Duration::from_secs(2)).await;
+            }
+            Case::LegacyDetach => {
+                // No guest exit and no closure: only the typed detach sequence can
+                // end this legacy session, and the parent releases the relay only
+                // after the child has reported that it did.
+                wait_for_dir(&dir, "release").await;
+            }
+            Case::LegacyClosed => {
+                write(
+                    &mut io,
+                    Message::with_payload(
+                        MessageType::ExecStdout,
+                        id,
+                        &ExecStdout {
+                            data: b"partial\n".to_vec(),
+                        },
+                    )
+                    .unwrap(),
+                )
+                .await;
+                // The legacy session treats a lost channel as the -1 sentinel.
+                drop(io);
             }
         }
     }
