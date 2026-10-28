@@ -103,6 +103,9 @@ enum Case {
     /// The guest closed its input, so the session reads no keystrokes at all:
     /// only a resize can carry a relay lost behind unconsumed output.
     InputClosedRelayLoss,
+    /// A guest `EIO` on PTY input means the guest's terminal is gone because it
+    /// is exiting, so the real exit status still comes back.
+    GuestInputEio,
     /// Dropping the session future restores the terminal.
     Cancel,
     /// The *no-options* legacy session still detaches on Ctrl-] while the
@@ -124,7 +127,7 @@ enum Case {
 }
 
 impl Case {
-    const ALL: [Case; 20] = [
+    const ALL: [Case; 21] = [
         Case::Input,
         Case::Resize,
         Case::Failed,
@@ -139,6 +142,7 @@ impl Case {
         Case::InputBehindStalledRelay,
         Case::HalfClosedRelayWaitsForDrain,
         Case::InputClosedRelayLoss,
+        Case::GuestInputEio,
         Case::Cancel,
         Case::LegacyDetach,
         Case::LegacyClosed,
@@ -169,6 +173,7 @@ impl Case {
             Case::InputBehindStalledRelay => "input-behind-stalled-relay",
             Case::HalfClosedRelayWaitsForDrain => "half-closed-relay-waits-for-drain",
             Case::InputClosedRelayLoss => "input-closed-relay-loss",
+            Case::GuestInputEio => "guest-input-eio",
             Case::Cancel => "cancel",
             Case::LegacyDetach => "legacy-detach",
             Case::LegacyClosed => "legacy-closed",
@@ -360,6 +365,7 @@ fn run_case(dir: &Path, case: Case) {
         }
         Case::Failed
         | Case::FailedAfterOutput
+        | Case::GuestInputEio
         | Case::Malformed
         | Case::Closed
         | Case::OutputFailure
@@ -628,6 +634,11 @@ fn run_case(dir: &Path, case: Case) {
                  loss: {receipt}",
                 case.name()
             );
+        }
+        Case::GuestInputEio => {
+            // A keystroke that races the guest's exit can deliver `EIO` before
+            // the exit event: the guest's own status must still come back.
+            assert_eq!(outcome, "ok:3", "case {}: {receipt}", case.name());
         }
         Case::LegacyDetach | Case::LegacyClosed => {
             // The legacy conventions, unchanged by the checked session: a
@@ -1493,6 +1504,32 @@ async fn fake_relay(mut io: DuplexStream, dir: PathBuf, case: Case) {
             .await;
             let mut flood = flood_until_saturated(io, &dir, id).await;
             flood.lose(&dir, Close::Full).await;
+        }
+        Case::GuestInputEio => {
+            // `EIO` is what the guest reports when its PTY's slave side has no
+            // opener left, which is the terminal state of a guest that is
+            // exiting. It arrives before the exit event, exactly like the race
+            // a keystroke at exit produces.
+            write(
+                &mut io,
+                Message::with_payload(
+                    MessageType::ExecStdinError,
+                    id,
+                    &ExecStdinError {
+                        errno: Some(5),
+                        errno_name: Some("EIO".to_string()),
+                        message: "Input/output error (os error 5)".to_string(),
+                    },
+                )
+                .unwrap(),
+            )
+            .await;
+            write(
+                &mut io,
+                Message::with_payload(MessageType::ExecExited, id, &ExecExited { code: 3 })
+                    .unwrap(),
+            )
+            .await;
         }
         Case::Cancel => {
             // Keep the connection open while the parent releases the case.

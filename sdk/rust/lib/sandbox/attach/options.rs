@@ -173,9 +173,10 @@ impl AttachOptionsBuilder {
     /// * malformed output/exit/failure payloads, host input read errors, every
     ///   input and resize send, output write/flush errors, a closed event
     ///   channel, and host input EOF before the guest exits are errors;
-    /// * a guest `EPIPE` for stdin (reported by agentd, so the guest's errno) is
-    ///   expected and stops feeding input while the session still waits for the
-    ///   guest's exit; any other stdin error is an error;
+    /// * a guest `EPIPE` or `EIO` for stdin (reported by agentd, so the guest's
+    ///   errno) is expected and stops feeding input while the session still
+    ///   waits for the guest's exit: the guest closed its input, or its PTY is
+    ///   gone because it is exiting. Any other stdin error is an error;
     /// * the host terminal's raw state is restored explicitly on both the normal
     ///   and the error return, and a restoration failure is appended to the
     ///   session's own failure rather than hiding it (it is returned as a

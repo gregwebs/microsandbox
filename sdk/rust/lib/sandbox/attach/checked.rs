@@ -22,6 +22,8 @@ use super::error::{AttachFailureKind, AttachSessionError, TeardownStage};
 /// The guest's `EPIPE`. agentd reports the errno it observed inside the
 /// guest, so this is not the host's `libc::EPIPE`.
 const GUEST_EPIPE: i32 = 32;
+/// The guest's `EIO`, reported when the guest's PTY has no slave side left.
+const GUEST_EIO: i32 = 5;
 
 //--------------------------------------------------------------------------------------------------
 // Types
@@ -214,10 +216,17 @@ fn teardown_kind(teardown: &[(TeardownStage, AttachSessionError)]) -> AttachFail
 }
 
 /// Whether a guest stdin failure means the guest simply closed its input.
+///
+/// A checked session is always a PTY session, and agentd writes its input to the
+/// PTY master. `EPIPE` means the guest closed its input. `EIO` means the PTY's
+/// slave side has no opener left: the guest's terminal is gone because it is
+/// exiting (Linux `n_tty_write`). Both stop feeding input; the guest's own exit
+/// event still ends the session, so a keystroke that races an exit cannot turn a
+/// real exit into a failure.
 fn guest_closed_input(error: &ExecStdinError) -> bool {
     match (error.errno_name.as_deref(), error.errno) {
-        (Some(name), _) => name == "EPIPE",
-        (None, errno) => errno == Some(GUEST_EPIPE),
+        (Some(name), _) => name == "EPIPE" || name == "EIO",
+        (None, errno) => errno == Some(GUEST_EPIPE) || errno == Some(GUEST_EIO),
     }
 }
 
@@ -372,15 +381,40 @@ mod tests {
     }
 
     #[test]
+    fn a_guest_eio_closes_input_without_failing_the_session() {
+        // The PTY's slave side has no opener left because the guest is exiting,
+        // which is what a keystroke racing the exit sees. That is a closed
+        // input, never a failed session.
+        for message in [
+            stdin_error_frame(7, Some(5), Some("EIO")),
+            stdin_error_frame(7, Some(5), None),
+        ] {
+            match classify_checked_message(message).expect("EIO is not a session failure") {
+                CheckedEvent::InputClosed => {}
+                other => panic!("EIO means the guest's input is gone: {other:?}"),
+            }
+        }
+    }
+
+    #[test]
     fn another_guest_stdin_failure_ends_the_session() {
         let failure = classify_checked_message(stdin_error_frame(7, Some(9), Some("EBADF")))
             .expect_err("only a closed input is benign");
+        assert_eq!(failure.kind(), AttachFailureKind::GuestInput);
         assert!(
             failure
                 .to_string()
                 .contains("forwarding host terminal input failed in the guest: EBADF"),
             "the failure must name the guest's errno: {failure}"
         );
+
+        // An errno the session does not know to be a closed input, and no errno
+        // at all, are failures too: only `EPIPE` and `EIO` are benign.
+        for (errno, name) in [(Some(28), Some("ENOSPC")), (None, None)] {
+            let failure = classify_checked_message(stdin_error_frame(7, errno, name))
+                .expect_err("only a closed input is benign");
+            assert_eq!(failure.kind(), AttachFailureKind::GuestInput);
+        }
     }
 
     #[test]
