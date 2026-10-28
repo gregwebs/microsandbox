@@ -701,8 +701,12 @@ async fn wait_for_dir(dir: &Path, name: &str) {
     }
 }
 
-async fn fake_relay(mut io: DuplexStream, dir: PathBuf, case: Case) {
-    // Relay handshake, exactly as agentd's relay answers one.
+/// Answer the agent handshake on a fresh stream, exactly as agentd's relay
+/// does: version, frame limit, then `Ready`.
+///
+/// Shared with the loop fixture in `unix.rs`, which needs an `AgentClient`
+/// over a relay it owns.
+pub(super) async fn relay_handshake(io: &mut DuplexStream) {
     io.write_all(&1u32.to_be_bytes()).await.unwrap();
     io.write_all(&1024u32.to_be_bytes()).await.unwrap();
     let ready = Ready {
@@ -713,10 +717,14 @@ async fn fake_relay(mut io: DuplexStream, dir: PathBuf, case: Case) {
         ..Default::default()
     };
     write(
-        &mut io,
+        io,
         Message::with_payload(MessageType::Ready, 0, &ready).unwrap(),
     )
     .await;
+}
+
+async fn fake_relay(mut io: DuplexStream, dir: PathBuf, case: Case) {
+    relay_handshake(&mut io).await;
 
     let request = codec::read_raw_frame(&mut io)
         .await
