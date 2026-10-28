@@ -617,16 +617,15 @@ pub(crate) mod agent {
         checked_epilogue_error, recv_filtered, require_filtered, route_input,
     };
 
+    //--------------------------------------------------------------------------------------------------
+    // Constants
+    //--------------------------------------------------------------------------------------------------
+
     /// Outstanding bytes one checked session may have queued or in flight.
     ///
     /// Memory accounting only. A full queue waits for the consumer, so guest
     /// backpressure stalls the session exactly as a native write to a slow
     /// terminal would; it never fails and never drops output.
-
-    //--------------------------------------------------------------------------------------------------
-    // Constants
-    //--------------------------------------------------------------------------------------------------
-
     pub(super) const CHECKED_OUTPUT_MAX_PENDING_BYTES: usize = 8 * 1024 * 1024;
     /// Largest queued frame. A guest frame is split so one reservation can never
     /// exceed the bound above.
@@ -1309,65 +1308,65 @@ pub(crate) mod agent {
                         }
                     }
 
-                // Filtered bytes reach the guest only here, one produced chunk at
-                // a time: the worker is the only thing that ever holds a chunk
-                // back, so input order is preserved without this arm ever
-                // overtaking the one above.
-                filtered = recv_filtered(&mut filtered_stdin), if feeding_input && filtered_stdin.is_some() => {
-                    let Some(data) = filtered else {
-                        return Err(checked_failure(STDIN_FILTER_TASK_ENDED));
-                    };
-                    client
-                        .send(id, MessageType::ExecStdin, &ExecStdin { data })
-                        .await
-                        .map_err(|error| {
-                            checked_failure(format!("forwarding host terminal input: {error}"))
-                        })?;
-                }
-
-                message = rx.recv() => {
-                    let Some(message) = message else {
-                        return Err(closed_session());
-                    };
-                    if let Some(end) =
-                        handle_checked_message(message, &mut pending, &mut feeding_input)?
-                    {
-                        break 'session end;
+                    // Filtered bytes reach the guest only here, one produced chunk at
+                    // a time: the worker is the only thing that ever holds a chunk
+                    // back, so input order is preserved without this arm ever
+                    // overtaking the one above.
+                    filtered = recv_filtered(&mut filtered_stdin), if feeding_input && filtered_stdin.is_some() => {
+                        let Some(data) = filtered else {
+                            return Err(checked_failure(STDIN_FILTER_TASK_ENDED));
+                        };
+                        client
+                            .send(id, MessageType::ExecStdin, &ExecStdin { data })
+                            .await
+                            .map_err(|error| {
+                                checked_failure(format!("forwarding host terminal input: {error}"))
+                            })?;
                     }
-                    // The drain loop must not diverge from the receive arm: a
-                    // terminal event batched behind guest output is handled by
-                    // exactly the same code.
-                    let mut drained = None;
-                    while drained.is_none() {
-                        match rx.try_recv() {
-                            Ok(next) => {
-                                drained =
-                                    handle_checked_message(next, &mut pending, &mut feeding_input)?;
+
+                    message = rx.recv() => {
+                        let Some(message) = message else {
+                            return Err(closed_session());
+                        };
+                        if let Some(end) =
+                            handle_checked_message(message, &mut pending, &mut feeding_input)?
+                        {
+                            break 'session end;
+                        }
+                        // The drain loop must not diverge from the receive arm: a
+                        // terminal event batched behind guest output is handled by
+                        // exactly the same code.
+                        let mut drained = None;
+                        while drained.is_none() {
+                            match rx.try_recv() {
+                                Ok(next) => {
+                                    drained =
+                                        handle_checked_message(next, &mut pending, &mut feeding_input)?;
+                                }
+                                // A disconnected channel is reported by the next
+                                // receive as the closed session it is.
+                                Err(_) => break,
                             }
-                            // A disconnected channel is reported by the next
-                            // receive as the closed session it is.
-                            Err(_) => break,
+                        }
+                        if let Some(end) = drained {
+                            break 'session end;
                         }
                     }
-                    if let Some(end) = drained {
-                        break 'session end;
+
+                    // The writer's own verdict, selectable without an enqueue or a
+                    // finish: an unwritable host descriptor ends the session even
+                    // while the guest sits at a prompt.
+                    failure = output.failure() => return Err(failure),
+
+                    _ = sigwinch.recv() => {
+                        let (cols, rows) = stdin_terminal_size()?;
+                        client
+                            .send(id, MessageType::ExecResize, &ExecResize { rows, cols })
+                            .await
+                            .map_err(|error| {
+                                checked_failure(format!("sending a terminal resize to the guest: {error}"))
+                            })?;
                     }
-                }
-
-                // The writer's own verdict, selectable without an enqueue or a
-                // finish: an unwritable host descriptor ends the session even
-                // while the guest sits at a prompt.
-                failure = output.failure() => return Err(failure),
-
-                _ = sigwinch.recv() => {
-                    let (cols, rows) = stdin_terminal_size()?;
-                    client
-                        .send(id, MessageType::ExecResize, &ExecResize { rows, cols })
-                        .await
-                        .map_err(|error| {
-                            checked_failure(format!("sending a terminal resize to the guest: {error}"))
-                        })?;
-                }
                 }
                 continue;
             };
@@ -2346,8 +2345,6 @@ pub(crate) mod agent {
 // Tests
 //--------------------------------------------------------------------------------------------------
 
-/// Both sessions over a real host terminal and an owned fake relay: the checked
-/// session, the untouched no-options legacy session, and their failure paths.
 #[cfg(all(test, unix))]
 mod pty_tests {
     //! Both sessions over a real host terminal and an owned fake relay.
