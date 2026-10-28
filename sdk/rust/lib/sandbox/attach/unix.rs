@@ -8,13 +8,16 @@
 //! caller that owns the process's exit status: a direct command launch has to
 
 use std::collections::VecDeque;
+use std::future::Future;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
+use std::pin::Pin;
 use std::sync::Arc;
 
 use microsandbox_protocol::{
     exec::{ExecExited, ExecFailed, ExecResize, ExecStdin, ExecStdinError, ExecStdout},
     message::{Message, MessageType},
 };
+use serde::Serialize;
 use tokio::io::AsyncWriteExt;
 use tokio::io::unix::AsyncFd;
 
@@ -65,6 +68,14 @@ pub(super) enum CheckedEnd {
     Failed(ExecFailed),
 }
 
+/// A send to the guest that has started.
+///
+/// Owned across loop iterations and polled as its own arm, or dropped with the
+/// session. Never restarted: `AgentClient::send` may already have queued its
+/// frame before it starts awaiting the transport, so a second call for the same
+/// bytes would duplicate them.
+type GuestSend = Pin<Box<dyn Future<Output = MicrosandboxResult<()>> + Send>>;
+
 /// The host terminal's saved attributes for one checked session.
 ///
 /// Duplicates fd 0 for ownership of the snapshot only: raw mode is a
@@ -108,10 +119,11 @@ pub(super) struct CheckedLoop<'a> {
     io: CheckedIo,
     /// Guest output read but not yet accepted by the writer.
     ///
-    /// Keeping it here instead of awaiting capacity inside the message
-    /// handler is what makes a capacity wait interruptible: a closed guest
-    /// channel or a dead writer still ends the session while the host
-    /// consumer is not draining.
+    /// The loop only *offers* the head to the writer and removes it once the
+    /// writer accepted it, so a capacity wait holds nothing back and every
+    /// other arm stays live: a closed guest channel, a dead writer or the
+    /// guest's own exit still ends the session while the host consumer is not
+    /// draining.
     pending: VecDeque<Vec<u8>>,
 }
 
@@ -182,176 +194,166 @@ impl<'a> CheckedLoop<'a> {
 
     /// The session loop: how the guest ended it, or the failure that ended it
     /// first.
+    ///
+    /// One `select!`, in which every arm whose guard allows it is live on every
+    /// iteration. Nothing in a handler awaits: a host consumer that stopped
+    /// draining must not stop the session from reading host input, forwarding a
+    /// resize, receiving the guest's exit, or reporting the writer's failure.
     pub(super) async fn run(&mut self) -> MicrosandboxResult<CheckedEnd> {
         let mut match_pos = 0usize;
         // A guest that stopped reading its stdin (`head`, an early exit) keeps
         // its session: only feeding stops, and its own exit event still ends it.
         let mut feeding_input = true;
         let mut input_buffer = [0u8; CHECKED_INPUT_CHUNK_BYTES];
+        // At most one send to the guest is in flight. A handler only *starts*
+        // one; this loop polls it to completion. Holding host input until then
+        // keeps keystrokes in read order and never restarts a frame that may
+        // already be on its way.
+        let mut outbound: Option<GuestSend> = None;
 
         let end = 'session: loop {
-            let Some(chunk) = self.pending.pop_front() else {
-                tokio::select! {
-                    ready = self.io.input.readable(), if feeding_input => {
-                        let mut readiness = ready.map_err(|error| {
-                            checked_failure(format!("waiting for host terminal input: {error}"))
-                        })?;
-                        let read = readiness.try_io(|inner| {
-                            read_from_fd(inner.get_ref().as_raw_fd(), &mut input_buffer)
-                        });
-                        let count = match read {
-                            Ok(Ok(count)) => count,
-                            Ok(Err(error)) if error.kind() == std::io::ErrorKind::Interrupted => {
-                                continue;
-                            }
-                            Ok(Err(error)) => {
-                                return Err(checked_failure(format!("reading host terminal input: {error}")));
-                            }
-                            // Spurious readiness: nothing to read yet.
-                            Err(_would_block) => continue,
-                        };
-                        drop(readiness);
+            tokio::select! {
+                // The head chunk leaves staging only once the writer accepted
+                // it, so the chunk a session ends with is still its own.
+                result = enqueue_front(&self.io.output, &self.pending), if !self.pending.is_empty() => {
+                    result?;
+                    self.pending.pop_front();
+                }
 
-                        if count == 0 {
+                // The in-flight send's verdict. A rejected send is a lost
+                // session: the transport, not the guest, refused the frame.
+                result = finish_send(&mut outbound), if outbound.is_some() => {
+                    outbound = None;
+                    result?;
+                }
+
+                ready = self.io.input.readable(), if feeding_input && outbound.is_none() => {
+                    let mut readiness = ready.map_err(|error| {
+                        checked_failure(format!("waiting for host terminal input: {error}"))
+                    })?;
+                    let read = readiness.try_io(|inner| {
+                        read_from_fd(inner.get_ref().as_raw_fd(), &mut input_buffer)
+                    });
+                    let count = match read {
+                        Ok(Ok(count)) => count,
+                        Ok(Err(error)) if error.kind() == std::io::ErrorKind::Interrupted => {
+                            continue;
+                        }
+                        Ok(Err(error)) => {
+                            return Err(checked_failure(format!("reading host terminal input: {error}")));
+                        }
+                        // Spurious readiness: nothing to read yet.
+                        Err(_would_block) => continue,
+                    };
+                    drop(readiness);
+
+                    if count == 0 {
+                        return Err(checked_failure(
+                            "host terminal input ended before the guest reported its exit",
+                        ));
+                    }
+
+                    // Routing is shared with the legacy session, so a filter sees
+                    // every chunk the same way and in the same order; only what a
+                    // detach, an ended worker or a failed send *mean* is stricter
+                    // here. The whole chunk, including any escape byte, reaches the
+                    // guest unchanged when nothing detaches.
+                    match route_input(
+                        &input_buffer[..count],
+                        self.detach_keys,
+                        &mut match_pos,
+                        self.filtered_stdin.as_ref(),
+                    ) {
+                        InputRoute::Detach => {
                             return Err(checked_failure(
-                                "host terminal input ended before the guest reported its exit",
+                                "the detach key sequence ended the session before the guest reported its exit",
                             ));
                         }
-
-                        // Routing is shared with the legacy session, so a filter sees
-                        // every chunk the same way and in the same order; only what a
-                        // detach, an ended worker or a failed send *mean* is stricter
-                        // here. The whole chunk, including any escape byte, reaches the
-                        // guest unchanged when nothing detaches.
-                        match route_input(
-                            &input_buffer[..count],
-                            self.detach_keys,
-                            &mut match_pos,
-                            self.filtered_stdin.as_ref(),
-                        ) {
-                            InputRoute::Detach => {
-                                return Err(checked_failure(
-                                    "the detach key sequence ended the session before the guest reported its exit",
-                                ));
-                            }
-                            InputRoute::Filtered => {}
-                            InputRoute::WorkerEnded => {
-                                return Err(checked_failure(STDIN_FILTER_TASK_ENDED));
-                            }
-                            InputRoute::Forward => {
-                                self.client
-                                    .send(
-                                        self.id,
-                                        MessageType::ExecStdin,
-                                        &ExecStdin {
-                                            data: input_buffer[..count].to_vec(),
-                                        },
-                                    )
-                                    .await
-                                    .map_err(|error| {
-                                        checked_failure(format!(
-                                            "forwarding host terminal input: {error}"
-                                        ))
-                                    })?;
-                            }
-                        }
-                    }
-
-                    // Filtered bytes reach the guest only here, one produced chunk at
-                    // a time: the worker is the only thing that ever holds a chunk
-                    // back, so input order is preserved without this arm ever
-                    // overtaking the one above.
-                    filtered = recv_filtered(&mut self.filtered_stdin), if feeding_input && self.filtered_stdin.is_some() => {
-                        let Some(data) = filtered else {
+                        InputRoute::Filtered => {}
+                        InputRoute::WorkerEnded => {
                             return Err(checked_failure(STDIN_FILTER_TASK_ENDED));
-                        };
-                        self.client
-                            .send(self.id, MessageType::ExecStdin, &ExecStdin { data })
-                            .await
-                            .map_err(|error| {
-                                checked_failure(format!("forwarding host terminal input: {error}"))
-                            })?;
-                    }
-
-                    message = self.rx.recv() => {
-                        let Some(message) = message else {
-                            return Err(closed_session());
-                        };
-                        if let Some(end) =
-                            handle_checked_message(message, &mut self.pending, &mut feeding_input)?
-                        {
-                            break 'session end;
                         }
-                        // The drain loop must not diverge from the receive arm: a
-                        // terminal event batched behind guest output is handled by
-                        // exactly the same code.
-                        let mut drained = None;
-                        while drained.is_none() {
-                            match self.rx.try_recv() {
-                                Ok(next) => {
-                                    drained = handle_checked_message(
-                                        next,
-                                        &mut self.pending,
-                                        &mut feeding_input,
-                                    )?;
-                                }
-                                // A disconnected channel is reported by the next
-                                // receive as the closed session it is.
-                                Err(_) => break,
-                            }
+                        InputRoute::Forward => {
+                            outbound = Some(start_send(
+                                self.client,
+                                self.id,
+                                MessageType::ExecStdin,
+                                ExecStdin {
+                                    data: input_buffer[..count].to_vec(),
+                                },
+                                "forwarding host terminal input",
+                            ));
                         }
-                        if let Some(end) = drained {
-                            break 'session end;
-                        }
-                    }
-
-                    // The writer's own verdict, selectable without an enqueue or a
-                    // finish: an unwritable host descriptor ends the session even
-                    // while the guest sits at a prompt.
-                    failure = self.io.output.failure() => return Err(failure),
-
-                    _ = self.io.resizes.recv() => {
-                        let (cols, rows) = stdin_terminal_size()?;
-                        self.client
-                            .send(self.id, MessageType::ExecResize, &ExecResize { rows, cols })
-                            .await
-                            .map_err(|error| {
-                                checked_failure(format!("sending a terminal resize to the guest: {error}"))
-                            })?;
                     }
                 }
-                continue;
-            };
 
-            // One staged chunk waits for output capacity. Only session-ending
-            // events may interrupt it: `enqueue_chunk` is cancel-safe for a single
-            // chunk, and a chunk it did not take goes back to the front of the
-            // queue so the byte stream keeps its order.
-            let mut delivered = false;
-            let mut ended = None;
-            tokio::select! {
-                result = self.io.output.enqueue_chunk(&chunk) => {
-                    result?;
-                    delivered = true;
+                // Filtered bytes reach the guest only here, one produced chunk at
+                // a time: the worker is the only thing that ever holds a chunk
+                // back, so input order is preserved without this arm ever
+                // overtaking the one above.
+                filtered = recv_filtered(&mut self.filtered_stdin), if feeding_input && self.filtered_stdin.is_some() && outbound.is_none() => {
+                    let Some(data) = filtered else {
+                        return Err(checked_failure(STDIN_FILTER_TASK_ENDED));
+                    };
+                    outbound = Some(start_send(
+                        self.client,
+                        self.id,
+                        MessageType::ExecStdin,
+                        ExecStdin { data },
+                        "forwarding host terminal input",
+                    ));
                 }
+
+                // A SIGWINCH that arrives while a send is in flight is recorded
+                // by the signal stream and forwarded once the send completes, so
+                // the geometry the guest ends up with is the latest one.
+                _ = self.io.resizes.recv(), if outbound.is_none() => {
+                    let (cols, rows) = stdin_terminal_size()?;
+                    outbound = Some(start_send(
+                        self.client,
+                        self.id,
+                        MessageType::ExecResize,
+                        ExecResize { rows, cols },
+                        "sending a terminal resize to the guest",
+                    ));
+                }
+
                 message = self.rx.recv(), if self.pending.len() < CHECKED_STAGED_CHUNKS => {
                     let Some(message) = message else {
                         return Err(closed_session());
                     };
-                    // Recorded, not acted on: the chunk below is still the
-                    // session's to deliver, so the loop may only end after it is
-                    // back at the head of `pending`.
-                    ended = handle_checked_message(message, &mut self.pending, &mut feeding_input)?;
+                    if let Some(end) =
+                        handle_checked_message(message, &mut self.pending, &mut feeding_input)?
+                    {
+                        break 'session end;
+                    }
+                    // The drain loop must not diverge from the receive arm: a
+                    // terminal event batched behind guest output is handled by
+                    // exactly the same code, and it stops for the same reason.
+                    let mut drained = None;
+                    while drained.is_none() && self.pending.len() < CHECKED_STAGED_CHUNKS {
+                        match self.rx.try_recv() {
+                            Ok(next) => {
+                                drained = handle_checked_message(
+                                    next,
+                                    &mut self.pending,
+                                    &mut feeding_input,
+                                )?;
+                            }
+                            // A disconnected channel is reported by the next
+                            // receive as the closed session it is.
+                            Err(_) => break,
+                        }
+                    }
+                    if let Some(end) = drained {
+                        break 'session end;
+                    }
                 }
+
+                // The writer's own verdict, selectable without an enqueue or a
+                // finish: an unwritable host descriptor ends the session even
+                // while the guest sits at a prompt.
                 failure = self.io.output.failure() => return Err(failure),
-            }
-            if !delivered {
-                // Back at the head: `handle_checked_message` only appends, so the
-                // order the guest wrote is preserved.
-                self.pending.push_front(chunk);
-            }
-            if let Some(end) = ended {
-                break 'session end;
             }
         };
 
@@ -694,6 +696,52 @@ async fn checked_bridge(
 // Functions: Helpers
 //--------------------------------------------------------------------------------------------------
 
+/// Start one send to the guest, with the context its failure is reported in.
+///
+/// Started, never awaited here: the loop owns it as a `GuestSend` and polls it
+/// as its own arm, so an unresponsive transport cannot stop the session from
+/// observing anything else.
+fn start_send<T>(
+    client: &Arc<AgentClient>,
+    id: u32,
+    t: MessageType,
+    payload: T,
+    context: &'static str,
+) -> GuestSend
+where
+    T: Serialize + Send + Sync + 'static,
+{
+    let client = Arc::clone(client);
+    Box::pin(async move {
+        client
+            .send(id, t, &payload)
+            .await
+            .map_err(|error| checked_failure(format!("{context}: {error}")))
+    })
+}
+
+/// The in-flight send's result; never resolves when there is none.
+///
+/// `select!` evaluates every arm's future expression, so the absent case has to
+/// be a future rather than an `unwrap` in the arm.
+async fn finish_send(outbound: &mut Option<GuestSend>) -> MicrosandboxResult<()> {
+    match outbound {
+        Some(send) => send.await,
+        None => std::future::pending().await,
+    }
+}
+
+/// The writer's verdict on the head of staging; never resolves when it is empty.
+async fn enqueue_front(
+    output: &CheckedOutput,
+    pending: &VecDeque<Vec<u8>>,
+) -> MicrosandboxResult<()> {
+    match pending.front() {
+        Some(chunk) => output.enqueue_chunk(chunk).await,
+        None => std::future::pending().await,
+    }
+}
+
 /// One session event: `Some` ends the session, `None` continues it.
 ///
 /// Nothing here awaits: a handler that blocked on output capacity could not
@@ -865,14 +913,17 @@ mod tests {
     //! other test changes behavior. Resize *forwarding* is covered by the PTY
     //! cases instead: this test's fd 0 is not a terminal.
 
+    use std::future::Future;
     use std::io::{PipeReader, PipeWriter, Read, Write};
     use std::os::fd::{AsRawFd, OwnedFd};
+    use std::pin::Pin;
     use std::sync::Arc;
     use std::time::Duration;
 
-    use microsandbox_protocol::exec::{ExecExited, ExecStdout};
+    use microsandbox_protocol::codec;
+    use microsandbox_protocol::exec::{ExecExited, ExecStdin, ExecStdout};
     use microsandbox_protocol::message::{Message, MessageType};
-    use tokio::io::DuplexStream;
+    use tokio::io::{AsyncReadExt, DuplexStream};
     use tokio::sync::mpsc;
 
     use crate::agent::AgentClient;
@@ -900,17 +951,15 @@ mod tests {
         /// `write(2)` blocks and nothing it is given is ever released.
         Prefilled,
         /// A pipe whose read end is closed, so the writer's first write fails.
-        #[allow(dead_code)] // used by the output-failure regression test
         Closed,
     }
 
     /// A checked loop over pipes and a relay this test owns.
-    #[allow(dead_code)]
     struct LoopFixture {
         client: Arc<AgentClient>,
         /// The relay's end of the agent connection; nothing reads it unless a
-        /// test does.
-        relay: DuplexStream,
+        /// test takes it.
+        relay: Option<DuplexStream>,
         /// Guest events, injected straight into the loop's receiver.
         events: mpsc::Sender<Message>,
         rx: mpsc::Receiver<Message>,
@@ -931,10 +980,16 @@ mod tests {
     }
 
     impl LoopFixture {
+        /// The checked loop over this fixture's relay, events and I/O, with an
+        /// optional stdin filter.
+        fn session_with(&mut self, filter: Option<Box<dyn StdinFilter>>) -> CheckedLoop<'_> {
+            let io = self.io.take().expect("the fixture's io");
+            CheckedLoop::new(&self.client, self.id, &mut self.rx, None, filter, io)
+        }
+
         /// The checked loop over this fixture's relay, events and I/O.
         fn session(&mut self) -> CheckedLoop<'_> {
-            let io = self.io.take().expect("the fixture's io");
-            CheckedLoop::new(&self.client, self.id, &mut self.rx, None, None, io)
+            self.session_with(None)
         }
 
         /// Deliver one guest event, exactly as the relay would.
@@ -1017,7 +1072,7 @@ mod tests {
 
         LoopFixture {
             client: Arc::new(client),
-            relay,
+            relay: Some(relay),
             events,
             rx,
             client_rx,
@@ -1082,6 +1137,23 @@ mod tests {
     fn exited(id: u32, code: i32) -> Message {
         Message::with_payload(MessageType::ExecExited, id, &ExecExited { code })
             .expect("a guest exit frame")
+    }
+
+    /// Replaces every host chunk with `n` bytes of `b'z'`.
+    ///
+    /// Larger than the fixture's duplex buffer, so a send the loop starts can
+    /// never complete until something reads the relay: it stays in flight for
+    /// as long as the test needs it to.
+    struct Expand(usize);
+
+    impl StdinFilter for Expand {
+        fn filter<'a>(
+            &'a mut self,
+            _data: &'a [u8],
+        ) -> Pin<Box<dyn Future<Output = Vec<u8>> + Send + 'a>> {
+            let expanded = vec![b'z'; self.0];
+            Box::pin(async move { expanded })
+        }
     }
 
     fn set_nonblocking(fd: RawFd) -> std::io::Result<()> {
@@ -1224,6 +1296,179 @@ mod tests {
             screen.join().expect("the screen thread"),
             expected,
             "every byte the guest wrote must reach the descriptor, in order"
+        );
+    }
+
+    /// Start a blocked send from the fixture's keyboard.
+    ///
+    /// Reading the frame's length prefix proves the loop *started* the send;
+    /// the payload cannot fit in the duplex buffer and nothing reads it, so the
+    /// send stays in flight until the loop drops it.
+    async fn blocked_send(relay: &mut DuplexStream, keyboard: &PipeWriter) {
+        let mut keyboard = keyboard;
+        keyboard.write_all(b"z").expect("type at the terminal");
+        let mut length = [0u8; 4];
+        within(relay.read_exact(&mut length))
+            .await
+            .expect("the loop must forward host input");
+        assert!(
+            u32::from_be_bytes(length) as usize > 1024 * 1024,
+            "the filtered chunk must be one frame larger than the duplex buffer"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_exit_ends_the_session_while_a_guest_send_is_blocked() {
+        let LoopFixture {
+            client,
+            relay,
+            events,
+            rx,
+            // Held open: dropping it would stop the connection's reader.
+            client_rx: _client_rx,
+            id,
+            keyboard,
+            screen: _screen,
+            prefill: _prefill,
+            io,
+        } = fixture(OutputPipe::Open, 64 * 1024).await;
+        let mut relay = relay.expect("the fixture's relay");
+        let mut rx = rx;
+        let mut session = CheckedLoop::new(
+            &client,
+            id,
+            &mut rx,
+            None,
+            Some(Box::new(Expand(1024 * 1024))),
+            io.expect("the fixture's io"),
+        );
+
+        // The transport never accepts the frame, so the send cannot complete.
+        let mut run = Box::pin(session.run());
+        tokio::select! {
+            result = blocked_send(&mut relay, &keyboard) => result,
+            end = &mut run => panic!("the loop ended before the send was in flight: {end:?}"),
+        }
+        // Injected while that send is still in flight: the guest's own exit has
+        // to end the session regardless of the send.
+        events
+            .send(exited(id, 4))
+            .await
+            .expect("the loop's event channel");
+
+        let end = within(&mut run)
+            .await
+            .expect("the guest exit ends the session even with a send in flight");
+        assert!(
+            matches!(end, CheckedEnd::Exited(4)),
+            "the loop must report the guest's own status"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_output_failure_ends_the_session_while_a_guest_send_is_blocked() {
+        let LoopFixture {
+            client,
+            relay,
+            events,
+            rx,
+            client_rx: _client_rx,
+            id,
+            keyboard,
+            screen: _screen,
+            prefill: _prefill,
+            io,
+        } = fixture(OutputPipe::Closed, 64 * 1024).await;
+        let mut relay = relay.expect("the fixture's relay");
+        let mut rx = rx;
+        let mut session = CheckedLoop::new(
+            &client,
+            id,
+            &mut rx,
+            None,
+            Some(Box::new(Expand(1024 * 1024))),
+            io.expect("the fixture's io"),
+        );
+
+        let mut run = Box::pin(session.run());
+        tokio::select! {
+            result = blocked_send(&mut relay, &keyboard) => result,
+            end = &mut run => panic!("the loop ended before the send was in flight: {end:?}"),
+        }
+        // The writer's first write fails, and that verdict has to reach the
+        // session while the send is still waiting for the transport.
+        events
+            .send(stdout(id, &[b'x'; 4096]))
+            .await
+            .expect("the loop's event channel");
+
+        let failure = within(&mut run)
+            .await
+            .expect_err("an unwritable descriptor ends the session");
+        assert!(
+            failure.to_string().contains("writing guest output"),
+            "the writer's own failure must be reported: {failure}"
+        );
+    }
+
+    #[tokio::test]
+    async fn input_is_forwarded_while_output_waits_for_capacity() {
+        let fixture = fixture(OutputPipe::Prefilled, 64 * 1024).await;
+        // The writer's queue and the pipe are both full, and the held screen
+        // means no capacity can free for as long as the test runs.
+        let io = fixture.io.as_ref().expect("the fixture's io");
+        fill_queue(&io.output).await;
+
+        let LoopFixture {
+            client,
+            relay,
+            events: _events,
+            rx,
+            client_rx: _client_rx,
+            id,
+            keyboard,
+            screen: _screen,
+            prefill: _prefill,
+            io,
+        } = fixture;
+        let mut relay = relay.expect("the fixture's relay");
+        let mut rx = rx;
+        let mut session = CheckedLoop::new(
+            &client,
+            id,
+            &mut rx,
+            None,
+            None,
+            io.expect("the fixture's io"),
+        );
+        for chunk in [
+            vec![0xB1u8; CHECKED_OUTPUT_CHUNK_BYTES],
+            vec![0xB2u8; CHECKED_OUTPUT_CHUNK_BYTES],
+        ] {
+            session.pending.push_back(chunk);
+        }
+
+        let mut keyboard = keyboard;
+        keyboard.write_all(&[0x03]).expect("type at the terminal");
+
+        let message = within(async {
+            tokio::select! {
+                end = session.run() => {
+                    panic!("the loop ended with output still waiting for capacity: {end:?}")
+                }
+                message = codec::read_message(&mut relay) => {
+                    message.expect("a guest frame")
+                }
+            }
+        })
+        .await;
+
+        assert_eq!(message.t, MessageType::ExecStdin);
+        let frame: ExecStdin = message.payload().expect("a stdin payload");
+        assert_eq!(
+            frame.data,
+            vec![0x03],
+            "host input must reach the guest while output waits for capacity"
         );
     }
 }

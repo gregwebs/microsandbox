@@ -13,6 +13,7 @@ use std::os::fd::{AsRawFd, OwnedFd, RawFd};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use microsandbox_protocol::codec;
@@ -21,7 +22,7 @@ use microsandbox_protocol::exec::{
     ExecExited, ExecFailed, ExecFailureKind, ExecRequest, ExecResize, ExecStdin, ExecStdout,
 };
 use microsandbox_protocol::message::{Message, MessageType};
-use tokio::io::{AsyncWriteExt, DuplexStream};
+use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, DuplexStream};
 
 use crate::agent::AgentClient;
 
@@ -73,6 +74,9 @@ enum Case {
     /// The guest exits while the host is not draining output: no staged chunk
     /// may be lost on the way out.
     ExitDuringBackpressure,
+    /// Host input and a resize still reach the guest while guest output is
+    /// waiting for a consumer that has stopped.
+    InputDuringBackpressure,
     /// Dropping the session future restores the terminal.
     Cancel,
     /// The *no-options* legacy session still detaches on Ctrl-] while the
@@ -94,7 +98,7 @@ enum Case {
 }
 
 impl Case {
-    const ALL: [Case; 14] = [
+    const ALL: [Case; 15] = [
         Case::Input,
         Case::Resize,
         Case::Failed,
@@ -103,6 +107,7 @@ impl Case {
         Case::OutputFailure,
         Case::OutputBackpressure,
         Case::ExitDuringBackpressure,
+        Case::InputDuringBackpressure,
         Case::Cancel,
         Case::LegacyDetach,
         Case::LegacyClosed,
@@ -127,6 +132,7 @@ impl Case {
             Case::OutputFailure => "output-failure",
             Case::OutputBackpressure => "output-backpressure",
             Case::ExitDuringBackpressure => "exit-during-backpressure",
+            Case::InputDuringBackpressure => "input-during-backpressure",
             Case::Cancel => "cancel",
             Case::LegacyDetach => "legacy-detach",
             Case::LegacyClosed => "legacy-closed",
@@ -211,6 +217,25 @@ fn run_case(dir: &Path, case: Case) {
             std::fs::write(dir.join("go"), b"go").expect("release the relay");
             wait_for(dir, "stage=exit-sent");
             std::fs::write(dir.join("drain"), b"drain").expect("drain the output");
+        }
+        Case::InputDuringBackpressure => {
+            // The relay floods until the session cannot take another byte, and
+            // only then is input typed: the host consumer is stalled for the
+            // whole case, so output can never make room for the keystroke.
+            std::fs::write(dir.join("go"), b"go").expect("release the relay");
+            wait_for(dir, "stage=saturated");
+            let mut master = std::fs::File::from(pty.master.try_clone().expect("clone master"));
+            master.write_all(&[0x03]).expect("type at the terminal");
+            master.flush().expect("flush the terminal input");
+            set_winsize(pty.slave.as_raw_fd(), 50, 132);
+            nix::sys::signal::kill(
+                nix::unistd::Pid::from_raw(child.id() as i32),
+                nix::sys::signal::Signal::SIGWINCH,
+            )
+            .expect("send SIGWINCH");
+            wait_for_prefix(dir, "stage=input-seen");
+            std::fs::write(dir.join("drain"), b"drain").expect("drain the output");
+            std::fs::write(dir.join("finish"), b"finish").expect("finish the relay");
         }
         Case::LegacyDetach => {
             // The detach sequence, typed at the terminal exactly as a user
@@ -361,6 +386,35 @@ fn run_case(dir: &Path, case: Case) {
                 case.name()
             );
         }
+        Case::InputDuringBackpressure => {
+            assert_eq!(outcome, "ok:0", "case {}: {receipt}", case.name());
+            let relay = wait_for_receipt_file(dir, "relay.receipt");
+            assert!(
+                relay
+                    .lines()
+                    .any(|line| line == "stage=input-seen drained=false"),
+                "case {}: input and a resize must reach the guest while the host is \
+                 not draining output: {relay}",
+                case.name()
+            );
+            assert_eq!(
+                relay_value(&relay, "resize"),
+                "50x132",
+                "case {}: a resize must reach the guest under output backpressure",
+                case.name()
+            );
+            assert!(
+                stdin_frames(dir).iter().any(|frame| frame == "03"),
+                "case {}: a keystroke must reach the guest under output backpressure",
+                case.name()
+            );
+            assert_eq!(
+                receipt_value(&receipt, "output_ok"),
+                "true",
+                "case {}: the output must arrive complete, in order and unaltered: {receipt}",
+                case.name()
+            );
+        }
         Case::LegacyDetach | Case::LegacyClosed => {
             // The legacy conventions, unchanged by the checked session: a
             // detach and a closed channel both end with the -1 sentinel rather
@@ -495,6 +549,27 @@ fn wait_for(dir: &Path, marker: &str) {
     }
 }
 
+/// Wait for a relay line that *starts with* `prefix`, e.g. a marker that carries
+/// a value.
+fn wait_for_prefix(dir: &Path, prefix: &str) {
+    let deadline = Instant::now() + DEADLINE;
+    loop {
+        let relay = std::fs::read_to_string(dir.join("relay.receipt")).unwrap_or_default();
+        if relay.lines().any(|line| line.starts_with(prefix)) {
+            return;
+        }
+        // A child that failed before the barrier says why.
+        if let Ok(receipt) = std::fs::read_to_string(dir.join("child.receipt")) {
+            panic!("the child finished before reaching {prefix}: {receipt}");
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the child never reported {prefix}"
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
 fn wait_for_receipt(dir: &Path) -> String {
     wait_for_receipt_file(dir, "child.receipt")
 }
@@ -590,7 +665,7 @@ fn checked_bridge_pty_case() {
     } else {
         String::new()
     };
-    let output_ok = match output_matches(&output, case) {
+    let output_ok = match output_matches(&dir, &output, case) {
         Some(ok) => ok.to_string(),
         None => "n/a".to_string(),
     };
@@ -669,7 +744,7 @@ impl Capture {
                     held: read_end.into(),
                 }
             }
-            Case::ExitDuringBackpressure => {
+            Case::ExitDuringBackpressure | Case::InputDuringBackpressure => {
                 let (read_end, write_end) = std::io::pipe().expect("an output pipe");
                 Self::Stalled {
                     fd: write_end.into(),
@@ -786,9 +861,16 @@ fn flood_bytes(frames: usize) -> Vec<u8> {
 
 /// Whether the captured output is exactly what the case's relay sent, for the
 /// cases that know their own expectation.
-fn output_matches(output: &[u8], case: Case) -> Option<bool> {
+fn output_matches(dir: &Path, output: &[u8], case: Case) -> Option<bool> {
     match case {
         Case::ExitDuringBackpressure => Some(output == flood_bytes(FLOOD_FRAMES)),
+        // The relay floods until the session stops taking output, so the count
+        // is only known from its own receipt.
+        Case::InputDuringBackpressure => {
+            let relay = std::fs::read_to_string(dir.join("relay.receipt")).ok()?;
+            let frames: usize = receipt_line(&relay, "relay_frames")?.parse().ok()?;
+            Some(frames > 0 && output == flood_bytes(frames))
+        }
         _ => None,
     }
 }
@@ -1083,6 +1165,7 @@ async fn fake_relay(mut io: DuplexStream, dir: PathBuf, case: Case) {
             .await;
             append(&dir, &["stage=exit-sent".to_string()]);
         }
+        Case::InputDuringBackpressure => input_during_backpressure(io, &dir, id).await,
         Case::Cancel => {
             // Keep the connection open while the parent releases the case.
             tokio::time::sleep(Duration::from_secs(2)).await;
@@ -1152,6 +1235,114 @@ async fn fake_relay(mut io: DuplexStream, dir: PathBuf, case: Case) {
     }
 }
 
+/// Flood guest output until the session stops taking any, then record what the
+/// session forwarded while the host consumer was stalled, and let the guest
+/// exit.
+///
+/// The harness assumes the session holds two bounds, so the flood has to keep
+/// going until *no frame completes* rather than for a fixed count: only then is
+/// the session's read-ahead necessarily full and its receive arm necessarily
+/// off.
+async fn input_during_backpressure(io: DuplexStream, dir: &Path, id: u32) {
+    let (mut reader, mut writer) = tokio::io::split(io);
+    let frames = Arc::new(AtomicUsize::new(0));
+    let stop = Arc::new(AtomicBool::new(false));
+
+    let producer = {
+        let frames = Arc::clone(&frames);
+        let stop = Arc::clone(&stop);
+        tokio::spawn(async move {
+            let mut index = 0usize;
+            while !stop.load(Ordering::Relaxed) {
+                let message = Message::with_payload(
+                    MessageType::ExecStdout,
+                    id,
+                    &ExecStdout {
+                        data: flood_frame(index),
+                    },
+                )
+                .expect("a guest output frame");
+                write(&mut writer, message).await;
+                frames.fetch_add(1, Ordering::Relaxed);
+                index += 1;
+            }
+            // The frame in progress when the parent said `finish` completes once
+            // the session takes output again, which is what `drain` is for.
+            writer
+        })
+    };
+
+    // `stage=saturated` only times the parent's next step: it says no frame has
+    // completed for a while, so the session is holding as much output as it can.
+    tokio::spawn({
+        let dir = dir.to_path_buf();
+        let frames = Arc::clone(&frames);
+        async move {
+            while frames.load(Ordering::Relaxed) == 0 {
+                tokio::time::sleep(Duration::from_millis(2)).await;
+            }
+            let mut last = frames.load(Ordering::Relaxed);
+            loop {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                let now = frames.load(Ordering::Relaxed);
+                if now == last {
+                    append(&dir, &["stage=saturated".to_string()]);
+                    return;
+                }
+                last = now;
+            }
+        }
+    });
+
+    let mut seen_stdin = false;
+    let mut seen_resize = false;
+    loop {
+        tokio::select! {
+            message = read(&mut reader) => {
+                let Some(message) = message else { break };
+                match message.t {
+                    MessageType::ExecStdin => {
+                        let frame: ExecStdin = message.payload().expect("stdin payload");
+                        append(dir, &[format!("stdin_frame={}", hex(&frame.data))]);
+                        seen_stdin |= frame.data.contains(&0x03);
+                    }
+                    MessageType::ExecResize => {
+                        let frame: ExecResize = message.payload().expect("resize payload");
+                        append(dir, &[format!("resize={}x{}", frame.rows, frame.cols)]);
+                        seen_resize = true;
+                    }
+                    _ => {}
+                }
+                if seen_stdin && seen_resize {
+                    // `drained` records whether the host consumer had started to
+                    // take output by the time both forwards happened.
+                    append(
+                        dir,
+                        &[format!(
+                            "stage=input-seen drained={}",
+                            dir.join("drain").exists()
+                        )],
+                    );
+                    seen_stdin = false;
+                    seen_resize = false;
+                }
+            }
+            _ = wait_for_dir(dir, "finish") => break,
+        }
+    }
+
+    stop.store(true, Ordering::Relaxed);
+    let mut writer = producer.await.expect("the flood producer");
+    let count = frames.load(Ordering::Relaxed);
+    append(dir, &[format!("relay_frames={count}")]);
+    write(
+        &mut writer,
+        Message::with_payload(MessageType::ExecExited, id, &ExecExited { code: 0 })
+            .expect("a guest exit frame"),
+    )
+    .await;
+}
+
 async fn announce_raw(dir: &Path) {
     // The bridge sets raw mode on the terminal fd 0 refers to, so the
     // observation is an attribute read, not a marker the code prints.
@@ -1176,14 +1367,20 @@ fn canonical(fd: RawFd) -> bool {
     attributes.c_lflag & libc::ICANON != 0
 }
 
-async fn read(io: &mut DuplexStream) -> Option<Message> {
+async fn read<S>(io: &mut S) -> Option<Message>
+where
+    S: AsyncRead + Unpin,
+{
     match tokio::time::timeout(DEADLINE, codec::read_message(io)).await {
         Ok(Ok(message)) => Some(message),
         Ok(Err(_)) | Err(_) => None,
     }
 }
 
-async fn write(io: &mut DuplexStream, message: Message) {
+async fn write<S>(io: &mut S, message: Message)
+where
+    S: AsyncWrite + Unpin,
+{
     codec::write_message(io, &message)
         .await
         .expect("the relay writes a frame");
