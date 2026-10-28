@@ -885,7 +885,7 @@ What a session can observe about a lost relay:
 - a relay that closed without refusing a send is reported as soon as the host accepts output again. While output is stalled and the session's read-ahead is full, that loss is behind guest output the host has not taken, and the session waits for the host exactly as a native writer would;
 - dropping the session future restores the terminal but reports nothing.
 
-A spawn failure is `MicrosandboxError::ExecFailed`; every other failure is `MicrosandboxError::Terminal` with a message that says what ended the session. The message text is diagnostic, not a stable interface. Map the result to an exit status like this:
+A spawn failure is `MicrosandboxError::ExecFailed` as long as the terminal came back; a failure that ends an established session is `MicrosandboxError::Terminal` with a message that says what ended it. Two exceptions: a validation, connection or request-setup failure happens before the session exists and keeps its own variant (`InvalidConfig` for an invalid option, the agent-client error for a connection problem, and so on), and a terminal that could not be restored outranks a spawn failure, which is then a `Terminal` error whose text still names the spawn failure. The message text is diagnostic, not a stable interface. Map the result to an exit status like this:
 
 ```rust
 match sb

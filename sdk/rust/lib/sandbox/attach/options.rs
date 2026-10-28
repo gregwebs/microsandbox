@@ -222,11 +222,18 @@ impl AttachOptionsBuilder {
     /// * dropping the session future restores the terminal but reports nothing.
     ///
     /// A spawn failure is
-    /// [`MicrosandboxError::ExecFailed`](crate::MicrosandboxError::ExecFailed);
-    /// every other failure is
+    /// [`MicrosandboxError::ExecFailed`](crate::MicrosandboxError::ExecFailed) as
+    /// long as the terminal came back; a failure that ends an established
+    /// session is
     /// [`MicrosandboxError::Terminal`](crate::MicrosandboxError::Terminal) with a
-    /// message that says what ended the session. The message text is diagnostic,
-    /// not a stable interface.
+    /// message that says what ended it. Two qualifications: a validation,
+    /// connection or request-setup failure happens before the session exists and
+    /// keeps its own variant (for example
+    /// [`InvalidConfig`](crate::MicrosandboxError::InvalidConfig) for an invalid
+    /// option, or the agent-client error for a connection problem), and a
+    /// terminal that could not be restored outranks a spawn failure, which is
+    /// then reported as a `Terminal` error whose text still names the spawn
+    /// failure. The message text is diagnostic, not a stable interface.
     ///
     /// Rust SDK only.
     ///
@@ -442,6 +449,24 @@ fn checked_completion_and_detach_disable_are_independent() {
         .unwrap();
     assert!(!disabled_only.checked_session);
     assert!(disabled_only.resolved_detach_keys().unwrap().is_none());
+}
+
+/// The checked-session error summary names this exception: an option that does
+/// not validate fails before a session exists, so the caller sees the builder's
+/// own public variant and never `Terminal`.
+#[test]
+fn an_invalid_option_keeps_the_public_configuration_variant() {
+    use crate::MicrosandboxError;
+    use crate::sandbox::exec::RlimitResource;
+
+    let error = AttachOptionsBuilder::default()
+        .rlimit_range(RlimitResource::Nofile, 2, 1)
+        .build()
+        .expect_err("a soft limit above the hard limit is not a valid option set");
+    assert!(
+        matches!(error, MicrosandboxError::InvalidConfig(_)),
+        "validation keeps its own variant instead of becoming a terminal error: {error}"
+    );
 }
 
 #[test]

@@ -124,10 +124,13 @@ enum Case {
     /// The same filter without `checked_session()`: a checked session must not
     /// change what the filter sees.
     FilteredLegacy,
+    /// The relay is gone before the session can open its stream, so the failure
+    /// happens before the session exists and keeps its own public variant.
+    SetupFailure,
 }
 
 impl Case {
-    const ALL: [Case; 21] = [
+    const ALL: [Case; 22] = [
         Case::Input,
         Case::Resize,
         Case::Failed,
@@ -149,6 +152,7 @@ impl Case {
         Case::Filtered,
         Case::FilteredSwallow,
         Case::FilteredLegacy,
+        Case::SetupFailure,
     ];
 
     /// Whether this case drives the untouched default session instead of the
@@ -180,6 +184,7 @@ impl Case {
             Case::Filtered => "filtered",
             Case::FilteredSwallow => "filtered-swallow",
             Case::FilteredLegacy => "filtered-legacy",
+            Case::SetupFailure => "setup-failure",
         }
     }
 
@@ -232,8 +237,12 @@ fn run_case(dir: &Path, case: Case) {
         let _ = child_stderr.read_to_end(&mut sink);
     });
 
-    // A held-open case proves raw state before it drives input or a fault.
-    wait_for(dir, "stage=raw");
+    // A held-open case proves raw state before it drives input or a fault. The
+    // setup-failure case never reaches raw mode: its session ends before the host
+    // terminal is touched.
+    if !matches!(case, Case::SetupFailure) {
+        wait_for(dir, "stage=raw");
+    }
     match case {
         Case::Input => {
             let mut master = std::fs::File::from(pty.master.try_clone().expect("clone master"));
@@ -371,7 +380,8 @@ fn run_case(dir: &Path, case: Case) {
         | Case::OutputFailure
         | Case::OutputBackpressure
         | Case::Cancel
-        | Case::LegacyClosed => {}
+        | Case::LegacyClosed
+        | Case::SetupFailure => {}
     }
     std::fs::write(dir.join("go"), b"go").expect("release the child");
 
@@ -653,6 +663,21 @@ fn run_case(dir: &Path, case: Case) {
         }
         Case::Cancel => {
             assert_eq!(outcome, "cancelled", "case {}: {receipt}", case.name());
+        }
+        Case::SetupFailure => {
+            // The session never existed, so the caller sees the transport's own
+            // variant rather than the terminal error an established session would
+            // produce.
+            assert!(
+                outcome.starts_with("err:agent-client:"),
+                "case {}: a request-setup failure keeps its own public variant: {receipt}",
+                case.name()
+            );
+            assert!(
+                !outcome.contains("terminal:"),
+                "case {}: a setup failure must not become a terminal error: {receipt}",
+                case.name()
+            );
         }
         Case::Filtered | Case::FilteredLegacy => {
             // Identical frames and status for both sessions: `checked_session`
@@ -1159,7 +1184,15 @@ async fn run_case_session(dir: &Path, case: Case) -> Outcome {
     // asserted instead of a rendered string. `Input` and `Resize` keep going
     // through `attach_connected`, so the dispatch and the crate-boundary
     // conversion stay covered end to end.
-    let outcome = if case.legacy() || matches!(case, Case::Input | Case::Resize) {
+    let outcome = if case.legacy()
+        || matches!(case, Case::Input | Case::Resize | Case::SetupFailure)
+    {
+        if matches!(case, Case::SetupFailure) {
+            // The relay says when it is gone, so the session cannot race the
+            // closure: its exec request is refused, which is the setup failure
+            // under test.
+            wait_for_dir(dir, "setup-closed").await;
+        }
         session_outcome(unix::attach_connected(client, &config, "bash".to_string(), options).await)
     } else {
         let detach_keys = options
@@ -1188,6 +1221,12 @@ fn session_outcome(result: crate::MicrosandboxResult<i32>) -> Outcome {
     match result {
         Ok(code) => Outcome::Exited(code),
         Err(crate::MicrosandboxError::ExecFailed(_)) => Outcome::Error("exec-failed".into()),
+        Err(crate::MicrosandboxError::InvalidConfig(text)) => {
+            Outcome::Error(format!("invalid-config:{text}"))
+        }
+        Err(crate::MicrosandboxError::AgentClient(error)) => {
+            Outcome::Error(format!("agent-client:{error}"))
+        }
         Err(error) => Outcome::Error(format!("terminal:{error}")),
     }
 }
@@ -1245,6 +1284,15 @@ pub(super) async fn relay_handshake(io: &mut DuplexStream) {
 
 async fn fake_relay(mut io: DuplexStream, dir: PathBuf, case: Case) {
     relay_handshake(&mut io).await;
+
+    if matches!(case, Case::SetupFailure) {
+        // The connection goes away before the session can open its stream, so no
+        // request is ever sent. The marker is a file so the child can wait for
+        // the closure instead of racing it.
+        std::fs::write(dir.join("setup-closed"), b"closed").expect("the setup marker");
+        drop(io);
+        return;
+    }
 
     let request = codec::read_raw_frame(&mut io)
         .await
@@ -1581,6 +1629,8 @@ async fn fake_relay(mut io: DuplexStream, dir: PathBuf, case: Case) {
             )
             .await;
         }
+        // Handled above, before any request could be read.
+        Case::SetupFailure => {}
         Case::LegacyClosed => {
             write(
                 &mut io,
