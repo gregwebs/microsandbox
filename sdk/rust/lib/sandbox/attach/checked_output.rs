@@ -133,6 +133,12 @@ struct CheckedOutputQueue {
     /// its session even when nothing is being enqueued, so it must not be
     /// routed through guest progress.
     failed: Notify,
+    /// Wakes the delivery policy for each write the descriptor accepted.
+    ///
+    /// At most one permit is stored, so a flood cannot queue notifications. The
+    /// policy only needs to know *that* progress happened, because the time it
+    /// is woken is the time it measures its idle deadline from.
+    progress: Notify,
 }
 
 pub(super) struct CheckedOutput {
@@ -216,9 +222,10 @@ impl CheckedOutputQueue {
         self.capacity.notify_waiters();
     }
 
-    /// Record bytes the descriptor accepted.
+    /// Record bytes the descriptor accepted, and wake the delivery policy.
     fn record_accepted(&self, bytes: usize) {
         self.accepted.fetch_add(bytes as u64, Ordering::Relaxed);
+        self.progress.notify_one();
     }
 
     /// Whether the writer has been told to stop: the session aborted, or the
@@ -334,7 +341,10 @@ impl CheckedOutput {
 
     /// The bytes the host descriptor has accepted so far, ever.
     ///
-    /// Monotonic: the delivery policy only compares two readings.
+    /// Monotonic, so a test that watches for progress only compares readings.
+    /// The delivery policy itself is woken by the writer rather than sampling
+    /// this counter.
+    #[cfg(test)]
     pub(super) fn accepted(&self) -> u64 {
         self.queue.accepted.load(Ordering::Relaxed)
     }
@@ -481,8 +491,16 @@ fn run_checked_writer(queue: Arc<CheckedOutputQueue>, output: OwnedFd) {
 ///
 /// Everything still staged is offered to the writer, then the finish receipt is
 /// awaited, while the host descriptor keeps accepting bytes: an `idle` interval
-/// in which `write(2)` took nothing, or `limit` in total, ends the attempt. The
-/// writer thread is still never joined, so cancellation is unaffected.
+/// measured from the *last byte the descriptor accepted*, or `limit` in total,
+/// ends the attempt. The writer thread is still never joined, so cancellation is
+/// unaffected.
+///
+/// The idle deadline is a real deadline, not a sample. The writer wakes this
+/// future on every accepted write, so `idle` runs from the last progress rather
+/// than from a periodic look at the accepted-byte counter: one accepted byte
+/// just after delivery starts must not buy a second interval, which is exactly
+/// what a "sample at `start + idle`, reset the timer if the counter moved" loop
+/// does.
 ///
 /// The error is the reason delivery was given up, for the caller to append to
 /// the session's own failure: an unrestored terminal or a lost relay is what the
@@ -503,22 +521,32 @@ pub(super) async fn deliver_after_failure(
         output.finish().await.map_err(|error| error.to_string())
     };
     tokio::pin!(delivery);
-    let deadline = tokio::time::Instant::now() + policy.limit;
-    let mut seen = output.accepted();
+    let start = tokio::time::Instant::now();
+    let limit = start + policy.limit;
+    let mut last_progress = start;
     loop {
+        // Registered before the deadline is read, so progress that lands
+        // between the two is a wakeup and not a lost notification that would
+        // lengthen the window past the policy.
+        let progress = output.queue.progress.notified();
+        tokio::pin!(progress);
+        progress.as_mut().enable();
+        let idle_deadline = last_progress + policy.idle;
         tokio::select! {
             result = &mut delivery => return result,
-            _ = tokio::time::sleep(policy.idle) => {
-                let now = output.accepted();
-                if now == seen {
-                    return Err(format!(
-                        "the host output accepted nothing for {:?}",
-                        policy.idle
-                    ));
-                }
-                seen = now;
+            // A write the descriptor accepted. Its own instant is the deadline
+            // base, so progress delays the deadline by exactly one interval
+            // from when it happened.
+            _ = &mut progress => {
+                last_progress = tokio::time::Instant::now();
             }
-            _ = tokio::time::sleep_until(deadline) => {
+            _ = tokio::time::sleep_until(idle_deadline) => {
+                return Err(format!(
+                    "the host output accepted nothing for {:?}",
+                    policy.idle
+                ));
+            }
+            _ = tokio::time::sleep_until(limit) => {
                 return Err(format!(
                     "the host output did not take the held guest output within {:?}",
                     policy.limit
@@ -1104,6 +1132,89 @@ mod tests {
 
         drop(output);
         assert_eq!(screen.join().expect("the screen thread"), expected);
+    }
+
+    #[tokio::test]
+    async fn one_late_byte_of_progress_does_not_buy_a_second_idle_window() {
+        // A consumer that takes one bufferful and then stops: the descriptor
+        // accepts bytes just after delivery starts and nothing afterwards. The
+        // idle deadline has to run from that last accepted byte, so the attempt
+        // ends one interval later — not two, which is what sampling the accepted
+        // counter once per interval produces.
+        let (write_end, reader, _prefill) = prefilled_pipe();
+        let output = CheckedOutput::start(write_end.as_raw_fd()).expect("start the writer");
+        drop(write_end);
+        let queue = Arc::clone(&output.queue);
+
+        let mut staging = Staging::default();
+        staging.stage(vec![b'p'; 8 * CHECKED_OUTPUT_CHUNK_BYTES]);
+        let policy = flush_policy(Duration::from_millis(300), Duration::from_secs(20));
+
+        let delivery =
+            tokio::spawn(async move { deliver_after_failure(&output, &mut staging, policy).await });
+
+        // Let the writer fill the pipe and block, then free room for one more
+        // accepted write. The descriptor stays open and is never read again, so
+        // that write is the last progress there is.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let screenful = within(tokio::task::spawn_blocking(move || {
+            let mut screen = reader;
+            let mut buffer = vec![0u8; 8 * 1024];
+            screen
+                .read_exact(&mut buffer)
+                .expect("the pipe's first bytes");
+            (screen, buffer)
+        }))
+        .await
+        .expect("the read task");
+        let _screen = screenful.0;
+
+        // Measure from the last byte the descriptor accepted, exactly as the
+        // policy does.
+        let mut last = queue.accepted.load(Ordering::Relaxed);
+        assert!(
+            last > 0,
+            "the writer must have delivered what the prefilled pipe held"
+        );
+        let mut last_progress = std::time::Instant::now();
+        loop {
+            tokio::time::sleep(Duration::from_millis(2)).await;
+            let now = queue.accepted.load(Ordering::Relaxed);
+            if now != last {
+                assert!(now > last, "the accepted count is monotonic");
+                last = now;
+                last_progress = std::time::Instant::now();
+                continue;
+            }
+            // Half an idle window without a byte is enough to know the consumer
+            // stopped; the deadline itself is still half an interval away.
+            if last_progress.elapsed() >= policy.idle / 2 {
+                break;
+            }
+            assert!(
+                last_progress.elapsed() < policy.idle,
+                "the consumer never stopped accepting bytes"
+            );
+        }
+
+        let error = within(delivery)
+            .await
+            .expect("the delivery task")
+            .expect_err("a consumer that stops taking bytes ends the attempt");
+        let since_progress = last_progress.elapsed();
+        assert!(
+            error.contains("accepted nothing"),
+            "the idle window must say what it was: {error}"
+        );
+        assert!(
+            since_progress >= policy.idle * 3 / 4,
+            "the attempt must not end before one idle interval without progress: \
+             {since_progress:?}"
+        );
+        assert!(
+            since_progress < policy.idle * 3 / 2,
+            "one idle interval after the last accepted byte, not two: {since_progress:?}"
+        );
     }
 
     #[tokio::test]
