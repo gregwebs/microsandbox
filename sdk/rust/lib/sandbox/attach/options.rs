@@ -148,7 +148,9 @@ impl AttachOptionsBuilder {
     ///
     /// Without the escape key a session ends only when the guest exits, so a
     /// caller that wants a detach must set its own `detach_keys` again (which
-    /// re-enables interception). A [`stdin_filter`](Self::stdin_filter) is
+    /// re-enables interception). Pairs with
+    /// [`checked_session`](Self::checked_session) for a command whose only end
+    /// is its own exit. A [`stdin_filter`](Self::stdin_filter) is
     /// unaffected either way: it sees every chunk, `Ctrl-]` included, because it
     /// runs after the scan that interception would have performed.
     pub fn disable_detach_keys(mut self) -> Self {
@@ -159,11 +161,12 @@ impl AttachOptionsBuilder {
     /// Report every terminal-session failure instead of the legacy
     /// best-effort conventions.
     ///
-    /// A legacy attach swallows host output write/flush errors, ignores
-    /// `ExecStdinError`, and reports a missing guest exit as the status `-1`.
-    /// That is the wrong contract for a caller that owns the process's exit
-    /// status: it cannot tell "the guest exited with -1" from "no exit event
-    /// ever arrived".
+    /// Return `Ok` only for an exit status the guest reported; every other way
+    /// the session can end is an error. That is the contract a caller needs when
+    /// it owns the process's exit status: a legacy attach swallows host output
+    /// write/flush errors, ignores `ExecStdinError`, and reports a missing guest
+    /// exit as the status `-1`, so it cannot tell "the guest exited with -1"
+    /// from "no exit event ever arrived".
     ///
     /// With this opt-in (Unix and Windows):
     ///
@@ -177,10 +180,19 @@ impl AttachOptionsBuilder {
     ///   errno) is expected and stops feeding input while the session still
     ///   waits for the guest's exit: the guest closed its input, or its PTY is
     ///   gone because it is exiting. Any other stdin error is an error;
+    /// * **detach is an error here.** With detach keys enabled (the default, or
+    ///   [`detach_keys`](Self::detach_keys)), typing the sequence ends the
+    ///   session with an error and leaves the guest running. Use
+    ///   [`disable_detach_keys`](Self::disable_detach_keys) for a session that
+    ///   only the guest can end;
     /// * the host terminal's raw state is restored explicitly on both the normal
     ///   and the error return, and a restoration failure is appended to the
     ///   session's own failure rather than hiding it (it is returned as a
     ///   terminal error when the session otherwise succeeded);
+    /// * after a failure, guest output the session already holds is still
+    ///   delivered while the host descriptor accepts it. Delivery stops after
+    ///   500 ms without progress or 5 s in total, so a stalled or crawling
+    ///   consumer cannot delay the error and the terminal restore for ever;
     /// * on Unix the guest's output is written by a dedicated thread over a
     ///   duplicated stdout descriptor. Guest backpressure waits for the consumer
     ///   and bytes are never dropped. The session holds at most 16 MiB of guest
@@ -192,6 +204,27 @@ impl AttachOptionsBuilder {
     ///   the descriptor or keep the descriptor until the process exits. There is
     ///   no Tokio blocking task, so dropping the Tokio runtime cannot block on
     ///   this writer.
+    ///
+    /// What a session can observe about a lost relay:
+    ///
+    /// * a relay that rejects a send is reported on the next keystroke or
+    ///   resize the transport refuses. After the guest closed its input,
+    ///   keystrokes are deliberately not read, so only a resize can carry it;
+    /// * a relay that closed without refusing a send is reported as soon as the
+    ///   host accepts output again. While output is stalled and the session's
+    ///   read-ahead is full, that loss is behind guest output the host has not
+    ///   taken, and the session waits for the host exactly as a native writer
+    ///   would;
+    /// * dropping the session future restores the terminal but reports nothing.
+    ///
+    /// A spawn failure is
+    /// [`MicrosandboxError::ExecFailed`](crate::MicrosandboxError::ExecFailed);
+    /// every other failure is
+    /// [`MicrosandboxError::Terminal`](crate::MicrosandboxError::Terminal) with a
+    /// message that says what ended the session. The message text is diagnostic,
+    /// not a stable interface.
+    ///
+    /// Rust SDK only.
     ///
     /// The defaults (neither setter called) keep every legacy behavior,
     /// including detach's `Ok(-1)` return and best-effort I/O.

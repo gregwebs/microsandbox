@@ -856,7 +856,9 @@ Setting a sequence also re-enables interception after [`disable_detach_keys()`](
 fn disable_detach_keys(self) -> Self
 ```
 
-Forward every host input byte, including the default `Ctrl+]`, to the guest instead of intercepting an escape sequence. For this session only, so other attaches keep the default. Leaving `detach_keys` unset is not a way to disable interception (unset means the default), and an empty sequence is rejected. A session without an escape key ends only when the guest does.
+Forward every host input byte, including the default `Ctrl+]`, to the guest instead of intercepting an escape sequence. For this session only, so other attaches keep the default. Leaving `detach_keys` unset is not a way to disable interception (unset means the default), and an empty sequence is rejected. A session without an escape key ends only when the guest does. Pairs with [`checked_session()`](#attach_options-checked_session) for a command whose only end is its own exit.
+
+Rust SDK only. The Python, Node.js and Go SDKs do not expose this option, and their attach keeps the default behavior.
 
 #### <span className="msb-recv">attach_options.</span><span className="msb-hn">checked_session()</span>
 
@@ -864,16 +866,42 @@ Forward every host input byte, including the default `Ctrl+]`, to the guest inst
 fn checked_session(self) -> Self
 ```
 
-Report every terminal-session failure instead of the legacy best-effort conventions, for a caller that owns the process exit status. Opt-in and per session; the defaults (neither setter called) keep the legacy `Ok(-1)` detach return, ignored `ExecStdinError`s and best-effort output.
+Report every terminal-session failure instead of the legacy best-effort conventions. Return `Ok` only for an exit status the guest reported; every other way the session can end is an error. Opt-in and per session; the defaults (neither setter called) keep the legacy `Ok(-1)` detach return, ignored `ExecStdinError`s and best-effort output.
 
 With the checked session:
 
 - the guest exit is decoded only from an exit event, so a receivable `ExecExited { code: -1 }` is a real status rather than a sentinel;
 - malformed output/exit/failure payloads, host input read errors, every input and resize send, output write/flush errors, a closed event channel, and host input EOF before the guest exits are errors;
 - a guest `EPIPE` or `EIO` for stdin is expected: the guest closed its input, or its PTY is gone because it is exiting. Feeding stops and the session still waits for the guest's exit; any other stdin error is an error;
+- detach is an error here. With detach keys enabled (the default, or `detach_keys()`), the sequence ends the session with an error and leaves the guest running. Use [`disable_detach_keys()`](#attach_options-disable_detach_keys) for a session that only the guest can end;
 - the host terminal is restored explicitly on both normal and error returns, and a restoration failure is reported rather than hidden (a device that has gone away cannot be guaranteed restorable);
+- after a failure, guest output the session already holds is still delivered while the host accepts it. Delivery stops after 500 ms without progress or 5 s in total, so a stalled or crawling consumer cannot delay the error and the terminal restore for ever;
 - on Unix, guest output is written by a dedicated thread over a duplicated stdout descriptor. Guest output backpressure waits for the consumer and bytes are never dropped. The session holds at most 16 MiB of guest output: up to 8 MiB read ahead and 8 MiB queued for the writer, measured by allocation. The agent client buffers at most a few frames more per stream, upstream of the session. A genuinely unwritable descriptor (closed pipe) or runtime loss is an error. The writer's failure is its own session event, and so is a lost guest channel while output waits for capacity: neither can be hidden behind a stalled consumer. Cancellation aborts without joining that thread, so a write already in progress may reach the descriptor or keep it until the process exits, and no Tokio blocking task is left for `Runtime::drop` to wait on;
 - a [`stdin_filter()`](#attach_options-stdin_filter) composes with it rather than being replaced: the filter keeps its own task, sees every chunk in input order after the detach scan, and its returned bytes still reach the guest, so a chunk it swallows is still swallowed. A detach, an ended filter worker and a failed send are errors here instead of `Ok(-1)`, a silent fallback or a dropped chunk.
+
+What a session can observe about a lost relay:
+
+- a relay that rejects a send is reported on the next keystroke or resize the transport refuses. After the guest closed its input, keystrokes are deliberately not read, so only a resize can carry it;
+- a relay that closed without refusing a send is reported as soon as the host accepts output again. While output is stalled and the session's read-ahead is full, that loss is behind guest output the host has not taken, and the session waits for the host exactly as a native writer would;
+- dropping the session future restores the terminal but reports nothing.
+
+A spawn failure is `MicrosandboxError::ExecFailed`; every other failure is `MicrosandboxError::Terminal` with a message that says what ended the session. The message text is diagnostic, not a stable interface. Map the result to an exit status like this:
+
+```rust
+match sb
+    .attach_with("cmd", |a| a.disable_detach_keys().checked_session())
+    .await
+{
+    Ok(code) => code,                                    // the guest's own status
+    Err(MicrosandboxError::ExecFailed(_failure)) => 127, // spawn failure, typed
+    Err(error) => {                                      // no exit status
+        eprintln!("attach failed: {error}");
+        125
+    }
+}
+```
+
+Rust SDK only. The Python, Node.js and Go SDKs do not expose this option, and their attach keeps the default behavior.
 
 #### <span className="msb-recv">attach_options.</span><span className="msb-hn">rlimit()</span>
 
