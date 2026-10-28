@@ -6,6 +6,8 @@
 //! conventions (`Ok(-1)` when no exit event arrived) and best-effort I/O are
 //! observable and must not change. The checked session is an opt-in for a
 //! caller that owns the process's exit status: a direct command launch has to
+//! tell the guest's own exit apart from a session that was lost, so it waits for
+//! a reported guest exit instead of accepting a lost session as a completion.
 
 use std::future::Future;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
