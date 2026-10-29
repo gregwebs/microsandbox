@@ -328,12 +328,13 @@ async fn run(
     debug_assert_eq!(ready.t, MessageType::Ready);
     drop(read_half_tmp);
 
-    // Auto-publish is a generation-10 feature: `LoopbackForward` and
-    // `core.port.event` do not exist before it. Against an older guest (e.g. a
-    // fork-built agentd advertising generation 8, or any pre-10 build), stay
-    // inert rather than erroring per port — the host cannot deliver the events
-    // and the request would be refused locally anyway. Logged once; the
-    // supervisor treats `Ok(())` as a clean stop and does not reconnect.
+    // Auto-publish is a generation-11 feature: `LoopbackForward` and
+    // `core.port.event` do not exist before it. Against an upstream
+    // generation-10 agentd, a pre-sync fork agentd advertising generation 10,
+    // or any older build, stay inert rather than erroring per port — the host
+    // cannot deliver the events and the request would be refused locally
+    // anyway. Logged once; the supervisor treats `Ok(())` as a clean stop and
+    // does not reconnect.
     if ready.v < MessageType::LoopbackForward.min_protocol_version() {
         tracing::info!(
             guest_generation = ready.v,
@@ -673,6 +674,7 @@ async fn read_proc(
                 truncate: false,
                 create_new: false,
                 mode: None,
+                user: None,
             },
         },
     };

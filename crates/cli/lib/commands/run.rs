@@ -1,6 +1,6 @@
 //! `msb run` command — create and start a new sandbox.
 
-use std::io::{IsTerminal, Write};
+use std::io::{self, IsTerminal, Write};
 use std::time::Duration;
 
 use clap::Args;
@@ -8,7 +8,7 @@ use futures::{FutureExt, StreamExt};
 use microsandbox::logs::{LogSource, LogStreamOptions, LogStreamStart};
 use microsandbox::sandbox::{ExecOutput, RlimitResource, Sandbox};
 
-use super::common::{SandboxOpts, apply_sandbox_opts, apply_sandbox_opts_after_config};
+use super::common::{self, SandboxOpts, apply_sandbox_opts, apply_sandbox_opts_after_config};
 use crate::{sandbox_config, ui};
 
 //--------------------------------------------------------------------------------------------------
@@ -37,6 +37,10 @@ pub struct RunArgs {
     #[arg(long = "no-tty", conflicts_with = "tty")]
     pub no_tty: bool,
 
+    /// Leave host stdin untouched and give the command EOF (disables automatic TTY).
+    #[arg(long, conflicts_with = "tty")]
+    pub no_stdin: bool,
+
     /// Kill the command after this duration (e.g. 30s, 5m, 1h).
     #[arg(long)]
     pub timeout: Option<String>,
@@ -63,6 +67,7 @@ pub struct RunArgs {
 /// Parsed per-command execution options for `msb run`.
 struct ExecOpts {
     tty: bool,
+    no_stdin: bool,
     timeout: Option<Duration>,
     rlimits: Vec<(RlimitResource, u64, u64)>,
     detach_keys: Option<String>,
@@ -73,16 +78,17 @@ impl ExecOpts {
         let rlimits: Vec<_> = args
             .rlimit
             .iter()
-            .map(|s| super::common::parse_rlimit(s))
+            .map(|s| common::parse_rlimit(s))
             .collect::<anyhow::Result<Vec<_>>>()?;
 
         let timeout = match &args.timeout {
-            Some(t) => Some(Duration::from_secs(super::common::parse_duration_secs(t)?)),
+            Some(t) => Some(Duration::from_secs(common::parse_duration_secs(t)?)),
             None => None,
         };
 
         Ok(Self {
             tty: args.tty,
+            no_stdin: args.no_stdin,
             timeout,
             rlimits,
             detach_keys: args.detach_keys.clone(),
@@ -130,11 +136,10 @@ async fn run_existing(name: String, args: RunArgs) -> anyhow::Result<()> {
 
     let exec_opts = ExecOpts::parse(&args)?;
     let interactive =
-        super::common::use_interactive_tty(std::io::stdin().is_terminal(), args.no_tty);
+        common::use_interactive_tty(io::stdin().is_terminal(), args.no_tty || args.no_stdin);
 
     let result: anyhow::Result<i32> = async {
-        let (cmd, cmd_args) =
-            super::common::resolve_command(sandbox.config(), args.command, interactive)?;
+        let (cmd, cmd_args) = common::resolve_command(sandbox.config(), args.command, interactive)?;
         match cmd {
             Some(cmd) => exec_in_sandbox(&sandbox, &cmd, cmd_args, interactive, &exec_opts).await,
             None => Ok(0),
@@ -211,7 +216,7 @@ async fn run_new(
         .await
         .map_err(|e| anyhow::anyhow!("create task panicked: {e}"))??;
 
-    super::common::display_restore_warnings(&sandbox).await;
+    common::display_restore_warnings(&sandbox).await;
 
     if sandbox.config().resumed_from_full_snapshot() {
         if !args.command.is_empty() {
@@ -238,7 +243,7 @@ async fn run_new(
 
     let exec_opts = ExecOpts::parse(&args)?;
     let interactive =
-        super::common::use_interactive_tty(std::io::stdin().is_terminal(), args.no_tty);
+        common::use_interactive_tty(io::stdin().is_terminal(), args.no_tty || args.no_stdin);
 
     if sandbox.config().init_owns_boot_workload() {
         let observe = observe_init_owned_workload(&sandbox, launch_started_at);
@@ -255,17 +260,18 @@ async fn run_new(
         {
             ui::warn(&format!("failed to stop sandbox: {error}"));
         }
+        super::finish_stopped_memory_cleanup().await;
         return handle_exit(result?);
     }
 
-    let (cmd, cmd_args) =
-        super::common::resolve_command(sandbox.config(), args.command, interactive)?;
+    let (cmd, cmd_args) = common::resolve_command(sandbox.config(), args.command, interactive)?;
     let (cmd, cmd_args) = match (cmd, cmd_args) {
         (Some(cmd), args) => (cmd, args),
         (None, _) => {
             if let Err(e) = sandbox.stop().await {
                 ui::warn(&format!("failed to stop sandbox: {e}"));
             }
+            super::finish_stopped_memory_cleanup().await;
             return Ok(());
         }
     };
@@ -277,6 +283,7 @@ async fn run_new(
     if let Err(e) = sandbox.stop().await {
         ui::warn(&format!("failed to stop sandbox: {e}"));
     }
+    super::finish_stopped_memory_cleanup().await;
 
     handle_exit(result?)
 }
@@ -376,11 +383,14 @@ async fn exec_in_sandbox(
         let rlimits = opts.rlimits.clone();
         let timeout = opts.timeout;
         let tty = opts.tty;
-        let has_opts = tty || timeout.is_some() || !rlimits.is_empty();
+        let has_opts = tty || opts.no_stdin || timeout.is_some() || !rlimits.is_empty();
         let output: ExecOutput = if has_opts {
             sandbox
                 .exec_with(cmd, |e| {
                     let mut e = e.args(cmd_args);
+                    if opts.no_stdin {
+                        e = e.stdin_bytes(Vec::new());
+                    }
                     if tty {
                         e = e.tty(true);
                     }
@@ -397,8 +407,8 @@ async fn exec_in_sandbox(
             sandbox.exec(cmd, cmd_args).await?
         };
 
-        std::io::stdout().write_all(output.stdout_bytes())?;
-        std::io::stderr().write_all(output.stderr_bytes())?;
+        io::stdout().write_all(output.stdout_bytes())?;
+        io::stderr().write_all(output.stderr_bytes())?;
 
         Ok(if output.status().success {
             0
@@ -484,11 +494,36 @@ mod tests {
     }
 
     #[test]
-    fn no_tty_conflicts_with_tty() {
-        let err =
-            TestCli::try_parse_from(["msb", "--tty", "--no-tty", "python:3-alpine"]).unwrap_err();
+    fn entrypoint_executable_and_arguments_parse_separately() {
+        let args = parse_run_args(&[
+            "--entrypoint",
+            "/bin/sh",
+            "alpine",
+            "--",
+            "-c",
+            "echo foo; exec something",
+            "-",
+        ]);
 
-        assert_eq!(err.kind(), ErrorKind::ArgumentConflict);
+        assert_eq!(args.sandbox.entrypoint.as_deref(), Some("/bin/sh"));
+        assert_eq!(args.image.as_deref(), Some("alpine"));
+        assert_eq!(
+            args.command,
+            vec![
+                "-c".to_string(),
+                "echo foo; exec something".to_string(),
+                "-".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn noninteractive_flags_conflict_with_tty() {
+        for flag in ["--no-tty", "--no-stdin"] {
+            let err =
+                TestCli::try_parse_from(["msb", "--tty", flag, "python:3-alpine"]).unwrap_err();
+            assert_eq!(err.kind(), ErrorKind::ArgumentConflict);
+        }
     }
 
     #[test]
@@ -697,6 +732,40 @@ mod tests {
             socks5.sandbox.socks5_password_env.as_deref(),
             Some("SOCKS5_PASSWORD")
         );
+
+        let http = parse_run_args(&[
+            "--proxy",
+            "http://127.0.0.1:3128",
+            "--http-connect-username",
+            "sandbox",
+            "--http-connect-password-env",
+            "HTTP_CONNECT_PASSWORD",
+            "alpine",
+        ]);
+        assert_eq!(
+            http.sandbox.http_connect_username.as_deref(),
+            Some("sandbox")
+        );
+        assert_eq!(
+            http.sandbox.http_connect_password_env.as_deref(),
+            Some("HTTP_CONNECT_PASSWORD")
+        );
+    }
+
+    #[cfg(feature = "net")]
+    #[test]
+    fn http_connect_cli_credentials_require_the_complete_pair() {
+        for auth in [
+            &["--http-connect-username", "sandbox"][..],
+            &["--http-connect-password-env", "HTTP_CONNECT_PASSWORD"][..],
+        ] {
+            let argv = ["msb", "--proxy", "http://127.0.0.1:3128"]
+                .into_iter()
+                .chain(auth.iter().copied())
+                .chain(["alpine"]);
+            let error = TestCli::try_parse_from(argv).unwrap_err();
+            assert_eq!(error.kind(), ErrorKind::MissingRequiredArgument);
+        }
     }
 
     #[cfg(feature = "net")]
@@ -724,7 +793,7 @@ mod tests {
 
     #[test]
     fn restore_only_flags_are_rejected_by_run() {
-        for flag in ["--disk-only", "--forked"] {
+        for flag in ["--disk-only", "--cow-mem", "--forked"] {
             assert!(TestCli::try_parse_from(["msb", "alpine", flag]).is_err());
         }
     }

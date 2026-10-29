@@ -74,6 +74,7 @@ use microsandbox_protocol::{
     },
     exec::ExecRlimit,
 };
+use microsandbox_runtime::ipc::SandboxSocketPaths;
 use microsandbox_runtime::launch::{FileMountConfig, LaunchConfig, Lifecycle};
 use microsandbox_runtime::vm::{MetricsSlotHandoff, StartupCommand};
 use microsandbox_types::{CommandResolutionError, SandboxLogLevel, resolve_default_command};
@@ -87,6 +88,7 @@ use crate::error::{Operation, UnsupportedReason};
 use crate::runtime::handle::WindowsJob;
 use crate::runtime::handle::{ProcessHandle, StartupProcess};
 use crate::runtime::launch_contract::{self, LaunchContract};
+use crate::sandbox::SecurityProfile;
 use crate::timing;
 use crate::{
     MicrosandboxError, MicrosandboxResult,
@@ -428,6 +430,11 @@ pub async fn spawn_sandbox(
     if crate::sandbox::config::has_header_credentials(config) {
         launch_contract::require_header_credentials(&resolved_runtime.msb_path).await?;
     }
+    #[cfg(feature = "net")]
+    launch_contract::validate_http_deny_response(&resolved_runtime.msb_path, config).await?;
+    launch_contract::validate_exec_limits(&resolved_runtime.msb_path, config).await?;
+    launch_contract::validate_guest_clock(&resolved_runtime.msb_path, config).await?;
+    launch_contract::validate_fs_state_limit(&resolved_runtime.msb_path, global).await?;
     if config.checkpoint_restore.as_ref().is_some_and(|restore| {
         restore
             .external_mounts
@@ -436,6 +443,11 @@ pub async fn spawn_sandbox(
     }) {
         launch_contract::require_restore_backing(&resolved_runtime.msb_path).await?;
     }
+    // Create already probed before replacing; a later start may use a different runtime.
+    #[cfg(feature = "net")]
+    launch_contract
+        .require_network_capabilities(&resolved_runtime.msb_path, resolved_network.config())
+        .await?;
     if launch_contract.patch < 9
         && !matches!(
             global.runtime.block_writeback,
@@ -1584,7 +1596,10 @@ fn set_nonblocking(fd: &OwnedFd) -> MicrosandboxResult<()> {
 async fn write_all_nonblocking(write_fd: OwnedFd, bytes: &[u8]) -> MicrosandboxResult<()> {
     use tokio::io::unix::AsyncFd;
 
-    let async_fd = AsyncFd::new(write_fd)?;
+    // SAFETY: `write_fd` is an owned descriptor that stays open and unchanged for
+    // the whole lifetime of the `AsyncFd`, and the caller set `O_NONBLOCK` on it
+    // before the handoff (see `set_nonblocking`).
+    let async_fd = unsafe { AsyncFd::register(write_fd) }.map_err(std::io::Error::from)?;
     let mut offset = 0usize;
     while offset < bytes.len() {
         let mut guard = async_fd.writable().await?;
@@ -2503,25 +2518,25 @@ fn sandbox_agent_socket_path_candidates_with_roots(
     sandboxes_dir: &Path,
     name: &str,
 ) -> Vec<PathBuf> {
-    let primary = microsandbox_runtime::ipc::canonical_agent_endpoint(run_dir, name);
-
     // New clients prefer the canonical per-sandbox endpoint, then the flat
     // legacy path used by older runtimes, and finally the pre-hash in-sandbox
     // fallback retained for unusually deep homes. Windows named pipes did not
     // change layout, so the canonical endpoint is the only candidate there.
     #[cfg(unix)]
     let candidates = {
-        let paths = microsandbox_runtime::ipc::sandbox_socket_paths(run_dir, name);
+        let paths = SandboxSocketPaths::in_sandboxes_dir(run_dir, sandboxes_dir, name);
         vec![
-            primary,
-            paths.legacy_agent,
-            in_sandbox_agent_socket_path(sandboxes_dir, name),
+            paths.runtime.agent,
+            paths.runtime.legacy_agent,
+            paths.fallback_agent,
         ]
     };
     #[cfg(not(unix))]
     let candidates = {
         let _ = sandboxes_dir;
-        vec![primary]
+        vec![microsandbox_runtime::ipc::canonical_agent_endpoint(
+            run_dir, name,
+        )]
     };
 
     candidates
@@ -2536,11 +2551,14 @@ fn launch_agent_socket_path(
 ) -> MicrosandboxResult<PathBuf> {
     #[cfg(unix)]
     if contract.patch < 9 {
-        let paths =
-            microsandbox_runtime::ipc::sandbox_socket_paths(&local.config().run_dir(), name);
+        let paths = SandboxSocketPaths::in_sandboxes_dir(
+            &local.config().run_dir(),
+            &local.sandboxes_dir(),
+            name,
+        );
         return resolve_sandbox_agent_socket_path_from_candidates(vec![
-            paths.legacy_agent,
-            in_sandbox_agent_socket_path(&local.sandboxes_dir(), name),
+            paths.runtime.legacy_agent,
+            paths.fallback_agent,
         ]);
     }
     #[cfg(not(unix))]
@@ -2713,14 +2731,6 @@ fn probe_agent_pipe_server(pipe_path: &Path) -> std::io::Result<AgentPipeProbe> 
     }
 }
 
-// The legacy `<sandboxes>/<name>/runtime/agent.sock` fallback only exists for
-// backward compatibility with the pre-hash Unix layout; Windows never shipped a
-// different agent-pipe scheme, so this is Unix-only.
-#[cfg(unix)]
-fn in_sandbox_agent_socket_path(sandboxes_dir: &Path, name: &str) -> PathBuf {
-    sandboxes_dir.join(name).join("runtime").join("agent.sock")
-}
-
 /// Remove every Unix runtime socket artifact deterministically owned by a sandbox.
 pub(crate) fn remove_sandbox_socket_artifacts_for(
     local: &LocalBackend,
@@ -2739,21 +2749,8 @@ pub(crate) fn remove_sandbox_socket_artifacts_at(
     sandboxes_dir: &Path,
     name: &str,
 ) -> MicrosandboxResult<()> {
-    let canonical_result =
-        microsandbox_runtime::ipc::remove_sandbox_socket_artifacts(run_dir, name);
+    SandboxSocketPaths::in_sandboxes_dir(run_dir, sandboxes_dir, name).remove_artifacts()?;
 
-    #[cfg(unix)]
-    let fallback_result = microsandbox_runtime::ipc::remove_socket_pair(
-        &in_sandbox_agent_socket_path(sandboxes_dir, name),
-    );
-
-    #[cfg(not(unix))]
-    let fallback_result: std::io::Result<()> = {
-        let _ = sandboxes_dir;
-        Ok(())
-    };
-
-    canonical_result.and(fallback_result)?;
     Ok(())
 }
 
@@ -3158,6 +3155,8 @@ fn machine_cli_args(
         agent_sock: agent_sock_path.to_path_buf(),
         libkrunfw_path: libkrunfw_path.to_path_buf(),
         thp: config.spec.resources.thp,
+        guest_clock: config.spec.runtime.guest_clock.unwrap_or_default(),
+        fs_state_limit_bytes: local.config().fs_state_limit_override(),
         memory_cache_dir: Some(local.cache_dir().join("memory")),
         startup: startup_command(config),
         lifecycle: Lifecycle {
@@ -3518,6 +3517,7 @@ fn machine_cli_args(
 /// Build guest settings shared by launch preflight and the final payload.
 pub(crate) fn guest_bootstrap(config: &SandboxConfig) -> GuestBootstrap {
     GuestBootstrap {
+        exec_limits: Some(config.exec_limits()),
         hostname: Some(
             config
                 .spec
@@ -3548,8 +3548,8 @@ pub(crate) fn guest_bootstrap(config: &SandboxConfig) -> GuestBootstrap {
             })
             .collect(),
         security_profile: match config.spec.security_profile {
-            crate::sandbox::SecurityProfile::Default => BootstrapSecurityProfile::Default,
-            crate::sandbox::SecurityProfile::Restricted => BootstrapSecurityProfile::Restricted,
+            SecurityProfile::Default => BootstrapSecurityProfile::Default,
+            SecurityProfile::Restricted => BootstrapSecurityProfile::Restricted,
         },
         handoff_init: config.spec.init.as_ref().map(|init| BootstrapHandoffInit {
             cmd: init.cmd.clone(),
@@ -3633,6 +3633,8 @@ mod tests {
     use sea_orm::{ActiveModelTrait, ColumnTrait, EntityTrait, QueryFilter, Set};
     use tempfile::tempdir;
 
+    #[cfg(unix)]
+    use microsandbox_runtime::ipc::RuntimeSocketPaths;
     use microsandbox_runtime::launch::{
         CheckpointRestoreConfig, LaunchConfig, RootfsUpperLayerConfig,
     };
@@ -5080,7 +5082,7 @@ mod tests {
             .unwrap();
         let run_dir = temp.path().join("run");
         let sandboxes_dir = temp.path().join("sandboxes");
-        let paths = microsandbox_runtime::ipc::sandbox_socket_paths(&run_dir, "old-runtime");
+        let paths = RuntimeSocketPaths::new(&run_dir, "old-runtime");
         std::fs::create_dir_all(paths.legacy_agent.parent().unwrap()).unwrap();
         let _listener = std::os::unix::net::UnixListener::bind(&paths.legacy_agent).unwrap();
 

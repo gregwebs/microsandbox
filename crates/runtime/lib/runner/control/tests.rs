@@ -14,13 +14,53 @@ use tokio_util::sync::CancellationToken;
 use super::dispatch::{Dispatcher, Input, Job, MAX_QUEUED, RUNTIME_BYTES};
 use super::handler::{Handler, Reply, Response};
 
+#[test]
+fn concurrent_job_replies_fit_the_connection_budget() {
+    use super::dispatch::{Budget, CONNECTION_BYTES, reply_bytes};
+    use microsandbox_protocol::jobs::{JOB_REQUEST, JobOperation, JobRequest};
+    let request = JobRequest {
+        version: 1,
+        runtime_boot_id: None,
+        operation: JobOperation::Hello,
+    };
+    let frame = Envelope::new(2, JOB_REQUEST, &request)
+        .unwrap()
+        .frame(1, 0)
+        .unwrap();
+    let reply = reply_bytes(&frame, 2).unwrap();
+    let connection = Arc::new(tokio::sync::Semaphore::new(CONNECTION_BYTES));
+    let runtime = Arc::new(tokio::sync::Semaphore::new(RUNTIME_BYTES));
+    let reservations: Vec<_> = (0..4)
+        .map(|_| Budget::reserve_reply(&connection, &runtime, reply).unwrap())
+        .collect();
+    assert_eq!(reservations.len(), 4);
+    assert!(connection.available_permits() >= CONNECTION_BYTES / 2);
+}
+
 #[derive(Default)]
 struct FakeHost {
     calls: Mutex<Vec<u32>>,
 }
 
 impl Handler for FakeHost {
-    fn handle(&self, request: ControlRequest) -> Response {
+    fn handle(&self, request: ControlOperation, _generation: u8) -> Response {
+        if matches!(&request, ControlOperation::Pause(_)) {
+            self.calls.lock().unwrap().push(u32::MAX);
+            return Response {
+                json: JsonControlResponse {
+                    ok: true,
+                    ..Default::default()
+                },
+                framed: Reply::Pause(PauseState {
+                    paused: true,
+                    recovery_required: false,
+                    capture_unavailable: None,
+                }),
+            };
+        }
+        let ControlOperation::GenerationOne(request) = request else {
+            panic!("unexpected generation-two fixture operation")
+        };
         let value = match request {
             ControlRequest::CpuTarget { online } => online,
             _ => 0,
@@ -99,7 +139,12 @@ fn connection(
 }
 
 async fn handshake(stream: &mut DuplexStream, capacity: u32) {
+    assert_eq!(handshake_generation(stream, capacity, 1).await, 1);
+}
+
+async fn handshake_generation(stream: &mut DuplexStream, capacity: u32, maximum: u8) -> u8 {
     let hello = ControlHello {
+        max_generation: maximum,
         max_in_flight: capacity,
         ..Default::default()
     };
@@ -116,6 +161,7 @@ async fn handshake(stream: &mut DuplexStream, capacity: u32) {
     let welcome: ControlWelcome = Envelope::decode(&response.body).unwrap().payload().unwrap();
     welcome.validate_for(&hello).unwrap();
     assert_eq!(welcome.max_in_flight, capacity.min(64));
+    welcome.generation
 }
 
 async fn request(
@@ -125,9 +171,20 @@ async fn request(
     name: &str,
     payload: &impl serde::Serialize,
 ) {
+    request_at(stream, 1, id, flags, name, payload).await;
+}
+
+async fn request_at(
+    stream: &mut DuplexStream,
+    generation: u8,
+    id: u32,
+    flags: u8,
+    name: &str,
+    payload: &impl serde::Serialize,
+) {
     codec::write_raw_frame(
         stream,
-        &Envelope::new(1, name, payload)
+        &Envelope::new(generation, name, payload)
             .unwrap()
             .frame(id, flags)
             .unwrap(),
@@ -150,6 +207,119 @@ fn queued_json(online: u32, reply: mpsc::Sender<super::dispatch::Outgoing>) -> J
         lease: None,
         cancelled: CancellationToken::new(),
     }
+}
+
+#[tokio::test]
+async fn blocked_exec_signal_does_not_block_other_connections_or_reorder_its_connection() {
+    use microsandbox_protocol::exec_control::{
+        EXEC_CONTROL_REQUEST, ExecControlRequest, ExecControlResponse,
+    };
+    struct SignalHost {
+        host: FakeHost,
+        started: tokio::sync::Notify,
+        release: Mutex<std::sync::mpsc::Receiver<()>>,
+    }
+    impl Handler for SignalHost {
+        fn handle(&self, request: ControlOperation, generation: u8) -> Response {
+            self.host.handle(request, generation)
+        }
+        fn handle_exec_signal(&self, request: ExecControlRequest) -> ExecControlResponse {
+            if request.id != 101 {
+                return ExecControlResponse::delivered();
+            }
+            self.started.notify_one();
+            self.release
+                .lock()
+                .unwrap()
+                .recv_timeout(Duration::from_secs(3))
+                .unwrap();
+            ExecControlResponse::delivered()
+        }
+    }
+    let (release, released) = std::sync::mpsc::channel();
+    let host = Arc::new(SignalHost {
+        host: FakeHost::default(),
+        started: tokio::sync::Notify::new(),
+        release: Mutex::new(released),
+    });
+    let dispatcher = Dispatcher::new(host.clone());
+    let task = tokio::spawn(dispatcher.clone().run());
+    let (mut signal, signal_server) = connection(&dispatcher);
+    handshake_generation(&mut signal, 4, 2).await;
+    request_at(
+        &mut signal,
+        2,
+        1,
+        0,
+        EXEC_CONTROL_REQUEST,
+        &ExecControlRequest {
+            version: 1,
+            connection: [0; 16],
+            id: 101,
+            signal: 9,
+        },
+    )
+    .await;
+    tokio::time::timeout(Duration::from_secs(1), host.started.notified())
+        .await
+        .unwrap();
+    // Mixed operations from this connection still wait behind its first signal.
+    request_at(
+        &mut signal,
+        2,
+        2,
+        0,
+        "control.cpu.target",
+        &CpuTarget { online: 7 },
+    )
+    .await;
+    let (mut lifecycle, lifecycle_server) = connection(&dispatcher);
+    handshake_generation(&mut lifecycle, 4, 2).await;
+    request_at(&mut lifecycle, 2, 1, 0, "control.capabilities", &Empty {}).await;
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(1), response(&mut lifecycle))
+            .await
+            .unwrap()
+            .t,
+        "control.capabilities.result"
+    );
+    let (mut independent, independent_server) = connection(&dispatcher);
+    handshake_generation(&mut independent, 4, 2).await;
+    request_at(
+        &mut independent,
+        2,
+        1,
+        0,
+        EXEC_CONTROL_REQUEST,
+        &ExecControlRequest {
+            version: 1,
+            connection: [0; 16],
+            id: 102,
+            signal: 9,
+        },
+    )
+    .await;
+    let independent_result =
+        tokio::time::timeout(Duration::from_secs(1), response(&mut independent)).await;
+    assert_eq!(*host.host.calls.lock().unwrap(), [0]);
+    release.send(()).unwrap();
+    assert_eq!(
+        independent_result.unwrap().t,
+        microsandbox_protocol::exec_control::EXEC_CONTROL_RESPONSE
+    );
+    drop(independent);
+    independent_server.await.unwrap().unwrap();
+    assert_eq!(
+        response(&mut signal).await.t,
+        microsandbox_protocol::exec_control::EXEC_CONTROL_RESPONSE
+    );
+    assert_eq!(response(&mut signal).await.t, "control.cpu.state");
+    assert_eq!(*host.host.calls.lock().unwrap(), [0, 7]);
+    drop(signal);
+    drop(lifecycle);
+    signal_server.await.unwrap().unwrap();
+    lifecycle_server.await.unwrap().unwrap();
+    task.abort();
 }
 
 #[test]
@@ -340,6 +510,28 @@ async fn recoverable_bad_operations_return_structured_errors_before_dispatch() {
     drop(stream);
     server.await.unwrap().unwrap();
     assert_eq!(host.calls.lock().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn generation_two_dispatches_typed_operations_and_generation_one_refuses_them() {
+    let (host, dispatcher) = dispatcher(true);
+    let (mut current, current_server) = connection(&dispatcher);
+    assert_eq!(handshake_generation(&mut current, 64, 2).await, 2);
+    request_at(&mut current, 2, 1, 0, "control.pause", &Pause::default()).await;
+    let pause: PauseState = response(&mut current).await.payload().unwrap();
+    assert!(pause.paused);
+    drop(current);
+    current_server.await.unwrap().unwrap();
+
+    let (mut old, old_server) = connection(&dispatcher);
+    handshake(&mut old, 64).await;
+    request_at(&mut old, 1, 1, 0, "control.pause", &Pause::default()).await;
+    let refusal: ControlError = response(&mut old).await.payload().unwrap();
+    assert_eq!(refusal.code, "unsupported_operation");
+    assert_eq!(refusal.effect, ErrorEffect::None);
+    drop(old);
+    old_server.await.unwrap().unwrap();
+    assert_eq!(*host.calls.lock().unwrap(), [u32::MAX]);
 }
 
 #[tokio::test]

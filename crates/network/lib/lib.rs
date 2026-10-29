@@ -22,7 +22,7 @@ pub mod proxy;
 #[cfg(feature = "engine")]
 pub(crate) use engine::addr;
 #[cfg(feature = "engine")]
-pub use engine::{extensions, icmp, intercept, netstack, network, ports, tcp, udp};
+pub use engine::{extensions, http_deny, icmp, intercept, netstack, network, ports, tcp, udp};
 pub use model::{config, dns, policy, secrets, tls};
 
 //--------------------------------------------------------------------------------------------------
@@ -43,9 +43,9 @@ pub(crate) const HOST_ALIAS: &str = "host.microsandbox.internal";
 #[doc(hidden)]
 pub use config::ResolvedNetworkConfig;
 pub use proxy::{
-    OutboundProxy, OutboundProxyBuildError, OutboundProxyBuilder, OutboundProxyConfig,
-    OutboundProxyParseError, OutboundProxyProtocol, Socks4ProxyBuilder, Socks5Credentials,
-    Socks5ProxyBuilder,
+    HttpConnectCredentials, HttpConnectProxyBuilder, OutboundProxy, OutboundProxyBuildError,
+    OutboundProxyBuilder, OutboundProxyConfig, OutboundProxyParseError, OutboundProxyProtocol,
+    Socks4ProxyBuilder, Socks5Credentials, Socks5ProxyBuilder,
 };
 
 pub use config::builder;

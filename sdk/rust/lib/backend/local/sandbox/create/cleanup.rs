@@ -115,12 +115,11 @@ impl CleanupState {
             // A WAL reader could otherwise observe "no row" before that commit completes.
             .one(pools.write())
             .await?;
-        // The retained transition excludes a new create/start/remove throughout the query
-        // and rollback. Release only the lifecycle probe so the existing rollback can own it.
-        drop(guard);
+        // Keep the same lifecycle guard through reconciliation. Dropping and reopening
+        // it can race a fork that briefly retains the original open file description.
         if let Some(model) = model {
             local
-                .rollback_failed_startup(pools.write(), model.id, &self.name, &self.volumes)
+                .rollback_failed_startup_guarded(pools.write(), model.id, &self.volumes, &guard)
                 .await?;
         } else {
             crate::runtime::rollback_created_named_volumes(local, &self.volumes).await;
@@ -129,12 +128,6 @@ impl CleanupState {
             // Rollback can retain a recoverable stopped row, or remove the row when
             // one-shot named volumes were created. Prove which outcome committed before
             // deleting anything, while still excluding both runtimes and replacements.
-            let _guard = crate::runtime::acquire_sandbox_lifecycle_guard(
-                &local.config().run_dir(),
-                &self.name,
-                Duration::from_secs(10),
-            )
-            .await?;
             let retained = sandbox_entity::Entity::find()
                 .filter(sandbox_entity::Column::Name.eq(&self.name))
                 .one(pools.write())
@@ -241,7 +234,10 @@ mod tests {
             }
             let config = SandboxBuilder::new(name)
                 .image(rootfs.clone())
-                .volume("/bind", |mount| mount.bind(rootfs))
+                .volume("/bind", |mount| {
+                    // Bind roots refuse symlinks, and /tmp is one on macOS.
+                    mount.bind(rootfs.canonicalize().unwrap())
+                })
                 .volume("/shared", |mount| mount.named("shared"))
                 .volume("/owned", |mount| mount.owned())
                 .build()
@@ -317,12 +313,13 @@ mod tests {
     #[tokio::test]
     async fn owned_format_failure_cleans_unpublished_directory_before_returning() {
         let mut fixture = OwnedFixture::new("owned-format-failure").await;
-        fixture.config.spec.mounts.push(
-            MountBuilder::new("/too-small")
-                .owned_with(|volume| volume.disk().size(1_u32))
-                .build()
-                .unwrap(),
-        );
+        fixture.config = SandboxBuilder::from(fixture.config)
+            .volume("/too-small", |mount| {
+                mount.owned_with(|volume| volume.disk().size(1_u32))
+            })
+            .build()
+            .await
+            .unwrap();
         let error = fixture
             .backend
             .create_sandbox(
@@ -435,9 +432,9 @@ mod tests {
 
     #[tokio::test]
     async fn owned_cleanup_preserves_backing_whenever_catalog_row_survives() {
-        for refuse_delete in [false, true] {
+        for refused_operation in [None, Some("DELETE"), Some("UPDATE")] {
             let mut fixture = OwnedFixture::new("owned-retained-row").await;
-            if refuse_delete {
+            if refused_operation == Some("DELETE") {
                 fixture.config.spec.mounts.push(
                     MountBuilder::new("/created")
                         .named_with("created", |volume| volume.ensure_exists())
@@ -451,19 +448,25 @@ mod tests {
                 LocalBackend::insert_starting_sandbox_record(pools.write(), &fixture.config, None)
                     .await
                     .unwrap();
-            if refuse_delete {
-                pools.write().execute_unprepared(
-                    "CREATE TRIGGER retain_sandbox BEFORE DELETE ON sandbox BEGIN SELECT RAISE(ABORT, 'retained'); END;",
-                ).await.unwrap();
+            if let Some(operation) = refused_operation {
+                pools.write().execute_unprepared(&format!(
+                    "CREATE TRIGGER retain_sandbox BEFORE {operation} ON sandbox BEGIN SELECT RAISE(ABORT, 'retained'); END;",
+                )).await.unwrap();
             }
             let error = finish_test_owned_failure(&mut cleanup).await;
-            assert_eq!(error.to_string(), "startup failed");
+            if refused_operation.is_some() {
+                let message = error.to_string();
+                assert!(message.contains("startup failed"), "{message}");
+                assert!(message.contains("retained"), "{message}");
+            } else {
+                assert_eq!(error.to_string(), "startup failed");
+            }
             let row = sandbox_entity::Entity::find_by_id(id)
                 .one(pools.write())
                 .await
                 .unwrap()
                 .unwrap();
-            if !refuse_delete {
+            if refused_operation.is_none() {
                 assert_eq!(row.status, SandboxStatus::Stopped);
             }
             assert_eq!(
@@ -716,7 +719,6 @@ mod tests {
         .await
         .unwrap();
         drop(cleanup);
-        tokio::time::sleep(Duration::from_millis(20)).await;
         assert!(
             microsandbox_runtime::ipc::try_acquire_transition_guard(
                 &backend.config().run_dir(),
@@ -736,21 +738,27 @@ mod tests {
             SandboxStatus::Running
         );
         drop(runtime);
-        tokio::time::timeout(Duration::from_secs(2), async {
-            loop {
-                let model = sandbox_entity::Entity::find_by_id(id)
-                    .one(pools.read())
-                    .await
-                    .unwrap()
-                    .unwrap();
-                if model.status == SandboxStatus::Stopped {
-                    break;
-                }
-                tokio::time::sleep(Duration::from_millis(5)).await;
-            }
-        })
+        // Cleanup owns the transition through its final catalog write. Reacquiring it
+        // waits for completion; the timeout is only a watchdog for a stuck cleanup.
+        let _transition = tokio::time::timeout(
+            Duration::from_secs(30),
+            LocalBackend::acquire_sandbox_transition_guard(
+                &backend.config().run_dir(),
+                &config.spec.name,
+            ),
+        )
         .await
+        .expect("cancelled creation cleanup did not release the name transition")
         .unwrap();
+        assert_eq!(
+            sandbox_entity::Entity::find_by_id(id)
+                .one(pools.read())
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            SandboxStatus::Stopped
+        );
         let runs = run_entity::Entity::find()
             .filter(run_entity::Column::SandboxId.eq(id))
             .all(pools.read())

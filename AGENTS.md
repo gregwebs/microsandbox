@@ -99,6 +99,14 @@ Repository layout:
 - For public APIs, keep the Rust SDK, CLI, Python SDK, Node SDK, Go SDK, docs, and examples consistent when they describe the same capability.
 - Prefer explicit errors with useful context over silent fallbacks.
 
+## Host Path Handling
+
+- For every path input, identify whether it belongs to the local host, a remote backend, or the guest before resolving it. Never resolve cloud or guest paths against the SDK client's working directory.
+- Resolve local host paths against their documented base once, before deferred use or persistence. Retained handles and asynchronous operations must reuse that resolved path, including their final writes. Sandbox and SDK configuration-file inputs use the contributing file's directory, including managed SDK settings.
+- Making a path absolute must preserve its symlink policy. Do not substitute filesystem canonicalization or collapse parent components across symlinks without reviewing the behavior change.
+- Preserve existing persisted relative paths and their legacy startup/resource-inheritance behavior. They have no reliable original base unless it was saved: do not reject, migrate, prompt about, or rewrite them during restart. Capture absolute host inputs only for new sandboxes, including new restore/branch children, without modifying their source sandbox.
+- Path changes need regression coverage with different creation and consumption directories, plus missing targets and symlinks where applicable. Change process cwd only inside an isolated test subprocess. Review sandbox mounts, rootfs paths, TLS files, backend storage roots, snapshots, transfers, and generated commands when adding a new path input.
+
 ## Backward Compatibility Review
 
 Backward-compatibility detection is a required part of working on this project. Surface potential compatibility breaks before making or continuing the affected change.
@@ -155,6 +163,21 @@ Treat stable strings, numeric constants, paths, hashes, serialized field details
 
 For changes affecting persisted data or cross-version communication, read [COMPATIBILITY.md](COMPATIBILITY.md) before implementation. Follow its contract-version naming, module ownership, migration, and validation guidelines.
 
+## Path Handling
+
+- Every relative path must have an explicit base directory. Never rely on the working directory at the time of eventual use.
+- Resolve CLI paths against the invocation directory, config-file paths against the config file’s directory, and SDK paths against a documented base.
+- Capture that base and resolve host paths before spawning asynchronous work or passing them to another process.
+- Persist absolute host paths when they reference a fixed local resource that must remain the same across restarts.
+- Distinguish host paths, guest paths, volume-relative paths, and resource identifiers. Do not apply host-path normalization to all strings.
+- Making a path absolute, collapsing `..`, and resolving symlinks are different operations. Choose deliberately; they can select different destinations.
+- Use structured path fields internally. Avoid concatenating paths into delimiter-separated strings that become ambiguous with valid filenames.
+- Return explicit errors when resolution fails. Never silently substitute another directory or panic.
+- Enforce filesystem containment during the operation, accounting for symlinks and concurrent changes. String-prefix checks alone are insufficient.
+- Centralize path-resolution rules so CLI, SDK, and background execution cannot drift.
+
+For path-related changes, test creation in directory A followed by use from directory B, plus relevant symlink, `..`, missing-path, and platform-specific cases. Assert the exact file or directory accessed—not just whether the operation succeeded.
+
 ## Rust Layout And Style
 
 - Most Rust crates use `lib/lib.rs` for library code and `bin/main.rs` for binaries. Keep using those paths for new crate entries unless the surrounding crate already does something different.
@@ -176,6 +199,7 @@ path = "bin/main.rs"
   3. Sectioned items.
 - Group imports by origin, separated by blank lines: standard library first, external crates second, then `crate::` and `super::` imports.
 - Do not put `use` statements inside sections unless there is a narrow local reason, such as a test module import.
+- Strongly prefer importing types at the top of the file or test module over spelling out full module paths in signatures, patterns, and function bodies. Use an import alias for name collisions; keep qualified paths when they meaningfully clarify an otherwise ambiguous name.
 - Use the exact section delimiter shown below. Do not invent alternate Markdown-style, shorter, or decorative section headers.
 - Include only sections that contain items. Do not add empty sections just to satisfy the full order.
 - Organize Rust files with these section headers, in this order when applicable:
@@ -229,8 +253,15 @@ path = "bin/main.rs"
 - Keep items in dependency order inside a section: public surface first, private helpers later.
 - Keep docs on public types, fields, methods, functions, and modules. This repo uses `#![warn(missing_docs)]` in public crates, so new public items should explain what they are for.
 - Prefer explicit domain types over loosely typed strings, booleans, or tuples when the value crosses an API or subsystem boundary.
+- Separate logical steps with blank lines: setup, early returns, normalization, validation, operations, and final results. Apply the same spacing to test setup, actions, and assertions; do not rely on `cargo fmt` to provide it.
+- Prefer named intermediate values when an expression combines distinct steps, especially fallible lookups, parsing, and validation. Make each failure point easy to identify.
+- Keep iterator chains simple. Prefer a straightforward loop when nested closures or branching make the logic harder to follow; do not add helpers solely to hide that complexity.
+- Keep straightforward logic together. Extract helpers when they clarify a distinct responsibility or remove meaningful duplication, rather than merely shortening a function.
+- Write comments to explain intent, constraints, or non-obvious behavior rather than narrating the code.
+- Name values for what they currently represent. Avoid names that imply an action has already happened when the value describes a requirement or planned action.
 - During refactors, conflict resolution, bug fixes, and feature work, call out any expected behavior, API, or data-format changes and wait for direction when the risk is material.
 - Use `thiserror` or existing local error patterns for typed errors. Include enough context for callers to understand the failing operation.
+- Keep shared library and SDK errors interface-neutral: describe the problem and remedy without CLI flags or command syntax. Add command-specific guidance in the CLI layer.
 - In async code, avoid holding locks across `.await`. Prefer explicit ownership, short critical sections, and existing Tokio patterns in the surrounding module.
 - Keep feature-gated code close to the feature it gates and use existing `#[cfg(feature = "...")]` patterns.
 - Do not add examples under `examples/` unless requested or clearly required. Prefer tests and docs for small usage coverage.
@@ -341,7 +372,16 @@ git diff origin/main..HEAD --name-status
 
 ## Documentation And Examples
 
+- For changes under `docs/`, read [the Microsandbox docs skill](.agents/skills/microsandbox-docs/SKILL.md) for page structure, examples, version labels, and validation.
 - Update docs when behavior, configuration, CLI flags, SDK APIs, or examples change.
+- Keep SDK reference introductions to a short purpose statement and a link to the relevant usage guide, then go straight into API entries. Follow the concise structure of the execution and networking reference pages across all SDK languages.
+- Start reference type sections directly with their members when the type heading is sufficient. Avoid redundant “Built by” / “Used by” rows and introductory text that repeats the member descriptions.
+- Do not prepend feature walkthroughs, lifecycle summaries, implementation details, or long examples to reference pages or type sections. Put API-specific details beside the relevant member and broader explanations in the usage guides; avoid duplicating those guides in the reference.
+- In SDK reference pages, wrap usage examples in a collapsed `<Accordion title="Example">`. Keep API signatures and type definitions visible outside the accordion.
+- When removing reference overviews, preserve unique signatures, constraints, result fields, and resource-cleanup requirements beside the relevant member or in the linked usage guide.
+- Omit field lists that only repeat documented builder options. Keep field references for returned data and properties not covered by the builder.
+- Do not use tables in SDK references. Use individual method and property headings with visible signatures and the existing parameter/return blocks. Group returned hash or record fields in the existing field blocks, including types, descriptions, and defaults where needed. Preserve links and existing anchors, and avoid repeating the same description above and inside a return block.
+- In Rust documentation examples, import types at the top of each snippet and use their short names in the body instead of fully qualified paths. Group standard-library imports before external-crate imports.
 - Keep examples realistic and runnable. Do not invent APIs or flags.
 - Prefer editing existing examples over adding new example projects unless the new example is requested or clearly fills a missing user workflow.
 - Documentation should describe current behavior, not future plans, unless the page is explicitly about roadmap work.

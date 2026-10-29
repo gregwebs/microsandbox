@@ -9,7 +9,7 @@ use crate::error::ProtocolResult;
 //--------------------------------------------------------------------------------------------------
 
 /// Current protocol version.
-pub const PROTOCOL_VERSION: u8 = 10;
+pub const PROTOCOL_VERSION: u8 = 11;
 
 /// Frame flag: this is the last message for the given correlation ID.
 ///
@@ -235,6 +235,14 @@ pub enum MessageType {
     #[strum(serialize = "core.exec.signal")]
     ExecSignal,
 
+    /// Return consumed stdout/stderr window credit for a flow-controlled execution.
+    #[strum(serialize = "core.exec.output.ack")]
+    ExecOutputAck,
+
+    /// Return stdin capacity after the child consumes piped input.
+    #[strum(serialize = "core.exec.stdin.ack")]
+    ExecStdinAck,
+
     /// Host requests a filesystem operation.
     #[strum(serialize = "core.fs.request")]
     FsRequest,
@@ -350,6 +358,14 @@ impl Message {
 }
 
 impl MessageType {
+    /// Whether this execution message belongs to the bounded progress-control class.
+    pub fn is_exec_control(self) -> bool {
+        matches!(
+            self,
+            Self::ExecOutputAck | Self::ExecStdinAck | Self::ExecSignal | Self::ExecResize
+        )
+    }
+
     /// Whether host-to-guest delivery can retain payload credit behind a workload consumer.
     ///
     /// The bundled workload barrier uses logical classes, not physical console ports. Payload
@@ -429,19 +445,22 @@ impl MessageType {
             | Self::ExecFailed
             | Self::ExecResize
             | Self::ExecSignal => 1,
+            Self::ExecOutputAck | Self::ExecStdinAck => 10,
             Self::FsRequest | Self::FsResponse | Self::FsData => 2,
             Self::CoreError => 5,
             Self::Ping | Self::Pong | Self::Touch | Self::Touched => 6,
             Self::Bootstrap => 7,
             // Auto-publish port mirroring + in-guest loopback forwarding.
-            // Generations 8 (raw bulk) and 9 (workload freeze / root disk)
-            // already shipped without these types, so they are introduced at
-            // generation 10 — a literal, like every other arm, so it stays
-            // correct if PROTOCOL_VERSION moves again.
+            // Generations 8 (raw bulk), 9 (workload freeze / root disk) and 10
+            // (upstream execution acknowledgements, released in v0.7.9) already
+            // shipped without these types, so they are introduced at generation
+            // 11 — a literal, like every other arm, so it stays correct if
+            // PROTOCOL_VERSION moves again. Pre-sync fork builds assigned them
+            // generation 10 (and earlier 8); that assignment is discarded.
             Self::PortEvent
             | Self::LoopbackForward
             | Self::LoopbackForwardCancel
-            | Self::LoopbackForwardResp => 10,
+            | Self::LoopbackForwardResp => 11,
             Self::WorkloadFreeze
             | Self::WorkloadFrozen
             | Self::WorkloadThaw
@@ -801,17 +820,17 @@ mod tests {
         // generation-7 peer must remain on the framed compatibility path.
         assert!(!MessageType::BulkAccepted.is_available_at(7));
         assert!(MessageType::BulkAccepted.is_available_at(8));
-        // Auto-publish port mirroring + loopback forwarding are generation-10
-        // additions: generations 8 (raw bulk) and 9 (workload freeze / root
-        // disk) already shipped without them.
-        assert!(!MessageType::PortEvent.is_available_at(9));
-        assert!(MessageType::PortEvent.is_available_at(10));
-        assert!(!MessageType::LoopbackForward.is_available_at(9));
-        assert!(MessageType::LoopbackForward.is_available_at(10));
-        assert!(!MessageType::LoopbackForwardCancel.is_available_at(9));
-        assert!(MessageType::LoopbackForwardCancel.is_available_at(10));
-        assert!(!MessageType::LoopbackForwardResp.is_available_at(9));
-        assert!(MessageType::LoopbackForwardResp.is_available_at(10));
+        // Auto-publish port mirroring + loopback forwarding are generation-11
+        // additions: generations 8 (raw bulk), 9 (workload freeze / root disk)
+        // and 10 (execution acknowledgements) already shipped without them.
+        assert!(!MessageType::PortEvent.is_available_at(10));
+        assert!(MessageType::PortEvent.is_available_at(11));
+        assert!(!MessageType::LoopbackForward.is_available_at(10));
+        assert!(MessageType::LoopbackForward.is_available_at(11));
+        assert!(!MessageType::LoopbackForwardCancel.is_available_at(10));
+        assert!(MessageType::LoopbackForwardCancel.is_available_at(11));
+        assert!(!MessageType::LoopbackForwardResp.is_available_at(10));
+        assert!(MessageType::LoopbackForwardResp.is_available_at(11));
     }
 
     #[test]
@@ -887,8 +906,8 @@ mod tests {
         ] {
             assert_eq!(
                 mt.min_protocol_version(),
-                10,
-                "{mt:?} should require gen 10"
+                11,
+                "{mt:?} should require gen 11"
             );
         }
 

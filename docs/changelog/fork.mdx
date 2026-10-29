@@ -1,7 +1,7 @@
 ---
 title: "Changes in this fork"
 sidebarTitle: "This fork"
-description: "Fork-only features: rotating file secrets, header credentials, request interception, and host proxy support."
+description: "Fork-only features: rotating file secrets, header credentials, request interception, opt-in ambient proxy discovery, and auto-published listeners."
 icon: "code-fork"
 ---
 
@@ -76,15 +76,35 @@ framing the interceptor's HTTP/1.1 parser can't read. Note that an `intercept` c
 
 See [Request interception](/sandboxes/intercept).
 
-## Host HTTP proxy
+### TLS without SNI
 
-The local runtime reads `HTTPS_PROXY`/`HTTP_PROXY`/`ALL_PROXY`/`NO_PROXY` (and their lowercase
-spellings) and routes authorized TCP connections through an HTTP `CONNECT` proxy with optional
-Basic authentication, so a sandbox running behind a corporate proxy reaches the network without
-per-sandbox configuration. This is separate from upstream's SOCKS [`outbound_proxy`](/networking/outbound-proxy),
-which wins when a sandbox names one explicitly.
+Interception requires a `ClientHello`, not a server name. A guest that connects to a literal IP
+address (or otherwise sends no SNI) is still accepted, with its identity taken from the destination
+IP: no DNS-origin material exists, so header credentials — which are origin-scoped by host name —
+are never applied on that route, while placeholder substitution may still be applied by a wildcard
+(`HostPattern::Any`) or IP-based secret policy. For the same reason a hostname intercept rule does
+not match an IP route; an exact-IP rule does.
 
-See [Host HTTP proxy](/networking/overview#host-http-proxy).
+## Opt-in ambient host proxy discovery
+
+A local sandbox can opt into discovering an HTTP `CONNECT` proxy from the host proxy environment
+(`HTTPS_PROXY`, `HTTP_PROXY`, `ALL_PROXY`, `NO_PROXY`, and their lowercase spellings) at each network
+start, so a machine behind a corporate proxy reaches the network without pinning an endpoint per
+sandbox. It is **off by default** and does not enable networking on its own.
+
+```bash
+msb run python --proxy-from-env          # or --proxy-from-env=false, proxy_from_env: true, MSB_PROXY_FROM_ENV=1
+```
+
+Only the enablement boolean is stored. The selected endpoint, its URL credentials, and the bypass
+rules stay in host memory and are never serialized into sandbox configuration or the guest
+environment. An explicit upstream [`outbound_proxy`](/networking/outbound-proxy) (HTTP `CONNECT`,
+SOCKS4, or SOCKS5) wins and is used without reading any host proxy variable. `NO_PROXY` bypasses a
+destination; once a proxy is selected, a proxy failure does not retry the origin directly. Non-DNS
+UDP cannot travel over `CONNECT` and is dropped while ambient routing is selected.
+
+See [Proxies](/networking/outbound-proxy#discover-a-proxy-from-the-host-environment) and
+[Ambient host HTTP proxy](/networking/overview#ambient-host-http-proxy).
 
 ## Auto-published guest listeners
 
@@ -97,6 +117,12 @@ network:
 
 Host listeners appear as the guest binds and disappear when it closes them, and the SDK can
 observe the same events through `Sandbox::port_events`.
+
+Auto-publish needs this build's generation-11 guest agent. A restored pre-sync memory snapshot keeps
+the older guest agent it captured, so its listeners are never published; restore it as a
+disk-only sandbox, or recreate it.
+
+See [Auto-published listeners](/networking/overview).
 
 ## Interactive attach input filter (Rust SDK)
 

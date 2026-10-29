@@ -12,11 +12,17 @@ use std::sync::{
 use std::time::{Duration, Instant};
 
 use crossbeam_queue::ArrayQueue;
+use ipnetwork::Ipv6Network;
+use microsandbox_types::HttpConfig;
 use microsandbox_utils::ttl_reverse_index::TtlReverseIndex;
 pub use microsandbox_utils::wake_pipe::WakePipe;
 use parking_lot::RwLock;
 
 use crate::addr::normalize_ip_addr;
+use crate::engine::http_deny::{
+    DEFAULT_HTTP_DENY_MESSAGE, http_forbidden_response, json_http_forbidden_response,
+    render_http_deny_message,
+};
 
 //--------------------------------------------------------------------------------------------------
 // Constants
@@ -24,6 +30,12 @@ use crate::addr::normalize_ip_addr;
 
 /// Default frame queue capacity. Matches libkrun's virtio queue size.
 pub const DEFAULT_QUEUE_CAPACITY: usize = 1024;
+
+/// Maximum live hostname/address bindings retained by one sandbox.
+pub(crate) const MAX_RESOLVED_HOSTNAME_BINDINGS: usize = 16_384;
+
+/// Maximum live bindings for one normalized hostname, across both families.
+pub(crate) const MAX_BINDINGS_PER_HOSTNAME: usize = 1_024;
 
 //--------------------------------------------------------------------------------------------------
 // Types
@@ -77,8 +89,14 @@ pub struct SharedState {
     /// Per-sandbox gateway IPv6. Set once at boot. See `gateway_ipv4`.
     gateway_ipv6: OnceLock<Ipv6Addr>,
 
+    /// NAT64 `/96` prefixes used by policy classification.
+    nat64_prefixes: OnceLock<Vec<Ipv6Network>>,
+
     /// Aggregate network byte counters at the guest/runtime boundary.
     metrics: NetworkMetrics,
+
+    /// HTTP denial settings installed before the network starts.
+    http: OnceLock<HttpConfig>,
 }
 
 /// Aggregate network byte counters shared with the runtime metrics sampler.
@@ -121,7 +139,9 @@ impl SharedState {
             resolved_hostnames: RwLock::new(TtlReverseIndex::default()),
             gateway_ipv4: OnceLock::new(),
             gateway_ipv6: OnceLock::new(),
+            nat64_prefixes: OnceLock::new(),
             metrics: NetworkMetrics::default(),
+            http: OnceLock::new(),
         }
     }
 
@@ -146,6 +166,66 @@ impl SharedState {
         self.gateway_ipv6.get().copied()
     }
 
+    /// Install HTTP denial settings. The first call wins.
+    pub fn set_http_config(&self, config: HttpConfig) {
+        let _ = self.http.set(config);
+    }
+
+    /// Whether readable denial responses were explicitly enabled.
+    pub fn http_deny_response_enabled(&self) -> bool {
+        self.http.get().is_some_and(|http| http.deny_response)
+    }
+
+    /// Whether JSON secret denials were explicitly enabled.
+    pub fn secret_deny_response_enabled(&self) -> bool {
+        self.http.get().is_some_and(|http| {
+            http.deny_response
+                && http.deny_response_format == microsandbox_types::HttpDenyResponseFormat::Json
+        })
+    }
+
+    /// Build a network denial using the selected wire contract.
+    pub fn network_denial_response(&self, host: &str) -> Vec<u8> {
+        if self.http.get().is_some_and(|http| {
+            http.deny_response_format == microsandbox_types::HttpDenyResponseFormat::Json
+        }) {
+            json_http_forbidden_response(self.network_deny_message(), host)
+        } else {
+            let template = self
+                .http
+                .get()
+                .and_then(|http| http.deny_message.as_deref())
+                .unwrap_or(DEFAULT_HTTP_DENY_MESSAGE);
+            http_forbidden_response(&render_http_deny_message(template, host))
+        }
+    }
+
+    /// Return the configured network-denial message without interpolation.
+    pub fn network_deny_message(&self) -> &str {
+        self.http
+            .get()
+            .and_then(|http| http.network_deny_message.as_deref())
+            .unwrap_or(crate::engine::http_deny::NETWORK_JSON_DENY_MESSAGE)
+    }
+
+    /// Return the configured secret-denial message without interpolation.
+    pub fn secret_deny_message(&self) -> &str {
+        self.http
+            .get()
+            .and_then(|http| http.secret_deny_message.as_deref())
+            .unwrap_or(crate::engine::http_deny::SECRET_HTTP_DENY_MESSAGE)
+    }
+
+    /// Set NAT64 prefixes. Called once before policy evaluation starts.
+    pub fn set_nat64_prefixes(&self, prefixes: Vec<Ipv6Network>) {
+        let _ = self.nat64_prefixes.set(prefixes);
+    }
+
+    /// NAT64 prefixes used by policy classification.
+    pub fn nat64_prefixes(&self) -> &[Ipv6Network] {
+        self.nat64_prefixes.get().map(Vec::as_slice).unwrap_or(&[])
+    }
+
     /// Install a host-side termination hook.
     pub fn set_termination_hook(&self, hook: Arc<dyn Fn() + Send + Sync>) {
         *self.termination_hook.lock().unwrap() = Some(hook);
@@ -159,20 +239,50 @@ impl SharedState {
         }
     }
 
-    /// Replace the resolved addresses for a hostname within the given address family.
+    /// Record resolved addresses for a hostname within the given address family.
+    ///
+    /// Addresses from earlier answers stay bound until the TTL of the answer
+    /// that returned them expires.
+    /// Resolvers that rotate their answers hand concurrent lookups of one name
+    /// different addresses, and a connection dialed on any of them must still
+    /// match the name's domain rules.
+    ///
+    /// Returns `false` if the complete answer would exceed either the hostname
+    /// or sandbox binding limit; existing bindings are preserved on rejection.
     pub fn cache_resolved_hostname(
         &self,
         domain: &str,
         family: ResolvedHostnameFamily,
         addrs: impl IntoIterator<Item = IpAddr>,
         ttl: Duration,
-    ) {
+    ) -> bool {
         let hostname = normalize_hostname(domain);
         let key = ResolvedHostnameKey { hostname, family };
         let addrs = addrs.into_iter().map(normalize_ip_addr);
-        self.resolved_hostnames
-            .write()
-            .insert(key, addrs, ttl, Instant::now());
+
+        let now = Instant::now();
+        let mut index = self.resolved_hostnames.write();
+        index.evict_expired(now);
+
+        let bindings_for = |family| {
+            index.member_count(&ResolvedHostnameKey {
+                hostname: key.hostname.clone(),
+                family,
+            })
+        };
+
+        let ipv4_bindings = bindings_for(ResolvedHostnameFamily::Ipv4);
+        let ipv6_bindings = bindings_for(ResolvedHostnameFamily::Ipv6);
+        let hostname_bindings = ipv4_bindings + ipv6_bindings;
+
+        let total_bindings = index.binding_count();
+        let hostname_slots = MAX_BINDINGS_PER_HOSTNAME.saturating_sub(hostname_bindings);
+        let sandbox_slots = MAX_RESOLVED_HOSTNAME_BINDINGS.saturating_sub(total_bindings);
+        let available_slots = hostname_slots.min(sandbox_slots);
+
+        // try_extend takes a total capacity; only new bindings consume slots.
+        let capacity = total_bindings + available_slots;
+        index.try_extend(key, addrs, ttl, now, capacity)
     }
 
     /// Clear the resolved addresses for a hostname within the given address family.
@@ -273,6 +383,46 @@ mod tests {
     use super::*;
 
     #[test]
+    fn explicit_text_format_preserves_legacy_body_and_host_substitution() {
+        for (raw, host, expected) in [
+            (
+                r#"{"deny_response":true,"deny_response_format":"text"}"#,
+                "example.com",
+                "This host is not allowed by the sandbox network policy config.\n\n\
+                Note to agent: `example.com` is not in the allowed-host list. Ask the \
+                user to add it to the sandbox network allow list.\n",
+            ),
+            (
+                r#"{"deny_response":true,"deny_response_format":"text","deny_message":"blocked {host}"}"#,
+                "example.com",
+                "blocked example.com",
+            ),
+            (
+                r#"{"deny_response":true,"deny_response_format":"text","deny_message":""}"#,
+                "example.com",
+                "",
+            ),
+            (
+                r#"{"deny_response_format":"text","deny_message":"blocked {host}"}"#,
+                "  ",
+                "blocked this host",
+            ),
+        ] {
+            let state = SharedState::new(8);
+            state.set_http_config(serde_json::from_str(raw).unwrap());
+            assert!(state.http_deny_response_enabled());
+            assert!(!state.secret_deny_response_enabled());
+            let response = state.network_denial_response(host);
+            let response = std::str::from_utf8(&response).unwrap();
+            let (headers, body) = response.split_once("\r\n\r\n").unwrap();
+            assert!(headers.starts_with("HTTP/1.1 403 Forbidden\r\n"));
+            assert!(headers.contains("Content-Type: text/plain; charset=utf-8\r\n"));
+            assert!(headers.contains(&format!("Content-Length: {}", expected.len())));
+            assert_eq!(body, expected);
+        }
+    }
+
+    #[test]
     fn shared_state_queue_push_pop() {
         let state = SharedState::new(4);
 
@@ -329,6 +479,34 @@ mod tests {
         assert!(state.any_resolved_hostname(v4, |h| h == "example.com"));
         assert!(state.any_resolved_hostname(v6, |h| h == "example.com"));
         assert!(!state.any_resolved_hostname(v4, |h| h == "other.example"));
+    }
+
+    #[test]
+    fn resolved_hostnames_keep_earlier_answers() {
+        let state = SharedState::new(4);
+        let first: IpAddr = "142.250.0.1".parse().unwrap();
+        let second: IpAddr = "142.250.0.2".parse().unwrap();
+
+        // Rotating answers must remain usable even beyond the old 64-address
+        // limit, as long as their TTLs have not expired.
+        for n in 1..=65 {
+            let addr = IpAddr::V4(Ipv4Addr::new(142, 250, 0, n));
+            state.cache_resolved_hostname(
+                "fonts.example",
+                ResolvedHostnameFamily::Ipv4,
+                [addr],
+                Duration::from_secs(30),
+            );
+        }
+
+        for n in 1..=65 {
+            let addr = IpAddr::V4(Ipv4Addr::new(142, 250, 0, n));
+            assert!(state.any_resolved_hostname(addr, |h| h == "fonts.example"));
+        }
+
+        state.clear_resolved_hostname("fonts.example", ResolvedHostnameFamily::Ipv4);
+        assert!(!state.any_resolved_hostname(first, |h| h == "fonts.example"));
+        assert!(!state.any_resolved_hostname(second, |h| h == "fonts.example"));
     }
 
     #[test]

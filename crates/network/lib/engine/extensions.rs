@@ -1,13 +1,10 @@
-//! Host-local extension points for already-authorized outbound network routes.
+//! Host-local extension points for already-authorized TLS routes.
 //!
 //! Extensions are absent by default. They are not serialized configuration and
-//! are only installed by the host through [`NetworkExtensions`]. A connection
-//! extension is invoked after the platform and tenant policies authorize a
-//! route; it must not treat rewritten host dial destinations as policy
-//! identities. A request extension is invoked only for TLS-intercepted routes
-//! after SNI, CONNECT-authority, and route policy checks, and sees bytes after
-//! secret substitution. Route authorization does not authorize an HTTP
-//! request.
+//! are only installed by the host through [`NetworkExtensions`]. A request
+//! extension is invoked only for TLS-intercepted routes after SNI,
+//! CONNECT-authority, and route policy checks, and sees bytes after secret
+//! substitution. Route authorization does not authorize an HTTP request.
 //!
 //! Extension futures are awaited inline. Core code does not detach work or add
 //! queues, so the existing bounded channel backpressure is preserved. Dropping
@@ -23,10 +20,8 @@
 //! | [`RequestAction::ForwardOwned`] | Writes exactly the supplied bytes | The adapter releases all intended bytes |
 //! | [`RequestAction::RespondAndClose`] | Sends a guest response and ends the relay | No held or current request bytes reach upstream |
 //!
-//! The outbound result is deliberately a concrete [`TcpStream`]. Adapters may
-//! establish a raw tunnel before returning it, but arbitrary I/O wrappers and
-//! TLS-to-proxy transports are outside this interface. Core owns the returned
-//! stream lifecycle, status updates, wakeups, half-close, and TLS shutdown.
+//! Core owns the upstream stream lifecycle, status updates, wakeups,
+//! half-close, and TLS shutdown; a request extension never receives it.
 //!
 //! Request adapters own HTTP byte and time limits: core supplies neither an
 //! implicit framing limit nor a timeout that may release held bytes. Extensions
@@ -38,45 +33,15 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 use futures::future::BoxFuture;
-use tokio::net::TcpStream;
-
-use crate::proxy::ResolvedOutboundProxy;
-use crate::tcp::upstream::UpstreamTcpTarget;
 
 //--------------------------------------------------------------------------------------------------
 // Types
 //--------------------------------------------------------------------------------------------------
 
-/// Host-local outbound extensions. The default installs no extension objects.
+/// Host-local authorized-route extensions. The default installs no extension objects.
 #[derive(Clone, Default)]
 pub struct NetworkExtensions {
-    outbound: Option<Arc<dyn OutboundConnectionExtension>>,
     requests: Option<Arc<dyn AuthorizedRouteRequestExtension>>,
-}
-
-/// The wire protocol associated with an outbound connection.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum OutboundProtocol {
-    /// A plain TCP relay.
-    Tcp,
-    /// A TLS bypass or TLS-intercepted relay.
-    Tls,
-}
-
-/// An already policy-authorized TCP route and its one-shot direct dial capability.
-///
-/// `guest_destination` is the policy identity. `primary_destination` and
-/// `fallback_destination` are host dial candidates and can be loopback
-/// rewrites. Calling [`Self::connect_direct`] consumes the route, preserving
-/// the existing primary/fallback behavior exactly once.
-pub struct AuthorizedTcpRoute {
-    guest_destination: SocketAddr,
-    target: UpstreamTcpTarget,
-    server_name: Option<String>,
-    protocol: OutboundProtocol,
-    /// The configured SOCKS outbound proxy, if any. Owned so a delegating
-    /// adapter's [`Self::connect_direct`] dials exactly what the core would.
-    outbound_proxy: Option<Arc<ResolvedOutboundProxy>>,
 }
 
 /// An already policy-authorized TLS route for post-substitution request handling.
@@ -97,16 +62,6 @@ pub enum RequestAction {
     ForwardOwned(Vec<u8>),
     /// Send these bytes to the guest and terminate the relay.
     RespondAndClose(Vec<u8>),
-}
-
-/// Connects an already-authorized outbound route.
-///
-/// Returning an error is terminal: core marks the upstream connection as
-/// failed and never retries the direct route. An adapter that does not
-/// transform a route can delegate once with [`AuthorizedTcpRoute::connect_direct`].
-pub trait OutboundConnectionExtension: Send + Sync {
-    /// Establish the route's raw TCP stream, including any adapter setup.
-    fn connect<'a>(&'a self, route: AuthorizedTcpRoute) -> BoxFuture<'a, io::Result<TcpStream>>;
 }
 
 /// Opens an optional per-authorized-TLS-route request stream.
@@ -142,12 +97,6 @@ impl NetworkExtensions {
         Self::default()
     }
 
-    /// Return a set with an outbound connection extension installed.
-    pub fn with_outbound(mut self, outbound: Arc<dyn OutboundConnectionExtension>) -> Self {
-        self.outbound = Some(outbound);
-        self
-    }
-
     /// Return a set with an authorized-route request extension installed.
     pub fn with_authorized_requests(
         mut self,
@@ -157,68 +106,8 @@ impl NetworkExtensions {
         self
     }
 
-    pub(crate) fn outbound(&self) -> Option<Arc<dyn OutboundConnectionExtension>> {
-        self.outbound.clone()
-    }
-
     pub(crate) fn authorized_requests(&self) -> Option<Arc<dyn AuthorizedRouteRequestExtension>> {
         self.requests.clone()
-    }
-}
-
-impl AuthorizedTcpRoute {
-    pub(crate) fn new(
-        guest_destination: SocketAddr,
-        target: UpstreamTcpTarget,
-        server_name: Option<&str>,
-        protocol: OutboundProtocol,
-        outbound_proxy: Option<Arc<ResolvedOutboundProxy>>,
-    ) -> Self {
-        Self {
-            guest_destination,
-            target,
-            server_name: server_name.map(ToOwned::to_owned),
-            protocol,
-            outbound_proxy,
-        }
-    }
-
-    /// Return the original guest destination used for policy evaluation.
-    pub fn guest_destination(&self) -> SocketAddr {
-        self.guest_destination
-    }
-
-    /// Return the first host-side destination to dial.
-    pub fn primary_destination(&self) -> SocketAddr {
-        self.target.primary()
-    }
-
-    /// Return the optional alternate host-side destination.
-    pub fn fallback_destination(&self) -> Option<SocketAddr> {
-        self.target.fallback()
-    }
-
-    /// Return the canonical SNI known for this route.
-    pub fn server_name(&self) -> Option<&str> {
-        self.server_name.as_deref()
-    }
-
-    /// Return the route protocol.
-    pub fn protocol(&self) -> OutboundProtocol {
-        self.protocol
-    }
-
-    /// Dial this route the way the core would: through the configured outbound
-    /// proxy when one is set, otherwise directly with address-family fallback.
-    ///
-    /// An adapter that delegates here therefore cannot accidentally bypass a
-    /// configured SOCKS proxy; an adapter that establishes its own transport
-    /// replaces it deliberately.
-    pub async fn connect_direct(self) -> io::Result<TcpStream> {
-        match self.outbound_proxy.as_deref() {
-            Some(proxy) => proxy.connect(self.target.primary()).await,
-            None => self.target.dial().await,
-        }
     }
 }
 

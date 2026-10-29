@@ -1,3 +1,5 @@
+mod jobs;
+
 use std::{
     ffi::c_void,
     future::Future,
@@ -19,9 +21,7 @@ use microsandbox_core::{
     AgentClientError, BackendKind, MicrosandboxError, MicrosandboxResult, Operation,
     PublishedSnapshotArtifact, SnapshotArtifactKind, SnapshotSourceRecoveryError,
     UnsupportedReason,
-    backend::{
-        CloudBackend, LocalBackend, default_backend, resolve_default_backend, set_default_backend,
-    },
+    backend::{CloudBackend, LocalBackend, resolve_default_backend, set_default_backend},
     image::{Image, ImageHandle},
     logs::{LogEntry, LogOptions, LogSource},
     sandbox::{
@@ -245,7 +245,9 @@ fn core_error_class_name(error: &MicrosandboxError) -> &'static str {
     match error {
         MicrosandboxError::RuntimeNotInstalled(_) => "RuntimeNotInstalledError",
         MicrosandboxError::RuntimeIncomplete(_) => "RuntimeIncompleteError",
-        MicrosandboxError::InvalidConfig(_) => "InvalidConfigError",
+        MicrosandboxError::InvalidConfig(_) | MicrosandboxError::MissingRestoreBindings { .. } => {
+            "InvalidConfigError"
+        }
         MicrosandboxError::NoDefaultCommand => "NoDefaultCommandError",
         MicrosandboxError::CloudHttp { .. } => "CloudHttpError",
         MicrosandboxError::SandboxNotFound(_) => "SandboxNotFoundError",
@@ -613,6 +615,10 @@ fn apply_secret_options(
 
 #[derive(Clone)]
 enum RubyOutboundProxyConfig {
+    HttpConnect {
+        address: String,
+        credentials: Option<(String, SecretSource)>,
+    },
     Socks4 {
         address: String,
         user_id: Option<String>,
@@ -625,6 +631,14 @@ enum RubyOutboundProxyConfig {
 
 fn apply_outbound_proxy(builder: SandboxBuilder, proxy: &RubyOutboundProxy) -> SandboxBuilder {
     match proxy.inner.borrow().clone() {
+        RubyOutboundProxyConfig::HttpConnect {
+            address,
+            credentials: Some((username, password)),
+        } => builder.proxy(|proxy| proxy.http_connect(address).credentials(username, password)),
+        RubyOutboundProxyConfig::HttpConnect {
+            address,
+            credentials: None,
+        } => builder.proxy(|proxy| proxy.http_connect(address)),
         RubyOutboundProxyConfig::Socks4 {
             address,
             user_id: Some(user_id),
@@ -780,6 +794,8 @@ fn apply_builder_options(
         "replace_timeout",
         "root_disk",
         "disable_network",
+        "http",
+        "intercept_tls",
         "network",
         "proxy",
         "secrets",
@@ -859,6 +875,47 @@ fn apply_builder_options(
             let policy = restricted_network_policy(ruby, net)?;
             builder = builder.network(|n| n.policy(policy));
         }
+    }
+    if let Some(http) = keyword::<RHash>(kwargs, "http")? {
+        reject_unknown_keywords(
+            ruby,
+            http,
+            &[
+                "deny_response",
+                "deny_response_format",
+                "deny_message",
+                "network_deny_message",
+                "secret_deny_message",
+            ],
+        )?;
+        if let Some(enabled) = keyword::<bool>(http, "deny_response")? {
+            builder = builder.network(|network| network.http(|h| h.deny_response(enabled)));
+        }
+        if let Some(format) = keyword::<String>(http, "deny_response_format")? {
+            let format = match format.as_str() {
+                "text" => microsandbox_core::sandbox::HttpDenyResponseFormat::Text,
+                "json" => microsandbox_core::sandbox::HttpDenyResponseFormat::Json,
+                _ => {
+                    return Err(argument_error(
+                        ruby,
+                        "deny_response_format must be text or json",
+                    ));
+                }
+            };
+            builder = builder.network(|network| network.http(|h| h.deny_response_format(format)));
+        }
+        if let Some(message) = keyword::<String>(http, "deny_message")? {
+            builder = builder.network(|network| network.http(|h| h.deny_message(message)));
+        }
+        if let Some(message) = keyword::<String>(http, "network_deny_message")? {
+            builder = builder.network(|network| network.http(|h| h.network_deny_message(message)));
+        }
+        if let Some(message) = keyword::<String>(http, "secret_deny_message")? {
+            builder = builder.network(|network| network.http(|h| h.secret_deny_message(message)));
+        }
+    }
+    if keyword::<bool>(kwargs, "intercept_tls")?.unwrap_or(false) {
+        builder = builder.intercept_tls();
     }
     if let Some(proxy) = keyword::<typed_data::Obj<RubyOutboundProxy>>(kwargs, "proxy")? {
         builder = apply_outbound_proxy(builder, &proxy);
@@ -1122,8 +1179,59 @@ impl RubySandboxBuilder {
     fn root_disk(this: typed_data::Obj<Self>, v: u32) -> Result<(), Error> {
         put_builder(&this, |b| b.root_disk(v))
     }
+    fn intercept_tls(this: typed_data::Obj<Self>) -> Result<(), Error> {
+        put_builder(&this, SandboxBuilder::intercept_tls)
+    }
+
     fn disable_network(this: typed_data::Obj<Self>) -> Result<(), Error> {
         put_builder(&this, SandboxBuilder::disable_network)
+    }
+    fn http(
+        this: typed_data::Obj<Self>,
+        enabled: Option<bool>,
+        message: Option<String>,
+    ) -> Result<(), Error> {
+        Self::http_config(this, enabled, None, None, None, message)
+    }
+    fn http_config(
+        this: typed_data::Obj<Self>,
+        enabled: Option<bool>,
+        network_message: Option<String>,
+        secret_message: Option<String>,
+        format: Option<String>,
+        message: Option<String>,
+    ) -> Result<(), Error> {
+        let format = format
+            .map(|format| match format.as_str() {
+                "text" => Ok(microsandbox_core::sandbox::HttpDenyResponseFormat::Text),
+                "json" => Ok(microsandbox_core::sandbox::HttpDenyResponseFormat::Json),
+                _ => Err(argument_error(
+                    &current_ruby(),
+                    "deny_response_format must be text or json",
+                )),
+            })
+            .transpose()?;
+        put_builder(&this, |mut builder| {
+            if let Some(enabled) = enabled {
+                builder = builder.network(|network| network.http(|h| h.deny_response(enabled)));
+            }
+            if let Some(format) = format {
+                builder =
+                    builder.network(|network| network.http(|h| h.deny_response_format(format)));
+            }
+            if let Some(message) = message {
+                builder = builder.network(|network| network.http(|h| h.deny_message(message)));
+            }
+            if let Some(message) = network_message {
+                builder =
+                    builder.network(|network| network.http(|h| h.network_deny_message(message)));
+            }
+            if let Some(message) = secret_message {
+                builder =
+                    builder.network(|network| network.http(|h| h.secret_deny_message(message)));
+            }
+            builder
+        })
     }
     fn quiet_logs(this: typed_data::Obj<Self>) -> Result<(), Error> {
         put_builder(&this, SandboxBuilder::quiet_logs)
@@ -1985,12 +2093,10 @@ fn set_runtime_libkrunfw_path(path: String) {
     microsandbox_core::config::set_sdk_libkrunfw_path(path);
 }
 
-fn default_backend_kind_str() -> String {
-    match default_backend().kind() {
-        BackendKind::Local => "local",
-        BackendKind::Cloud => "cloud",
-    }
-    .to_owned()
+fn default_backend_kind_str(ruby: &Ruby) -> Result<String, Error> {
+    let info =
+        microsandbox_core::default_backend_info().map_err(|error| core_error(ruby, error))?;
+    Ok(info.kind.as_str().to_owned())
 }
 
 fn remember_backend_selection(ruby: &Ruby, selection: BackendSelection) -> Result<(), Error> {
@@ -2045,6 +2151,15 @@ fn outbound_proxy_socks4(address: String) -> RubyOutboundProxy {
     }
 }
 
+fn outbound_proxy_http_connect(address: String) -> RubyOutboundProxy {
+    RubyOutboundProxy {
+        inner: std::cell::RefCell::new(RubyOutboundProxyConfig::HttpConnect {
+            address,
+            credentials: None,
+        }),
+    }
+}
+
 fn outbound_proxy_socks5(address: String) -> RubyOutboundProxy {
     RubyOutboundProxy {
         inner: std::cell::RefCell::new(RubyOutboundProxyConfig::Socks5 {
@@ -2080,6 +2195,10 @@ impl RubyOutboundProxy {
                 ruby,
                 "user_id is only supported for SOCKS4 proxies",
             )),
+            RubyOutboundProxyConfig::HttpConnect { .. } => Err(argument_error(
+                ruby,
+                "user_id is only supported for SOCKS4 proxies",
+            )),
         }
     }
 
@@ -2092,9 +2211,10 @@ impl RubyOutboundProxy {
         match &mut *this.inner.borrow_mut() {
             RubyOutboundProxyConfig::Socks4 { .. } => Err(argument_error(
                 ruby,
-                "credentials are only supported for SOCKS5 proxies",
+                "credentials are only supported for SOCKS5 and HTTP CONNECT proxies",
             )),
-            RubyOutboundProxyConfig::Socks5 { credentials, .. } => {
+            RubyOutboundProxyConfig::HttpConnect { credentials, .. }
+            | RubyOutboundProxyConfig::Socks5 { credentials, .. } => {
                 *credentials = Some((username, password.inner.clone()));
                 Ok(())
             }
@@ -2615,6 +2735,8 @@ fn init(ruby: &Ruby) -> Result<(), Error> {
     secret_source.define_singleton_method("env", function!(secret_source_env, 1))?;
 
     let outbound_proxy = module.define_class("OutboundProxy", ruby.class_object())?;
+    outbound_proxy
+        .define_singleton_method("http_connect", function!(outbound_proxy_http_connect, 1))?;
     outbound_proxy.define_singleton_method("socks4", function!(outbound_proxy_socks4, 1))?;
     outbound_proxy.define_singleton_method("socks5", function!(outbound_proxy_socks5, 1))?;
     outbound_proxy.define_method("user_id!", method!(RubyOutboundProxy::user_id, 1))?;
@@ -2754,9 +2876,15 @@ fn init(ruby: &Ruby) -> Result<(), Error> {
     )?;
     builder.define_method("root_disk!", method!(RubySandboxBuilder::root_disk, 1))?;
     builder.define_method(
+        "intercept_tls!",
+        method!(RubySandboxBuilder::intercept_tls, 0),
+    )?;
+    builder.define_method(
         "disable_network!",
         method!(RubySandboxBuilder::disable_network, 0),
     )?;
+    builder.define_method("http!", method!(RubySandboxBuilder::http, 2))?;
+    builder.define_method("http_config!", method!(RubySandboxBuilder::http_config, 5))?;
     builder.define_method("quiet_logs!", method!(RubySandboxBuilder::quiet_logs, 0))?;
     builder.define_method("entrypoint!", method!(RubySandboxBuilder::entrypoint, 1))?;
     builder.define_method("init!", method!(RubySandboxBuilder::init, 1))?;
@@ -2865,6 +2993,7 @@ fn init(ruby: &Ruby) -> Result<(), Error> {
     snap_handle.define_method("open", method!(RubySnapshotHandle::open, 0))?;
     snap_handle.define_method("save_to", method!(RubySnapshotHandle::save_to, -1))?;
 
+    jobs::init(ruby, module)?;
     Ok(())
 }
 

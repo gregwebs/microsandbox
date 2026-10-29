@@ -15,9 +15,13 @@
 //! the bulk of the old global config singleton plus the SQLite pool, so multiple
 //! backends can hold different configurations for tests / migrations.
 
-mod control;
+#[cfg(test)]
+mod config_paths;
+pub(crate) mod control;
 mod control_lookup;
 mod database;
+pub(crate) mod host_paths;
+mod metrics_lookup;
 mod sandbox;
 pub(crate) mod snapshot;
 
@@ -46,6 +50,7 @@ use microsandbox_utils::process_lock::{lock_exclusive, open_lock_file, unlock};
 use sea_orm::{ConnectionTrait, DatabaseBackend, DatabaseConnection, DbErr, Statement};
 use tokio::sync::OnceCell;
 
+use self::control::identity::DatabaseIdentity;
 use super::{
     Backend, BackendInfo, BackendKind, BackendSelectionSource, SandboxBackend, VolumeBackend,
 };
@@ -72,6 +77,8 @@ pub struct LocalBackend {
     selection_source: BackendSelectionSource,
     profile: Option<String>,
     control_sessions: control::ControlSessions,
+    metrics_lookup: metrics_lookup::MetricsLookup,
+    pub(crate) metrics_registry_names: Vec<String>,
 }
 
 /// Fluent builder for [`LocalBackend`]. Construct via [`LocalBackend::builder`].
@@ -122,12 +129,20 @@ impl LocalBackend {
         selection_source: BackendSelectionSource,
         profile: Option<String>,
     ) -> Self {
+        let mut metrics_registry_names = vec![config.resolved_config().metrics_registry_shm_name()];
+        if let Some(legacy) = &config.legacy_metrics_registry
+            && !metrics_registry_names.contains(legacy)
+        {
+            metrics_registry_names.push(legacy.clone());
+        }
         Self {
             config,
             db: OnceCell::new(),
             selection_source,
             profile,
             control_sessions: control::ControlSessions::default(),
+            metrics_lookup: metrics_lookup::MetricsLookup::default(),
+            metrics_registry_names,
         }
     }
 
@@ -156,9 +171,15 @@ impl LocalBackend {
                     &self.config().snapshots_dir(),
                 )
                 .await?;
+                let identity = Arc::new(
+                    DatabaseIdentity::capture(db_dir.join(microsandbox_utils::DB_FILENAME))
+                        .await
+                        .map_err(|error| MicrosandboxError::ControlClient(Arc::new(error)))?,
+                );
                 self.control_sessions
-                    .bind_database(&db_dir.join(microsandbox_utils::DB_FILENAME))
+                    .bind_database(identity.clone())
                     .map_err(MicrosandboxError::ControlClient)?;
+                self.metrics_lookup.bind_database(identity)?;
                 Ok(pools)
             })
             .await
@@ -466,6 +487,7 @@ impl LocalBackendBuilder {
         let path = self.config_path.unwrap_or_else(crate::config::config_path);
         let config = BackendConfig::load_from(&path, self.managed_config_path.as_deref())?
             .prepare_for_local_backend(self.config)?;
+        config.require_backend(BackendKind::Local, None)?;
 
         Ok(LocalBackend::from_backend_config(
             config,
@@ -499,13 +521,13 @@ impl Backend for LocalBackend {
         BackendKind::Local
     }
 
-    fn info(&self) -> BackendInfo {
-        BackendInfo {
+    fn info(&self) -> crate::MicrosandboxResult<BackendInfo> {
+        Ok(BackendInfo {
             kind: BackendKind::Local,
             api_url: None,
             source: self.selection_source,
             profile: self.profile.clone(),
-        }
+        })
     }
 
     fn sandboxes(&self) -> &dyn SandboxBackend {
@@ -1710,6 +1732,69 @@ mod tests {
             .unwrap();
         assert_eq!(backend.config().sandbox_defaults.cpus, 3);
         assert!(backend.db.get().is_none());
+    }
+
+    #[test]
+    fn local_construction_checks_final_policy_without_creating_home_or_database() {
+        let _env_guard = crate::test_support::lock_env();
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().join("runtime");
+        let user = dir.path().join("config.json");
+        let managed = dir.path().join("managed.json");
+        for (ordinary, enforced, builder_policy, allowed) in [
+            (
+                r#"{"allowed_backends":["cloud"]}"#,
+                r#"{"overrides":{}}"#,
+                None,
+                false,
+            ),
+            (
+                r#"{"allowed_backends":["local"]}"#,
+                r#"{"overrides":{"allowed_backends":["cloud"]}}"#,
+                None,
+                false,
+            ),
+            (
+                r#"{"allowed_backends":[]}"#,
+                r#"{"overrides":{}}"#,
+                None,
+                false,
+            ),
+            (
+                "{}",
+                r#"{"overrides":{}}"#,
+                Some(vec![BackendKind::Cloud]),
+                false,
+            ),
+            (
+                "{}",
+                r#"{"overrides":{"allowed_backends":["local"]}}"#,
+                Some(vec![BackendKind::Cloud]),
+                true,
+            ),
+        ] {
+            std::fs::write(&user, ordinary).unwrap();
+            std::fs::write(&managed, enforced).unwrap();
+            let mut builder = LocalBackend::builder()
+                .config_path(&user)
+                .managed_config_path(&managed)
+                .home(&home);
+            if let Some(policy) = builder_policy {
+                builder.config.allowed_backends_mut(policy);
+            }
+
+            let result = builder.build_lazy();
+            if allowed {
+                assert!(result.unwrap().db.get().is_none());
+            } else {
+                let error = result.err().unwrap();
+                assert!(
+                    error.to_string().contains("allowed_backends")
+                        || error.to_string().contains("allowed backends")
+                );
+            }
+            assert!(!home.exists());
+        }
     }
 
     #[test]

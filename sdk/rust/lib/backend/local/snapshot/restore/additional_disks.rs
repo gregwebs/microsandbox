@@ -130,7 +130,9 @@ pub(crate) async fn materialize_additional_disks(
         let expected_integrity = layer.integrity_root.clone();
         let expected_size = layer.file_size;
         let qcow2 = layer.format == "qcow2";
+        let pin = super::super::lease::pin_source(&source)?;
         let worker = tokio::task::spawn_blocking(move || {
+            let _pin = pin;
             stage_additional_disk(
                 &source,
                 &staging_parent,
@@ -160,6 +162,14 @@ pub(crate) fn apply_additional_disks(config: &mut crate::SandboxConfig, mounts: 
             .mounts
             .retain(|existing| existing.guest() != guest);
         config.spec.mounts.push(mount);
+    }
+
+    // Fork callers can supply only some destinations. Save the completed list
+    // after captured volumes are materialized so rebuilding retains them too.
+    if let Some(overrides) = &mut config.caller_config_overrides
+        && overrides.spec.mounts.is_some()
+    {
+        overrides.spec.mounts = Some(config.spec.mounts.clone());
     }
 }
 

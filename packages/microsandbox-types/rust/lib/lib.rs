@@ -2,10 +2,13 @@
 
 #![warn(missing_docs)]
 
+extern crate self as microsandbox_types;
+
 mod cloud;
 mod command;
 mod domain;
 mod error;
+mod exec;
 
 #[doc(hidden)]
 pub mod compat;
@@ -14,6 +17,7 @@ mod guest_flush;
 pub mod helpers;
 pub mod modify;
 mod registry;
+mod secret;
 pub mod snapshot;
 mod validation;
 
@@ -43,7 +47,8 @@ pub use domain::{
     Action, AutoPublishConfig, CertCacheConfig, CpuPlacement, DEFAULT_METRICS_SAMPLE_INTERVAL_MS,
     DEFAULT_SANDBOX_CPUS, DEFAULT_SANDBOX_MEMORY_MIB, DeploymentProfile, Destination,
     DestinationGroup, Direction, DiskImageFormat, DnsConfig, DnsConfigPatch,
-    DurableHeaderCredential, EnvVar, FlatClone, HandoffInit, HostPattern, HostPermissions,
+    DurableHeaderCredential, EnvVar, FlatClone, GuestClockPolicy, HandoffInit, HostPattern,
+    HostPermissions, HttpConfig, HttpConfigPatch, HttpConnectCredentials, HttpDenyResponseFormat,
     HttpsOrigin, InterceptCaConfig, InterceptConfig, InterceptConfigPatch, InterceptRule,
     InterfaceOverrides, InterfaceOverridesPatch, LogSource, MAX_HEADER_CREDENTIAL_FORMAT_BYTES,
     MAX_HEADER_CREDENTIAL_VALUE_BYTES, MAX_HEADER_CREDENTIALS, MAX_SECRET_FILE_BYTES,
@@ -59,9 +64,10 @@ pub use domain::{
     SecretsConfigPatch, SecurityProfile, SnapshotSpec, Socks5Credentials, StatVirtualization,
     TlsConfig, TlsConfigPatch, TokenBucketConfig, TransparentHugePagePolicy, VolumeKind,
     VolumeMount, VolumeSpec, VsockRouteSpec, VsockSocketType, VsockSpec, VsockSpecPatch,
-    canonicalize_volume_mounts, owned_volume_mount_id,
+    WELL_KNOWN_NAT64_PREFIX, canonicalize_volume_mounts, owned_volume_mount_id,
 };
 pub use error::{SnapshotManifestError, SnapshotManifestResult, TypesError, TypesResult};
+pub use exec::{EXEC_OUTPUT_EVENT_OVERHEAD, ExecLimits};
 pub use guest_flush::GuestFlush;
 pub use modify::{
     ChangeKind, ConfigPlannedChange, ModificationConflict, ModificationDisposition,
@@ -70,6 +76,7 @@ pub use modify::{
     SecretModificationPatch, SecretPlannedChange, SecretSource,
 };
 pub use registry::RegistryAuth;
+pub use secret::SecretValue;
 pub use snapshot::manifest::Manifest as SnapshotManifest;
 pub use snapshot::{
     DiskCompactionDiskResult, DiskCompactionResult, DiskCompactionTarget,

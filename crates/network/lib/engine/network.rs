@@ -20,7 +20,7 @@ use microsandbox_types::{
 };
 use msb_krun::backends::net::NetBackend;
 
-use crate::config::{ConnectionLimit, NetworkConfig, ResolvedNetworkConfig};
+use crate::config::{ConnectionLimit, NetworkConfig, PortProtocol, ResolvedNetworkConfig};
 use crate::engine::tls::state::{TlsState, TlsStateError};
 use crate::extensions::NetworkExtensions;
 use crate::netstack::{
@@ -68,7 +68,7 @@ pub struct SmoltcpNetwork {
     gateway_mac: [u8; 6],
     mtu: u16,
     // IPv4 / IPv6 are `Some` when active for this sandbox: the user supplied
-    // an explicit address, or the host has a route for that family.
+    // an explicit address, the host has a route, or published ports need that family.
     guest_ipv4: Option<Ipv4Addr>,
     gateway_ipv4: Option<Ipv4Addr>,
     guest_ipv6: Option<Ipv6Addr>,
@@ -104,70 +104,11 @@ struct HostRoutes {
 /// feature: these extras are orthogonal and all optional.
 #[derive(Default)]
 pub struct HostIntegrations {
-    /// Outbound-connection and authorized-request extension adapters.
+    /// Authorized-route request extension adapters (TLS interception).
     pub extensions: NetworkExtensions,
     /// Launch-only resolved header credentials; must match the durable
     /// definitions in `config.secrets.header_credentials` one-to-one.
     pub resolved_header_credentials: Vec<ResolvedHeaderCredential>,
-}
-
-impl HostIntegrations {
-    /// Install the ambient host HTTP `CONNECT` proxy, if the environment sets
-    /// one and no explicit configuration takes precedence.
-    ///
-    /// An explicit `outbound_proxy` (the guest's SOCKS proxy) wins over an
-    /// ambient `HTTPS_PROXY`/`HTTP_PROXY`/`ALL_PROXY`: the two are distinct
-    /// mechanisms, and silently replacing configured SOCKS egress with an
-    /// ambient HTTP proxy would ignore explicit configuration. A caller that
-    /// has already installed its own outbound extension also wins.
-    pub fn with_ambient_host_proxy(mut self, explicit_outbound_proxy: bool) -> Self {
-        let connector = crate::engine::host_proxy::HostHttpProxyConnector::from_env();
-        if explicit_outbound_proxy && connector.is_some() {
-            tracing::info!(
-                "explicit outbound_proxy configured; ignoring the ambient host HTTP proxy"
-            );
-            return self;
-        }
-        self.extensions = install_host_proxy_extension(self.extensions, connector);
-        self
-    }
-
-    /// Testable core of [`Self::with_ambient_host_proxy`].
-    #[cfg(test)]
-    fn with_host_proxy(
-        mut self,
-        connector: Option<crate::engine::host_proxy::HostHttpProxyConnector>,
-        explicit_outbound_proxy: bool,
-    ) -> Self {
-        if explicit_outbound_proxy {
-            return self;
-        }
-        self.extensions = install_host_proxy_extension(self.extensions, connector);
-        self
-    }
-}
-
-fn install_host_proxy_extension(
-    extensions: NetworkExtensions,
-    host_proxy: Option<crate::engine::host_proxy::HostHttpProxyConnector>,
-) -> NetworkExtensions {
-    let Some(host_proxy) = host_proxy else {
-        return extensions;
-    };
-    if extensions.outbound().is_some() {
-        tracing::debug!(
-            "caller-installed outbound connection extension takes precedence over host HTTP proxy"
-        );
-        return extensions;
-    }
-    let (https, http) = host_proxy.endpoint_displays();
-    tracing::info!(
-        https = ?https,
-        http = ?http,
-        no_proxy_configured = host_proxy.has_no_proxy_rules(),
-        "guest egress will use the host HTTP proxy"
-    );
-    extensions.with_outbound(Arc::new(host_proxy))
 }
 
 /// Errors that prevent the smoltcp network from being created safely.
@@ -192,6 +133,13 @@ pub enum NetworkInitError {
         pool: Ipv6Network,
         /// Requested sandbox slot.
         slot: u16,
+    },
+
+    /// A configured NAT64 prefix is not an IPv6 `/96` network.
+    #[error("invalid NAT64 prefix `{raw}`: prefix must be IPv6 /96")]
+    InvalidNat64Prefix {
+        /// Invalid raw prefix.
+        raw: String,
     },
 
     /// TLS interception state failed to initialize.
@@ -400,9 +348,28 @@ impl SmoltcpNetwork {
         let gateway_mac = derive_gateway_mac(slot);
         let mtu = config.interface.mtu.unwrap_or(1500);
 
+        // Preserve existing family selection, including IPv6-only TCP targets. If
+        // startup would leave the guest without any IP, supply the private addresses
+        // needed for published ports: TCP can bridge families and uses IPv4, while
+        // UDP needs the host bind's family. Neither requires an external host route.
+        let no_guest_address = !host_routes.ipv4
+            && !host_routes.ipv6
+            && config.interface.ipv4_address.is_none()
+            && config.interface.ipv6_address.is_none();
+        let published_ipv4 = no_guest_address
+            && config
+                .ports
+                .iter()
+                .any(|port| port.protocol == PortProtocol::Tcp || port.host_bind.is_ipv4());
+        let published_ipv6 = no_guest_address
+            && config
+                .ports
+                .iter()
+                .any(|port| port.protocol == PortProtocol::Udp && port.host_bind.is_ipv6());
+
         let guest_ipv4 = match config.interface.ipv4_address {
             Some(address) => Some(address),
-            None if host_routes.ipv4 => Some(derive_guest_ipv4(
+            None if host_routes.ipv4 || published_ipv4 => Some(derive_guest_ipv4(
                 config
                     .interface
                     .ipv4_pool
@@ -414,7 +381,7 @@ impl SmoltcpNetwork {
         let gateway_ipv4 = guest_ipv4.map(gateway_from_guest_ipv4);
         let guest_ipv6 = match config.interface.ipv6_address {
             Some(address) => Some(address),
-            None if host_routes.ipv6 => Some(derive_guest_ipv6(
+            None if host_routes.ipv6 || published_ipv6 => Some(derive_guest_ipv6(
                 config
                     .interface
                     .ipv6_pool
@@ -428,6 +395,17 @@ impl SmoltcpNetwork {
         // Packet queue capacity is independent of the optional connection cap:
         // a large cap must not allocate a correspondingly large packet queue.
         let shared = Arc::new(SharedState::new(DEFAULT_QUEUE_CAPACITY));
+        shared.set_http_config(config.http.clone());
+        if let Some(prefix) = config
+            .nat64_prefixes
+            .iter()
+            .find(|prefix| prefix.prefix() != 96)
+        {
+            return Err(NetworkInitError::InvalidNat64Prefix {
+                raw: prefix.to_string(),
+            });
+        }
+        shared.set_nat64_prefixes(config.nat64_prefixes.clone());
         // Every write path validates rate limiters (`NetworkBuilder::build`),
         // but a stored config bypasses the builder: fail startup cleanly
         // instead of panicking on a corrupted spec.
@@ -562,6 +540,8 @@ impl SmoltcpNetwork {
         let strict = config.strict;
         let max_tcp_connections = config.max_tcp_connections.and_then(ConnectionLimit::cap);
         let max_udp_connections = config.max_udp_connections;
+        let max_inbound_tcp_connections = config.max_inbound_tcp_connections;
+        let tcp_accept_queue_size = config.tcp_accept_queue_size.unwrap_or_default();
         let secrets = self.secrets.clone();
         let activation_gate = self.activation_gate.take();
         let outbound_proxy = self.config.outbound_proxy().cloned().map(Arc::new);
@@ -586,6 +566,8 @@ impl SmoltcpNetwork {
                         strict,
                         max_tcp_connections,
                         max_udp_connections,
+                        tcp_accept_queue_size,
+                        max_inbound_tcp_connections,
                         tokio_handle,
                         secrets,
                         outbound_proxy,
@@ -962,6 +944,18 @@ fn host_has_ipv6_route() -> bool {
 //--------------------------------------------------------------------------------------------------
 // Tests
 //--------------------------------------------------------------------------------------------------
+
+#[cfg(test)]
+#[path = "network/test_support.rs"]
+mod test_support;
+
+#[cfg(test)]
+#[path = "network/tcp_connect_tests.rs"]
+mod tcp_connect_tests;
+
+#[cfg(test)]
+#[path = "network/published_ports_tests.rs"]
+mod published_ports_tests;
 
 #[cfg(test)]
 mod tests {
@@ -1404,6 +1398,104 @@ mod tests {
     }
 
     #[test]
+    fn published_ports_preserve_existing_address_families() {
+        for (host_routes, explicit_address, profile, expected_ipv4, expected_ipv6) in [
+            (
+                routes(true, false),
+                None,
+                DeploymentProfile::SingleTenant,
+                true,
+                false,
+            ),
+            (
+                routes(false, true),
+                None,
+                DeploymentProfile::SingleTenant,
+                false,
+                true,
+            ),
+            (
+                routes(true, true),
+                None,
+                DeploymentProfile::SingleTenant,
+                true,
+                true,
+            ),
+            (
+                routes(false, false),
+                Some("fd42:6d73:62:99::2"),
+                DeploymentProfile::SingleTenant,
+                false,
+                true,
+            ),
+            (
+                routes(false, false),
+                Some("172.20.0.2"),
+                DeploymentProfile::SingleTenant,
+                true,
+                false,
+            ),
+            (
+                routes(false, false),
+                None,
+                DeploymentProfile::MultiTenant,
+                false,
+                false,
+            ),
+        ] {
+            let mut config = NetworkConfig::default();
+            config.tls.enabled = false;
+            let explicit_address = explicit_address.map(|address| address.parse().unwrap());
+            match explicit_address {
+                Some(std::net::IpAddr::V4(address)) => {
+                    config.interface.ipv4_address = Some(address)
+                }
+                Some(std::net::IpAddr::V6(address)) => {
+                    config.interface.ipv6_address = Some(address)
+                }
+                None => {}
+            }
+            config.ports.push(PublishedPort {
+                host_port: 8080,
+                guest_port: 8000,
+                protocol: PortProtocol::Tcp,
+                host_bind: Ipv4Addr::UNSPECIFIED.into(),
+            });
+            // Adding a missing UDP family must not switch an existing TCP target
+            // from IPv6 to IPv4, or otherwise change an already-addressed guest.
+            for host_bind in [Ipv4Addr::LOCALHOST.into(), Ipv6Addr::LOCALHOST.into()] {
+                config.ports.push(PublishedPort {
+                    host_port: 8081,
+                    guest_port: 8001,
+                    protocol: PortProtocol::Udp,
+                    host_bind,
+                });
+            }
+            let network = SmoltcpNetwork::build(
+                resolved(config),
+                7,
+                profile,
+                HostIntegrations::default(),
+                host_routes,
+            )
+            .unwrap();
+            let bootstrap = network.guest_bootstrap_network();
+
+            assert_eq!(bootstrap.ipv4.is_some(), expected_ipv4);
+            assert_eq!(bootstrap.ipv6.is_some(), expected_ipv6);
+            match explicit_address {
+                Some(std::net::IpAddr::V4(address)) => {
+                    assert_eq!(bootstrap.ipv4.unwrap().address, address);
+                }
+                Some(std::net::IpAddr::V6(address)) => {
+                    assert_eq!(bootstrap.ipv6.unwrap().address, address);
+                }
+                None => {}
+            }
+        }
+    }
+
+    #[test]
     fn neither_family_active_emits_only_base_env_vars() {
         let net = SmoltcpNetwork::build(
             resolved(NetworkConfig::default()),
@@ -1621,19 +1713,6 @@ mod tests {
         let mut empty = NetworkConfig::default();
         empty.tls.enabled = true;
         assert!(validate_launch_header_credentials(&empty, &[]).is_ok());
-    }
-
-    #[test]
-    fn ambient_host_proxy_is_installed_only_without_explicit_config() {
-        let connector = crate::engine::host_proxy::HostHttpProxyConnector::from_url(
-            "http://proxy.example:3128",
-        );
-        // No explicit outbound proxy: the ambient connector is installed.
-        let installed = HostIntegrations::default().with_host_proxy(connector.clone(), false);
-        assert!(installed.extensions.outbound().is_some());
-        // Explicit outbound proxy wins: nothing is installed.
-        let skipped = HostIntegrations::default().with_host_proxy(connector, true);
-        assert!(skipped.extensions.outbound().is_none());
     }
 
     #[test]

@@ -7,7 +7,7 @@
 pub(crate) mod addr;
 pub mod dns;
 pub mod extensions;
-mod host_proxy;
+pub mod http_deny;
 pub mod icmp;
 pub mod intercept;
 pub mod netstack;

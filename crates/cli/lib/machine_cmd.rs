@@ -314,9 +314,14 @@ pub fn run(args: MachineArgs) -> ! {
         );
         std::process::exit(2);
     }
+    if let Err(err) = VmConfig::validate_fs_state_limit(launch.fs_state_limit_bytes) {
+        eprintln!("{err}");
+        std::process::exit(2);
+    }
     let vm_config = VmConfig {
         libkrunfw_path: launch.libkrunfw_path,
         thp: launch.thp,
+        guest_clock: launch.guest_clock,
         memory_cache_dir: launch.memory_cache_dir,
         vcpus: args.vcpus,
         memory_mib: args.memory_mib,
@@ -328,6 +333,7 @@ pub fn run(args: MachineArgs) -> ! {
         cpu_placement: launch.cpu_placement,
         placement_profile_name: launch.placement_profile_name,
         placement_profile: launch.placement_profile,
+        fs_state_limit_bytes: launch.fs_state_limit_bytes,
         block_writeback_limit_bytes: launch.block_writeback_limit_bytes,
         rootfs_path: launch.rootfs.path,
         rootfs_follow_root_symlinks: launch.rootfs.follow_root_symlinks,
@@ -352,7 +358,6 @@ pub fn run(args: MachineArgs) -> ! {
         file_mounts: launch.file_mounts,
         disks,
         vsock: launch.vsock,
-        #[cfg(unix)]
         backends: vec![],
         init_path: launch.init_path,
         bootstrap: launch.bootstrap,

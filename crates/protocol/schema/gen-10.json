@@ -151,6 +151,14 @@
       "wire": "core.exec.signal"
     },
     {
+      "introduced_in": 10,
+      "wire": "core.exec.output.ack"
+    },
+    {
+      "introduced_in": 10,
+      "wire": "core.exec.stdin.ack"
+    },
+    {
       "introduced_in": 2,
       "wire": "core.fs.request"
     },
@@ -193,22 +201,6 @@
     {
       "introduced_in": 7,
       "wire": "core.bootstrap"
-    },
-    {
-      "introduced_in": 10,
-      "wire": "core.port.event"
-    },
-    {
-      "introduced_in": 10,
-      "wire": "core.loopback.forward"
-    },
-    {
-      "introduced_in": 10,
-      "wire": "core.loopback.forward.cancel"
-    },
-    {
-      "introduced_in": 10,
-      "wire": "core.loopback.forward.resp"
     }
   ],
   "protocol_version": 10

@@ -10,9 +10,9 @@ This is the network chapter of the security model: the threats the stack is buil
 
 ## Host proxy trust boundary
 
-Platform and tenant destination policy authorize the original guest route before a trusted host-side outbound adapter can connect it. A host HTTP proxy endpoint, its credentials, and its environment remain host-local. `NO_PROXY` deliberately creates a direct route only after that policy authorization, while ambient proxy operators can observe CONNECT authorities.
+Destination policy authorizes the original guest route before Microsandbox opens any host-side proxy connection for it, whether that is an explicitly configured `outbound_proxy` or, with `proxy_from_env` enabled, a proxy discovered from the host environment. The proxy endpoint, its URL credentials, and the `no_proxy` rules stay host-local and are never serialized into sandbox configuration or the guest environment. `no_proxy` deliberately creates a direct route, and it does so only after that policy authorization.
 
-For hostname CONNECT routes, the proxy resolves the SNI authority after Microsandbox has authorized the guest destination. That creates a policy-to-dial identity gap: Microsandbox does not revalidate the proxy's DNS answer. In multi-tenant deployments, treat the proxy, its destination controls, environment, and credentials as trusted platform policy infrastructure.
+A proxy operator can still observe the destinations a sandbox connects to. In multi-tenant deployments, treat the proxy, its destination controls, environment, and credentials as trusted platform policy infrastructure.
 
 ## Default posture
 
@@ -51,12 +51,6 @@ Override the default with allow-all egress only when a workload genuinely needs 
 On AWS, GCP, Azure, and similar platforms, `169.254.169.254` is the instance metadata service. It's a classic SSRF target because it hands temporary credentials to anything that can connect. The default policy blocks it. For custom policies that flip egress to allow-by-default, deny it explicitly:
 
 <CodeGroup>
-```bash CLI
-msb create python --name worker \
-    --net-default-egress allow \
-    --net-rule "deny@meta"
-```
-
 ```typescript TypeScript
 NetworkPolicy.builder()
   .defaultAllow()
@@ -70,7 +64,39 @@ NetworkPolicy::builder()
     .rule(|r| r.egress().deny_meta())
     .build()?
 ```
+
+```python Python
+from microsandbox import Action, Destination, DestGroup, NetworkPolicy, Rule
+
+policy = NetworkPolicy(
+    default_egress=Action.ALLOW,
+    default_ingress=Action.ALLOW,
+    rules=(Rule.deny(destination=Destination.group(DestGroup.METADATA)),),
+)
+```
+
+```go Go
+network := &m.NetworkConfig{
+    DefaultEgress: m.PolicyActionAllow,
+    DefaultIngress: m.PolicyActionAllow,
+    Rules: []m.PolicyRule{
+        {
+            Action: m.PolicyActionDeny,
+            Direction: m.PolicyDirectionEgress,
+            Destination: "metadata",
+        },
+    },
+}
+```
+
+```bash CLI
+msb create python --name worker \
+    --net-default-egress allow \
+    --net-rule "deny@meta"
+```
 </CodeGroup>
+
+NAT64-translated access to IPv4 metadata and private ranges is treated the same way for NAT64 prefixes. The well-known `64:ff9b::/96` prefix is configured by default, and operators can add routed environment-specific `/96` prefixes with `--net-nat64-prefix`.
 
 ## DNS rebinding
 

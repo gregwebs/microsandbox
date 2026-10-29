@@ -763,11 +763,11 @@ async fn explicitly_published_port_is_excluded_from_auto_publish() {
     );
 }
 
-/// A generation-9 guest predates `LoopbackForward`/`core.port.event`, so the
-/// poll task must stay inert — no `PortCommand`, no `PortEvent` — and let the
-/// supervisor treat the clean return as a stop rather than reconnecting.
+/// A guest below generation 11 predates `LoopbackForward`/`core.port.event`, so
+/// the poll task must stay inert — no `PortCommand`, no `PortEvent` — and let
+/// the supervisor treat the clean return as a stop rather than reconnecting.
 #[tokio::test]
-async fn auto_publish_stays_inert_against_a_pre_generation_10_guest() {
+async fn auto_publish_stays_inert_against_a_pre_generation_11_guest() {
     let dir = tempfile::tempdir().expect("tempdir");
     let sock_path = dir.path().join("agent.sock");
     let listener = UnixListener::bind(&sock_path).expect("bind fake agent.sock");
@@ -781,7 +781,7 @@ async fn auto_publish_stays_inert_against_a_pre_generation_10_guest() {
             .await
             .unwrap();
         let mut ready = Message::new(MessageType::Ready, 0, Vec::new());
-        ready.v = 9;
+        ready.v = 10;
         write_message(&mut write_half, &ready).await.unwrap();
         let mut buf = [0u8; 64];
         let _ = read_half.read(&mut buf).await;
@@ -814,7 +814,7 @@ async fn auto_publish_stays_inert_against_a_pre_generation_10_guest() {
     }
     assert!(
         commands.is_empty(),
-        "a pre-generation-10 guest must produce no PortCommand"
+        "a pre-generation-11 guest must produce no PortCommand"
     );
     let mut events = Vec::new();
     while let Ok(event) = event_rx.try_recv() {
@@ -822,6 +822,6 @@ async fn auto_publish_stays_inert_against_a_pre_generation_10_guest() {
     }
     assert!(
         events.is_empty(),
-        "a pre-generation-10 guest must produce no PortEvent"
+        "a pre-generation-11 guest must produce no PortEvent"
     );
 }
