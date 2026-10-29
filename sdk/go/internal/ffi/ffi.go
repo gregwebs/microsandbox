@@ -1804,6 +1804,9 @@ type CreateOptions struct {
 	Vsock           []VsockRouteOptions   `json:"vsock,omitempty"`
 	Network         *NetworkOptions       `json:"network,omitempty"`
 	Proxy           *OutboundProxyOptions `json:"proxy,omitempty"`
+	// ProxyFromEnv is promoted from either spelling so a strict older native
+	// library refuses the unknown field instead of silently routing direct.
+	ProxyFromEnv *bool `json:"proxy_from_env,omitempty"`
 	Secrets         []SecretOptions       `json:"secrets,omitempty"`
 	Patches         []PatchOptions        `json:"patches,omitempty"`
 	Volumes         map[string]MountSpec  `json:"volumes,omitempty"`
@@ -1889,6 +1892,7 @@ type NetworkOptions struct {
 	SecretViolationAction    string                     `json:"secret_violation_action,omitempty"`
 	TrustHostCAs             *bool                      `json:"trust_host_cas,omitempty"`
 	HTTP                     *HTTPConfig                `json:"http,omitempty"`
+	ProxyFromEnv             *bool                      `json:"proxy_from_env,omitempty"`
 }
 
 // RateLimiterOptions limits one traffic direction; a nil bucket leaves that
