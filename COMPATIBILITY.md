@@ -93,6 +93,38 @@ Sources and checks:
 
 Required review should include golden encoded payload bytes when serialization changes. Schema snapshots protect the protocol inventory, but they do not freeze every payload's encoded representation.
 
+#### Exec exit signal identity (#467)
+
+`ExecExited` gained one additive field, `signal: Option<i32>`
+(`#[serde(default, skip_serializing_if = "Option::is_none")]`). Directions:
+
+- **Wire, either way:** safe. `None` is omitted, so a pre-field agentd's frame is
+  byte-identical to what it always sent (`{"code": -1}` =
+  `A1 64 'code' 20`) and decodes as `None`; a new signal-bearing body
+  (`{"code": -1, "signal": 15}` = `A2 64 'code' 20 66 'signal' 0F`) decodes in an
+  old reader that ignores unknown keys. Both bodies are pinned as literal bytes in
+  `crates/protocol/lib/codec.rs`, which also decodes the signalled body through
+  every reader (async, buffered, borrowed, raw). No message type, flag,
+  generation or capability changes.
+- **Rust source, `microsandbox-protocol`:** **breaking.** The field is public, so
+  an exhaustive destructuring of `ExecExited`, or a struct literal that names
+  every field, no longer compiles. `ExecExited` has no `Default` impl —
+  `#[serde(default)]` only affects decoding — so `..Default::default()` is not an
+  available migration. Every whole-struct literal in this tree is already migrated
+  by the change that added the field. A downstream consumer needs the same
+  mechanical edit: `signal: None` in each literal, and the new field or `..` in
+  each destructuring.
+- **Rust SDK:** unaffected. `ExecEvent::Exited { code }` keeps its exact shape and
+  the signal is exposed through `ExecHandle::termination_signal()`, so every
+  existing matcher and constructor still compiles.
+- **Other SDKs:** unaffected. The Python, Node, Go and Ruby bindings expose the
+  exit code only (with `-1` for a signal death) and need no edit.
+
+`ExecExited.code` is unchanged on both sides of the change and remains the exit
+status: the exit code for a normal exit, `-1` for a process the guest killed by a
+signal. `signal` is the additional fact — it does not replace or deprecate `code`,
+and a client that only wants the status keeps reading `code` exactly as before.
+
 ### Execution output backpressure
 
 Execution limits are fixed at sandbox creation and advertised in `Ready.exec_limits`: 128 executions, 64 KiB stdin allowance, 1 MiB combined stdout/stderr allowance, and 16 KiB stdin and output chunks. The values are built-in defaults, not user configuration; clients obey the advertised values, so the defaults can change between releases without a lockstep upgrade. The SDK has no stdin staging queue. Generation-10 cumulative `.stdin.ack` and `.output.ack` messages replenish consumed allowance. Released older SDKs retain legacy behavior outside the buffering guarantee; new SDKs fall back to historical buffering when Ready lacks limits. Existing sandboxes require no restart. Intermediate unreleased generation-10 builds are not compatibility targets. No new snapshot-manifest extension is required. Disk-only restores use the current built-in defaults, while memory restores preserve the guest limits from captured Ready; restoring a memory snapshot that captured limits requires the launch capability `exec_limits`. Disk and catalog formats are unchanged. Older relay and cross-version launch coverage must be validated separately from same-version tests.

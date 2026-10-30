@@ -2028,9 +2028,15 @@ mod tests {
             )
             .unwrap();
             codec::write_message(&mut server_io, &stdout).await.unwrap();
-            let exited =
-                Message::with_payload(MessageType::ExecExited, request.id, &ExecExited { code: 0 })
-                    .unwrap();
+            let exited = Message::with_payload(
+                MessageType::ExecExited,
+                request.id,
+                &ExecExited {
+                    code: 0,
+                    signal: None,
+                },
+            )
+            .unwrap();
             codec::write_message(&mut server_io, &exited).await.unwrap();
         });
 

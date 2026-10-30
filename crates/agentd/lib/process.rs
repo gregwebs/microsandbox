@@ -57,7 +57,7 @@ struct ProcessManagerState {
 #[derive(Debug)]
 struct TrackedProcess {
     generation: u64,
-    exit_tx: Option<oneshot::Sender<i32>>,
+    exit_tx: Option<oneshot::Sender<ProcessExit>>,
 }
 
 /// Keeps process reaping paused until a newly spawned PID is tracked.
@@ -75,19 +75,48 @@ pub struct ProcessIdentity {
     generation: u64,
 }
 
-/// Observes the eventual exit code of a tracked process.
+/// How a tracked process terminated, as the guest kernel reported it.
 ///
-/// Processes terminated by a signal resolve to `-1`. If the reaper thread
-/// unexpectedly drops the notification, the failure is logged and also resolves
-/// to `-1` to preserve the exec-session wire protocol.
+/// `code` keeps the legacy `exit_code` contract (`-1` for any non-`WIFEXITED`
+/// status) while `signal` carries the terminating signal number when the wait
+/// status was a signal death. The identity is decoded once here, next to
+/// `waitpid`, and travels unchanged to the exec frame; no later layer infers a
+/// signal from a host action.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ProcessExit {
+    /// Legacy exit code; `-1` when the process did not exit normally.
+    pub code: i32,
+    /// Terminating signal number from `WTERMSIG`, if `WIFSIGNALED`.
+    pub signal: Option<i32>,
+}
+
+/// Observes the eventual exit of a tracked process.
+///
+/// If the reaper thread unexpectedly drops the notification, the failure is
+/// logged and the watcher resolves to `ProcessExit { code: -1, signal: None }`
+/// to preserve the exec-session wire protocol without inventing an identity.
 pub struct ProcessExitWatcher {
     identity: ProcessIdentity,
-    receiver: oneshot::Receiver<i32>,
+    receiver: oneshot::Receiver<ProcessExit>,
 }
 
 //--------------------------------------------------------------------------------------------------
 // Methods
 //--------------------------------------------------------------------------------------------------
+
+impl ProcessExit {
+    /// Decodes a `waitpid` status into legacy code plus optional signal identity.
+    ///
+    /// A stopped or continued status (`WIFSTOPPED`/`WIFCONTINUED`) is neither a
+    /// normal exit nor a signal death, so it must not be reported as a signal.
+    fn from_wait_status(status: i32) -> Self {
+        let signal = libc::WIFSIGNALED(status).then(|| libc::WTERMSIG(status));
+        Self {
+            code: exit_code(status),
+            signal,
+        }
+    }
+}
 
 impl ProcessManager {
     /// Returns the process-wide manager, starting its `SIGCHLD` thread on first use.
@@ -366,7 +395,7 @@ impl ProcessManagerState {
                     // Keep a completed registration as a tombstone while the
                     // exec session drains output and remains signalable. If the
                     // watcher was already dropped, no session owns the identity.
-                    remove = exit_tx.send(exit_code(status)).is_err();
+                    remove = exit_tx.send(ProcessExit::from_wait_status(status)).is_err();
                 }
                 if remove {
                     self.processes.remove(&pid);
@@ -435,17 +464,20 @@ impl ProcessExitWatcher {
 //--------------------------------------------------------------------------------------------------
 
 impl Future for ProcessExitWatcher {
-    type Output = i32;
+    type Output = ProcessExit;
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         match Pin::new(&mut self.receiver).poll(cx) {
-            Poll::Ready(Ok(code)) => Poll::Ready(code),
+            Poll::Ready(Ok(exit)) => Poll::Ready(exit),
             Poll::Ready(Err(error)) => {
                 eprintln!(
                     "agentd: process manager dropped the exit notification for PID {}: {error}",
                     self.identity.pid
                 );
-                Poll::Ready(-1)
+                Poll::Ready(ProcessExit {
+                    code: -1,
+                    signal: None,
+                })
             }
             Poll::Pending => Poll::Pending,
         }
@@ -553,6 +585,177 @@ mod tests {
     const HELPER_ENV: &str = "MSB_AGENTD_PROCESS_MANAGER_HELPER";
     const HELPER_SENTINEL: &str = "process-manager-helper-passed";
     const TEST_NAME: &str = "process::tests::reaping_is_batched_and_tracks_exit_codes";
+    const EXIT_IDENTITY_ENV: &str = "MSB_AGENTD_EXIT_IDENTITY_HELPER";
+    const EXIT_IDENTITY_SENTINEL: &str = "exit-identity-helper-passed";
+    const EXIT_IDENTITY_TEST: &str = "process::tests::wait_status_identity_comes_from_the_kernel";
+    /// Bound on a real child's exit report. Generous: a CI container can stall.
+    const EXIT_TIMEOUT: Duration = Duration::from_secs(10);
+
+    // Linux `wait(2)` status encodings, built from the same macros the decoder
+    // uses so a platform change cannot silently invert these controls.
+    fn exited_status(code: i32) -> i32 {
+        (code & 0xff) << 8
+    }
+
+    fn signalled_status(signal: i32) -> i32 {
+        signal & 0x7f
+    }
+
+    fn stopped_status(signal: i32) -> i32 {
+        ((signal & 0xff) << 8) | 0x7f
+    }
+
+    fn continued_status() -> i32 {
+        0xffff
+    }
+
+    #[test]
+    fn exit_code_controls_keep_legacy_numbers() {
+        for (status, expected) in [
+            (
+                exited_status(0),
+                ProcessExit {
+                    code: 0,
+                    signal: None,
+                },
+            ),
+            (
+                exited_status(7),
+                ProcessExit {
+                    code: 7,
+                    signal: None,
+                },
+            ),
+            (
+                exited_status(143),
+                ProcessExit {
+                    code: 143,
+                    signal: None,
+                },
+            ),
+            (
+                signalled_status(libc::SIGTERM),
+                ProcessExit {
+                    code: -1,
+                    signal: Some(libc::SIGTERM),
+                },
+            ),
+            (
+                signalled_status(libc::SIGKILL),
+                ProcessExit {
+                    code: -1,
+                    signal: Some(libc::SIGKILL),
+                },
+            ),
+        ] {
+            assert_eq!(ProcessExit::from_wait_status(status), expected);
+        }
+
+        // A signal-killed process still reports the legacy `-1`, and a normal
+        // `exit 143` never claims signal death.
+        assert_eq!(exit_code(signalled_status(libc::SIGTERM)), -1);
+        assert_eq!(exit_code(exited_status(143)), 143);
+    }
+
+    #[test]
+    fn stopped_and_continued_statuses_are_not_signal_death() {
+        assert!(libc::WIFSTOPPED(stopped_status(libc::SIGSTOP)));
+        assert!(libc::WIFCONTINUED(continued_status()));
+        for status in [stopped_status(libc::SIGSTOP), continued_status()] {
+            assert_eq!(
+                ProcessExit::from_wait_status(status),
+                ProcessExit {
+                    code: -1,
+                    signal: None,
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn wait_status_identity_comes_from_the_kernel() {
+        if std::env::var_os(EXIT_IDENTITY_ENV).is_some() {
+            run_exit_identity_scenario();
+            println!("{EXIT_IDENTITY_SENTINEL}");
+            return;
+        }
+
+        // The process manager owns process-wide child statuses, so the scenario
+        // runs in its own test binary rather than racing this process's reaper.
+        let mut helper = Command::new(std::env::current_exe().expect("current test binary"))
+            .args(["--exact", EXIT_IDENTITY_TEST, "--nocapture"])
+            .env(EXIT_IDENTITY_ENV, "1")
+            .stdout(Stdio::piped())
+            .spawn()
+            .expect("spawn isolated exit identity test");
+        let mut output = String::new();
+        helper
+            .stdout
+            .take()
+            .expect("helper stdout")
+            .read_to_string(&mut output)
+            .expect("read helper stdout");
+
+        match helper.wait() {
+            Ok(status) => assert!(status.success(), "helper failed: {status}\n{output}"),
+            Err(error) if error.raw_os_error() == Some(libc::ECHILD) => {}
+            Err(error) => panic!("wait for helper: {error}"),
+        }
+        assert!(
+            output.contains(EXIT_IDENTITY_SENTINEL),
+            "helper did not complete the exit identity scenario:\n{output}"
+        );
+    }
+
+    fn run_exit_identity_scenario() {
+        let manager = ProcessManager::get().expect("start process manager");
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .expect("test runtime");
+
+        for (script, expected) in [
+            (
+                "kill -TERM $$",
+                ProcessExit {
+                    code: -1,
+                    signal: Some(libc::SIGTERM),
+                },
+            ),
+            (
+                "kill -KILL $$",
+                ProcessExit {
+                    code: -1,
+                    signal: Some(libc::SIGKILL),
+                },
+            ),
+            (
+                "exit 143",
+                ProcessExit {
+                    code: 143,
+                    signal: None,
+                },
+            ),
+        ] {
+            let guard = manager.spawn_guard().expect("acquire process spawn guard");
+            let child = Command::new("/bin/sh")
+                .args(["-c", script])
+                .spawn()
+                .expect("spawn signalled child");
+            let pid = child.id() as i32;
+            let exit_watcher = guard.track(pid).expect("track child");
+
+            // The manager reaps it; never `Child::wait` here, which would steal
+            // the status from the reaper and hide the identity we assert.
+            drop(child);
+            let exit = runtime.block_on(async {
+                tokio::time::timeout(EXIT_TIMEOUT, exit_watcher)
+                    .await
+                    .expect("child exit report")
+            });
+            assert_eq!(exit, expected, "script: {script}");
+        }
+    }
 
     #[test]
     fn reaping_is_batched_and_tracks_exit_codes() {
@@ -631,7 +834,13 @@ mod tests {
             failure_rx.borrow().as_deref(),
             Some("process manager test failure")
         );
-        assert_eq!(runtime.block_on(exit_watcher), -1);
+        assert_eq!(
+            runtime.block_on(exit_watcher),
+            ProcessExit {
+                code: -1,
+                signal: None
+            }
+        );
     }
 
     #[test]
@@ -655,7 +864,12 @@ mod tests {
             .exit_tx
             .take()
             .expect("first exit sender");
-        first_exit_tx.send(0).expect("send first exit code");
+        first_exit_tx
+            .send(ProcessExit {
+                code: 0,
+                signal: None,
+            })
+            .expect("send first exit code");
 
         assert!(
             manager
@@ -741,7 +955,7 @@ mod tests {
             .build()
             .expect("test runtime");
         for (_, expected_code, exit_watcher) in tracked {
-            assert_eq!(runtime.block_on(exit_watcher), expected_code);
+            assert_eq!(runtime.block_on(exit_watcher).code, expected_code);
         }
 
         let orphan = Command::new("/bin/sh")

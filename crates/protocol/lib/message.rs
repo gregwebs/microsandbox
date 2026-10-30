@@ -727,8 +727,15 @@ mod tests {
     fn test_message_with_payload_roundtrip() {
         use crate::exec::ExecExited;
 
-        let msg =
-            Message::with_payload(MessageType::ExecExited, 7, &ExecExited { code: 42 }).unwrap();
+        let msg = Message::with_payload(
+            MessageType::ExecExited,
+            7,
+            &ExecExited {
+                code: 42,
+                signal: None,
+            },
+        )
+        .unwrap();
 
         assert_eq!(msg.t, MessageType::ExecExited);
         assert_eq!(msg.id, 7);
@@ -736,6 +743,28 @@ mod tests {
 
         let payload: ExecExited = msg.payload().unwrap();
         assert_eq!(payload.code, 42);
+        assert_eq!(payload.signal, None);
+    }
+
+    #[test]
+    fn test_message_with_signalled_payload_roundtrip() {
+        use crate::exec::ExecExited;
+
+        const SIGTERM: i32 = 15;
+
+        let msg = Message::with_payload(
+            MessageType::ExecExited,
+            7,
+            &ExecExited {
+                code: -1,
+                signal: Some(SIGTERM),
+            },
+        )
+        .unwrap();
+
+        let payload: ExecExited = msg.payload().unwrap();
+        assert_eq!(payload.code, -1);
+        assert_eq!(payload.signal, Some(SIGTERM));
     }
 
     #[test]
@@ -820,6 +849,33 @@ mod tests {
         ciborium::into_writer(&Old { a: 1, b: 2 }, &mut old_bytes).unwrap();
         let as_new: New = ciborium::from_reader(&old_bytes[..]).unwrap();
         assert_eq!(as_new, New { a: 1, b: 2, c: 0 });
+
+        // `ExecExited.signal` is the same pattern with a real message payload:
+        // an older peer omits the key entirely, and its reader ignores ours.
+        use crate::exec::ExecExited;
+
+        #[derive(Serialize, Deserialize)]
+        struct OldExecExited {
+            code: i32,
+        }
+
+        let mut old_payload = Vec::new();
+        ciborium::into_writer(&OldExecExited { code: -1 }, &mut old_payload).unwrap();
+        let as_new: ExecExited = ciborium::from_reader(&old_payload[..]).unwrap();
+        assert_eq!(as_new.code, -1);
+        assert_eq!(as_new.signal, None);
+
+        let mut new_payload = Vec::new();
+        ciborium::into_writer(
+            &ExecExited {
+                code: -1,
+                signal: Some(9),
+            },
+            &mut new_payload,
+        )
+        .unwrap();
+        let as_old: OldExecExited = ciborium::from_reader(&new_payload[..]).unwrap();
+        assert_eq!(as_old.code, -1);
     }
 
     #[test]

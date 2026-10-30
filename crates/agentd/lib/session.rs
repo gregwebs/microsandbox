@@ -23,7 +23,7 @@ use microsandbox_protocol::transport::ClientIncarnation;
 use crate::config::SecurityProfile;
 use crate::error::{AgentdError, AgentdResult};
 use crate::exec_output::OutputWindow;
-use crate::process::{ProcessExitWatcher, ProcessIdentity, ProcessManager};
+use crate::process::{ProcessExit, ProcessExitWatcher, ProcessIdentity, ProcessManager};
 use crate::rlimit;
 use crate::serial::InputCharge;
 use crate::workload::WorkloadPlacement;
@@ -166,8 +166,8 @@ pub struct ExecSession {
     stdin_eof_received: bool,
     /// Cumulative accepted stdin bytes, including input still awaiting child delivery.
     stdin_received: u64,
-    /// Exit code retained until all published output has been acknowledged.
-    pending_exit: Option<i32>,
+    /// Exit identity retained until all published output has been acknowledged.
+    pending_exit: Option<ProcessExit>,
 }
 
 /// Runtime-authorized limits together with the output window and acknowledgement
@@ -200,8 +200,8 @@ pub enum SessionOutput {
     /// Data from stderr (pipe mode only).
     Stderr(Vec<u8>),
 
-    /// The process has exited with the given code.
-    Exited(i32),
+    /// The process has exited, carrying the guest kernel's exit identity.
+    Exited(ProcessExit),
 
     /// Pre-encoded frame bytes to write directly to the serial output buffer.
     Raw(RawSessionOutput),
@@ -742,12 +742,12 @@ impl ExecSession {
     }
 
     /// Retain execution admission until the last unread output is acknowledged.
-    pub(crate) fn finish(&mut self, code: i32) -> Option<i32> {
-        self.pending_exit = Some(code);
+    pub(crate) fn finish(&mut self, exit: ProcessExit) -> Option<ProcessExit> {
+        self.pending_exit = Some(exit);
         self.take_completed_exit()
     }
 
-    pub(crate) fn take_completed_exit(&mut self) -> Option<i32> {
+    pub(crate) fn take_completed_exit(&mut self) -> Option<ProcessExit> {
         if self
             .flow
             .as_ref()
@@ -1990,8 +1990,8 @@ async fn pty_reader_task(
 
     let _ = read_result;
 
-    let code = exit_watcher.await;
-    let _ = tx.send(id, SessionOutput::Exited(code)).await;
+    let exit = exit_watcher.await;
+    let _ = tx.send(id, SessionOutput::Exited(exit)).await;
 }
 
 /// Background task that reads from piped stdout/stderr and sends output events.
@@ -2081,9 +2081,9 @@ async fn pipe_reader_task(
         }
     }
 
-    let code = exit_watcher.await;
+    let exit = exit_watcher.await;
 
-    let _ = tx.send(id, SessionOutput::Exited(code)).await;
+    let _ = tx.send(id, SessionOutput::Exited(exit)).await;
 }
 
 //--------------------------------------------------------------------------------------------------
@@ -2116,6 +2116,12 @@ mod tests {
     const PIPE_OWNER_HELPER_ENV: &str = "MSB_AGENTD_PIPE_OWNER_HELPER";
     const PIPE_OWNER_HELPER_SENTINEL: &str = "pipe-owner-helper-passed";
 
+    /// Ordinary guest exit with no reported signal, for plumbing assertions that
+    /// say nothing about signal identity.
+    fn guest_exit(code: i32) -> ProcessExit {
+        ProcessExit { code, signal: None }
+    }
+
     #[tokio::test]
     async fn session_output_permit_lives_until_envelope_is_consumed() {
         let (tx, mut rx) = SessionOutputSender::channel();
@@ -2143,7 +2149,7 @@ mod tests {
         let (tx, mut rx) = SessionOutputSender::channel();
         let scoped = tx.with_incarnation(Some(incarnation));
 
-        assert!(scoped.send(7, SessionOutput::Exited(0)).await);
+        assert!(scoped.send(7, SessionOutput::Exited(guest_exit(0))).await);
         let envelope = rx.recv().await.unwrap();
 
         assert_eq!(envelope.id, 7);
@@ -2171,7 +2177,7 @@ mod tests {
                 )
                 .await
         );
-        assert!(scoped.send(10, SessionOutput::Exited(0)).await);
+        assert!(scoped.send(10, SessionOutput::Exited(guest_exit(0))).await);
         let mut completed = scoped.drop_bulk_flow(9).unwrap().unwrap();
 
         assert!(matches!(
@@ -2180,7 +2186,10 @@ mod tests {
         ));
         assert!(matches!(
             control_rx.recv().await.unwrap().output,
-            SessionOutput::Exited(0)
+            SessionOutput::Exited(ProcessExit {
+                code: 0,
+                signal: None
+            })
         ));
         let BulkOutputCommand::DropFlow {
             incarnation: command_incarnation,
@@ -2215,7 +2224,7 @@ mod tests {
             )
             .await
         );
-        assert!(tx.send(9, SessionOutput::Exited(0)).await);
+        assert!(tx.send(9, SessionOutput::Exited(guest_exit(0))).await);
 
         assert!(matches!(
             control_rx.recv().await.unwrap().output,
@@ -2223,7 +2232,10 @@ mod tests {
         ));
         assert!(matches!(
             control_rx.recv().await.unwrap().output,
-            SessionOutput::Exited(0)
+            SessionOutput::Exited(ProcessExit {
+                code: 0,
+                signal: None
+            })
         ));
         assert!(bulk_rx.recv().await.is_none());
     }
@@ -2233,9 +2245,15 @@ mod tests {
         let (tx, mut rx) = SessionOutputSender::channel();
         let full_budget = tx.reserve(SESSION_OUTPUT_BYTE_CAPACITY).await.unwrap();
 
-        assert!(tx.send(9, SessionOutput::Exited(0)).await);
+        assert!(tx.send(9, SessionOutput::Exited(guest_exit(0))).await);
         let envelope = rx.recv().await.unwrap();
-        assert!(matches!(envelope.output, SessionOutput::Exited(0)));
+        assert!(matches!(
+            envelope.output,
+            SessionOutput::Exited(ProcessExit {
+                code: 0,
+                signal: None
+            })
+        ));
         drop(full_budget);
     }
     const PIPE_OWNER_TEST_NAME: &str =
@@ -2310,7 +2328,7 @@ mod tests {
                 assert_eq!(envelope.id, 17);
                 match envelope.output {
                     SessionOutput::Stdout(data) => stdout.extend_from_slice(&data),
-                    SessionOutput::Exited(code) => panic!("session exited early with {code}"),
+                    SessionOutput::Exited(exit) => panic!("session exited early with {exit:?}"),
                     SessionOutput::Stderr(_) | SessionOutput::Raw(_) | SessionOutput::Bulk(_) => {}
                 }
             }
@@ -2357,14 +2375,14 @@ mod tests {
             loop {
                 let envelope = rx.recv().await.expect("session output after signal");
                 assert_eq!(envelope.id, 17);
-                if let SessionOutput::Exited(code) = envelope.output {
-                    break code;
+                if let SessionOutput::Exited(exit) = envelope.output {
+                    break exit;
                 }
             }
         })
         .await
         .expect("session should finish after its descendant is signalled");
-        assert_eq!(exit, 0);
+        assert_eq!(exit, guest_exit(0));
 
         let proc_path = format!("/proc/{descendant_pid}");
         time::timeout(Duration::from_secs(5), async {
@@ -2470,8 +2488,8 @@ mod tests {
         time::timeout(Duration::from_secs(15), async {
             while exits.len() < PROCESS_COUNT as usize {
                 let envelope = rx.recv().await.expect("session output");
-                if let SessionOutput::Exited(code) = envelope.output {
-                    exits.insert(envelope.id, code);
+                if let SessionOutput::Exited(exit) = envelope.output {
+                    exits.insert(envelope.id, exit);
                 }
             }
         })
@@ -2479,7 +2497,10 @@ mod tests {
         .expect("wait for concurrent exits");
 
         for offset in 0..PROCESS_COUNT {
-            assert_eq!(exits.get(&(100 + offset)), Some(&(20 + offset as i32)));
+            assert_eq!(
+                exits.get(&(100 + offset)),
+                Some(&guest_exit(20 + offset as i32))
+            );
         }
         drop(sessions);
     }
@@ -2554,7 +2575,7 @@ mod tests {
         })
         .await
         .expect("wait for exit on replacement runtime");
-        assert_eq!(actual, code);
+        assert_eq!(actual, guest_exit(code));
     }
 
     #[test]
@@ -2615,12 +2636,12 @@ mod tests {
             .enable_all()
             .build()
             .expect("waiting runtime");
-        let code = waiting_runtime.block_on(async {
+        let exit = waiting_runtime.block_on(async {
             time::timeout(Duration::from_secs(5), exit_watcher)
                 .await
                 .expect("wait for piped process exit")
         });
-        assert_eq!(code, 63);
+        assert_eq!(exit, guest_exit(63));
     }
 
     // Run on Linux as root with CAP_SYS_RESOURCE and a finite memlock hard limit.
@@ -2740,8 +2761,8 @@ mod tests {
                 if result.is_err() {
                     let _ = session.send_signal(libc::SIGKILL);
                 }
-                let (code, output) = result.expect("non-root command timed out");
-                assert_eq!(code, 0, "{}", String::from_utf8_lossy(&output));
+                let (exit, output) = result.expect("non-root command timed out");
+                assert_eq!(exit.code, 0, "{}", String::from_utf8_lossy(&output));
             }
         });
 
@@ -2788,7 +2809,7 @@ mod tests {
                                     data.len() as u64 + u64::from(EXEC_OUTPUT_EVENT_OVERHEAD);
                                 output.extend_from_slice(&data);
                             }
-                            SessionOutput::Exited(code) => return code,
+                            SessionOutput::Exited(exit) => return exit,
                             _ => {}
                         }
                     }
@@ -2798,16 +2819,22 @@ mod tests {
                 if result.is_err() {
                     let _ = session.send_signal(libc::SIGKILL);
                 }
-                assert_eq!(result.unwrap(), 0);
+                assert_eq!(result.unwrap().code, 0);
                 assert!(output.ends_with(b"hello"));
+                // A guest-reported signal must survive the drain handshake, so
+                // the assertions cannot be satisfied by a code-only fallback.
+                let signalled = ProcessExit {
+                    code: -1,
+                    signal: Some(libc::SIGTERM),
+                };
                 if policy.is_some() {
                     assert_eq!(
-                        session.finish(0),
+                        session.finish(signalled),
                         None,
                         "unread output must retain the execution"
                     );
                     session.acknowledge_output(consumed).unwrap();
-                    assert_eq!(session.take_completed_exit(), Some(0));
+                    assert_eq!(session.take_completed_exit(), Some(signalled));
                     assert_eq!(
                         session.take_completed_exit(),
                         None,
@@ -2815,8 +2842,8 @@ mod tests {
                     );
                 } else {
                     assert_eq!(
-                        session.finish(0),
-                        Some(0),
+                        session.finish(signalled),
+                        Some(signalled),
                         "legacy execution must not wait for acknowledgements"
                     );
                 }
@@ -2853,8 +2880,8 @@ mod tests {
                 assert_eq!(envelope.id, 7);
                 match envelope.output {
                     SessionOutput::Stdout(data) => stdout.extend_from_slice(&data),
-                    SessionOutput::Exited(code) => {
-                        exit = Some(code);
+                    SessionOutput::Exited(reported) => {
+                        exit = Some(reported);
                         break;
                     }
                     SessionOutput::Stderr(_) | SessionOutput::Raw(_) | SessionOutput::Bulk(_) => {}
@@ -2868,7 +2895,7 @@ mod tests {
             panic!("timed out waiting for PTY output");
         }
 
-        assert_eq!(exit, Some(0));
+        assert_eq!(exit, Some(guest_exit(0)));
 
         let second = stdout
             .windows(b"SECOND".len())
@@ -2916,8 +2943,8 @@ mod tests {
             while let Some(envelope) = rx.recv().await {
                 match envelope.output {
                     SessionOutput::Stdout(data) => stdout.extend_from_slice(&data),
-                    SessionOutput::Exited(code) => {
-                        exit = Some(code);
+                    SessionOutput::Exited(reported) => {
+                        exit = Some(reported);
                         break;
                     }
                     SessionOutput::Stderr(_) | SessionOutput::Raw(_) | SessionOutput::Bulk(_) => {}
@@ -2931,7 +2958,7 @@ mod tests {
             panic!("timed out waiting for PTY output");
         }
 
-        assert_eq!(exit, Some(0));
+        assert_eq!(exit, Some(guest_exit(0)));
         let child_status = String::from_utf8_lossy(&stdout);
         assert!(
             child_status.contains("SigIgn:"),
@@ -2941,6 +2968,56 @@ mod tests {
             !sigpipe_ignored(&child_status),
             "PTY child inherited an ignored SIGPIPE: {child_status}"
         );
+    }
+
+    /// A guest process that signals itself must reach `SessionOutput` with the
+    /// kernel's identity on both reader paths — the pipe and the PTY reader are
+    /// separate producers, and only the kernel knows the terminating signal.
+    #[tokio::test]
+    async fn self_signalled_session_reports_signal_on_pipe_and_pty_readers() {
+        for tty in [false, true] {
+            let (tx, mut rx) = SessionOutputSender::channel();
+            let req: ExecRequest = serde_json::from_value(serde_json::json!({
+                "cmd": "/bin/sh",
+                "args": ["-c", "printf hello; kill -TERM $$"],
+                "tty": tty,
+            }))
+            .unwrap();
+            let session =
+                ExecSession::spawn(23, &req, tx, None, SecurityProfile::Default, None, None)
+                    .expect("spawn self-signalled session");
+
+            let result = time::timeout(Duration::from_secs(10), async {
+                let mut output = Vec::new();
+                loop {
+                    let envelope = rx.recv().await.expect("session output");
+                    assert_eq!(envelope.id, 23);
+                    match envelope.output {
+                        SessionOutput::Stdout(data) => output.extend_from_slice(&data),
+                        SessionOutput::Exited(exit) => break (exit, output),
+                        SessionOutput::Stderr(_)
+                        | SessionOutput::Raw(_)
+                        | SessionOutput::Bulk(_) => {}
+                    }
+                }
+            })
+            .await;
+            let Ok((exit, output)) = result else {
+                let _ = session.send_signal(libc::SIGKILL);
+                panic!("self-signalled session did not report an exit (tty={tty})");
+            };
+
+            assert_eq!(
+                exit,
+                ProcessExit {
+                    code: -1,
+                    signal: Some(libc::SIGTERM),
+                },
+                "tty={tty}; output={:?}",
+                String::from_utf8_lossy(&output)
+            );
+            assert!(output.ends_with(b"hello"), "tty={tty}");
+        }
     }
 
     /// Whether a `/proc/<pid>/status` dump reports SIGPIPE as ignored.

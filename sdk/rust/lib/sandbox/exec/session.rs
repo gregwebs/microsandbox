@@ -3,7 +3,7 @@
 use std::{
     sync::{
         Arc, Mutex,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicI32, Ordering},
     },
     time::Duration,
 };
@@ -115,6 +115,11 @@ pub struct ExecHandle {
 
     /// Client-owned deadline state, shared with the independent event pump.
     timeout: Option<Arc<StreamTimeout>>,
+
+    /// Guest-reported terminating signal, published by the event mapper before it
+    /// delivers `Exited`. `0` means no reported signal; independent of `timeout`
+    /// so executions without a deadline still carry identity.
+    exit_signal: Arc<AtomicI32>,
 }
 
 struct StreamTimeout {
@@ -152,6 +157,12 @@ pub enum ExecEvent {
     Stderr(Bytes),
 
     /// Process exited.
+    ///
+    /// `code` is unchanged and remains the exit status: the exit code for a
+    /// normal exit (`WEXITSTATUS`), and `-1` for a process the guest killed by a
+    /// signal. When the guest kernel reported that signal, read it from
+    /// [`ExecHandle::termination_signal`] once this event has been observed; it
+    /// adds the identity to the status, it does not replace it.
     Exited {
         /// Exit code.
         code: i32,
@@ -342,6 +353,7 @@ impl ExecHandle {
         stdin: Option<ExecSink>,
         client: Arc<AgentClient>,
         timeout: Option<Arc<StreamTimeout>>,
+        exit_signal: Arc<AtomicI32>,
     ) -> Self {
         Self {
             id,
@@ -349,12 +361,32 @@ impl ExecHandle {
             stdin,
             client,
             timeout,
+            exit_signal,
         }
     }
 
     /// Get the execution session ID.
     pub fn id(&self) -> String {
         self.id.to_string()
+    }
+
+    /// Guest-reported signal that terminated the session's process, if any.
+    ///
+    /// Valid once [`ExecEvent::Exited`] has been observed on this handle (including
+    /// after [`Self::wait`] or [`Self::collect`] consumed it). `Some(n)` is the signal
+    /// number the guest kernel reported for the exit; `None` means the process exited
+    /// normally or the agent reported no identity. It is never inferred from a signal
+    /// the host sent.
+    ///
+    /// The value is published before `Exited` is delivered, survives the session's
+    /// channel closing, and is not consumed by reading it. Before `Exited`, treat it
+    /// as not yet meaningful: a failed spawn or a lost transport reports no terminal
+    /// result through it.
+    pub fn termination_signal(&self) -> Option<i32> {
+        match self.exit_signal.load(Ordering::Acquire) {
+            0 => None,
+            signal => Some(signal),
+        }
     }
 
     /// Get a cloneable control handle for this session.
@@ -746,6 +778,12 @@ pub(crate) mod agent {
             });
         }
 
+        // One signal slot per exec: 0 means "no reported signal", so a fresh
+        // allocation per handle is what keeps identity from leaking across
+        // executions or sessions. It is not a counter or a timestamp — only the
+        // terminal signal, published once.
+        let exit_signal = Arc::new(super::AtomicI32::new(0));
+
         let (event_tx, event_rx) = mpsc::unbounded_channel();
         let (event_rx, acknowledgements) = EventReceiver::new(event_rx, controlled);
         tokio::spawn(event_mapper_task(
@@ -756,9 +794,17 @@ pub(crate) mod agent {
             id,
             acknowledgements,
             input_window,
+            Arc::clone(&exit_signal),
         ));
 
-        Ok(ExecHandle::new(id, event_rx, stdin, client, timeout))
+        Ok(ExecHandle::new(
+            id,
+            event_rx,
+            stdin,
+            client,
+            timeout,
+            exit_signal,
+        ))
     }
 
     pub(crate) async fn exec(
@@ -789,6 +835,12 @@ pub(crate) mod agent {
     }
 
     /// Background task that converts raw protocol messages into [`ExecEvent`]s.
+    ///
+    /// Each parameter is one piece of per-exec state this task owns for the life
+    /// of the session, and the tests construct them individually to prove a single
+    /// seam (the deadline, the acknowledgement path, the shared signal slot), so
+    /// grouping them into a struct would only add indirection here.
+    #[allow(clippy::too_many_arguments)]
     async fn event_mapper_task(
         mut rx: mpsc::Receiver<Message>,
         tx: mpsc::UnboundedSender<ExecEvent>,
@@ -797,6 +849,7 @@ pub(crate) mod agent {
         id: u32,
         acknowledgements: Option<io::OutputAcknowledgements>,
         input_window: Option<Arc<io::InputWindow>>,
+        exit_signal: Arc<super::AtomicI32>,
     ) {
         let policy = client
             .upgrade()
@@ -922,6 +975,11 @@ pub(crate) mod agent {
                 },
                 MessageType::ExecExited => {
                     if let Ok(exited) = msg.payload::<ExecExited>() {
+                        // Publish identity before the terminal event so any observer of
+                        // `Exited` can already read it. A normal or pre-signal payload
+                        // stores 0 explicitly: the accessor must never report an older
+                        // exec's signal for this one.
+                        exit_signal.store(exited.signal.unwrap_or(0), super::Ordering::Release);
                         let _ = tx.send(ExecEvent::Exited { code: exited.code });
                     }
                     break;
@@ -1019,7 +1077,7 @@ pub(crate) mod agent {
     #[cfg(test)]
     mod tests {
         use std::sync::Mutex;
-        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 
         use super::*;
         use microsandbox_protocol::{codec, core::Ready, message::PROTOCOL_VERSION};
@@ -1354,6 +1412,7 @@ pub(crate) mod agent {
                 let (tx, events) = mpsc::unbounded_channel();
                 let (events, acknowledgements) =
                     super::super::io::EventReceiver::new(events, controlled);
+                let exit_signal = Arc::new(AtomicI32::new(0));
                 let pump = tokio::spawn(event_mapper_task(
                     rx,
                     tx,
@@ -1362,8 +1421,10 @@ pub(crate) mod agent {
                     id,
                     acknowledgements,
                     None,
+                    Arc::clone(&exit_signal),
                 ));
-                let handle = ExecHandle::new(id, events, None, client, None);
+                let handle =
+                    ExecHandle::new(id, events, None, client, None, Arc::clone(&exit_signal));
                 let control = handle.control();
 
                 let started =
@@ -1398,9 +1459,15 @@ pub(crate) mod agent {
                     let signal = codec::read_message(&mut peer).await.unwrap();
                     assert_eq!(signal.t, MessageType::ExecSignal);
                     assert_eq!(signal.payload::<ExecSignal>().unwrap().signal, 9);
-                    let exited =
-                        Message::with_payload(MessageType::ExecExited, id, &ExecExited { code: 0 })
-                            .unwrap();
+                    let exited = Message::with_payload(
+                        MessageType::ExecExited,
+                        id,
+                        &ExecExited {
+                            code: 0,
+                            signal: None,
+                        },
+                    )
+                    .unwrap();
                     codec::write_message(&mut peer, &exited).await.unwrap();
                     pump.await.unwrap();
                 })
@@ -1500,7 +1567,15 @@ pub(crate) mod agent {
             .await
             .unwrap();
             tx.send(
-                Message::with_payload(MessageType::ExecExited, 1, &ExecExited { code: 0 }).unwrap(),
+                Message::with_payload(
+                    MessageType::ExecExited,
+                    1,
+                    &ExecExited {
+                        code: 0,
+                        signal: None,
+                    },
+                )
+                .unwrap(),
             )
             .await
             .unwrap();
@@ -1512,6 +1587,7 @@ pub(crate) mod agent {
                 1,
                 None,
                 None,
+                Arc::new(AtomicI32::new(0)),
             )
             .await;
             assert!(matches!(
@@ -1524,6 +1600,238 @@ pub(crate) mod agent {
             ));
             tokio::time::advance(Duration::from_secs(2)).await;
             assert!(!state.expired.load(Ordering::Acquire));
+        }
+
+        /// One exec driven by the real event mapper, exposing the shared signal slot
+        /// so a test can observe the stored value rather than only the event stream.
+        struct MappedExec {
+            handle: ExecHandle,
+            frames: mpsc::Sender<Message>,
+            exit_signal: Arc<AtomicI32>,
+            _peer: tokio::io::DuplexStream,
+        }
+
+        async fn mapped_exec(id: u32) -> MappedExec {
+            let (client, peer) = flow_test_client().await;
+            let (events_tx, events_rx) = mpsc::unbounded_channel();
+            let (events, acknowledgements) = super::super::io::EventReceiver::new(events_rx, false);
+            let (frames, frame_rx) = mpsc::channel(4);
+            let exit_signal = Arc::new(AtomicI32::new(0));
+            // No deadline: identity must not depend on the timeout machinery.
+            tokio::spawn(event_mapper_task(
+                frame_rx,
+                events_tx,
+                None,
+                Weak::new(),
+                id,
+                acknowledgements,
+                None,
+                Arc::clone(&exit_signal),
+            ));
+            MappedExec {
+                handle: ExecHandle::new(id, events, None, client, None, Arc::clone(&exit_signal)),
+                frames,
+                exit_signal,
+                _peer: peer,
+            }
+        }
+
+        fn exited_frame(id: u32, code: i32, signal: Option<i32>) -> Message {
+            Message::with_payload(MessageType::ExecExited, id, &ExecExited { code, signal })
+                .unwrap()
+        }
+
+        /// The accessor is readable as soon as `Exited` has been delivered.
+        ///
+        /// Deliberately **not** named as an ordering test. The guarantee is program
+        /// order in the mapper task — the store to the shared slot runs before the
+        /// send of `ExecEvent::Exited` — together with the happens-before that send
+        /// and `recv()` establish. The `Release`/`Acquire` pair only makes the
+        /// stored value visible; it cannot publish a store that runs *after* the
+        /// send, so it is not what orders the two. A single-threaded test cannot
+        /// observe them swapped and a pass here is not proof of the order. What it
+        /// proves is the contract a consumer relies on: read after `Exited` and the
+        /// value is there.
+        #[tokio::test]
+        async fn the_reported_signal_is_readable_once_exited_is_delivered() {
+            const SIGTERM: i32 = 15;
+
+            let mut exec = mapped_exec(41).await;
+            assert_eq!(
+                exec.handle.termination_signal(),
+                None,
+                "a fresh exec reports no identity"
+            );
+
+            exec.frames
+                .send(exited_frame(41, -1, Some(SIGTERM)))
+                .await
+                .unwrap();
+
+            // The public event keeps its exact existing shape.
+            assert!(matches!(
+                exec.handle.recv().await,
+                Some(ExecEvent::Exited { code: -1 })
+            ));
+            assert_eq!(
+                exec.handle.termination_signal(),
+                Some(SIGTERM),
+                "the first read after `Exited` must see the guest's identity"
+            );
+
+            // Exactly one terminal event, and the identity survives channel closure.
+            assert!(exec.handle.recv().await.is_none());
+            assert_eq!(exec.handle.termination_signal(), Some(SIGTERM));
+            assert_eq!(exec.handle.termination_signal(), Some(SIGTERM));
+        }
+
+        /// The same first-read contract with the mapper on another thread.
+        ///
+        /// Program order plus the channel's happens-before is what makes this pass
+        /// under the multi-threaded runtime too: the value crosses the channel and
+        /// is published before the event that announces it. It is still not a
+        /// reordering detector — a swapped pair would fail here only when the two
+        /// threads actually race — so nothing in this file claims ordering
+        /// regression protection.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn the_reported_signal_is_readable_on_first_read_across_threads() {
+            const SIGKILL: i32 = 9;
+
+            let mut exec = mapped_exec(49).await;
+            exec.frames
+                .send(exited_frame(49, -1, Some(SIGKILL)))
+                .await
+                .unwrap();
+            assert!(matches!(
+                exec.handle.recv().await,
+                Some(ExecEvent::Exited { code: -1 })
+            ));
+            assert_eq!(exec.handle.termination_signal(), Some(SIGKILL));
+        }
+
+        #[tokio::test]
+        async fn old_shape_terminal_payload_reports_no_identity() {
+            // `{"code": -1}` exactly as a pre-signal agentd encoded it, pinned so the
+            // fixture cannot grow a `signal` key with the struct under test.
+            const OLD_BODY: [u8; 7] = [0xA1, 0x64, b'c', b'o', b'd', b'e', 0x20];
+
+            let mut exec = mapped_exec(42).await;
+            exec.frames
+                .send(Message::new(MessageType::ExecExited, 42, OLD_BODY.to_vec()))
+                .await
+                .unwrap();
+
+            assert!(matches!(
+                exec.handle.recv().await,
+                Some(ExecEvent::Exited { code: -1 })
+            ));
+            assert_eq!(
+                exec.handle.termination_signal(),
+                None,
+                "a pre-signal producer reports a code, never an inferred signal"
+            );
+            assert!(exec.handle.recv().await.is_none());
+        }
+
+        #[tokio::test]
+        async fn stream_loss_without_a_terminal_event_reports_no_identity() {
+            let mut exec = mapped_exec(43).await;
+            drop(exec.frames);
+            assert!(exec.handle.recv().await.is_none());
+            assert_eq!(exec.handle.termination_signal(), None);
+        }
+
+        #[tokio::test]
+        async fn wait_and_collect_keep_exit_status_for_a_signalled_guest() {
+            const SIGTERM: i32 = 15;
+
+            let mut waited = mapped_exec(44).await;
+            waited
+                .frames
+                .send(exited_frame(44, -1, Some(SIGTERM)))
+                .await
+                .unwrap();
+            let status = waited.handle.wait().await.unwrap();
+            assert_eq!(
+                (status.code, status.success),
+                (-1, false),
+                "signalled guests keep the code-only ExitStatus contract"
+            );
+            assert_eq!(waited.handle.termination_signal(), Some(SIGTERM));
+
+            let mut collected = mapped_exec(45).await;
+            collected
+                .frames
+                .send(
+                    Message::with_payload(
+                        MessageType::ExecStdout,
+                        45,
+                        &ExecStdout {
+                            data: b"hi".to_vec(),
+                        },
+                    )
+                    .unwrap(),
+                )
+                .await
+                .unwrap();
+            collected
+                .frames
+                .send(exited_frame(45, -1, Some(SIGTERM)))
+                .await
+                .unwrap();
+            let output = collected.handle.collect().await.unwrap();
+            assert_eq!((output.status.code, output.status.success), (-1, false));
+            assert_eq!(output.stdout, Bytes::from_static(b"hi"));
+            assert_eq!(collected.handle.termination_signal(), Some(SIGTERM));
+        }
+
+        #[tokio::test]
+        async fn concurrent_handles_keep_independent_signal_identity() {
+            const SIGKILL: i32 = 9;
+            const SIGTERM: i32 = 15;
+
+            let mut killed = mapped_exec(46).await;
+            let mut terminated = mapped_exec(47).await;
+            assert_eq!(killed.exit_signal.load(Ordering::Acquire), 0);
+            assert_eq!(terminated.exit_signal.load(Ordering::Acquire), 0);
+
+            // Interleave the two sessions so one slot shared between them would be
+            // observable.
+            killed
+                .frames
+                .send(exited_frame(46, -1, Some(SIGKILL)))
+                .await
+                .unwrap();
+            terminated
+                .frames
+                .send(exited_frame(47, 0, None))
+                .await
+                .unwrap();
+
+            assert!(matches!(
+                killed.handle.recv().await,
+                Some(ExecEvent::Exited { code: -1 })
+            ));
+            assert!(matches!(
+                terminated.handle.recv().await,
+                Some(ExecEvent::Exited { code: 0 })
+            ));
+            assert_eq!(killed.handle.termination_signal(), Some(SIGKILL));
+            assert_eq!(terminated.handle.termination_signal(), None);
+
+            // A later signalled exec in the same process is unaffected by the others.
+            let mut later = mapped_exec(48).await;
+            assert_eq!(later.handle.termination_signal(), None);
+            later
+                .frames
+                .send(exited_frame(48, -1, Some(SIGTERM)))
+                .await
+                .unwrap();
+            assert!(matches!(
+                later.handle.recv().await,
+                Some(ExecEvent::Exited { code: -1 })
+            ));
+            assert_eq!(later.handle.termination_signal(), Some(SIGTERM));
         }
 
         #[tokio::test(start_paused = true)]
@@ -1545,6 +1853,7 @@ pub(crate) mod agent {
                 1,
                 None,
                 None,
+                Arc::new(AtomicI32::new(0)),
             )
             .await;
             assert!(matches!(

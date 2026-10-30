@@ -963,6 +963,8 @@ Finalize the options. Called automatically by [`attach_with()`](#sb-attach_with)
 
 A handle to a running streaming execution. Receives [`ExecEvent`](#execevent)s as the process produces output, and provides control over stdin, signals, and the PTY size.
 
+`ExecEvent::Exited` reports the command's exit code, unchanged. When the guest kernel reports that a signal terminated the process, [`termination_signal()`](#h-termination_signal) returns that signal number; it is never inferred from a signal the host sent.
+
 A configured streaming timeout is enforced by the SDK even when the caller is not reading output. At expiry, the SDK waits for process startup before sending SIGKILL. Waiting or collecting reports `ExecTimeout` after the guest confirms exit; cancelling a pending wait does not cancel the deadline. Raw event readers receive the actual exit event. If termination cannot be delivered, the SDK reports a separate error without claiming the process exited. The SDK connection must remain open for this client-owned deadline to run.
 
 #### <span className="msb-recv">h.</span><span className="msb-hn">recv()</span>
@@ -976,6 +978,40 @@ Receive the next event. `None` when the session has ended and all output has bee
 <p className="msb-label">Returns</p>
 
 `Option<`[`ExecEvent`](#execevent)`>`
+
+#### <span className="msb-recv">h.</span><span className="msb-hn">termination_signal()</span>
+
+```rust
+termination_signal()
+```
+
+The signal number that terminated the process, as the guest kernel reported it (`WTERMSIG`). `None` when the process exited normally, and `None` when the runtime or SDK is too old to carry the signal. Never inferred from a host signal.
+
+Valid once [`Exited`](#execevent) has been observed on this handle, including after [`wait()`](#h-wait) or [`collect()`](#h-collect) consumed it. The value is published before `Exited` is delivered, survives the event stream closing, and is not consumed by reading it. Before `Exited`, do not use it to infer completion: a failed spawn or a lost connection reports no terminal result through it. [`wait()`](#h-wait) and [`collect()`](#h-collect) results keep their existing code-only [`ExitStatus`](#exitstatus).
+
+<Accordion title="Example">
+
+```rust
+use microsandbox::ExecEvent;
+
+let mut handle = sb.exec_stream("bash", ["-c", "kill -TERM $$"]).await?;
+while let Some(event) = handle.recv().await {
+    if let ExecEvent::Exited { code } = event {
+        // Valid because `Exited` has been observed on this handle.
+        match handle.termination_signal() {
+            Some(signal) => println!("killed by signal {signal} (code {code})"),
+            None => println!("exited with {code}"),
+        }
+        break;
+    }
+}
+```
+
+</Accordion>
+
+<p className="msb-label">Returns</p>
+
+`Option<i32>`
 
 #### <span className="msb-recv">h.</span><span className="msb-hn">wait()</span>
 
