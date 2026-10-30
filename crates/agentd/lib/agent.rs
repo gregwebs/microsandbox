@@ -58,7 +58,7 @@ use crate::config::{AgentdConfig, scripts_path};
 use crate::error::{AgentdError, AgentdResult};
 use crate::fs::{FsReadSession, FsState, FsStreamSession, FsWriteSession};
 use crate::loopback::ForwarderRegistry;
-use crate::process::ProcessManager;
+use crate::process::{ProcessExit, ProcessManager};
 use crate::serial::{AGENT_BULK_PORT_NAME, AGENT_PORT_NAME, InputCharge, InputLane, InputWindow};
 use crate::session::{
     BulkOutputCommand, ExecSession, RawActivity, RawSessionCompletion, RawSessionOutput,
@@ -1157,15 +1157,10 @@ pub async fn run(
                         activity.record_guest_message();
                         activity.add_exec_output_bytes(len);
                     }
-                    SessionOutput::Exited(code) => {
-                        let code = state.sessions.get_mut(&id).and_then(|session| session.finish(code));
-                        let Some(code) = code else { continue; };
-                        let msg = Message::with_payload(MessageType::ExecExited, id, &ExecExited { code })
-                            .map_err(|e| AgentdError::ExecSession(format!("encode exited: {e}")))?;
-                        codec::encode_to_buf(&msg, &mut serial_out_buf)
-                            .map_err(|e| AgentdError::ExecSession(format!("encode exited frame: {e}")))?;
-                        state.sessions.remove(&id);
-                        activity.record_guest_message();
+                    SessionOutput::Exited(exit) => {
+                        if finish_reported_exit(&mut state, id, exit, &mut serial_out_buf)? {
+                            activity.record_guest_message();
+                        }
                     }
                     SessionOutput::Raw(output) => {
                         apply_raw_activity(output.activity, &mut activity);
@@ -2530,6 +2525,67 @@ fn discard_inherited_output(
     true
 }
 
+/// Emits the single terminal frame for a session whose reader already reported its exit.
+///
+/// Returns `false` while flow-controlled output is still unacknowledged: the identity stays
+/// in the session until [`finish_acknowledged_exit`] emits it, so an exec never produces two
+/// terminal frames and never loses the guest's identity in the drain handshake.
+fn finish_reported_exit(
+    state: &mut AgentState,
+    id: u32,
+    exit: ProcessExit,
+    out: &mut Vec<u8>,
+) -> AgentdResult<bool> {
+    let Some(exit) = state
+        .sessions
+        .get_mut(&id)
+        .and_then(|session| session.finish(exit))
+    else {
+        return Ok(false);
+    };
+
+    encode_exited_frame(id, exit, out)?;
+    state.sessions.remove(&id);
+    Ok(true)
+}
+
+/// Emits the terminal frame retained after the host acknowledged the remaining output.
+fn finish_acknowledged_exit(
+    state: &mut AgentState,
+    id: u32,
+    out: &mut Vec<u8>,
+) -> AgentdResult<bool> {
+    let Some(exit) = state
+        .sessions
+        .get_mut(&id)
+        .and_then(ExecSession::take_completed_exit)
+    else {
+        return Ok(false);
+    };
+
+    encode_exited_frame(id, exit, out)?;
+    state.sessions.remove(&id);
+    Ok(true)
+}
+
+/// Encodes the one terminal `ExecExited` frame, carrying the guest's exit identity.
+///
+/// Both completion paths share this so `signal` cannot be dropped by only one of them.
+fn encode_exited_frame(id: u32, exit: ProcessExit, out: &mut Vec<u8>) -> AgentdResult<()> {
+    let frame = Message::with_payload(
+        MessageType::ExecExited,
+        id,
+        &ExecExited {
+            code: exit.code,
+            signal: exit.signal,
+        },
+    )
+    .map_err(|e| AgentdError::ExecSession(format!("encode exited: {e}")))?;
+
+    codec::encode_to_buf(&frame, out)
+        .map_err(|e| AgentdError::ExecSession(format!("encode exited frame: {e}")))
+}
+
 // Keep the loop-owned latch and output generation explicit at this dispatch boundary; merging
 // them into AgentState would obscure the ownership needed by restore and background producers.
 #[allow(clippy::too_many_arguments)]
@@ -2979,16 +3035,7 @@ async fn handle_message_with_charge(
                     msg.id
                 );
             }
-            if let Some(code) = state
-                .sessions
-                .get_mut(&msg.id)
-                .and_then(ExecSession::take_completed_exit)
-            {
-                let reply =
-                    Message::with_payload(MessageType::ExecExited, msg.id, &ExecExited { code })?;
-                codec::encode_to_buf(&reply, out_buf)?;
-                state.sessions.remove(&msg.id);
-            }
+            finish_acknowledged_exit(&mut *state, msg.id, out_buf)?;
         }
 
         MessageType::ExecResize => {
@@ -4327,7 +4374,16 @@ fn request_guest_poweroff() -> AgentdResult<()> {
 mod tests {
     use super::*;
     use bytes::Bytes;
-    use microsandbox_protocol::{exec::ExecLimits, message::PROTOCOL_VERSION};
+    use microsandbox_protocol::{
+        exec::{EXEC_OUTPUT_EVENT_OVERHEAD, ExecExited, ExecLimits, ExecOutputAck},
+        message::PROTOCOL_VERSION,
+    };
+    use tokio::sync::mpsc;
+
+    /// Ordinary guest exit with no reported signal, for plumbing assertions.
+    fn guest_exit(code: i32) -> ProcessExit {
+        ProcessExit { code, signal: None }
+    }
 
     #[allow(clippy::too_many_arguments)]
     async fn handle_message(
@@ -6140,7 +6196,7 @@ mod tests {
                         (_, _, result) = std::future::poll_fn(|cx| poll_pending_stdin(&mut state, cx)) => result.unwrap(),
                         envelope = output.recv() => match envelope.unwrap().output {
                             SessionOutput::Stdout(data) => received.extend(data),
-                            SessionOutput::Exited(code) => { assert_eq!(code, 0); exited = true; },
+                            SessionOutput::Exited(exit) => { assert_eq!(exit.code, 0); exited = true; },
                             _ => {},
                         },
                     }
@@ -6222,8 +6278,8 @@ mod tests {
             time::timeout(Duration::from_secs(5), async {
                 loop {
                     let envelope = output.recv().await.unwrap();
-                    if let SessionOutput::Exited(code) = envelope.output {
-                        assert_eq!(state.sessions.get_mut(&1).unwrap().finish(code), None);
+                    if let SessionOutput::Exited(exit) = envelope.output {
+                        assert_eq!(state.sessions.get_mut(&1).unwrap().finish(exit), None);
                         break;
                     }
                 }
@@ -6252,6 +6308,193 @@ mod tests {
             );
             assert!(state.detached_sessions.is_empty());
         }
+    }
+
+    /// Spawns `/bin/sh -c 'printf hello; kill -TERM $$'` through the real request
+    /// path and returns the exit identity its reader reported, with the output
+    /// charge the host still owes.
+    #[allow(clippy::too_many_arguments)]
+    async fn spawn_self_signalled_session(
+        state: &mut AgentState,
+        sender: &mut SessionOutputSender,
+        output: &mut mpsc::Receiver<SessionOutputEnvelope>,
+        activity: &mut ActivityTracker,
+        workload: &mut WorkloadLatch,
+        heartbeat: &heartbeat::HeartbeatControl,
+        config: &AgentdConfig,
+        tty: bool,
+    ) -> (ProcessExit, u64) {
+        let request = ExecRequest {
+            cmd: "/bin/sh".into(),
+            args: vec!["-c".into(), "printf hello; kill -TERM $$".into()],
+            env: vec![],
+            cwd: None,
+            user: None,
+            tty,
+            rows: 24,
+            cols: 80,
+            rlimits: vec![],
+        };
+        let mut encoded = Vec::new();
+        handle_message(
+            Message::with_payload(MessageType::ExecRequest, 1, &request).unwrap(),
+            state,
+            activity,
+            sender,
+            &mut encoded,
+            config,
+            workload,
+            heartbeat,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            decode_reply_skipping_credit(&mut BytesMut::from(encoded.as_slice())).t,
+            MessageType::ExecStarted
+        );
+
+        time::timeout(Duration::from_secs(10), async {
+            let mut consumed = 0_u64;
+            loop {
+                let envelope = output.recv().await.expect("session output");
+                match envelope.output {
+                    SessionOutput::Stdout(data) => {
+                        consumed += data.len() as u64 + u64::from(EXEC_OUTPUT_EVENT_OVERHEAD);
+                    }
+                    SessionOutput::Exited(exit) => break (exit, consumed),
+                    _ => {}
+                }
+            }
+        })
+        .await
+        .expect("self-signalled session should report its exit")
+    }
+
+    fn signalled_config(exec_limits: Option<ExecLimits>) -> AgentdConfig {
+        AgentdConfig {
+            exec_limits,
+            user: None,
+            security_profile: Default::default(),
+            default_cwd: None,
+            default_env: Vec::new(),
+        }
+    }
+
+    /// The serial loop's producer: the reader's exit becomes the only terminal
+    /// frame as soon as its output is drained, and it carries the signal.
+    #[tokio::test]
+    async fn reported_signal_exit_is_encoded_once_by_the_serial_loop_producer() {
+        for tty in [false, true] {
+            let mut state = AgentState::default();
+            let (mut sender, mut output) = SessionOutputSender::channel();
+            let mut activity = ActivityTracker::new();
+            let heartbeat = heartbeat::HeartbeatControl::default();
+            let mut workload = WorkloadLatch::unavailable("test process has no workload cgroup");
+            let config = signalled_config(None);
+
+            let (exit, _) = spawn_self_signalled_session(
+                &mut state,
+                &mut sender,
+                &mut output,
+                &mut activity,
+                &mut workload,
+                &heartbeat,
+                &config,
+                tty,
+            )
+            .await;
+            assert_eq!(exit, signalled_exit());
+
+            let mut encoded = Vec::new();
+            assert!(finish_reported_exit(&mut state, 1, exit, &mut encoded).unwrap());
+            let (frame, single) = decoded_exited_frame(&encoded);
+            assert_eq!(frame, signalled_exit());
+            assert!(single, "one terminal frame per execution: {encoded:?}");
+            assert!(!state.sessions.contains_key(&1));
+
+            // A second report for the same id (a replayed producer event) emits nothing.
+            encoded.clear();
+            assert!(!finish_reported_exit(&mut state, 1, exit, &mut encoded).unwrap());
+            assert!(encoded.is_empty());
+        }
+    }
+
+    /// The output-acknowledgement producer: the identity is retained across the
+    /// drain handshake and emitted once, still carrying the signal.
+    #[tokio::test]
+    async fn reported_signal_exit_is_encoded_once_by_the_acknowledgement_producer() {
+        for tty in [false, true] {
+            let mut state = AgentState::default();
+            let (mut sender, mut output) = SessionOutputSender::channel();
+            let mut activity = ActivityTracker::new();
+            let heartbeat = heartbeat::HeartbeatControl::default();
+            let mut workload = WorkloadLatch::unavailable("test process has no workload cgroup");
+            let config = signalled_config(Some(ExecLimits::default()));
+
+            let (exit, consumed) = spawn_self_signalled_session(
+                &mut state,
+                &mut sender,
+                &mut output,
+                &mut activity,
+                &mut workload,
+                &heartbeat,
+                &config,
+                tty,
+            )
+            .await;
+            assert_eq!(exit, signalled_exit());
+
+            let mut encoded = Vec::new();
+            assert!(
+                !finish_reported_exit(&mut state, 1, exit, &mut encoded).unwrap(),
+                "unacknowledged output must retain the execution"
+            );
+            assert!(encoded.is_empty());
+            assert!(state.sessions.contains_key(&1));
+
+            handle_message(
+                Message::with_payload(MessageType::ExecOutputAck, 1, &ExecOutputAck { consumed })
+                    .unwrap(),
+                &mut state,
+                &mut activity,
+                &mut sender,
+                &mut encoded,
+                &config,
+                &mut workload,
+                &heartbeat,
+            )
+            .await
+            .unwrap();
+            let (frame, single) = decoded_exited_frame(&encoded);
+            assert_eq!(frame, signalled_exit());
+            assert!(single, "one terminal frame per execution: {encoded:?}");
+            assert!(!state.sessions.contains_key(&1));
+        }
+    }
+
+    fn signalled_exit() -> ProcessExit {
+        ProcessExit {
+            code: -1,
+            signal: Some(libc::SIGTERM),
+        }
+    }
+
+    /// The terminal frame in `encoded` and whether it was the **only** one.
+    ///
+    /// The decoder consumes its buffer, so an empty remainder is what proves the
+    /// producer emitted exactly one terminal frame rather than two.
+    fn decoded_exited_frame(encoded: &[u8]) -> (ProcessExit, bool) {
+        let mut frames = BytesMut::from(encoded);
+        let frame = decode_reply_skipping_credit(&mut frames);
+        assert_eq!(frame.t, MessageType::ExecExited, "{frame:?}");
+        let payload: ExecExited = frame.payload().unwrap();
+        (
+            ProcessExit {
+                code: payload.code,
+                signal: payload.signal,
+            },
+            frames.is_empty(),
+        )
     }
 
     #[tokio::test]
@@ -6340,8 +6583,8 @@ mod tests {
                         if let SessionOutput::Stdout(bytes) = &envelope.output {
                             saw_inherited |= String::from_utf8_lossy(bytes).contains("inherited");
                         }
-                        if let SessionOutput::Exited(code) = &envelope.output {
-                            assert_eq!(*code, 23);
+                        if let SessionOutput::Exited(exit) = &envelope.output {
+                            assert_eq!(exit.code, 23);
                             saw_old_exit = true;
                         }
                         assert!(discard_inherited_output(
@@ -6359,8 +6602,8 @@ mod tests {
                             &envelope,
                             sender.generation()
                         ));
-                        if let SessionOutput::Exited(code) = envelope.output {
-                            assert_eq!(code, 24);
+                        if let SessionOutput::Exited(exit) = envelope.output {
+                            assert_eq!(exit.code, 24);
                             saw_new_exit = true;
                         }
                     }
@@ -6545,7 +6788,7 @@ mod tests {
         let (mut sender, mut output) = SessionOutputSender::channel();
         for _ in 0..3 {
             let old = sender.clone();
-            old.send(1, SessionOutput::Exited(7)).await;
+            old.send(1, SessionOutput::Exited(guest_exit(7))).await;
             restore_client_state(&mut state, &mut sender).await.unwrap();
             let stale = output.recv().await.unwrap();
             assert!(discard_inherited_output(
@@ -6554,13 +6797,13 @@ mod tests {
                 sender.generation()
             ));
             // A late producer is as stale as an event that was already queued at the cut.
-            old.send(1, SessionOutput::Exited(7)).await;
+            old.send(1, SessionOutput::Exited(guest_exit(7))).await;
             assert!(discard_inherited_output(
                 &mut state,
                 &output.recv().await.unwrap(),
                 sender.generation()
             ));
-            sender.send(1, SessionOutput::Exited(8)).await;
+            sender.send(1, SessionOutput::Exited(guest_exit(8))).await;
             assert!(!discard_inherited_output(
                 &mut state,
                 &output.recv().await.unwrap(),

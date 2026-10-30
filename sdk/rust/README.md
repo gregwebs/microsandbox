@@ -137,7 +137,12 @@ while let Some(event) = handle.recv().await {
         ExecEvent::Stdout(data) => print!("{}", String::from_utf8_lossy(&data)),
         ExecEvent::Stderr(data) => eprint!("{}", String::from_utf8_lossy(&data)),
         ExecEvent::Exited { code } => {
-            println!("exited with {code}");
+            // Read after `Exited`: `Some(signal)` when the guest kernel reported
+            // that a signal killed the process, never inferred from a host signal.
+            match handle.termination_signal() {
+                Some(signal) => println!("killed by signal {signal} (code {code})"),
+                None => println!("exited with {code}"),
+            }
             break;
         }
         ExecEvent::Started { .. } => {}

@@ -365,6 +365,9 @@ mod tests {
         use microsandbox_protocol::exec::{ExecExited, ExecRequest, ExecStdout};
         use tokio::io::AsyncWriteExt;
 
+        /// Terminating signal; this crate deliberately has no `libc` dependency.
+        const SIGTERM: i32 = 15;
+
         let (client_io, mut server_io) = tokio::io::duplex(64 * 1024);
         let ready = AgentReadyPayload {
             exec_limits: None,
@@ -387,7 +390,8 @@ mod tests {
                 .await
                 .unwrap();
 
-            // One exec stream echoed back: stdout, then a terminal exited.
+            // One exec stream echoed back: stdout, then a terminal exited that
+            // reports the guest's terminating signal beside the legacy code.
             let request = codec::read_raw_frame(&mut server_io).await.unwrap();
             let stdout = Message::with_payload(
                 MessageType::ExecStdout,
@@ -398,9 +402,15 @@ mod tests {
             )
             .unwrap();
             codec::write_message(&mut server_io, &stdout).await.unwrap();
-            let exited =
-                Message::with_payload(MessageType::ExecExited, request.id, &ExecExited { code: 0 })
-                    .unwrap();
+            let exited = Message::with_payload(
+                MessageType::ExecExited,
+                request.id,
+                &ExecExited {
+                    code: -1,
+                    signal: Some(SIGTERM),
+                },
+            )
+            .unwrap();
             codec::write_message(&mut server_io, &exited).await.unwrap();
         });
 
@@ -437,7 +447,7 @@ mod tests {
         let second = rx.recv().await.unwrap().unwrap();
         assert_eq!(second.t, MessageType::ExecExited.as_str());
         let exit: ExecExited = second.payload().unwrap();
-        assert_eq!(exit.code, 0);
+        assert_eq!((exit.code, exit.signal), (-1, Some(SIGTERM)));
     }
 
     #[cfg(any(all(feature = "uds", unix), all(feature = "named-pipe", windows)))]

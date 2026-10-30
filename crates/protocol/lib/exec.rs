@@ -126,7 +126,28 @@ pub struct ExecStderr {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ExecExited {
     /// The exit code of the process.
+    ///
+    /// Unchanged and still authoritative: the exit code for a normal exit
+    /// (`WEXITSTATUS`), and `-1` for a process the guest killed by a signal.
+    /// [`Self::signal`] adds that identity; it does not replace this field.
     pub code: i32,
+
+    /// Signal number that terminated the process, when the guest kernel
+    /// reported one (`WIFSIGNALED`/`WTERMSIG`).
+    ///
+    /// Decoded from the guest's own wait status by agentd, never inferred from a
+    /// host signal. Omitted on the wire when absent, so an agentd from before this
+    /// field and a reader that knows it stay compatible in both directions.
+    ///
+    /// Note the source-compatibility cost of the added field: an exhaustive
+    /// destructuring of `ExecExited` in another crate, or a struct literal that
+    /// names every field, no longer compiles. There is no `Default` impl to fall
+    /// back on — `#[serde(default)]` only affects decoding — so the migration is
+    /// `signal: None` in each literal and the new field or `..` in each pattern.
+    /// The wire format and the SDK's `ExecEvent` patterns are unaffected; see
+    /// `COMPATIBILITY.md` §1.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signal: Option<i32>,
 }
 
 /// Notification that a command failed to start (the user's program

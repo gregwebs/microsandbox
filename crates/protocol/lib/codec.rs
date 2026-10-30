@@ -588,8 +588,15 @@ mod tests {
     async fn test_codec_roundtrip_with_payload() {
         use crate::exec::ExecExited;
 
-        let msg =
-            Message::with_payload(MessageType::ExecExited, 7, &ExecExited { code: 42 }).unwrap();
+        let msg = Message::with_payload(
+            MessageType::ExecExited,
+            7,
+            &ExecExited {
+                code: 42,
+                signal: None,
+            },
+        )
+        .unwrap();
 
         let mut buf = Vec::new();
         write_message(&mut buf, &msg).await.unwrap();
@@ -604,6 +611,7 @@ mod tests {
 
         let payload: ExecExited = decoded.payload().unwrap();
         assert_eq!(payload.code, 42);
+        assert_eq!(payload.signal, None);
     }
 
     #[tokio::test]
@@ -639,8 +647,15 @@ mod tests {
     fn test_sync_encode_decode_roundtrip() {
         use crate::exec::ExecExited;
 
-        let msg =
-            Message::with_payload(MessageType::ExecExited, 5, &ExecExited { code: 0 }).unwrap();
+        let msg = Message::with_payload(
+            MessageType::ExecExited,
+            5,
+            &ExecExited {
+                code: 0,
+                signal: None,
+            },
+        )
+        .unwrap();
 
         let mut buf = Vec::new();
         encode_to_buf(&msg, &mut buf).unwrap();
@@ -659,8 +674,15 @@ mod tests {
     fn test_borrowed_decode_message_frame_roundtrip() {
         use crate::exec::ExecExited;
 
-        let msg =
-            Message::with_payload(MessageType::ExecExited, 5, &ExecExited { code: 0 }).unwrap();
+        let msg = Message::with_payload(
+            MessageType::ExecExited,
+            5,
+            &ExecExited {
+                code: 0,
+                signal: None,
+            },
+        )
+        .unwrap();
 
         let mut buf = Vec::new();
         encode_to_buf(&msg, &mut buf).unwrap();
@@ -979,8 +1001,15 @@ mod tests {
     fn test_raw_frame_to_message() {
         use crate::exec::ExecExited;
 
-        let msg =
-            Message::with_payload(MessageType::ExecExited, 13, &ExecExited { code: 7 }).unwrap();
+        let msg = Message::with_payload(
+            MessageType::ExecExited,
+            13,
+            &ExecExited {
+                code: 7,
+                signal: None,
+            },
+        )
+        .unwrap();
 
         let mut buf = Vec::new();
         encode_to_buf(&msg, &mut buf).unwrap();
@@ -1037,5 +1066,145 @@ mod tests {
                 Poll::Ready(Ok(0))
             }
         }
+    }
+
+    /// `ExecExited.signal` is optional metadata on an existing terminal frame:
+    /// a pre-signal agentd keeps decoding, and this reader keeps decoding its
+    /// frames, without a new message type or a protocol generation bump.
+    #[tokio::test]
+    async fn test_exec_exited_signal_is_wire_additive() {
+        use crate::exec::ExecExited;
+
+        // `{"code": -1}` as a pre-signal agentd encoded it. Pinned so the
+        // fixture cannot grow a `signal` key with the struct it exercises.
+        const OLD_BODY: &[u8] = &[0xA1, 0x64, b'c', b'o', b'd', b'e', 0x20];
+
+        #[derive(serde::Serialize)]
+        struct OldExecExited {
+            code: i32,
+        }
+
+        let old_body =
+            Message::with_payload(MessageType::ExecExited, 31, &OldExecExited { code: -1 })
+                .unwrap()
+                .p;
+        assert_eq!(
+            old_body, OLD_BODY,
+            "old-format CBOR fixture must not change"
+        );
+
+        // Old sender -> new receiver, through every decode path.
+        let old_frame = Message::new(MessageType::ExecExited, 31, OLD_BODY.to_vec());
+
+        let mut wire = Vec::new();
+        write_message(&mut wire, &old_frame).await.unwrap();
+        let mut cursor = &wire[..];
+        let decoded = read_message(&mut cursor).await.unwrap();
+        assert_eq!(decoded.id, 31);
+        assert_eq!(decoded.flags, FLAG_TERMINAL);
+        let payload: ExecExited = decoded.payload().unwrap();
+        assert_eq!((payload.code, payload.signal), (-1, None));
+
+        let mut sync_wire = Vec::new();
+        encode_to_buf(&old_frame, &mut sync_wire).unwrap();
+        let decoded = try_decode_from_buf(&mut sync_wire).unwrap().unwrap();
+        let payload: ExecExited = decoded.payload().unwrap();
+        assert_eq!((payload.code, payload.signal), (-1, None));
+
+        let decoded = decode_message_frame(&wire).unwrap();
+        let payload: ExecExited = decoded.payload().unwrap();
+        assert_eq!((payload.code, payload.signal), (-1, None));
+
+        let mut raw_wire = Vec::new();
+        encode_to_buf(&old_frame, &mut raw_wire).unwrap();
+        let raw = try_decode_raw_from_buf(&mut raw_wire).unwrap().unwrap();
+        let payload: ExecExited = raw_frame_to_message(raw).unwrap().payload().unwrap();
+        assert_eq!((payload.code, payload.signal), (-1, None));
+
+        // An explicit CBOR null is also "no reported signal".
+        #[derive(serde::Serialize)]
+        struct NullSignalExecExited {
+            code: i32,
+            signal: Option<i32>,
+        }
+
+        let mut null_body = Vec::new();
+        ciborium::into_writer(
+            &NullSignalExecExited {
+                code: -1,
+                signal: None,
+            },
+            &mut null_body,
+        )
+        .unwrap();
+        let null_frame = Message::new(MessageType::ExecExited, 31, null_body);
+        let payload: ExecExited = null_frame.payload().unwrap();
+        assert_eq!((payload.code, payload.signal), (-1, None));
+        assert_ne!(
+            payload.signal,
+            Some(0),
+            "absent and null both mean no reported signal"
+        );
+
+        // The new body, pinned the same way and for the same reason: `{"code": -1,
+        // "signal": 15}`. Without this only the old bytes are frozen and a change
+        // to the field's name, position or encoding would pass unnoticed.
+        const SIGNAL_BODY: &[u8] = &[
+            0xA2, 0x64, b'c', b'o', b'd', b'e', 0x20, 0x66, b's', b'i', b'g', b'n', b'a', b'l',
+            0x0F,
+        ];
+
+        let signalled = Message::with_payload(
+            MessageType::ExecExited,
+            32,
+            &ExecExited {
+                code: -1,
+                signal: Some(15),
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            signalled.p, SIGNAL_BODY,
+            "signal-bearing CBOR fixture must not change"
+        );
+
+        // New sender -> new receiver, through every decode path, with the routing
+        // and terminal flag intact on each.
+        let mut signal_wire = Vec::new();
+        write_message(&mut signal_wire, &signalled).await.unwrap();
+        let mut cursor = &signal_wire[..];
+        let decoded = read_message(&mut cursor).await.unwrap();
+        assert_eq!(decoded.id, 32);
+        assert_eq!(decoded.flags, FLAG_TERMINAL);
+        let payload: ExecExited = decoded.payload().unwrap();
+        assert_eq!((payload.code, payload.signal), (-1, Some(15)));
+
+        let mut signal_sync = Vec::new();
+        encode_to_buf(&signalled, &mut signal_sync).unwrap();
+        let decoded = try_decode_from_buf(&mut signal_sync).unwrap().unwrap();
+        assert_eq!((decoded.id, decoded.flags), (32, FLAG_TERMINAL));
+        let payload: ExecExited = decoded.payload().unwrap();
+        assert_eq!((payload.code, payload.signal), (-1, Some(15)));
+
+        let decoded = decode_message_frame(&signal_wire).unwrap();
+        assert_eq!((decoded.id, decoded.flags), (32, FLAG_TERMINAL));
+        let payload: ExecExited = decoded.payload().unwrap();
+        assert_eq!((payload.code, payload.signal), (-1, Some(15)));
+
+        let mut signal_raw = Vec::new();
+        encode_to_buf(&signalled, &mut signal_raw).unwrap();
+        let raw = try_decode_raw_from_buf(&mut signal_raw).unwrap().unwrap();
+        let decoded = raw_frame_to_message(raw).unwrap();
+        assert_eq!((decoded.id, decoded.flags), (32, FLAG_TERMINAL));
+        let payload: ExecExited = decoded.payload().unwrap();
+        assert_eq!((payload.code, payload.signal), (-1, Some(15)));
+
+        // New sender -> old receiver: the unknown key is ignored.
+        #[derive(serde::Deserialize)]
+        struct OldExecExitedIn {
+            code: i32,
+        }
+        let as_old: OldExecExitedIn = decoded.payload().unwrap();
+        assert_eq!(as_old.code, -1);
     }
 }

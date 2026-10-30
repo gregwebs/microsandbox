@@ -373,7 +373,13 @@ while let Some(event) = handle.recv().await {
     match event {
         ExecEvent::Stdout(data) => print!("{}", String::from_utf8_lossy(&data)),
         ExecEvent::Stderr(data) => eprint!("{}", String::from_utf8_lossy(&data)),
-        ExecEvent::Exited { code } => break,
+        ExecEvent::Exited { code } => {
+            // `handle.termination_signal()` is readable now, because `Exited` has
+            // been observed: `Some(n)` when the guest kernel reported that signal
+            // `n` terminated the process, `None` for an ordinary exit.
+            println!("exited with {code}");
+            break;
+        }
         _ => {}
     }
 }
