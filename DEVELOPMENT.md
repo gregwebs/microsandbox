@@ -239,7 +239,7 @@ See that repository's README for setup, workload descriptions, and usage.
 Pre-commit hooks are installed by `just setup`. They run automatically on every commit and check:
 
 - `cargo fmt --all --check` — formatting
-- `cargo clippy --workspace -- -D warnings` — lints
+- `cargo clippy --workspace --all-targets -- -D warnings` — lints
 - `cargo doc` — documentation builds without warnings
 - `cargo build -p microsandbox-cli` — CLI compiles
 - Standard checks (trailing whitespace, merge conflicts, TOML/YAML validity)
@@ -259,7 +259,7 @@ If pre-commit is not installed, install it with `pip install pre-commit` (or `br
 
 ```bash
 cargo fmt --all           # Format code
-cargo clippy --workspace  # Run lints
+cargo clippy --workspace --all-targets  # Run lints
 ```
 
 ### Self-hosted CI disk space
