@@ -30,8 +30,8 @@ use std::time::Duration;
 use microsandbox_network::auto_publish::{
     ListenEntry, parse_listen_v4, parse_listen_v6, should_forward,
 };
-use microsandbox_network::config::AutoPublishConfig;
-use microsandbox_network::publisher::PortCommand;
+use microsandbox_network::config::{AutoPublishConfig, TcpAcceptQueueSize};
+use microsandbox_network::publisher::{PortCommand, bind_listener};
 use microsandbox_protocol::codec::{read_message, write_message};
 use microsandbox_protocol::fs::{
     FsData, FsOp, FsOpenOptions, FsRequest, FsResponse, FsResponseData,
@@ -220,6 +220,7 @@ pub fn spawn(
     runtime: &tokio::runtime::Handle,
     agent_sock_path: PathBuf,
     cfg: AutoPublishConfig,
+    tcp_accept_queue_size: TcpAcceptQueueSize,
     port_handle: UnboundedSender<PortCommand>,
     guest_ipv4: Option<Ipv4Addr>,
     guest_ipv6: Option<Ipv6Addr>,
@@ -254,6 +255,7 @@ pub fn spawn(
             match run(
                 &agent_sock_path,
                 &cfg,
+                tcp_accept_queue_size,
                 &port_handle,
                 guest_ipv4,
                 guest_ipv6,
@@ -296,6 +298,7 @@ fn is_stream_error(e: &std::io::Error) -> bool {
 async fn run(
     agent_sock_path: &PathBuf,
     cfg: &AutoPublishConfig,
+    tcp_accept_queue_size: TcpAcceptQueueSize,
     port_handle: &UnboundedSender<PortCommand>,
     guest_ipv4: Option<Ipv4Addr>,
     guest_ipv6: Option<Ipv6Addr>,
@@ -520,7 +523,7 @@ async fn run(
                 continue;
             }
 
-            match bind_host_for(host_bind, guest_port).await {
+            match bind_host_for(host_bind, guest_port, tcp_accept_queue_size) {
                 Ok((listener, addr)) => {
                     let key = (addr.ip(), addr.port());
                     if port_handle
@@ -620,17 +623,18 @@ async fn run(
 /// Try to bind `(host_bind, guest_port)` first so the host port
 /// mirrors the guest port (Lima-ish). If that's taken, fall back to
 /// an OS-assigned ephemeral port.
-async fn bind_host_for(
+fn bind_host_for(
     host_bind: IpAddr,
     guest_port: u16,
+    backlog: TcpAcceptQueueSize,
 ) -> std::io::Result<(TcpListener, SocketAddr)> {
     let preferred = SocketAddr::new(host_bind, guest_port);
-    if let Ok(l) = TcpListener::bind(preferred).await {
+    if let Ok(l) = bind_listener(preferred, backlog) {
         let addr = l.local_addr()?;
         return Ok((l, addr));
     }
     let any = SocketAddr::new(host_bind, 0);
-    let l = TcpListener::bind(any).await?;
+    let l = bind_listener(any, backlog)?;
     let addr = l.local_addr()?;
     Ok((l, addr))
 }
@@ -955,6 +959,52 @@ mod tests {
         });
         let out = collapse_listeners(&s);
         assert_eq!(out.get(&8080), Some(&WantedFamily::LoopbackV6));
+    }
+
+    /// Both the mirrored-port path and occupied-port fallback must use the
+    /// configured queue depth. Linux exposes the kernel-applied backlog;
+    /// macOS has no equivalent readback (and clamps it to somaxconn).
+    #[tokio::test]
+    async fn auto_published_listener_queues_the_configured_backlog() {
+        let host = IpAddr::V4(Ipv4Addr::LOCALHOST);
+        for backlog in [
+            TcpAcceptQueueSize::default(),
+            TcpAcceptQueueSize::try_from(3).unwrap(),
+        ] {
+            let reserved = bind_listener(SocketAddr::new(host, 0), backlog).unwrap();
+            let preferred_port = reserved.local_addr().unwrap().port();
+            // Occupied preferred port forces the ephemeral fallback.
+            let (fallback, addr) = bind_host_for(host, preferred_port, backlog).unwrap();
+            assert_ne!(addr.port(), preferred_port);
+            assert_eq!(fallback.local_addr().unwrap(), addr);
+            drop(reserved);
+            let (preferred, addr) = bind_host_for(host, preferred_port, backlog).unwrap();
+            assert_eq!(addr.port(), preferred_port);
+            #[cfg(target_os = "linux")]
+            for listener in [&preferred, &fallback] {
+                use std::os::fd::AsRawFd;
+                let somaxconn: u32 = std::fs::read_to_string("/proc/sys/net/core/somaxconn")
+                    .unwrap()
+                    .trim()
+                    .parse()
+                    .unwrap();
+                // SAFETY: tcp_info is POD, and getsockopt receives its exact size.
+                let mut info: libc::tcp_info = unsafe { std::mem::zeroed() };
+                let mut len = std::mem::size_of_val(&info) as libc::socklen_t;
+                let rc = unsafe {
+                    libc::getsockopt(
+                        listener.as_raw_fd(),
+                        libc::IPPROTO_TCP,
+                        libc::TCP_INFO,
+                        (&mut info as *mut libc::tcp_info).cast(),
+                        &mut len,
+                    )
+                };
+                assert_eq!(rc, 0, "TCP_INFO: {}", std::io::Error::last_os_error());
+                assert_eq!(info.tcpi_sacked, backlog.get().min(somaxconn));
+            }
+            drop(preferred);
+        }
     }
 
     #[test]
