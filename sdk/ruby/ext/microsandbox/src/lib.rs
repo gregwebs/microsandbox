@@ -3048,14 +3048,8 @@ mod proxy_from_env_applied_values {
         take_builder,
     };
 
-    fn build_config(
-        ruby: &Ruby,
-        builder: SandboxBuilder,
-    ) -> SandboxConfig {
-        let runtime = Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap();
+    fn build_config(ruby: &Ruby, builder: SandboxBuilder) -> SandboxConfig {
+        let runtime = Builder::new_current_thread().enable_all().build().unwrap();
         runtime.block_on(builder.build()).unwrap_or_else(|error| {
             panic!("built configuration rejected: {error}");
         })
@@ -3072,16 +3066,10 @@ mod proxy_from_env_applied_values {
             let kwargs = RHash::new();
             kwargs.aset(Symbol::new("image"), "alpine").unwrap();
             if let Some(enabled) = value {
-                kwargs
-                    .aset(Symbol::new("proxy_from_env"), enabled)
-                    .unwrap();
+                kwargs.aset(Symbol::new("proxy_from_env"), enabled).unwrap();
             }
-            let builder = apply_builder_options(
-                &ruby,
-                SandboxBuilder::new("ruby-ambient"),
-                kwargs,
-            )
-            .expect("keyword accepted");
+            let builder = apply_builder_options(&ruby, SandboxBuilder::new("ruby-ambient"), kwargs)
+                .expect("keyword accepted");
             build_config(&ruby, builder).spec.network.proxy_from_env
         };
 

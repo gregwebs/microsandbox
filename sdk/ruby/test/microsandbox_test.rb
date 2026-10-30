@@ -363,14 +363,21 @@ end
 
 class ProxyFromEnvTest < Test::Unit::TestCase
   def test_create_accepts_proxy_from_env_keyword
-    # Parse-time acceptance is observable because the runtime never launches:
-    # both explicit values reach the builder, and the failure is the ordinary
-    # runtime/detection error rather than an unknown keyword.
+    # Parse-time acceptance is the subject: an accepted keyword reaches the
+    # builder, so any later failure is an SDK error rather than an unknown
+    # keyword. The SDK raises typed subclasses of Microsandbox::Error, and a
+    # host with a runtime installed may create the sandbox outright, so both
+    # outcomes count as acceptance.
     [true, false, nil].each do |value|
-      error = assert_raise(Microsandbox::Error) do
-        Microsandbox::Sandbox.create("ruby-ambient", image: "alpine", proxy_from_env: value)
+      begin
+        sandbox = Microsandbox::Sandbox.create("ruby-ambient", image: "alpine", proxy_from_env: value)
+      rescue ArgumentError => error
+        flunk("proxy_from_env must be an accepted keyword: #{error.message}")
+      rescue Microsandbox::Error => error
+        refute_match(/unknown keyword/i, error.message)
+      else
+        sandbox.destroy
       end
-      refute_match(/unknown keyword/i, error.message)
     end
   end
 
