@@ -768,9 +768,7 @@ impl SecretsHandler {
                 && !resolution_failed
                 && secret_host_allowed(secret, sni, identity.as_ref());
 
-            // Substitution and placeholder passthrough are independent policies. An
-            // allowed host can substitute enabled locations while disabled locations
-            // remain protected by the violation detector below. A verified
+            // Substitution and placeholder passthrough are independent policies. A verified
             // destination trusted with the credential may also receive its
             // placeholder unchanged outside enabled substitution locations.
             if host_allowed && let Some(value) = resolved_value {
