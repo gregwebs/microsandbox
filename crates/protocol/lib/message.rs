@@ -76,6 +76,11 @@ pub struct Message {
     /// The CBOR-encoded payload bytes.
     #[serde(with = "serde_bytes")]
     pub p: Vec<u8>,
+
+    /// Internal filesystem maintenance traffic, excluded from idle activity.
+    /// Only the fork's host-generated procfs polling sets this marker.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub maintenance: bool,
 }
 
 /// Identifies the type of a protocol message.
@@ -330,6 +335,7 @@ impl Message {
             id,
             flags,
             p,
+            maintenance: false,
         }
     }
 
@@ -348,6 +354,7 @@ impl Message {
             id,
             flags,
             p,
+            maintenance: false,
         })
     }
 
@@ -536,6 +543,25 @@ impl<'de> Deserialize<'de> for MessageType {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn maintenance_marker_roundtrips_without_changing_ordinary_envelopes() {
+        let mut request = Message::new(MessageType::FsRequest, 1, Vec::new());
+        let ordinary = serde_json::to_value(&request).unwrap();
+        assert!(ordinary.get("maintenance").is_none());
+        request.maintenance = true;
+        let mut frame = Vec::new();
+        crate::codec::encode_to_buf(&request, &mut frame).unwrap();
+        let decoded = crate::codec::decode_message_frame(&frame).unwrap();
+        assert!(decoded.maintenance);
+        assert_eq!(decoded.id, request.id);
+        assert_eq!(decoded.flags, request.flags);
+        assert!(
+            !serde_json::from_value::<Message>(ordinary)
+                .unwrap()
+                .maintenance
+        );
+    }
 
     #[test]
     fn retained_payload_and_eof_use_data_credit_without_changing_frame_flags() {

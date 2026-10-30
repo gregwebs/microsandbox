@@ -272,6 +272,7 @@ pub struct SessionOutputPermit(tokio::sync::OwnedSemaphorePermit);
 #[derive(Clone)]
 pub struct SessionOutputSender {
     generation: u64,
+    maintenance: bool,
     control_tx: mpsc::Sender<SessionOutputEnvelope>,
     bulk_tx: Option<mpsc::Sender<SessionOutputEnvelope>>,
     bulk_command_tx: Option<mpsc::Sender<BulkOutputCommand>>,
@@ -428,6 +429,7 @@ impl SessionOutputSender {
         (
             Self {
                 generation: 0,
+                maintenance: false,
                 control_tx: tx,
                 bulk_tx: None,
                 bulk_command_tx: None,
@@ -452,6 +454,7 @@ impl SessionOutputSender {
         (
             Self {
                 generation: 0,
+                maintenance: false,
                 control_tx,
                 bulk_tx: Some(bulk_tx),
                 bulk_command_tx: Some(bulk_command_tx),
@@ -469,6 +472,7 @@ impl SessionOutputSender {
     pub fn with_incarnation(&self, incarnation: Option<ClientIncarnation>) -> Self {
         Self {
             generation: self.generation,
+            maintenance: self.maintenance,
             control_tx: self.control_tx.clone(),
             bulk_tx: self.bulk_tx.clone(),
             bulk_command_tx: self.bulk_command_tx.clone(),
@@ -476,6 +480,13 @@ impl SessionOutputSender {
             bulk_budget: Arc::clone(&self.bulk_budget),
             incarnation,
         }
+    }
+
+    /// Mark asynchronous replies to one internal filesystem maintenance request.
+    pub fn with_maintenance(&self, maintenance: bool) -> Self {
+        let mut sender = self.clone();
+        sender.maintenance = maintenance;
+        sender
     }
 
     /// Current local attachment generation, independent of the wire protocol version.
@@ -624,7 +635,7 @@ impl SessionOutputSender {
     pub async fn send_reserved(
         &self,
         id: u32,
-        output: SessionOutput,
+        mut output: SessionOutput,
         permit: SessionOutputPermit,
     ) -> bool {
         let charged = output.budget_bytes();
@@ -636,6 +647,15 @@ impl SessionOutputSender {
             return false;
         }
 
+        // Keep byte accounting intact: maintenance changes activity, not the
+        // output reservation or stream completion handling.
+        if self.maintenance {
+            match &mut output {
+                SessionOutput::Raw(raw) => raw.activity = RawActivity::default(),
+                SessionOutput::Bulk(bulk) => bulk.activity = RawActivity::default(),
+                _ => {}
+            }
+        }
         let tx = if matches!(&output, SessionOutput::Bulk(_)) {
             self.bulk_tx.as_ref().unwrap_or(&self.control_tx)
         } else {

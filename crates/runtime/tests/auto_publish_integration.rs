@@ -152,6 +152,10 @@ async fn run_fake_relay(listener: UnixListener, state: Arc<Mutex<GuestState>>) {
         };
         match msg.t {
             MessageType::FsRequest => {
+                assert!(
+                    msg.maintenance,
+                    "every auto-publish filesystem poll must be maintenance"
+                );
                 let req: FsRequest = match msg.payload() {
                     Ok(r) => r,
                     Err(_) => return,
@@ -322,6 +326,7 @@ impl Harness {
             &rt_handle,
             sock_path,
             cfg,
+            Default::default(),
             port_tx,
             guest_ipv4,
             guest_ipv6,
@@ -798,6 +803,7 @@ async fn auto_publish_stays_inert_against_a_pre_generation_11_guest() {
         &tokio::runtime::Handle::current(),
         sock_path,
         cfg,
+        Default::default(),
         port_tx,
         Some(Ipv4Addr::new(172, 16, 0, 2)),
         None,

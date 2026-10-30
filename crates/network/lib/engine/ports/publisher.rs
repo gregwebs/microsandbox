@@ -847,7 +847,7 @@ fn reject_with_rst(stream: &TcpStream) {
 /// `TcpListener::bind`. That includes `SO_REUSEADDR` on Unix, so a listener can be re-created
 /// without waiting out `TIME_WAIT`, and deliberately not on Windows, where the option would let
 /// another socket bind over a port that is still in use.
-fn bind_listener(
+pub fn bind_listener(
     bind_addr: SocketAddr,
     backlog: TcpAcceptQueueSize,
 ) -> std::io::Result<TcpListener> {

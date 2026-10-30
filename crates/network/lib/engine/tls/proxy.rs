@@ -2588,6 +2588,29 @@ mod tests {
     /// origin to the destination IP and the request asks for that host.
     #[tokio::test]
     async fn no_sni_route_never_receives_an_origin_scoped_header_credential() {
+        let outcome = assert_no_sni_header_credential_not_injected(
+            b"GET / HTTP/1.1\r\nHost: api.example.com\r\n\r\n",
+        )
+        .await;
+        // The DNS pin must not reconstruct route authority. The hostname Host
+        // disagrees with the IP-only TLS identity, so fail closed before forwarding.
+        assert!(outcome.relay.is_err());
+        assert!(outcome.upstream.is_empty());
+    }
+
+    /// An IP-literal request Host cannot authorize a DNS-origin credential,
+    /// even when the destination IP has a live DNS pin for that origin.
+    #[tokio::test]
+    async fn no_sni_ip_host_never_receives_an_origin_scoped_header_credential() {
+        let outcome = assert_no_sni_header_credential_not_injected(
+            b"GET / HTTP/1.1\r\nHost: 203.0.113.10\r\n\r\n",
+        )
+        .await;
+        // Matching IP authority is forwarded unchanged, without a DNS credential.
+        assert!(contains(&outcome.upstream, b"GET / HTTP/1.1"));
+    }
+
+    async fn assert_no_sni_header_credential_not_injected(request: &'static [u8]) -> NoSniOutcome {
         let _ = rustls::crypto::ring::default_provider().install_default();
         let shared = Arc::new(SharedState::new(8));
         shared.cache_resolved_hostname(
@@ -2612,22 +2635,16 @@ mod tests {
         let tls_state =
             test_tls_state_with_credentials(SecretsConfig::default(), false, vec![credential]);
 
-        let outcome = run_no_sni_probe(
-            tls_state,
-            shared,
-            NetworkExtensions::default(),
-            b"GET / HTTP/1.1\r\nHost: 203.0.113.10\r\n\r\n",
-        )
-        .await;
+        let outcome =
+            run_no_sni_probe(tls_state, shared, NetworkExtensions::default(), request).await;
 
-        // No secret policy applies, so the request itself is forwarded.
-        assert!(contains(&outcome.upstream, b"GET / HTTP/1.1"));
         assert!(
             !contains(&outcome.upstream, b"header-credential-value"),
             "an origin-scoped credential must not be injected without hostname authority: {:?}",
             String::from_utf8_lossy(&outcome.upstream)
         );
         assert!(!contains(&outcome.upstream, b"x-api-key"));
+        outcome
     }
 
     /// D9 (b): a host-bound secret placeholder is neither substituted nor

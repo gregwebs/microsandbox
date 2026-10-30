@@ -494,6 +494,7 @@ type VmBuildOutput = (
 struct AutoPublishHandles {
     port_handle: tokio::sync::mpsc::UnboundedSender<microsandbox_network::publisher::PortCommand>,
     cfg: microsandbox_network::config::AutoPublishConfig,
+    tcp_accept_queue_size: microsandbox_network::config::TcpAcceptQueueSize,
     guest_ipv4: Option<std::net::Ipv4Addr>,
     guest_ipv6: Option<std::net::Ipv6Addr>,
     /// Guest ports already covered by a boot-time `--publish` listener. Passed
@@ -1433,6 +1434,7 @@ fn run(
             tokio_rt.handle(),
             config.agent_sock_path.clone(),
             handles.cfg,
+            handles.tcp_accept_queue_size,
             handles.port_handle,
             handles.guest_ipv4,
             handles.guest_ipv6,
@@ -2804,6 +2806,11 @@ fn build_vm(
             auto_publish_handles = Some(AutoPublishHandles {
                 port_handle: network.port_handle(),
                 cfg: ap_cfg,
+                tcp_accept_queue_size: vm
+                    .network
+                    .config()
+                    .tcp_accept_queue_size
+                    .unwrap_or_default(),
                 guest_ipv4: network.guest_ipv4(),
                 guest_ipv6: network.guest_ipv6(),
                 explicit_guest_ports: vm
