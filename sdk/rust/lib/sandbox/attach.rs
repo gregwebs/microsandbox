@@ -1,7 +1,15 @@
 //! Interactive attach types for terminal bridging with sandboxes.
 
 use std::{
-    collections::VecDeque, fmt, future::Future, panic::AssertUnwindSafe, pin::Pin, sync::Arc,
+    collections::VecDeque,
+    fmt,
+    future::Future,
+    panic::AssertUnwindSafe,
+    pin::Pin,
+    sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    },
 };
 
 use futures::FutureExt;
@@ -32,7 +40,7 @@ const MAX_TERMINAL_INPUT_BACKLOG: usize = 64 * 1024 * 1024;
 
 /// Filtered chunks the worker may produce ahead of the attach loop. When
 /// the channel is full the worker waits, never the loop. Input towards the
-/// worker is unbounded (see `FilteredStdin::push`).
+/// worker shares the terminal's byte budget (see `FilteredStdin::try_push`).
 const FILTERED_STDIN_CAPACITY: usize = 16;
 
 /// Error reported when the stdin-filter worker has ended (an unwinding panic in
@@ -125,8 +133,9 @@ pub trait StdinFilter: Send + 'static {
 /// Chunks come out in the order they were pushed. Dropping this aborts the
 /// task and drops the filter.
 pub(crate) struct FilteredStdin {
-    input: mpsc::UnboundedSender<Vec<u8>>,
-    output: mpsc::Receiver<Vec<u8>>,
+    input: mpsc::UnboundedSender<BudgetedInput>,
+    output: mpsc::Receiver<MicrosandboxResult<BudgetedInput>>,
+    budget: Arc<InputBudget>,
     _task: AbortOnDropHandle<()>,
 }
 
@@ -141,6 +150,8 @@ pub(crate) enum InputRoute {
     Filtered,
     /// The worker ended; fail explicitly rather than silently lose input.
     WorkerEnded,
+    /// The shared terminal input budget was exhausted.
+    BacklogExceeded,
 }
 
 /// Parsed detach key sequence.
@@ -179,15 +190,58 @@ enum AttachMessage {
 
 /// Queues terminal input while one write waits for guest stdin credit.
 struct TerminalInput {
-    queued: VecDeque<Vec<u8>>,
-    queued_bytes: usize,
+    queued: VecDeque<BudgetedInput>,
+    budget: Arc<InputBudget>,
     pending_write: Option<AbortOnDropHandle<MicrosandboxResult<()>>>,
     closed: bool,
+}
+
+/// One byte budget for raw filter input, filtered output, and terminal writes.
+#[derive(Default)]
+struct InputBudget {
+    bytes: AtomicUsize,
+}
+
+struct BudgetedInput {
+    data: Vec<u8>,
+    charged: usize,
+    budget: Arc<InputBudget>,
 }
 
 //--------------------------------------------------------------------------------------------------
 // Methods
 //--------------------------------------------------------------------------------------------------
+
+impl InputBudget {
+    fn charge(self: &Arc<Self>, data: Vec<u8>) -> MicrosandboxResult<BudgetedInput> {
+        let charged = data.len();
+        let mut current = self.bytes.load(Ordering::Acquire);
+        loop {
+            let next = current
+                .checked_add(charged)
+                .filter(|total| *total <= MAX_TERMINAL_INPUT_BACKLOG)
+                .ok_or_else(terminal_backlog_error)?;
+            // A compare-exchange loop rather than a read-modify-write helper:
+            // the budget is shared by concurrently draining producers, and the
+            // loop keeps the ceiling exact without a deprecated accessor.
+            match self.bytes.compare_exchange_weak(
+                current,
+                next,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => {
+                    return Ok(BudgetedInput {
+                        data,
+                        charged,
+                        budget: Arc::clone(self),
+                    });
+                }
+                Err(observed) => current = observed,
+            }
+        }
+    }
+}
 
 impl AttachOptionsBuilder {
     /// Prepend arguments resolved by a higher-level execution helper.
@@ -357,8 +411,13 @@ impl DetachKeys {
 }
 
 impl FilteredStdin {
-    /// Spawn `filter` on a new task. Must be called within a Tokio runtime.
-    pub(crate) fn spawn(filter: Box<dyn StdinFilter>) -> Self {
+    #[cfg(test)]
+    fn spawn(filter: Box<dyn StdinFilter>) -> Self {
+        Self::spawn_with_budget(filter, Arc::new(InputBudget::default()))
+    }
+
+    /// Spawn a worker sharing the terminal writer's in-flight byte budget.
+    fn spawn_with_budget(filter: Box<dyn StdinFilter>, budget: Arc<InputBudget>) -> Self {
         let (input, input_rx) = mpsc::unbounded_channel();
         let (output_tx, output) = mpsc::channel(FILTERED_STDIN_CAPACITY);
         let task =
@@ -366,20 +425,31 @@ impl FilteredStdin {
         Self {
             input,
             output,
+            budget,
             _task: task,
         }
     }
 
-    /// Queue a chunk for filtering. Returns false if the worker has stopped.
-    /// Never waits: the attach loop must keep reading the terminal (for the detach keys) and draining guest output
-    /// while a filter is busy.
-    pub(crate) fn push(&self, chunk: Vec<u8>) -> bool {
-        self.input.send(chunk).is_ok()
+    #[cfg(test)]
+    fn push(&self, chunk: Vec<u8>) -> bool {
+        self.try_push(chunk).is_ok()
     }
 
-    /// Next non-empty filtered chunk, or None if the worker ended. Cancel-safe for `select!`.
-    pub(crate) async fn recv(&mut self) -> Option<Vec<u8>> {
-        self.output.recv().await
+    /// Never wait for capacity: the loop must keep scanning detach keys and
+    /// draining guest output while the filter is busy.
+    fn try_push(&self, chunk: Vec<u8>) -> MicrosandboxResult<()> {
+        let chunk = self.budget.charge(chunk)?;
+        self.input
+            .send(chunk)
+            .map_err(|_| MicrosandboxError::Runtime(STDIN_FILTER_TASK_ENDED.into()))
+    }
+
+    #[cfg(test)]
+    async fn recv(&mut self) -> Option<Vec<u8>> {
+        self.output.recv().await.map(|chunk| {
+            let mut chunk = chunk.expect("filter input budget");
+            std::mem::take(&mut chunk.data)
+        })
     }
 }
 
@@ -496,7 +566,7 @@ impl TerminalInput {
     fn new() -> Self {
         Self {
             queued: VecDeque::new(),
-            queued_bytes: 0,
+            budget: Arc::new(InputBudget::default()),
             pending_write: None,
             closed: false,
         }
@@ -515,23 +585,26 @@ impl TerminalInput {
             return Ok(());
         }
 
+        let data = self.budget.charge(data)?;
+        self.push_budgeted(client, id, window, data);
+        Ok(())
+    }
+
+    fn push_budgeted(
+        &mut self,
+        client: &Arc<AgentClient>,
+        id: u32,
+        window: Option<Arc<InputWindow>>,
+        data: BudgetedInput,
+    ) {
+        if self.closed {
+            return;
+        }
         if self.pending_write.is_none() {
             self.pending_write = Some(spawn_stdin_write(Arc::clone(client), id, window, data));
-            return Ok(());
+        } else {
+            self.queued.push_back(data);
         }
-
-        let queued_bytes = self.queued_bytes.checked_add(data.len()).ok_or_else(|| {
-            MicrosandboxError::Terminal("terminal input backlog size overflow".into())
-        })?;
-        if queued_bytes > MAX_TERMINAL_INPUT_BACKLOG {
-            return Err(MicrosandboxError::Terminal(
-                "terminal input backlog exceeded 64 MiB while guest stdin was blocked".into(),
-            ));
-        }
-
-        self.queued_bytes = queued_bytes;
-        self.queued.push_back(data);
-        Ok(())
     }
 
     /// Start the next queued write after the previous one completes.
@@ -544,7 +617,6 @@ impl TerminalInput {
         self.pending_write = None;
 
         if let Some(data) = self.queued.pop_front() {
-            self.queued_bytes -= data.len();
             self.pending_write = Some(spawn_stdin_write(Arc::clone(client), id, window, data));
         }
     }
@@ -559,7 +631,6 @@ impl TerminalInput {
         self.closed = true;
         self.pending_write = None;
         self.queued.clear();
-        self.queued_bytes = 0;
         true
     }
 }
@@ -567,6 +638,12 @@ impl TerminalInput {
 //--------------------------------------------------------------------------------------------------
 // Trait Implementations
 //--------------------------------------------------------------------------------------------------
+
+impl Drop for BudgetedInput {
+    fn drop(&mut self) {
+        self.budget.bytes.fetch_sub(self.charged, Ordering::AcqRel);
+    }
+}
 
 impl fmt::Debug for dyn StdinFilter {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -577,6 +654,19 @@ impl fmt::Debug for dyn StdinFilter {
 //--------------------------------------------------------------------------------------------------
 // Functions
 //--------------------------------------------------------------------------------------------------
+
+fn terminal_backlog_error() -> MicrosandboxError {
+    MicrosandboxError::Terminal(
+        "terminal input backlog exceeded 64 MiB while guest stdin was blocked".into(),
+    )
+}
+
+async fn recv_budgeted(filter: &mut Option<FilteredStdin>) -> MicrosandboxResult<BudgetedInput> {
+    match filter {
+        Some(filter) => require_filtered(filter.output.recv().await)?,
+        None => std::future::pending().await,
+    }
+}
 
 /// Scan `data` for the detach sequence. When it does not detach, route the
 /// chunk to the filter if one is set. The scan always runs first, so a
@@ -591,18 +681,17 @@ pub(crate) fn route_input(
         return InputRoute::Detach;
     }
     match filter {
-        Some(filter) => {
-            if filter.push(data.to_vec()) {
-                InputRoute::Filtered
-            } else {
-                InputRoute::WorkerEnded
-            }
-        }
+        Some(filter) => match filter.try_push(data.to_vec()) {
+            Ok(()) => InputRoute::Filtered,
+            Err(MicrosandboxError::Terminal(_)) => InputRoute::BacklogExceeded,
+            Err(_) => InputRoute::WorkerEnded,
+        },
         None => InputRoute::Forward,
     }
 }
 
 /// Resolves to the next filtered chunk, or never when no filter is set.
+#[cfg(test)]
 pub(crate) async fn recv_filtered(filter: &mut Option<FilteredStdin>) -> Option<Vec<u8>> {
     match filter {
         Some(filter) => filter.recv().await,
@@ -611,8 +700,8 @@ pub(crate) async fn recv_filtered(filter: &mut Option<FilteredStdin>) -> Option<
 }
 
 /// Shared failure handling for a filtered output channel that closes.
-/// Used by both platform loops so the None path is independently unit-testable.
-pub(crate) fn require_filtered(data: Option<Vec<u8>>) -> MicrosandboxResult<Vec<u8>> {
+/// Used by both platform loops through `recv_budgeted`.
+pub(crate) fn require_filtered<T>(data: Option<T>) -> MicrosandboxResult<T> {
     data.ok_or_else(|| crate::MicrosandboxError::Runtime(STDIN_FILTER_TASK_ENDED.into()))
 }
 
@@ -663,13 +752,13 @@ fn queue_terminal_input(
 /// A panicking Drop also closes the output channel when the worker dies.
 async fn run_stdin_filter(
     mut filter: Box<dyn StdinFilter>,
-    mut input: mpsc::UnboundedReceiver<Vec<u8>>,
-    output: mpsc::Sender<Vec<u8>>,
+    mut input: mpsc::UnboundedReceiver<BudgetedInput>,
+    output: mpsc::Sender<MicrosandboxResult<BudgetedInput>>,
 ) {
     while let Some(chunk) = input.recv().await {
         // The call is inside the async block: catch both a synchronous
         // `filter()` panic and a panic while polling its returned future.
-        let filtered = AssertUnwindSafe(async { filter.filter(&chunk).await })
+        let filtered = AssertUnwindSafe(async { filter.filter(&chunk.data).await })
             .catch_unwind()
             .await;
         let out = match filtered {
@@ -679,7 +768,13 @@ async fn run_stdin_filter(
         if out.is_empty() {
             continue;
         }
-        if output.send(out).await.is_err() {
+        // Charge output before releasing raw input, including expansion and
+        // output blocked on the channel. A caller-owned filter can allocate
+        // internally; its returned bytes are admitted before entering our queues.
+        let out = chunk.budget.charge(out);
+        drop(chunk);
+        let failed = out.is_err();
+        if output.send(out).await.is_err() || failed {
             break;
         }
     }
@@ -690,15 +785,23 @@ fn spawn_stdin_write(
     client: Arc<AgentClient>,
     id: u32,
     window: Option<Arc<InputWindow>>,
-    data: Vec<u8>,
+    mut data: BudgetedInput,
 ) -> AbortOnDropHandle<MicrosandboxResult<()>> {
     AbortOnDropHandle::new(tokio::spawn(async move {
         if let Some(window) = window {
             window.wait_started().await?;
-            window.send(&client, id, data).await
+            window
+                .send(&client, id, std::mem::take(&mut data.data))
+                .await
         } else {
             client
-                .send(id, MessageType::ExecStdin, &ExecStdin { data })
+                .send(
+                    id,
+                    MessageType::ExecStdin,
+                    &ExecStdin {
+                        data: std::mem::take(&mut data.data),
+                    },
+                )
                 .await?;
             Ok(())
         }
@@ -733,8 +836,8 @@ pub(crate) mod agent {
 
     use super::{
         AttachMessage, AttachProtocol, DetachKeys, FilteredStdin, InputRoute,
-        STDIN_FILTER_TASK_ENDED, TerminalInput, queue_terminal_input, recv_filtered,
-        require_filtered, route_input,
+        STDIN_FILTER_TASK_ENDED, TerminalInput, queue_terminal_input, recv_budgeted, route_input,
+        terminal_backlog_error,
     };
 
     pub(crate) async fn attach(
@@ -800,7 +903,9 @@ pub(crate) mod agent {
 
         // Filtered on its own task: a filter that awaits the guest must not
         // stop this loop from draining guest output (see `StdinFilter`).
-        let mut filtered_stdin = stdin_filter.map(FilteredStdin::spawn);
+        let mut filtered_stdin = stdin_filter.map(|filter| {
+            FilteredStdin::spawn_with_budget(filter, Arc::clone(&terminal_input.budget))
+        });
 
         loop {
             tokio::select! {
@@ -820,6 +925,7 @@ pub(crate) mod agent {
                             match route_input(data, detach_seq, &mut match_pos, filtered_stdin.as_ref()) {
                                 InputRoute::Detach => break,
                                 InputRoute::Filtered => {}
+                                InputRoute::BacklogExceeded => return Err(terminal_backlog_error()),
                                 InputRoute::WorkerEnded => {
                                     return Err(crate::MicrosandboxError::Runtime(
                                         STDIN_FILTER_TASK_ENDED.into(),
@@ -842,10 +948,9 @@ pub(crate) mod agent {
                     }
                 }
 
-                // Disabled without a filter: preserve the original set of enabled branches.
-                filtered = recv_filtered(&mut filtered_stdin), if filtered_stdin.is_some() => {
-                    let data = require_filtered(filtered)?;
-                    queue_terminal_input(&mut terminal_input, &client, id, &protocol, data)?;
+                // The reservation moves with the bytes through the terminal writer.
+                filtered = recv_budgeted(&mut filtered_stdin), if filtered_stdin.is_some() => {
+                    terminal_input.push_budgeted(&client, id, protocol.input_window(), filtered?);
                 }
 
                 result = async { terminal_input.pending_write.as_mut().unwrap().await }, if terminal_input.pending_write.is_some() => {
@@ -950,8 +1055,8 @@ pub(crate) mod agent {
 
     use super::{
         AttachMessage, AttachProtocol, DetachKeys, FilteredStdin, InputRoute,
-        STDIN_FILTER_TASK_ENDED, TerminalInput, queue_terminal_input, recv_filtered,
-        require_filtered, route_input,
+        STDIN_FILTER_TASK_ENDED, TerminalInput, queue_terminal_input, recv_budgeted, route_input,
+        terminal_backlog_error,
     };
 
     pub(crate) async fn attach(
@@ -998,7 +1103,9 @@ pub(crate) mod agent {
 
         // Filtered on its own task: a filter that awaits the guest must not
         // stop this loop from draining guest output (see `StdinFilter`).
-        let mut filtered_stdin = stdin_filter.map(FilteredStdin::spawn);
+        let mut filtered_stdin = stdin_filter.map(|filter| {
+            FilteredStdin::spawn_with_budget(filter, Arc::clone(&terminal_input.budget))
+        });
 
         loop {
             tokio::select! {
@@ -1008,6 +1115,7 @@ pub(crate) mod agent {
                             match route_input(&data, detach_seq, &mut match_pos, filtered_stdin.as_ref()) {
                                 InputRoute::Detach => break,
                                 InputRoute::Filtered => {}
+                                InputRoute::BacklogExceeded => return Err(terminal_backlog_error()),
                                 InputRoute::WorkerEnded => {
                                     return Err(MicrosandboxError::Runtime(
                                         STDIN_FILTER_TASK_ENDED.into(),
@@ -1034,10 +1142,9 @@ pub(crate) mod agent {
                     }
                 }
 
-                // Disabled without a filter: preserve the original set of enabled branches.
-                filtered = recv_filtered(&mut filtered_stdin), if filtered_stdin.is_some() => {
-                    let data = require_filtered(filtered)?;
-                    queue_terminal_input(&mut terminal_input, &client, id, &protocol, data)?;
+                // The reservation moves with the bytes through the terminal writer.
+                filtered = recv_budgeted(&mut filtered_stdin), if filtered_stdin.is_some() => {
+                    terminal_input.push_budgeted(&client, id, protocol.input_window(), filtered?);
                 }
 
                 result = async { terminal_input.pending_write.as_mut().unwrap().await }, if terminal_input.pending_write.is_some() => {
@@ -1700,7 +1807,7 @@ mod tests {
         // the constant's value here also pins the loops' message; a loop-local
         // literal would be free to drift.
         assert_eq!(STDIN_FILTER_TASK_ENDED, "stdin filter task ended");
-        match require_filtered(None) {
+        match require_filtered(None::<Vec<u8>>) {
             Err(crate::MicrosandboxError::Runtime(message)) => {
                 assert_eq!(message, STDIN_FILTER_TASK_ENDED);
             }
@@ -1810,6 +1917,122 @@ mod tests {
         };
         let (client, peer) = tokio::join!(connect, handshake);
         (Arc::new(client.unwrap()), peer)
+    }
+
+    #[tokio::test]
+    async fn stalled_filter_hits_shared_backlog_without_blocking_detach_or_output() {
+        let (entered_tx, entered_rx) = oneshot::channel();
+        let (_release_tx, release_rx) = oneshot::channel();
+        let stdin = FilteredStdin::spawn(Box::new(Gate {
+            entered: Some(entered_tx),
+            release: Some(release_rx),
+            first_output: vec![],
+        }));
+        assert!(stdin.push(vec![b'x'; 1024]));
+        entered_rx.await.unwrap();
+        let chunk = vec![b'x'; 1024 * 1024];
+        for _ in 0..63 {
+            stdin.try_push(chunk.clone()).unwrap();
+        }
+        assert!(
+            matches!(stdin.try_push(chunk.clone()), Err(MicrosandboxError::Terminal(message)) if message.contains("backlog exceeded 64 MiB"))
+        );
+        let mut match_pos = 0;
+        assert_eq!(
+            route_input(&[0x1d], &[0x1d], &mut match_pos, Some(&stdin)),
+            InputRoute::Detach
+        );
+        // Routing remains synchronous even with a blocked worker: the loop can
+        // immediately consume guest output instead of awaiting queue capacity.
+        let (tx, mut rx) = mpsc::channel(1);
+        tx.send(b"guest output").await.unwrap();
+        assert_eq!(rx.try_recv().unwrap(), b"guest output");
+    }
+
+    #[tokio::test]
+    async fn stalled_guest_counts_pending_write_and_filter_queues_in_one_budget() {
+        let (client, mut peer) =
+            flow_test_client(PROTOCOL_VERSION, Some(ExecLimits::default())).await;
+        let mut protocol = AttachProtocol::new(&client).unwrap();
+        mark_execution_started(&mut protocol);
+        let mut terminal = TerminalInput::new();
+        let budget = Arc::clone(&terminal.budget);
+        terminal
+            .push(
+                &client,
+                7,
+                protocol.input_window(),
+                vec![b'x'; 32 * 1024 * 1024],
+            )
+            .unwrap();
+        // The started guest consumes its allowance but never acknowledges it.
+        // Verify the writer actually reaches the stalled-credit state before
+        // continuing input through both the terminal and filter paths.
+        let mut received = 0;
+        while received < ExecLimits::default().input_limit as usize {
+            let message = timeout(Duration::from_secs(5), codec::read_message(&mut peer))
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(message.t, MessageType::ExecStdin);
+            received += message.payload::<ExecStdin>().unwrap().data.len();
+        }
+        assert!(
+            timeout(Duration::from_millis(25), codec::read_message(&mut peer))
+                .await
+                .is_err()
+        );
+        let mut stdin = Some(FilteredStdin::spawn_with_budget(
+            Box::new(Expand {
+                to_len: 16 * 1024 * 1024,
+            }),
+            Arc::clone(&budget),
+        ));
+        stdin.as_ref().unwrap().try_push(vec![b'x']).unwrap();
+        let filtered = recv_budgeted(&mut stdin).await.unwrap();
+        terminal.push_budgeted(&client, 7, protocol.input_window(), filtered);
+        terminal
+            .push(
+                &client,
+                7,
+                protocol.input_window(),
+                vec![b'x'; 16 * 1024 * 1024],
+            )
+            .unwrap();
+        assert_eq!(
+            budget.bytes.load(Ordering::Acquire),
+            MAX_TERMINAL_INPUT_BACKLOG
+        );
+        assert!(matches!(
+            stdin.as_ref().unwrap().try_push(vec![b'x']),
+            Err(MicrosandboxError::Terminal(_))
+        ));
+        assert!(matches!(
+            terminal.push(&client, 7, protocol.input_window(), vec![b'x']),
+            Err(MicrosandboxError::Terminal(_))
+        ));
+        assert!(terminal.close());
+        tokio::task::yield_now().await;
+        assert_eq!(budget.bytes.load(Ordering::Acquire), 0);
+    }
+
+    #[tokio::test]
+    async fn filter_expansion_is_charged_before_publication() {
+        let budget = Arc::new(InputBudget::default());
+        let held = budget
+            .charge(vec![0; MAX_TERMINAL_INPUT_BACKLOG - 1024])
+            .unwrap();
+        let mut stdin = Some(FilteredStdin::spawn_with_budget(
+            Box::new(Expand { to_len: 2048 }),
+            Arc::clone(&budget),
+        ));
+        stdin.as_ref().unwrap().try_push(vec![b'x']).unwrap();
+        assert!(matches!(
+            recv_budgeted(&mut stdin).await,
+            Err(MicrosandboxError::Terminal(_))
+        ));
+        drop(held);
+        assert_eq!(budget.bytes.load(Ordering::Acquire), 0);
     }
 
     /// Feed the attach loop's `ExecStarted` handling so the input window admits writes.
