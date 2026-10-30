@@ -152,6 +152,10 @@ async fn run_fake_relay(listener: UnixListener, state: Arc<Mutex<GuestState>>) {
         };
         match msg.t {
             MessageType::FsRequest => {
+                assert!(
+                    msg.maintenance,
+                    "every auto-publish filesystem poll must be maintenance"
+                );
                 let req: FsRequest = match msg.payload() {
                     Ok(r) => r,
                     Err(_) => return,

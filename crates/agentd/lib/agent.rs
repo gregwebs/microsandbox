@@ -1058,7 +1058,8 @@ pub async fn run(
                                     continue;
                                 }
 
-                                if message_refreshes_idle_timer(&msg.t) {
+                                let maintenance = msg.maintenance && msg.t == MessageType::FsRequest;
+                                if !maintenance && message_refreshes_idle_timer(&msg.t) {
                                     activity.record_host_message();
                                     publish_heartbeat_snapshot(&heartbeat_tx, &state, &activity);
                                 }
@@ -1075,11 +1076,16 @@ pub async fn run(
                                     &heartbeat_control,
                                     charge,
                                 ).await?;
-                                record_encoded_guest_messages(
-                                    &serial_out_buf,
-                                    out_before,
-                                    &mut activity,
-                                );
+                                // Synchronous replies inherit the incoming request's
+                                // maintenance classification; async producers carry it
+                                // on their scoped SessionOutputSender instead.
+                                if !maintenance {
+                                    record_encoded_guest_messages(
+                                        &serial_out_buf,
+                                        out_before,
+                                        &mut activity,
+                                    );
+                                }
                                 publish_heartbeat_snapshot(&heartbeat_tx, &state, &activity);
                             }
 
@@ -3007,8 +3013,8 @@ async fn handle_message_with_charge(
             let Some(req) = decode_payload_or_core_error::<FsRequest>(&msg, out_buf)? else {
                 return Ok(());
             };
-            match fs::handle_fs_request(msg.id, msg.v, req, &mut state.fs, out_buf, &session_tx)
-                .await
+            let reply_tx = session_tx.with_maintenance(msg.maintenance);
+            match fs::handle_fs_request(msg.id, msg.v, req, &mut state.fs, out_buf, &reply_tx).await
             {
                 Ok(Some(FsStreamSession::Read(rs))) => {
                     state.read_sessions.insert(msg.id, rs);
@@ -6367,6 +6373,79 @@ mod tests {
                 state.detached_sessions.is_empty(),
                 "exited inherited handles leaked"
             );
+        }
+    }
+
+    #[tokio::test]
+    async fn filesystem_maintenance_replies_do_not_refresh_idle_but_client_reads_do() {
+        use microsandbox_protocol::fs::{FsOp, FsOpenOptions, FsResponseData};
+
+        for maintenance in [true, false] {
+            let mut state = FsState::default();
+            let (sender, mut output) = SessionOutputSender::channel();
+            let sender = sender.with_maintenance(maintenance);
+            let mut encoded = Vec::new();
+            fs::handle_fs_request(
+                1,
+                PROTOCOL_VERSION,
+                FsRequest {
+                    op: FsOp::OpenFile {
+                        path: "/proc/net/tcp".into(),
+                        options: FsOpenOptions {
+                            read: true,
+                            ..Default::default()
+                        },
+                    },
+                    bulk: None,
+                },
+                &mut state,
+                &mut encoded,
+                &sender,
+            )
+            .await
+            .unwrap();
+            let reply = codec::decode_message_frame(&encoded).unwrap();
+            let Some(FsResponseData::Handle(handle)) = reply.payload::<FsResponse>().unwrap().data
+            else {
+                panic!("missing file handle");
+            };
+            let read = fs::handle_fs_request(
+                2,
+                PROTOCOL_VERSION,
+                FsRequest {
+                    op: FsOp::Read {
+                        handle,
+                        offset: 0,
+                        len: None,
+                    },
+                    bulk: None,
+                },
+                &mut state,
+                &mut Vec::new(),
+                &sender,
+            )
+            .await
+            .unwrap();
+            let mut activity = ActivityTracker::new();
+            let mut saw_data = false;
+            loop {
+                let envelope = time::timeout(Duration::from_secs(5), output.recv())
+                    .await
+                    .unwrap()
+                    .unwrap();
+                let SessionOutput::Raw(raw) = envelope.output else {
+                    panic!("expected filesystem output");
+                };
+                let message = codec::decode_message_frame(&raw.frame).unwrap();
+                saw_data |= message.t == MessageType::FsData;
+                apply_raw_activity(raw.activity, &mut activity);
+                if message.t == MessageType::FsResponse {
+                    break;
+                }
+            }
+            assert!(saw_data);
+            assert_eq!(activity.activity_seq == 0, maintenance);
+            drop(read);
         }
     }
 

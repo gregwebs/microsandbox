@@ -678,7 +678,9 @@ async fn read_proc(
             },
         },
     };
-    let msg = Message::with_payload(MessageType::FsRequest, open_id, &open_req).map_err(io_err)?;
+    let mut msg =
+        Message::with_payload(MessageType::FsRequest, open_id, &open_req).map_err(io_err)?;
+    msg.maintenance = true;
     write_message(write_half, &msg)
         .await
         .map_err(protocol_err)?;
@@ -710,7 +712,9 @@ async fn read_proc(
             len: None,
         },
     };
-    let msg = Message::with_payload(MessageType::FsRequest, read_id, &read_req).map_err(io_err)?;
+    let mut msg =
+        Message::with_payload(MessageType::FsRequest, read_id, &read_req).map_err(io_err)?;
+    msg.maintenance = true;
     write_message(write_half, &msg)
         .await
         .map_err(protocol_err)?;
@@ -744,7 +748,8 @@ async fn read_proc(
         bulk: None,
         op: FsOp::CloseHandle { handle },
     };
-    if let Ok(msg) = Message::with_payload(MessageType::FsRequest, close_id, &close_req) {
+    if let Ok(mut msg) = Message::with_payload(MessageType::FsRequest, close_id, &close_req) {
+        msg.maintenance = true;
         let _ = write_message(write_half, &msg).await;
         loop {
             match read_message(read_half).await {
