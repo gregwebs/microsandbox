@@ -284,7 +284,7 @@ cargo clippy --no-default-features --features net,ssh,keyring -p microsandbox-cl
 cargo check  --no-default-features --features local,net       -p microsandbox            --lib --profile test --target x86_64-pc-windows-gnu
 cargo check  --no-default-features --features net,runner      -p microsandbox-runtime    --lib --profile test --target x86_64-pc-windows-gnu
 cargo check                                                   -p microsandbox-network    --lib --profile test --target x86_64-pc-windows-gnu
-cargo check                                                   -p microsandbox-filesystem --lib --profile test --target x86_64-pc-windows-gnu
+cargo check  --no-default-features                            -p microsandbox-filesystem --lib --profile test --target x86_64-pc-windows-gnu
 ```
 
 The CLI steps mirror CI's `check` plus `clippy --all-targets -- -D warnings`. The
