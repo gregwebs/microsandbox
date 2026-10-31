@@ -24,7 +24,7 @@ cd "$(dirname "${BASH_SOURCE[0]}")/.."
 # because it runs as its own process.
 readonly RUST_TARGET=x86_64-pc-windows-gnu
 readonly CLI_PACKAGE=microsandbox-cli
-readonly CLI_FEATURES=net,ssh
+readonly CLI_FEATURES=net,ssh,keyring
 
 case "$(uname -s)" in
 Darwin | Linux) ;;
