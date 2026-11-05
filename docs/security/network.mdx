@@ -136,7 +136,11 @@ It does not cut an already-admitted TCP connection. That connection keeps the po
 
 A `CONNECT` tunnel opened through an already-admitted proxy connection is not revoked either. The strict `CONNECT` check only refuses a target the current policy allows by hostname alone, because a tunnel cannot be inspected; it does not authorize the target. The tunnel is authorized by the outer connection, so a tunnel to a revoked host keeps working until that connection closes.
 
-A replacement cannot relax the platform floor of a `multi-tenant` deployment, so traffic the floor refused stays refused. It is also not persisted: restart, restore, and fork begin again from the launch policy. Treat a replacement as a lease the launcher owns and re-sends, not as a change to the sandbox's configuration.
+Two things sit outside a replacement, and they decide how to treat the call.
+
+The platform floor is not part of the tenant policy. A `multi-tenant` deployment applies it from the host runtime, so a replacement cannot grant access it withholds: a destination the floor blocks, such as the host gateway or a private range, stays blocked even when the replacement allows everything. See [Deployment profiles](/networking/overview#deployment-profiles).
+
+The replacement is not persisted. A sandbox keeps the policy it was created with, so restart, restore, and fork all start again from that policy at revision `1`. A launcher that needs a replaced policy to survive one of those starts must send it again; a replacement lasts only as long as the sandbox that accepted it.
 
 See [Replacing a running sandbox's policy](/networking/overview#live-policy-replacement) for the API and per-reader details.
 
