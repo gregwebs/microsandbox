@@ -61,7 +61,7 @@ Ruby exposes network disablement, host/port allowlists, proxies, and basic TLS i
 
 ## Deployment profiles
 
-Local sandboxes use `single-tenant` by default. Use `multi-tenant` for shared hosts: it enforces public-network access, DNS rebinding protection, and stricter limits. Sandbox policies can restrict access further. Cloud chooses its own profile.
+Local sandboxes use `single-tenant` by default. Use `multi-tenant` for shared hosts: the host then applies a fixed *platform floor* to every sandbox on the machine — public destinations and DNS are allowed, private ranges and the host gateway are not, and egress is denied by default. The floor sits beside each sandbox's own policy instead of inside it, so a sandbox policy can restrict access further but can never relax it, and the host configuration is authoritative on create and restart. `multi-tenant` also forces DNS rebinding protection and stricter connection limits. Cloud chooses its own profile.
 
 <CodeGroup>
 ```typescript TypeScript

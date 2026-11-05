@@ -138,7 +138,7 @@ A `CONNECT` tunnel opened through an already-admitted proxy connection is not re
 
 Two things sit outside a replacement, and they decide how to treat the call.
 
-The platform floor is not part of the tenant policy. A `multi-tenant` deployment applies it from the host runtime, so a replacement cannot grant access it withholds: a destination the floor blocks, such as the host gateway or a private range, stays blocked even when the replacement allows everything. See [Deployment profiles](/networking/overview#deployment-profiles).
+The platform floor is the policy a `multi-tenant` host applies to every sandbox on the machine: public destinations and DNS are allowed, private ranges and the host gateway are not, and egress is denied by default. It is fixed for the sandbox's lifetime, evaluated beside the sandbox policy rather than inside it, and no control request can reach it. So a replacement cannot grant access the floor withholds, even when the replacement allows everything. See [Deployment profiles](/networking/overview#deployment-profiles).
 
 The replacement is not persisted. A sandbox keeps the policy it was created with, so restart, restore, and fork all start again from that policy at revision `1`. A launcher that needs a replaced policy to survive one of those starts must send it again; a replacement lasts only as long as the sandbox that accepted it.
 
