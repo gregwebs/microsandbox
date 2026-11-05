@@ -45,6 +45,28 @@ fn message_at(generation: u8, name: &str, payload: &impl serde::Serialize) -> Me
     CborEnvelopeCodec.decode(frame).unwrap()
 }
 
+fn hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+/// The tenant policy pinned by the protocol crate's network-policy golden bytes.
+fn probe_policy() -> microsandbox_types::NetworkPolicy {
+    microsandbox_types::NetworkPolicy {
+        default_egress: microsandbox_types::Action::Deny,
+        default_ingress: microsandbox_types::Action::Allow,
+        rules: vec![microsandbox_types::Rule {
+            direction: microsandbox_types::Direction::Egress,
+            destination: microsandbox_types::Destination::Domain("probe.example".into()),
+            protocols: vec![microsandbox_types::Protocol::Tcp],
+            ports: vec![microsandbox_types::PortRange {
+                start: 443,
+                end: 443,
+            }],
+            action: microsandbox_types::Action::Allow,
+        }],
+    }
+}
+
 fn memory() -> MemoryState {
     MemoryState {
         boot_mib: 512,
@@ -541,4 +563,51 @@ fn partial_secret_progress_is_preserved_and_inconsistent_or_duplicate_records_re
         request.decode(malformed),
         Err(ControlClientError::InvalidResponse { .. })
     ));
+}
+
+#[test]
+fn network_policy_replace_pins_its_payload_and_requires_a_new_revision() {
+    let replace = ReplaceNetworkPolicy(NetworkPolicyReplace {
+        policy: probe_policy(),
+    });
+    let encoded = replace.message().unwrap();
+    assert_eq!(encoded.message_type, "control.network-policy.replace");
+    assert_eq!(replace.min_generation(), 2);
+    // Byte-identical to the protocol crate's pinned request payload.
+    assert_eq!(
+        hex(&encoded.payload),
+        "a166706f6c696379a36e64656661756c745f6567726573736464656e796f64656661756c745f696e677265737365616c6c6f776572756c657381a569646972656374696f6e666567726573736b64657374696e6174696f6ea166646f6d61696e6d70726f62652e6578616d706c656970726f746f636f6c73816374637065706f72747381a26573746172741901bb63656e641901bb66616374696f6e65616c6c6f77"
+    );
+
+    let result = NetworkPolicyResult { revision: 2 };
+    assert_eq!(
+        replace
+            .decode(message_at(2, "control.network-policy.result", &result))
+            .unwrap(),
+        result
+    );
+    // A replacement can never report the launch revision.
+    for revision in [0, 1] {
+        assert!(matches!(
+            replace.decode(message_at(
+                2,
+                "control.network-policy.result",
+                &NetworkPolicyResult { revision }
+            )),
+            Err(ControlClientError::InvalidResponse { .. })
+        ));
+    }
+    // The reply is defined by generation two only.
+    assert!(matches!(
+        replace.decode(message_at(1, "control.network-policy.result", &result)),
+        Err(ControlClientError::InvalidResponse { .. })
+    ));
+
+    let refusal = ControlError::rejected("invalid_network_policy", "safe diagnostic");
+    match replace.decode(message_at(2, "control.error", &refusal)) {
+        Err(ControlClientError::Peer { error, .. }) => {
+            assert_eq!(error.code, "invalid_network_policy")
+        }
+        other => panic!("wrong failure: {other:?}"),
+    }
 }

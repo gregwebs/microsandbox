@@ -31,13 +31,14 @@ use crate::engine::dns::{
 use crate::engine::tls::{proxy::TlsProxy, state::TlsState};
 use crate::extensions::NetworkExtensions;
 use crate::icmp::relay::IcmpRelay;
+use crate::policy::handle::NetworkPolicyHandle;
 use crate::policy::{EgressEvaluation, HostnameSource, NetworkPolicy, Protocol};
 use crate::ports::PortPublisher;
 use crate::ports::publisher::PortCommand;
 use crate::proxy::{OutboundRouting, ResolvedOutboundProxy};
 use crate::secrets::handle::SecretsHandle;
 use crate::tcp::{
-    connection::{TcpAcceptMode, TcpConnectionTracker},
+    connection::{FlowPolicy, TcpAcceptMode, TcpConnectionTracker},
     deny as tcp_deny,
     pending::PendingConnect,
     proxy::TcpProxy,
@@ -231,9 +232,11 @@ pub struct PollLoopHost {
 /// * `shared` - Stack-wide shared state: `tx_ring` / `rx_ring` for the virtio-net boundary
 ///   and the wake eventfds.
 /// * `config` - Resolved per-sandbox parameters (gateway / guest MAC + IPv4 + IPv6, MTU).
-/// * `network_policy` - User-provided egress policy. Evaluated against the sandbox's
+/// * `network_policy` - Tenant egress/ingress policy handle. The poll loop reads it per guest
+///   frame, so a replacement applies to the next frame. Evaluated against the sandbox's
 ///   gateway IPs (stored on [`SharedState`]) so `DestinationGroup::Host` rules match.
-/// * `platform_policy` - Optional host-owned policy floor. Traffic must pass both policies.
+/// * `platform_policy` - Optional host-owned policy floor, a fixed copy for the sandbox's
+///   lifetime. Traffic must pass both policies, and no handle can reach the floor.
 /// * `dns_config` - DNS interception settings (block lists, upstreams, timeout).
 /// * `tls_state` - Optional TLS MITM state; drives interception of intercepted ports and DoT
 ///   when present.
@@ -252,7 +255,7 @@ pub struct PollLoopHost {
 pub fn smoltcp_poll_loop(
     shared: Arc<SharedState>,
     config: PollLoopConfig,
-    network_policy: NetworkPolicy,
+    network_policy: NetworkPolicyHandle,
     platform_policy: Option<NetworkPolicy>,
     dns_config: DnsConfig,
     tls_state: Option<Arc<TlsState>>,
@@ -296,7 +299,8 @@ pub fn smoltcp_poll_loop(
     // Gateway IPs must be on SharedState before any egress evaluation runs,
     // so `DestinationGroup::Host` rules can resolve to the right address.
     shared.set_gateway_ips(config.gateway.ipv4, config.gateway.ipv6);
-    let network_policy = Arc::new(network_policy);
+    // Tenant decisions read the handle per frame; the platform floor stays a fixed copy (R4).
+    let mut tenant_policy = network_policy.cursor();
     let platform_policy = platform_policy.map(Arc::new);
 
     let (mut dns_interceptor, dns_forwarder_handle) = DnsInterceptor::new(
@@ -376,23 +380,16 @@ pub fn smoltcp_poll_loop(
 
         // ── Phase 1: Drain all guest frames with pre-inspection ──────────
         while let Some(frame) = device.stage_next_frame() {
-            if handle_gateway_icmp_echo(
-                frame,
-                &config,
-                &shared,
-                &network_policy,
-                platform_policy.as_deref(),
-            ) {
+            // One atomic load per frame; the snapshot is re-read only after a replace.
+            let tenant = tenant_policy.current();
+            if handle_gateway_icmp_echo(frame, &config, &shared, tenant, platform_policy.as_deref())
+            {
                 device.drop_staged_frame();
                 continue;
             }
 
-            if icmp_relay.relay_outbound_if_echo(
-                frame,
-                &config,
-                &network_policy,
-                platform_policy.as_deref(),
-            ) {
+            if icmp_relay.relay_outbound_if_echo(frame, &config, tenant, platform_policy.as_deref())
+            {
                 device.drop_staged_frame();
                 continue;
             }
@@ -400,80 +397,17 @@ pub fn smoltcp_poll_loop(
             match classify_frame(frame) {
                 FrameAction::TcpSyn { src, dst } => {
                     let dns_port_type = DnsPortType::from_tcp(dst.port());
-                    let accept_mode = match dns_port_type {
-                        // Plain DNS: the interceptor enforces policy at
-                        // the application layer (block list + rebind
-                        // protection); bypass the network egress check.
-                        DnsPortType::Dns => TcpAcceptMode::AcceptImmediately,
-                        // DoT: intercept only when TLS MITM is
-                        // configured. Without it, the block list can't
-                        // apply (traffic is encrypted end-to-end), so
-                        // we refuse to force a fall-back to plain
-                        // TCP/53. When TLS MITM is configured, bypass
-                        // egress policy the same way plain DNS does —
-                        // policy for the upstream resolver is applied
-                        // per query by the forwarder.
-                        DnsPortType::EncryptedDns => {
-                            if tls_state.is_some() {
-                                TcpAcceptMode::AcceptImmediately
-                            } else {
-                                tracing::debug!(%dst, "DoT port refused (TLS interception not configured); stub should fall back to TCP/53");
-                                TcpAcceptMode::Reject
-                            }
-                        }
-                        // Alternative DNS protocol we can't proxy:
-                        // refuse outright — no socket means smoltcp
-                        // emits RST, which the guest's stub treats as
-                        // "upstream unavailable" and falls back to
-                        // plain TCP/53.
-                        DnsPortType::AlternativeDns => {
-                            tracing::debug!(%dst, "alternative-DNS TCP port refused; stub should fall back to TCP/53");
-                            TcpAcceptMode::Reject
-                        }
-                        // Other: regular outbound — defer Domain rules to first-flight;
-                        // accept unless an IP-layer rule denies.
-                        DnsPortType::Other => {
-                            let platform_allows = platform_policy.as_deref().is_none_or(|policy| {
-                                policy
-                                    .evaluate_egress(dst, Protocol::Tcp, &shared)
-                                    .is_allow()
-                            });
-                            let evaluation = network_policy.evaluate_egress_with_source(
-                                dst,
-                                Protocol::Tcp,
-                                &shared,
-                                HostnameSource::Deferred,
-                            );
-
-                            match (platform_allows, evaluation) {
-                                (false, _) => TcpAcceptMode::Reject,
-                                (true, EgressEvaluation::Allow) => TcpAcceptMode::WaitForUpstream,
-                                // Hostname rules need guest bytes before they
-                                // can authorize a host connection.
-                                (true, EgressEvaluation::DeferUntilHostname) => {
-                                    TcpAcceptMode::AcceptImmediately
-                                }
-                                // Only default denies may receive an HTTP
-                                // response; explicit denies remain resets.
-                                (true, EgressEvaluation::Deny)
-                                    if shared.http_deny_response_enabled()
-                                        && tcp_deny::answers_denied_http(
-                                            dst.port(),
-                                            tls_state.as_deref(),
-                                        )
-                                        && network_policy.egress_denied_by_default(
-                                            dst,
-                                            Protocol::Tcp,
-                                            &shared,
-                                            HostnameSource::Deferred,
-                                        ) =>
-                                {
-                                    TcpAcceptMode::RespondWithDenial
-                                }
-                                (true, EgressEvaluation::Deny) => TcpAcceptMode::Reject,
-                            }
-                        }
-                    };
+                    // A SYN is rare compared with a packet, so admission loads the handle
+                    // directly instead of using the cursor. Whichever snapshot is evaluated is
+                    // the one the flow keeps, so the two can never disagree.
+                    let (accept_mode, policy_admission) = classify_syn(
+                        network_policy.load(),
+                        platform_policy.as_deref(),
+                        dns_port_type,
+                        dst,
+                        &shared,
+                        tls_state.as_deref(),
+                    );
                     // A reset can return a passive socket to Listen. Retire it
                     // before another SYN can reuse its previous host connection,
                     // including when both packets arrive in the same batch.
@@ -502,6 +436,7 @@ pub fn smoltcp_poll_loop(
                             dst,
                             &mut sockets,
                             accept_mode,
+                            policy_admission,
                             outbound_route,
                         );
                     }
@@ -517,7 +452,7 @@ pub fn smoltcp_poll_loop(
                         src,
                         dst,
                         &config,
-                        &network_policy,
+                        tenant,
                         platform_policy.as_deref(),
                         &shared,
                         &mut port_publisher,
@@ -536,7 +471,7 @@ pub fn smoltcp_poll_loop(
                             now,
                             &mut sockets,
                             &config,
-                            &network_policy,
+                            tenant,
                             platform_policy.as_deref(),
                             &shared,
                             &mut port_publisher,
@@ -557,7 +492,7 @@ pub fn smoltcp_poll_loop(
                             now,
                             &mut sockets,
                             &config,
-                            &network_policy,
+                            tenant,
                             platform_policy.as_deref(),
                             &shared,
                             &mut port_publisher,
@@ -622,7 +557,7 @@ pub fn smoltcp_poll_loop(
         // Detect newly-established connections and spawn proxy tasks.
         let new_conns = conn_tracker.take_new_connections(&mut sockets);
         for conn in new_conns {
-            if conn.policy_denied {
+            if matches!(conn.policy, FlowPolicy::Denied) {
                 // Accepted only to answer 403; never dials upstream.
                 tcp_deny::spawn_deny_responder(
                     &tokio_handle,
@@ -722,6 +657,8 @@ pub fn smoltcp_poll_loop(
                 conn.to_smoltcp,
                 shared.clone(),
                 network_policy.clone(),
+                // The SYN's admission travels with the flow; it is never recomputed here.
+                conn.policy,
                 // Load the current snapshot per connection so live secret
                 // updates apply to traffic the guest starts afterwards.
                 secrets.load(),
@@ -948,6 +885,93 @@ fn handle_reassembled_udp_datagram(
         udp_relay,
     );
     device.drop_staged_frame();
+}
+
+/// Classify one guest TCP SYN into the socket mode and the admission the flow carries.
+///
+/// The pair is decided once, against the snapshot the caller loaded from the live handle, and it
+/// is never recomputed: an admitted flow keeps that snapshot, a hostname-deferred flow keeps none
+/// and decides again when the guest's first bytes arrive, a port-owned flow is the engine's own
+/// DNS proxy, and a denied flow carries nothing that could admit it.
+fn classify_syn(
+    policy: Arc<NetworkPolicy>,
+    platform_policy: Option<&NetworkPolicy>,
+    port_type: DnsPortType,
+    dst: SocketAddr,
+    shared: &SharedState,
+    tls_state: Option<&TlsState>,
+) -> (TcpAcceptMode, FlowPolicy) {
+    match port_type {
+        // Plain DNS: the interceptor enforces policy at the application
+        // layer (block list + rebind protection); bypass the network egress
+        // check.
+        DnsPortType::Dns => (TcpAcceptMode::AcceptImmediately, FlowPolicy::PortProxy),
+        // DoT: intercept only when TLS MITM is configured. Without it, the
+        // block list can't apply (traffic is encrypted end-to-end), so we
+        // refuse to force a fall-back to plain TCP/53. When TLS MITM is
+        // configured, bypass egress policy the same way plain DNS does —
+        // policy for the upstream resolver is applied per query by the
+        // forwarder.
+        DnsPortType::EncryptedDns => {
+            if tls_state.is_some() {
+                (TcpAcceptMode::AcceptImmediately, FlowPolicy::PortProxy)
+            } else {
+                tracing::debug!(%dst, "DoT port refused (TLS interception not configured); stub should fall back to TCP/53");
+                (TcpAcceptMode::Reject, FlowPolicy::Denied)
+            }
+        }
+        // Alternative DNS protocol we can't proxy: refuse outright — no
+        // socket means smoltcp emits RST, which the guest's stub treats as
+        // "upstream unavailable" and falls back to plain TCP/53.
+        DnsPortType::AlternativeDns => {
+            tracing::debug!(%dst, "alternative-DNS TCP port refused; stub should fall back to TCP/53");
+            (TcpAcceptMode::Reject, FlowPolicy::Denied)
+        }
+        // Other: regular outbound — defer Domain rules to first-flight;
+        // accept unless an IP-layer rule denies.
+        DnsPortType::Other => {
+            let platform_allows = platform_policy.is_none_or(|policy| {
+                policy
+                    .evaluate_egress(dst, Protocol::Tcp, shared)
+                    .is_allow()
+            });
+            let evaluation = policy.evaluate_egress_with_source(
+                dst,
+                Protocol::Tcp,
+                shared,
+                HostnameSource::Deferred,
+            );
+
+            match (platform_allows, evaluation) {
+                (false, _) => (TcpAcceptMode::Reject, FlowPolicy::Denied),
+                (true, EgressEvaluation::Allow) => {
+                    (TcpAcceptMode::WaitForUpstream, FlowPolicy::Admitted(policy))
+                }
+                // Hostname rules need guest bytes before they can authorize a
+                // host connection, so the policy that will decide is not
+                // settled yet: the flow must not keep this snapshot.
+                (true, EgressEvaluation::DeferUntilHostname) => (
+                    TcpAcceptMode::AcceptImmediately,
+                    FlowPolicy::PendingHostname,
+                ),
+                // Only default denies may receive an HTTP response; explicit
+                // denies remain resets.
+                (true, EgressEvaluation::Deny)
+                    if shared.http_deny_response_enabled()
+                        && tcp_deny::answers_denied_http(dst.port(), tls_state)
+                        && policy.egress_denied_by_default(
+                            dst,
+                            Protocol::Tcp,
+                            shared,
+                            HostnameSource::Deferred,
+                        ) =>
+                {
+                    (TcpAcceptMode::RespondWithDenial, FlowPolicy::Denied)
+                }
+                (true, EgressEvaluation::Deny) => (TcpAcceptMode::Reject, FlowPolicy::Denied),
+            }
+        }
+    }
 }
 
 /// Select the egress route frozen for one eligible guest TCP flow.
@@ -1909,6 +1933,140 @@ mod tests {
         assert!(tls_destination(nonstandard, Some(&state)));
     }
 
+    /// The SYN classification is the only place a flow receives its admission, so every arm is
+    /// pinned here. The proxy-level tests build [`FlowPolicy`] by hand and cannot see a wrong
+    /// classification upstream: a derived flow that kept the SYN snapshot would make its hostname
+    /// decision against a policy a replacement already displaced, and an admitted flow that kept
+    /// none would decide a second time.
+    #[test]
+    fn syn_classification_pins_every_admission_arm() {
+        use microsandbox_types::HttpConfig;
+
+        // Building the intercepted-port TLS state below needs a crypto provider.
+        let _ = rustls::crypto::ring::default_provider().install_default();
+
+        let shared = SharedState::new(4);
+        let policy = Arc::new(NetworkPolicy::allow_all());
+        let other: SocketAddr = "203.0.113.9:443".parse().unwrap();
+
+        // Plain DNS and intercepted DoT belong to the engine's own proxy: no egress decision and
+        // no hostname decision of their own, so they are neither `PendingHostname` nor admitted.
+        let (mode, admission) = classify_syn(
+            Arc::clone(&policy),
+            None,
+            DnsPortType::Dns,
+            "203.0.113.9:53".parse().unwrap(),
+            &shared,
+            None,
+        );
+        assert!(matches!(mode, TcpAcceptMode::AcceptImmediately));
+        assert!(matches!(admission, FlowPolicy::PortProxy));
+
+        let tls = tls_state_with_intercepted_ports(vec![853]);
+        let (mode, admission) = classify_syn(
+            Arc::clone(&policy),
+            None,
+            DnsPortType::EncryptedDns,
+            "203.0.113.9:853".parse().unwrap(),
+            &shared,
+            Some(tls.as_ref()),
+        );
+        assert!(matches!(mode, TcpAcceptMode::AcceptImmediately));
+        assert!(matches!(admission, FlowPolicy::PortProxy));
+
+        // DoT without TLS interception and an alternative DNS protocol are refused outright, so
+        // the guest's stub falls back to plain TCP/53.
+        for port_type in [DnsPortType::EncryptedDns, DnsPortType::AlternativeDns] {
+            let (mode, admission) = classify_syn(
+                Arc::clone(&policy),
+                None,
+                port_type,
+                "203.0.113.9:853".parse().unwrap(),
+                &shared,
+                None,
+            );
+            assert!(matches!(mode, TcpAcceptMode::Reject));
+            assert!(matches!(admission, FlowPolicy::Denied));
+        }
+
+        // A platform-floor denial never carries an admissible policy, whatever the tenant says.
+        let floor = NetworkPolicy::none();
+        let (mode, admission) = classify_syn(
+            Arc::clone(&policy),
+            Some(&floor),
+            DnsPortType::Other,
+            other,
+            &shared,
+            None,
+        );
+        assert!(matches!(mode, TcpAcceptMode::Reject));
+        assert!(matches!(admission, FlowPolicy::Denied));
+
+        // An allow is admitted at the SYN and carries the very snapshot that was evaluated.
+        let (mode, admission) = classify_syn(
+            Arc::clone(&policy),
+            None,
+            DnsPortType::Other,
+            other,
+            &shared,
+            None,
+        );
+        assert!(matches!(mode, TcpAcceptMode::WaitForUpstream));
+        match admission {
+            FlowPolicy::Admitted(snapshot) => assert!(
+                Arc::ptr_eq(&snapshot, &policy),
+                "an admitted flow must keep the evaluated snapshot, not a copy"
+            ),
+            _ => panic!("an allowed SYN must be admitted"),
+        }
+
+        // A deferred hostname decision is *not* settled at the SYN: keeping the snapshot here
+        // would make a revoke that lands before the guest's first bytes invisible.
+        let deferred = Arc::new(
+            NetworkPolicy::allow_all()
+                .deny_domain("blocked.example")
+                .expect("domain"),
+        );
+        let (mode, admission) =
+            classify_syn(deferred, None, DnsPortType::Other, other, &shared, None);
+        assert!(matches!(mode, TcpAcceptMode::AcceptImmediately));
+        assert!(matches!(admission, FlowPolicy::PendingHostname));
+
+        // A default deny is a reset unless the guest can be answered with a readable denial.
+        let deny = Arc::new(NetworkPolicy::none());
+        let http: SocketAddr = "203.0.113.9:80".parse().unwrap();
+        let (mode, admission) = classify_syn(
+            Arc::clone(&deny),
+            None,
+            DnsPortType::Other,
+            http,
+            &shared,
+            None,
+        );
+        assert!(matches!(mode, TcpAcceptMode::Reject));
+        assert!(matches!(admission, FlowPolicy::Denied));
+
+        shared.set_http_config(HttpConfig::default());
+        let (mode, admission) = classify_syn(deny, None, DnsPortType::Other, http, &shared, None);
+        assert!(matches!(mode, TcpAcceptMode::RespondWithDenial));
+        assert!(matches!(admission, FlowPolicy::Denied));
+
+        // An explicit deny is always a reset, even with denial responses on for that port: only a
+        // flow that fell through to `default_egress` gets the readable 403. The proxy tests build
+        // `FlowPolicy` by hand, so this arm is invisible to them.
+        let explicit = Arc::new(
+            NetworkPolicy::builder()
+                .default_allow()
+                .egress(|rules| rules.tcp().port(80).deny().any())
+                .build()
+                .expect("explicit deny rule"),
+        );
+        let (mode, admission) =
+            classify_syn(explicit, None, DnsPortType::Other, http, &shared, None);
+        assert!(matches!(mode, TcpAcceptMode::Reject));
+        assert!(matches!(admission, FlowPolicy::Denied));
+    }
+
     /// Build a disposable TLS state whose only persistent CA files live in an
     /// exclusive temporary directory; the real MSB_HOME is never touched.
     fn tls_state_with_intercepted_ports(ports: Vec<u16>) -> Arc<TlsState> {
@@ -1972,6 +2130,7 @@ mod tests {
             dst,
             &mut network.sockets,
             TcpAcceptMode::WaitForUpstream,
+            FlowPolicy::Admitted(Arc::new(NetworkPolicy::allow_all())),
             Some(Arc::clone(&selected)),
         ));
         for _ in 0..16 {
@@ -1995,6 +2154,7 @@ mod tests {
             dst,
             &mut network.sockets,
             TcpAcceptMode::WaitForUpstream,
+            FlowPolicy::Admitted(Arc::new(NetworkPolicy::allow_all())),
             None,
         ));
         for _ in 0..16 {
@@ -2249,7 +2409,7 @@ mod tests {
             smoltcp_poll_loop(
                 loop_shared,
                 leak_poll_config(),
-                NetworkPolicy::allow_all(),
+                NetworkPolicyHandle::new(NetworkPolicy::allow_all()),
                 None,
                 DnsConfig::default(),
                 None,
@@ -2399,7 +2559,7 @@ mod tests {
             smoltcp_poll_loop(
                 loop_shared,
                 leak_poll_config(),
-                NetworkPolicy::allow_all(),
+                NetworkPolicyHandle::new(NetworkPolicy::allow_all()),
                 None,
                 DnsConfig::default(),
                 None,
@@ -2569,7 +2729,13 @@ mod tests {
         // 1) Guest SYN — tracker creates the listening socket first (as the
         //    real poll loop does), then smoltcp completes the handshake.
         assert!(
-            tracker.create_tcp_socket(src, dst, sockets, TcpAcceptMode::AcceptImmediately),
+            tracker.create_tcp_socket(
+                src,
+                dst,
+                sockets,
+                TcpAcceptMode::AcceptImmediately,
+                FlowPolicy::PendingHostname,
+            ),
             "socket creation should succeed under the limit"
         );
         ingress(
@@ -2921,7 +3087,13 @@ mod tests {
         let src = SocketAddr::new(Ipv4Addr::from(GUEST_IP).into(), 40001);
         let dst = SocketAddr::new(Ipv4Addr::from(SERVER_IP).into(), 443);
         assert!(
-            !tracker.create_tcp_socket(src, dst, &mut sockets, TcpAcceptMode::AcceptImmediately),
+            !tracker.create_tcp_socket(
+                src,
+                dst,
+                &mut sockets,
+                TcpAcceptMode::AcceptImmediately,
+                FlowPolicy::PendingHostname,
+            ),
             "the pending reset still owns its socket budget"
         );
         loop {
@@ -2939,7 +3111,8 @@ mod tests {
             src,
             dst,
             &mut sockets,
-            TcpAcceptMode::AcceptImmediately
+            TcpAcceptMode::AcceptImmediately,
+            FlowPolicy::PendingHostname,
         ));
         assert!(!tracker.has_socket_for(
             &SocketAddr::new(Ipv4Addr::from(GUEST_IP).into(), 40000),
@@ -2970,7 +3143,8 @@ mod tests {
             src,
             dst,
             &mut sockets,
-            TcpAcceptMode::AcceptImmediately
+            TcpAcceptMode::AcceptImmediately,
+            FlowPolicy::PendingHostname,
         ));
         ingress(
             build_tcp_frame(40000, 443, TcpControl::Syn, 1000, None, &[]),
@@ -2997,7 +3171,8 @@ mod tests {
             next_src,
             dst,
             &mut sockets,
-            TcpAcceptMode::AcceptImmediately
+            TcpAcceptMode::AcceptImmediately,
+            FlowPolicy::PendingHostname,
         ));
         assert!(!tracker.has_socket_for(&src, &dst));
     }
@@ -3070,7 +3245,8 @@ mod tests {
             src,
             dst,
             &mut sockets,
-            TcpAcceptMode::AcceptImmediately
+            TcpAcceptMode::AcceptImmediately,
+            FlowPolicy::PendingHostname,
         ));
         assert_eq!(only_tcp_state(&sockets), Some(tcp::State::TimeWait));
     }
@@ -3105,7 +3281,13 @@ mod tests {
         // sees egress as unreachable.
         let src = SocketAddr::new(Ipv4Addr::from(GUEST_IP).into(), 40004);
         assert!(
-            !tracker.create_tcp_socket(src, dst, &mut sockets, TcpAcceptMode::AcceptImmediately),
+            !tracker.create_tcp_socket(
+                src,
+                dst,
+                &mut sockets,
+                TcpAcceptMode::AcceptImmediately,
+                FlowPolicy::PendingHostname,
+            ),
             "creation at the limit must be refused",
         );
     }
@@ -3159,6 +3341,302 @@ mod tests {
             new_conns.len(),
             1,
             "a connection that reached CLOSE_WAIT still needs a proxy task",
+        );
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // Live tenant-policy reads.
+    //
+    // The poll loop reads one shared policy handle per guest frame, so a
+    // replacement applies to the next frame. UDP datagrams and ICMP echoes
+    // stay per-packet decisions (D2), and the platform floor is a fixed copy
+    // no handle can reach (R4).
+    // ─────────────────────────────────────────────────────────────────────
+
+    /// Build a guest UDP datagram to the gateway with a payload and correct checksums.
+    fn build_udp_datagram(source_port: u16, dst_port: u16, payload: &[u8]) -> Vec<u8> {
+        use smoltcp::wire::{IpProtocol, Ipv4Repr, UdpRepr};
+
+        let src_addr = Ipv4Addr::from(GUEST_IP);
+        let dst_addr = Ipv4Addr::from(GATEWAY_IP);
+        let udp_repr = UdpRepr {
+            src_port: source_port,
+            dst_port,
+        };
+        let ipv4_repr = Ipv4Repr {
+            src_addr,
+            dst_addr,
+            next_header: IpProtocol::Udp,
+            payload_len: udp_repr.header_len() + payload.len(),
+            hop_limit: 64,
+        };
+        let mut frame = vec![0u8; 14 + ipv4_repr.buffer_len() + ipv4_repr.payload_len];
+
+        EthernetRepr {
+            src_addr: EthernetAddress(GUEST_MAC),
+            dst_addr: EthernetAddress(GATEWAY_MAC),
+            ethertype: EthernetProtocol::Ipv4,
+        }
+        .emit(&mut EthernetFrame::new_unchecked(&mut frame));
+
+        let ip_end = 14 + ipv4_repr.buffer_len();
+        ipv4_repr.emit(
+            &mut Ipv4Packet::new_unchecked(&mut frame[14..ip_end]),
+            &ChecksumCapabilities::default(),
+        );
+        udp_repr.emit(
+            &mut UdpPacket::new_unchecked(&mut frame[ip_end..]),
+            &IpAddress::Ipv4(src_addr),
+            &IpAddress::Ipv4(dst_addr),
+            payload.len(),
+            |buf| buf.copy_from_slice(payload),
+            &ChecksumCapabilities::default(),
+        );
+
+        frame
+    }
+
+    /// A replace applies to the next UDP datagram, in both directions: a revoke is not delayed
+    /// past the next packet, and a grant applies without a restart.
+    ///
+    /// Runs in a child process because the poll loop has no shutdown API.
+    #[test]
+    fn udp_datagrams_follow_the_live_tenant_policy() {
+        const CHILD_ENV: &str = "MSB_TEST_UDP_POLICY_SWAP_CHILD";
+        if std::env::var_os(CHILD_ENV).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "engine::netstack::poll::tests::udp_datagrams_follow_the_live_tenant_policy",
+                    "--nocapture",
+                ])
+                .env(CHILD_ENV, "1")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "policy-swap child failed:\n{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr),
+            );
+            return;
+        }
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            tokio::time::timeout(
+                std::time::Duration::from_secs(30),
+                check_udp_policy_swap(None, true),
+            )
+            .await
+            .expect("UDP policy swap timed out");
+        });
+    }
+
+    /// The tenant can be replaced by `allow_all` and the platform floor still refuses host traffic
+    /// (AC4 at the engine seam).
+    #[test]
+    fn udp_datagrams_still_respect_the_platform_floor() {
+        const CHILD_ENV: &str = "MSB_TEST_UDP_FLOOR_CHILD";
+        if std::env::var_os(CHILD_ENV).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "engine::netstack::poll::tests::udp_datagrams_still_respect_the_platform_floor",
+                    "--nocapture",
+                ])
+                .env(CHILD_ENV, "1")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "platform-floor child failed:\n{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr),
+            );
+            return;
+        }
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let floor = NetworkPolicy::from_profiles([crate::policy::NetworkProfile::Public]);
+            tokio::time::timeout(
+                std::time::Duration::from_secs(30),
+                check_udp_policy_swap(Some(floor), false),
+            )
+            .await
+            .expect("UDP platform floor timed out");
+        });
+    }
+
+    /// Guest UDP to the gateway, with a host socket standing in for the destination.
+    ///
+    /// `expect_swap` drives a grant/revoke pair on the tenant handle and asserts each datagram is
+    /// evaluated against the policy current when it arrives. With a platform floor the tenant is
+    /// replaced by `allow_all` and every datagram must still be refused.
+    async fn check_udp_policy_swap(platform_policy: Option<NetworkPolicy>, expect_swap: bool) {
+        use std::time::Duration;
+        use tokio::net::UdpSocket;
+
+        let host = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let host_port = host.local_addr().unwrap().port();
+        let shared = Arc::new(SharedState::new(256));
+        let policy = NetworkPolicyHandle::new(NetworkPolicy::none());
+        let loop_shared = shared.clone();
+        let loop_policy = policy.clone();
+        let runtime_handle = tokio::runtime::Handle::current();
+        std::thread::spawn(move || {
+            smoltcp_poll_loop(
+                loop_shared,
+                leak_poll_config(),
+                loop_policy,
+                platform_policy,
+                DnsConfig::default(),
+                None,
+                vec![],
+                false,
+                None,
+                None,
+                TcpAcceptQueueSize::DEFAULT,
+                None,
+                runtime_handle,
+                SecretsHandle::new(Default::default()),
+                Arc::new(OutboundRouting::default()),
+                PollLoopHost::default(),
+            );
+        });
+
+        let send_datagram = |source_port: u16, payload: &'static [u8]| {
+            shared
+                .tx_ring
+                .push(build_udp_datagram(source_port, host_port, payload))
+                .unwrap();
+            shared.tx_wake.wake();
+        };
+        async fn receive(host: &UdpSocket) -> std::io::Result<Vec<u8>> {
+            let mut buf = [0u8; 64];
+            host.recv_from(&mut buf)
+                .await
+                .map(|(n, _)| buf[..n].to_vec())
+        }
+
+        // Deny-all tenant: the datagram never reaches the host socket.
+        send_datagram(40000, b"denied");
+        assert!(
+            tokio::time::timeout(Duration::from_millis(300), receive(&host))
+                .await
+                .is_err(),
+            "deny-all policy must not relay the datagram"
+        );
+
+        if expect_swap {
+            // Grant: the next datagram is relayed without restarting anything.
+            assert_eq!(policy.replace(NetworkPolicy::allow_all()), Ok(2));
+            send_datagram(40001, b"granted");
+            let received = tokio::time::timeout(Duration::from_secs(5), receive(&host))
+                .await
+                .expect("a granted policy must relay the next datagram")
+                .unwrap();
+            assert_eq!(received, b"granted");
+
+            // Revoke: the next datagram is refused again, per packet (D2).
+            assert_eq!(policy.replace(NetworkPolicy::none()), Ok(3));
+            send_datagram(40002, b"revoked");
+            assert!(
+                tokio::time::timeout(Duration::from_millis(300), receive(&host))
+                    .await
+                    .is_err(),
+                "a revoked policy must refuse the next datagram"
+            );
+        } else {
+            // Tenant allow_all, platform floor still applies to host traffic.
+            assert_eq!(policy.replace(NetworkPolicy::allow_all()), Ok(2));
+            send_datagram(40003, b"floored");
+            assert!(
+                tokio::time::timeout(Duration::from_millis(300), receive(&host))
+                    .await
+                    .is_err(),
+                "the platform floor must still refuse host traffic after a tenant replace"
+            );
+        }
+    }
+
+    /// The gateway echo path is fed from the same cursor as the rest of the frame, so a replace
+    /// applies to the next echo request, and the platform floor is still independent of it.
+    #[test]
+    fn gateway_icmp_echo_follows_the_live_tenant_policy() {
+        let shared = SharedState::new(4);
+        let gateway = Ipv4Addr::new(100, 96, 0, 1);
+        let guest = Ipv4Addr::new(100, 96, 0, 2);
+        shared.set_gateway_ips(Some(gateway), None);
+        let config = PollLoopConfig {
+            gateway_mac: GATEWAY_MAC,
+            guest_mac: GUEST_MAC,
+            gateway: GatewayIps {
+                ipv4: Some(gateway),
+                ipv6: None,
+            },
+            guest_ipv4: Some(guest),
+            guest_ipv6: None,
+            mtu: 1500,
+        };
+        let echo = |ident: u16| {
+            build_icmpv4_echo_frame(
+                GUEST_MAC,
+                GATEWAY_MAC,
+                guest.octets(),
+                gateway.octets(),
+                ident,
+                1,
+                b"ping",
+            )
+        };
+
+        let policy = NetworkPolicyHandle::new(NetworkPolicy::none());
+        let mut cursor = policy.cursor();
+        assert!(handle_gateway_icmp_echo(
+            &echo(1),
+            &config,
+            &shared,
+            cursor.current(),
+            None,
+        ));
+        assert!(
+            shared.rx_ring.pop().is_none(),
+            "a denying policy must not answer the echo"
+        );
+
+        assert_eq!(policy.replace(NetworkPolicy::allow_all()), Ok(2));
+        assert!(handle_gateway_icmp_echo(
+            &echo(2),
+            &config,
+            &shared,
+            cursor.current(),
+            None,
+        ));
+        assert!(
+            shared.rx_ring.pop().is_some(),
+            "the cursor must observe the replacement on the next frame"
+        );
+
+        // The floor is not reachable through the handle: a tenant allow never relaxes it.
+        let floor = NetworkPolicy::from_profiles([crate::policy::NetworkProfile::Public]);
+        assert!(handle_gateway_icmp_echo(
+            &echo(3),
+            &config,
+            &shared,
+            cursor.current(),
+            Some(&floor),
+        ));
+        assert!(
+            shared.rx_ring.pop().is_none(),
+            "the platform floor must still refuse the gateway echo"
         );
     }
 }

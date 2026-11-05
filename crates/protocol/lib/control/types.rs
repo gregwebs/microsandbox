@@ -70,6 +70,9 @@ pub struct RuntimeCapabilities {
     /// Live disk-only capture is available.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub disk_checkpoint_create: bool,
+    /// The running tenant network policy can be replaced.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub network_policy_update: bool,
 }
 
 /// Purpose of a full checkpoint capture.
@@ -229,6 +232,20 @@ pub struct DiskCompact {
     /// Resolve without applying the plan.
     #[serde(default)]
     pub dry_run: bool,
+}
+
+/// Replace the running sandbox's whole tenant network policy.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NetworkPolicyReplace {
+    /// Complete replacement; the runtime accepts it only if it would decode at boot.
+    pub policy: microsandbox_types::NetworkPolicy,
+}
+
+/// Tenant policy revision in force after a successful replacement.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NetworkPolicyResult {
+    /// Monotonic per runtime boot; the launch policy is revision 1.
+    pub revision: u64,
 }
 
 /// Accepted and observed memory quantities, all in MiB.

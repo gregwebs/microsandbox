@@ -28,6 +28,7 @@ use crate::netstack::{
     poll::{self, GatewayIps, PollLoopConfig, PollLoopHost},
     shared::{DEFAULT_QUEUE_CAPACITY, SharedState},
 };
+use crate::policy::handle::NetworkPolicyHandle;
 use crate::policy::{NetworkPolicy, NetworkProfile};
 use crate::ports::publisher::PortCommand;
 use crate::proxy::OutboundRouting;
@@ -80,6 +81,10 @@ pub struct SmoltcpNetwork {
 
     // Live-swappable secrets view shared with the poll loop and TLS state.
     secrets: SecretsHandle,
+
+    // Live-swappable tenant policy view shared with the poll loop, proxies, DNS forwarder and
+    // publisher. The platform floor is separate and unreachable from here.
+    network_policy: NetworkPolicyHandle,
 
     // Host-local extension adapters, threaded into the poll loop.
     extensions: NetworkExtensions,
@@ -454,6 +459,7 @@ impl SmoltcpNetwork {
         validate_launch_header_credentials(config, &host.resolved_header_credentials)?;
 
         let secrets = SecretsHandle::new(config.secrets.clone());
+        let network_policy = NetworkPolicyHandle::new(config.policy.clone());
         let tls_state = if config.tls.enabled {
             Some(Arc::new(
                 TlsState::new(
@@ -486,6 +492,7 @@ impl SmoltcpNetwork {
             port_cmd_rx: Some(port_cmd_rx),
             tls_state,
             secrets,
+            network_policy,
             outbound_routing,
         })
     }
@@ -540,7 +547,7 @@ impl SmoltcpNetwork {
             mtu: self.mtu as usize,
         };
         let config = self.config.config();
-        let network_policy = config.policy.clone();
+        let network_policy = self.network_policy.clone();
         let platform_policy = self.platform_policy.clone();
         let dns_config = config.dns.clone();
         let tls_state = self.tls_state.clone();
@@ -743,6 +750,13 @@ impl SmoltcpNetwork {
     /// updates without restarting the sandbox.
     pub fn secrets_handle(&self) -> SecretsHandle {
         self.secrets.clone()
+    }
+
+    /// Live-swappable view of the tenant network policy. The runtime control
+    /// socket uses it to replace the whole policy without restarting the
+    /// sandbox; the optional platform floor is not reachable through it.
+    pub fn network_policy_handle(&self) -> NetworkPolicyHandle {
+        self.network_policy.clone()
     }
 }
 

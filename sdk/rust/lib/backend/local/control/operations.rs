@@ -5,6 +5,8 @@ use std::sync::Arc;
 use microsandbox_control_client::{
     CompactDisks, CreateCheckpoint, CreateDiskCheckpoint, GetCpuState, GetMemoryState,
 };
+#[cfg(feature = "net")]
+use microsandbox_control_client::{NetworkPolicyReplace, ReplaceNetworkPolicy};
 
 use crate::backend::LocalBackend;
 use crate::error::{Operation, UnsupportedReason};
@@ -123,6 +125,32 @@ impl LocalBackend {
 }
 
 impl ControlSession {
+    /// Capability-gated tenant policy replacement; returns the runtime's new policy revision.
+    ///
+    /// The only caller is the networked `Sandbox::update_network_policy`.
+    #[cfg(feature = "net")]
+    pub(crate) async fn replace_network_policy(
+        &self,
+        policy: microsandbox_types::NetworkPolicy,
+    ) -> MicrosandboxResult<u64> {
+        if !self.capabilities().network_policy_update {
+            return Err(MicrosandboxError::unsupported(
+                Operation::SandboxUpdateNetworkPolicy,
+                UnsupportedReason::NotAvailable(
+                    "this running sandbox cannot replace its network policy: its runtime predates \
+                     live policy replacement or networking is disabled"
+                        .into(),
+                ),
+            ));
+        }
+        // The runtime owns the revision; never infer success from a local acknowledgement.
+        let result = self
+            .request(&ReplaceNetworkPolicy(NetworkPolicyReplace { policy }))
+            .await
+            .map_err(MicrosandboxError::ControlClient)?;
+        Ok(result.revision)
+    }
+
     /// Capability-gated disk maintenance over the existing control endpoint.
     pub(crate) async fn compact_disks(
         &self,

@@ -141,6 +141,7 @@ pub(crate) fn capabilities(value: &JsonValue) -> Option<RuntimeCapabilities> {
         secrets_update: value.get("secrets_update")?.as_bool()?,
         checkpoint_create: optional("checkpoint_create")?,
         disk_checkpoint_create: optional("disk_checkpoint_create")?,
+        network_policy_update: optional("network_policy_update")?,
     })
 }
 

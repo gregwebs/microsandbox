@@ -1,7 +1,7 @@
 ---
 title: "Changes in this fork"
 sidebarTitle: "This fork"
-description: "Fork-only features: rotating file secrets, header credentials, request interception, opt-in ambient proxy discovery, and auto-published listeners."
+description: "Fork-only features: rotating file secrets, header credentials, request interception, opt-in ambient proxy discovery, auto-published listeners, and live network policy replacement."
 icon: "code-fork"
 ---
 
@@ -142,3 +142,37 @@ after detach. With `panic = "abort"`, no policy can intercept the process exit. 
 filter set, attach behaves exactly as before.
 
 See [`AttachOptionsBuilder::stdin_filter()`](/sdk/rust/execution#attach_options-stdin_filter).
+
+## Live network policy replacement
+
+A running local sandbox's policy can be replaced over the live control endpoint, with no restart
+and no lost work. `Sandbox::update_network_policy` returns the new policy revision; the launch
+policy is revision `1`. Decisions made after the call returns — DNS queries, new flows, and new
+connections — see the new revision, while a TCP connection that was already admitted keeps the
+policy it was admitted under, including its per-request plain-HTTP secret authority checks. A
+`CONNECT` tunnel through such a connection keeps working too: the strict `CONNECT` check only
+applies the opaque-hostname restriction and never re-authorizes the tunnel's target, so a
+replacement does not close a tunnel. UDP
+datagrams and ICMP echoes are evaluated per packet, so a revoke reaches the next datagram and does
+not cut an established UDP session. The `multi-tenant` platform floor is a separate fixed policy
+and cannot be relaxed this way, and the replacement is not persisted: restart, restore, and fork
+start again from the launch policy at revision `1`.
+
+```rust
+use microsandbox::NetworkPolicy;
+
+let policy = NetworkPolicy::builder()
+    .default_deny()
+    .egress(|e| e.tcp().port(443).allow_domains(["api.example.com"]))
+    .egress(|e| e.udp().tcp().port(53).allow_host())
+    .build()?;
+
+let revision = sb.update_network_policy(policy).await?;
+```
+
+The runtime advertises `network_policy_update` in capability discovery, and the SDK refuses
+before sending when it is absent, returning `Unsupported` instead of reporting a fault so a
+launcher can offer a next-launch grant. This is the Rust SDK only: there is no `msb` command and
+no Python, Node, Go, or Ruby method.
+
+See [Replacing a running sandbox's policy](/networking/overview#live-policy-replacement).

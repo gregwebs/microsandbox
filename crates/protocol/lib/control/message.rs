@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 
 use super::{
     BranchCreate, CheckpointCreate, ControlRequest, CpuTarget, DiskCheckpointCreate, DiskCompact,
-    Empty, MemoryTarget, Pause, RootDiskGrow, SecretsResult, SecretsUpdate,
+    Empty, MemoryTarget, NetworkPolicyReplace, Pause, RootDiskGrow, SecretsResult, SecretsUpdate,
 };
 use crate::wire::{Envelope, WireError, decode_value, validate_record};
 
@@ -31,6 +31,8 @@ pub const CONTROL_GENERATION_TWO_MESSAGES: &[&str] = &[
     "control.root-disk.state",
     "control.disk.compact",
     "control.disk.compact.result",
+    "control.network-policy.replace",
+    "control.network-policy.result",
 ];
 
 //--------------------------------------------------------------------------------------------------
@@ -109,6 +111,8 @@ pub enum ControlOperation {
     RootDiskGrow(RootDiskGrow),
     /// Compact selected owned disk chains.
     DiskCompact(DiskCompact),
+    /// Replace the running tenant network policy.
+    NetworkPolicyReplace(NetworkPolicyReplace),
 }
 
 //--------------------------------------------------------------------------------------------------
@@ -180,6 +184,16 @@ impl ControlOperation {
                 }
                 Self::DiskCompact(value.deserialized().map_err(|_| WireError::InvalidRecord)?)
             }
+            "control.network-policy.replace" if generation >= 2 => {
+                // The policy and its rules are nested records. Check the layers the policy type
+                // knows about so a duplicate key is reported as the precise `DuplicateKey`.
+                // Unknown field values stay opaque.
+                let value = decode_value(&envelope.p)?;
+                validate_policy_records(&value)?;
+                Self::NetworkPolicyReplace(
+                    value.deserialized().map_err(|_| WireError::InvalidRecord)?,
+                )
+            }
             _ => Self::GenerationOne(ControlRequest::from_envelope(envelope)?),
         };
         Ok(operation)
@@ -208,6 +222,50 @@ pub fn control_message_min_generation(name: &str) -> Option<u8> {
         | "control.error" => 1,
         _ => return None,
     })
+}
+
+/// Validate the record layers of a replacement, leaving unknown values opaque.
+///
+/// The duplicate is rejected either way: serde's derive refuses a repeated struct field or a
+/// repeated multi-key enum key, so no collapsed policy can reach the engine. Checking the known
+/// layers here buys the precise `DuplicateKey` error instead of the generic `InvalidRecord` serde
+/// would produce, and stops the walk at the layers the type knows about: an unknown future field
+/// may legally carry a map with non-text keys, which [`validate_record`] would refuse.
+fn validate_policy_records(value: &Value) -> Result<(), WireError> {
+    validate_record(value)?;
+    let Value::Map(fields) = value else {
+        unreachable!()
+    };
+    let Some((_, policy)) = fields
+        .iter()
+        .find(|(key, _)| key.as_text() == Some("policy"))
+    else {
+        return Ok(());
+    };
+    validate_record(policy)?;
+    let Value::Map(policy_fields) = policy else {
+        unreachable!()
+    };
+    let Some((_, Value::Array(rules))) = policy_fields
+        .iter()
+        .find(|(key, _)| key.as_text() == Some("rules"))
+    else {
+        return Ok(());
+    };
+    for rule in rules {
+        validate_record(rule)?;
+        let Value::Map(rule_fields) = rule else {
+            unreachable!()
+        };
+        if let Some((_, destination)) = rule_fields
+            .iter()
+            .find(|(key, _)| key.as_text() == Some("destination"))
+            && matches!(destination, Value::Map(_))
+        {
+            validate_record(destination)?;
+        }
+    }
+    Ok(())
 }
 
 impl ControlRequest {

@@ -28,6 +28,7 @@ use super::proxies::udp::UdpProxy;
 use crate::config::DnsConfig;
 use crate::netstack::{poll::GatewayIps, shared::SharedState};
 use crate::policy::NetworkPolicy;
+use crate::policy::handle::NetworkPolicyHandle;
 
 //--------------------------------------------------------------------------------------------------
 // Constants
@@ -95,7 +96,7 @@ impl DnsInterceptor {
         shared: Arc<SharedState>,
         tokio_handle: &tokio::runtime::Handle,
         gateway_ips: Arc<HashSet<IpAddr>>,
-        network_policy: Arc<NetworkPolicy>,
+        network_policy: NetworkPolicyHandle,
         platform_policy: Option<Arc<NetworkPolicy>>,
         gateway: GatewayIps,
         gateway_mac: [u8; 6],

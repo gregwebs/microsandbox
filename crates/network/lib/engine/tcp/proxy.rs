@@ -16,9 +16,9 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::sync::mpsc;
 
-use super::connection::ProxyConnectState;
 #[cfg(test)]
 use super::connection::ProxyConnectStatus;
+use super::connection::{FlowPolicy, ProxyConnectState};
 use super::upstream::UpstreamTcpTarget;
 use crate::engine::http_deny::classify_http_request;
 use crate::engine::secrets::config::SecretsConfigExt;
@@ -27,6 +27,7 @@ use crate::engine::tls::sni;
 use crate::engine::tls::state::TlsState;
 use crate::extensions::NetworkExtensions;
 use crate::netstack::shared::SharedState;
+use crate::policy::handle::NetworkPolicyHandle;
 use crate::policy::{EgressEvaluation, HostnameSource, NetworkPolicy, Protocol};
 use crate::proxy::ResolvedOutboundProxy;
 use crate::secrets::config::{SecretViolationAction, SecretsConfig};
@@ -85,7 +86,11 @@ pub(crate) struct TcpProxy {
     from_smoltcp: mpsc::Receiver<Bytes>,
     to_smoltcp: mpsc::Sender<Bytes>,
     shared: Arc<SharedState>,
-    network_policy: Arc<NetworkPolicy>,
+    /// Live tenant policy. Only a pending hostname decision loads it; an admitted flow keeps the
+    /// snapshot it was admitted under.
+    policy_handle: NetworkPolicyHandle,
+    /// Egress authorization decided at the guest SYN and handed over by the tracker.
+    policy_admission: FlowPolicy,
     secrets: Arc<SecretsConfig>,
     tls_state: Option<Arc<TlsState>>,
     strict: bool,
@@ -155,7 +160,8 @@ impl TcpProxy {
         from_smoltcp: mpsc::Receiver<Bytes>,
         to_smoltcp: mpsc::Sender<Bytes>,
         shared: Arc<SharedState>,
-        network_policy: Arc<NetworkPolicy>,
+        policy_handle: NetworkPolicyHandle,
+        policy_admission: FlowPolicy,
         secrets: Arc<SecretsConfig>,
         tls_state: Option<Arc<TlsState>>,
         strict: bool,
@@ -170,7 +176,8 @@ impl TcpProxy {
             from_smoltcp,
             to_smoltcp,
             shared,
-            network_policy,
+            policy_handle,
+            policy_admission,
             secrets,
             tls_state,
             strict,
@@ -204,7 +211,8 @@ impl TcpProxy {
             mut from_smoltcp,
             to_smoltcp,
             shared,
-            network_policy,
+            policy_handle,
+            policy_admission,
             secrets,
             tls_state,
             strict,
@@ -213,20 +221,52 @@ impl TcpProxy {
             outbound_proxy,
         } = self;
 
-        // Mirror the SYN-time policy walk so only flows that actually reached a
-        // hostname rule wait for client bytes. A domain rule elsewhere in the
-        // policy must not stall unrelated or server-first traffic.
-        let hostname_policy_deferred = match network_policy.evaluate_egress_with_source(
-            guest_dst,
-            Protocol::Tcp,
-            &shared,
-            HostnameSource::Deferred,
-        ) {
-            EgressEvaluation::Allow => false,
-            EgressEvaluation::DeferUntilHostname => true,
-            // Preserve the existing fail-closed path if a DNS-cache binding
-            // expires between the SYN evaluation and proxy startup.
-            EgressEvaluation::Deny => network_policy.has_domain_rules(),
+        // Admission was decided at the SYN and travels with the connection. Never recompute it
+        // from the live policy: a replace that removes every domain rule must not erase a
+        // pending hostname check. `FlowPolicy::Denied` never reaches this task; the dispatcher
+        // answers it and continues.
+        let admitted: Option<Arc<NetworkPolicy>> = match policy_admission {
+            FlowPolicy::PendingHostname => None,
+            FlowPolicy::Admitted(snapshot) => Some(snapshot),
+            // Neither state is ever dispatched to this task: the poll loop answers `Denied`
+            // itself and hands port-owned flows to their own proxy. If one still arrives, close
+            // the flow as a policy denial instead of falling into the pending path, which would
+            // decide again against the live policy and could admit a flow the SYN refused. This
+            // path is deliberately behaviour, not a debug assertion: a release build must fail
+            // closed too.
+            FlowPolicy::Denied | FlowPolicy::PortProxy => {
+                proxy_connect.mark_policy_denied();
+                shared.proxy_wake.wake();
+                return Ok(());
+            }
+        };
+
+        // Whether the hostname walk still has to run before the upstream dial.
+        let hostname_policy_deferred = match &admitted {
+            // A pending decision always happens; it is the admission.
+            None => true,
+            // Mirror the SYN-time policy walk against the snapshot the flow was authorized under,
+            // so only flows that actually reached a hostname rule wait for client bytes. A domain
+            // rule elsewhere in the policy must not stall unrelated or server-first traffic. This
+            // re-walk reads the mutable DNS cache, not the policy: the snapshot is the one the SYN
+            // authorized and no replacement can change it, but a binding that appeared or expired
+            // since the SYN changes whether the flow still reaches a domain rule at all.
+            Some(snapshot) => {
+                match snapshot.evaluate_egress_with_source(
+                    guest_dst,
+                    Protocol::Tcp,
+                    &shared,
+                    HostnameSource::Deferred,
+                ) {
+                    EgressEvaluation::Allow => false,
+                    EgressEvaluation::DeferUntilHostname => true,
+                    // DNS-state driven, not a policy re-decision: no snapshot changed, but the
+                    // binding that tied this destination to a domain name expired or never
+                    // existed, so the flow can no longer be authorized without a hostname. Walk
+                    // the hostname path and fail closed there, exactly as a pending flow would.
+                    EgressEvaluation::Deny => snapshot.has_domain_rules(),
+                }
+            }
         };
 
         // Pre-connect peek is only for domain policy: the hostname has to be known
@@ -241,7 +281,15 @@ impl TcpProxy {
             (Vec::new(), None)
         };
 
-        // Re-evaluate egress against the *guest* dst — the address the
+        // The snapshot this flow is admitted under. An admitted flow keeps the one the SYN
+        // authorized; a pending flow takes the policy current *now*, after the peek, so a replace
+        // that landed while the guest's first bytes were in flight still applies to it.
+        let network_policy = match admitted {
+            Some(snapshot) => snapshot,
+            None => policy_handle.load(),
+        };
+
+        // Evaluate egress against the *guest* dst — the address the
         // guest dialed, not the post-rewrite host-side address. SNI
         // refines over-allow when the cache matched a shared CDN IP;
         // CacheOnly is the non-TLS fallback path so Domain rules still
@@ -339,7 +387,7 @@ impl TcpProxy {
                 from_smoltcp,
                 to_smoltcp,
                 shared,
-                network_policy,
+                policy_handle,
                 tls_state,
                 strict,
                 proxy_connect,
@@ -416,7 +464,7 @@ impl TcpProxy {
                 from_smoltcp,
                 to_smoltcp,
                 shared,
-                network_policy,
+                policy_handle,
                 tls_state,
                 strict,
                 proxy_connect,
@@ -515,7 +563,7 @@ impl TcpProxy {
                                     from_smoltcp,
                                     to_smoltcp,
                                     shared,
-                                    network_policy,
+                                    policy_handle,
                                     tls_state,
                                     strict,
                                     proxy_connect,
@@ -611,6 +659,9 @@ impl TcpProxy {
 /// `guest_dst` is what the guest dialed — the address policy rules match
 /// against. `connect_dst` is the host-side address tokio actually dials.
 ///
+/// `network_policy` fixes both the policy and the flow's admission for the life of this standalone
+/// helper: it is wrapped into a handle with no writer and admitted outright.
+///
 /// `proxy_connect` is updated before the task exits so the connection
 /// tracker can decide between FIN (clean close) and RST (upstream
 /// connect failure).
@@ -636,7 +687,8 @@ pub fn spawn_tcp_proxy(
         from_smoltcp,
         to_smoltcp,
         shared,
-        network_policy,
+        NetworkPolicyHandle::new(NetworkPolicy::clone(&network_policy)),
+        FlowPolicy::Admitted(network_policy),
         secrets,
         tls_state,
         strict,
@@ -676,6 +728,9 @@ fn strict_hostname_allow_is_opaque(
 ///
 /// `guest_dst` is what the guest dialed; `proxy_target` contains the rewritten
 /// loopback address the gateway actually connects to and its optional fallback.
+/// `policy_handle` is the live tenant policy, loaded at the CONNECT request for the strict
+/// hostname restriction. The tunnel is not admitted here: it is authorized by the outer
+/// connection's admission, and a replacement never revokes it.
 #[allow(clippy::too_many_arguments)]
 async fn handle_connect_tunnel(
     guest_dst: SocketAddr,
@@ -684,7 +739,7 @@ async fn handle_connect_tunnel(
     mut from_smoltcp: mpsc::Receiver<Bytes>,
     to_smoltcp: mpsc::Sender<Bytes>,
     shared: Arc<SharedState>,
-    network_policy: Arc<NetworkPolicy>,
+    policy_handle: NetworkPolicyHandle,
     tls_state: Arc<TlsState>,
     strict: bool,
     proxy_connect: Arc<ProxyConnectState>,
@@ -718,6 +773,13 @@ async fn handle_connect_tunnel(
 
     if !connect_req.target.is_intercepted(&tls_state) {
         let tunnel_dst = connect_req.target.guest_dst(guest_dst, &shared);
+        // This is the strict-mode opaque-hostname restriction, not this tunnel's admission: a
+        // target allowed only by a hostname rule cannot be inspected in a tunnel, so it is
+        // refused. It is evaluated against the policy current at this CONNECT request (a
+        // replacement decides whether the restriction applies), but the inner target is
+        // authorized only by the outer connection's admission, so a replacement never revokes
+        // an already-open tunnel.
+        let network_policy = policy_handle.load();
         if strict
             && let Some(expected_sni) = connect_req.target.expected_sni.as_deref()
             && network_policy.allows_egress_via_hostname(
@@ -808,7 +870,7 @@ async fn handle_connect_tunnel(
         to_smoltcp,
         shared,
         tls_state,
-        network_policy,
+        policy_handle,
         strict,
         proxy_connect,
         extensions,
@@ -1512,7 +1574,7 @@ mod tests {
             from_rx,
             to_tx,
             Arc::new(SharedState::new(4)),
-            Arc::new(NetworkPolicy::default()),
+            NetworkPolicyHandle::new(NetworkPolicy::default()),
             tls_state,
             false,
             proxy_connect.clone(),
@@ -1735,7 +1797,8 @@ mod tests {
                 from_rx,
                 to_tx,
                 shared,
-                policy,
+                NetworkPolicyHandle::new(NetworkPolicy::clone(&policy)),
+                FlowPolicy::Admitted(policy),
                 Arc::new(SecretsConfig::default()),
                 None,
                 false,
@@ -2404,7 +2467,8 @@ mod tests {
             from_rx,
             to_tx,
             shared,
-            policy,
+            NetworkPolicyHandle::new(NetworkPolicy::clone(&policy)),
+            FlowPolicy::Admitted(policy),
             secrets,
             None,
             false,
@@ -2494,6 +2558,332 @@ mod tests {
         assert_eq!(wire, b"GET /one HTTP/1.1\r\nHost: allowed.example\r\n\r\n");
     }
 
+    //----------------------------------------------------------------------------------------------
+    // Live tenant-policy reads and SYN admission
+    //----------------------------------------------------------------------------------------------
+
+    /// Build a proxy whose admission is supplied explicitly, so a test can model the three states
+    /// the tracker hands over. The guest channel stays open, so the proxy decides on its own
+    /// whether to dial, peek or refuse.
+    #[allow(clippy::too_many_arguments)]
+    async fn run_proxy_with_admission(
+        request: &'static [u8],
+        shared: Arc<SharedState>,
+        policy_handle: NetworkPolicyHandle,
+        admission: FlowPolicy,
+        server_addr: SocketAddr,
+        strict: bool,
+    ) -> Result<(), io::Error> {
+        let (from_tx, from_rx) = mpsc::channel::<Bytes>(8);
+        let (to_tx, _to_rx) = mpsc::channel::<Bytes>(8);
+        from_tx.send(Bytes::from_static(request)).await.unwrap();
+        drop(from_tx);
+
+        let proxy = TcpProxy::new(
+            None,
+            server_addr,
+            UpstreamTcpTarget::direct(server_addr),
+            from_rx,
+            to_tx,
+            shared,
+            policy_handle,
+            admission,
+            Arc::new(SecretsConfig::default()),
+            None,
+            strict,
+            Arc::new(ProxyConnectState::new()),
+            NetworkExtensions::default(),
+            None,
+        );
+        tokio::time::timeout(Duration::from_secs(5), proxy.try_run())
+            .await
+            .expect("proxy did not finish")
+    }
+
+    /// An admitted flow keeps the snapshot it was admitted under: a later replace to deny-all must
+    /// not stop a connection that is already running (AC2 at the engine seam).
+    #[tokio::test]
+    async fn admitted_flow_keeps_its_snapshot_after_a_replace() {
+        let (addr, sink) = spawn_sink().await;
+        let shared = Arc::new(shared_with("allowed.example", "127.0.0.1"));
+        let admitted = Arc::new(NetworkPolicy::allow_all());
+        let policy_handle = NetworkPolicyHandle::new(NetworkPolicy::allow_all());
+        assert_eq!(policy_handle.replace(NetworkPolicy::none()), Ok(2));
+
+        let (from_tx, from_rx) = mpsc::channel::<Bytes>(8);
+        let (to_tx, _to_rx) = mpsc::channel::<Bytes>(8);
+        from_tx
+            .send(Bytes::from_static(
+                b"GET / HTTP/1.1\r\nHost: allowed.example\r\n\r\n",
+            ))
+            .await
+            .unwrap();
+        drop(from_tx);
+        TcpProxy::new(
+            None,
+            addr,
+            UpstreamTcpTarget::direct(addr),
+            from_rx,
+            to_tx,
+            shared,
+            policy_handle,
+            FlowPolicy::Admitted(admitted),
+            Arc::new(SecretsConfig::default()),
+            None,
+            false,
+            Arc::new(ProxyConnectState::new()),
+            NetworkExtensions::default(),
+            None,
+        )
+        .try_run()
+        .await
+        .unwrap();
+
+        assert_eq!(
+            sink.await.unwrap(),
+            b"GET / HTTP/1.1\r\nHost: allowed.example\r\n\r\n",
+            "an admitted flow must keep relaying after a deny-all replace"
+        );
+    }
+
+    /// A pending hostname decision must never be lost. A replace that removes every domain rule
+    /// between the SYN and the proxy's decision still requires the decision, taken against the
+    /// current policy, and it still fails closed instead of dialing.
+    #[tokio::test]
+    async fn pending_hostname_decision_survives_a_rule_removing_replace() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let shared = Arc::new(shared_with("allowed.example", "127.0.0.1"));
+        // The SYN deferred the decision to the hostname, then every rule disappeared.
+        let policy_handle = NetworkPolicyHandle::new(
+            NetworkPolicy::none()
+                .allow_domain("allowed.example")
+                .unwrap(),
+        );
+        assert_eq!(policy_handle.replace(NetworkPolicy::none()), Ok(2));
+
+        let result = run_proxy_with_admission(
+            b"GET / HTTP/1.1\r\nHost: allowed.example\r\n\r\n",
+            shared,
+            policy_handle,
+            FlowPolicy::PendingHostname,
+            addr,
+            false,
+        )
+        .await;
+
+        assert!(result.is_ok());
+        assert!(
+            tokio::time::timeout(Duration::from_millis(300), listener.accept())
+                .await
+                .is_err(),
+            "a pending hostname decision must fail closed, not dial upstream"
+        );
+    }
+
+    /// A pending decision loads the policy *after* the peek, so a replace that lands while the
+    /// guest's first bytes are in flight applies to it.
+    #[tokio::test]
+    async fn pending_hostname_decision_loads_after_the_peek() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let shared = Arc::new(shared_with("allowed.example", "127.0.0.1"));
+        let policy_handle = NetworkPolicyHandle::new(
+            NetworkPolicy::none()
+                .allow_domain("allowed.example")
+                .unwrap(),
+        );
+
+        let (from_tx, from_rx) = mpsc::channel::<Bytes>(8);
+        let (to_tx, _to_rx) = mpsc::channel::<Bytes>(8);
+        let proxy = TcpProxy::new(
+            None,
+            addr,
+            UpstreamTcpTarget::direct(addr),
+            from_rx,
+            to_tx,
+            shared,
+            policy_handle.clone(),
+            FlowPolicy::PendingHostname,
+            Arc::new(SecretsConfig::default()),
+            None,
+            false,
+            Arc::new(ProxyConnectState::new()),
+            NetworkExtensions::default(),
+            None,
+        );
+        let task = tokio::spawn(proxy.try_run());
+
+        // Nothing has been sent yet, so the proxy is blocked inside the peek.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(policy_handle.replace(NetworkPolicy::none()), Ok(2));
+        from_tx
+            .send(Bytes::from_static(
+                b"GET / HTTP/1.1\r\nHost: allowed.example\r\n\r\n",
+            ))
+            .await
+            .unwrap();
+        drop(from_tx);
+
+        tokio::time::timeout(Duration::from_secs(5), task)
+            .await
+            .expect("proxy did not finish")
+            .unwrap()
+            .unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(300), listener.accept())
+                .await
+                .is_err(),
+            "the hostname decision must load the policy after the peek, not at task start"
+        );
+    }
+
+    /// A denied admission that reaches the proxy fails closed. The dispatcher answers a denied
+    /// flow itself, so this state should never arrive; if it does, the proxy must refuse the flow
+    /// as a policy denial instead of falling into the pending path, where a fresh hostname
+    /// decision against an allow-all live policy would dial the very upstream the SYN refused.
+    #[tokio::test]
+    async fn a_denied_admission_that_reaches_the_proxy_fails_closed() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let shared = Arc::new(shared_with("allowed.example", "127.0.0.1"));
+        let (from_tx, from_rx) = mpsc::channel::<Bytes>(8);
+        let (to_tx, _to_rx) = mpsc::channel::<Bytes>(8);
+        from_tx
+            .send(Bytes::from_static(
+                b"GET / HTTP/1.1\r\nHost: allowed.example\r\n\r\n",
+            ))
+            .await
+            .unwrap();
+        drop(from_tx);
+        let proxy_connect = Arc::new(ProxyConnectState::new());
+        let proxy = TcpProxy::new(
+            None,
+            addr,
+            UpstreamTcpTarget::direct(addr),
+            from_rx,
+            to_tx,
+            shared,
+            // Every live decision would allow this flow; the admission still wins.
+            NetworkPolicyHandle::new(NetworkPolicy::allow_all()),
+            FlowPolicy::Denied,
+            Arc::new(SecretsConfig::default()),
+            None,
+            false,
+            Arc::clone(&proxy_connect),
+            NetworkExtensions::default(),
+            None,
+        );
+
+        tokio::time::timeout(Duration::from_secs(5), proxy.try_run())
+            .await
+            .expect("a denied admission must finish instead of peeking")
+            .expect("a denied admission is not an I/O failure");
+
+        assert_eq!(
+            proxy_connect.status(),
+            ProxyConnectStatus::PolicyDenied,
+            "the guest must see a denial, not a silent close"
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_millis(300), listener.accept())
+                .await
+                .is_err(),
+            "a denied admission must never dial upstream"
+        );
+    }
+
+    /// An admitted flow still re-walks its deferred evaluation when the proxy starts. That re-walk
+    /// is DNS-state driven and can never be a policy re-decision: the snapshot is the one the SYN
+    /// authorized, and no replacement changes it. What can change is whether the flow reaches a
+    /// domain rule at all, because the rule matches through the mutable DNS cache. This pins both
+    /// halves — the walk still happens, and it is only the cache that moved.
+    #[tokio::test]
+    async fn admitted_flow_re_walks_the_deferred_decision_against_the_dns_cache() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        // No binding yet: the SYN's deferred walk falls through to the allow default, so the flow
+        // is admitted and carries this snapshot.
+        let shared = Arc::new(SharedState::new(4));
+        let policy = Arc::new(
+            NetworkPolicy::allow_all()
+                .allow_domain("allowed.example")
+                .expect("domain"),
+        );
+        assert!(
+            matches!(
+                policy.evaluate_egress_with_source(
+                    addr,
+                    Protocol::Tcp,
+                    &shared,
+                    HostnameSource::Deferred,
+                ),
+                EgressEvaluation::Allow
+            ),
+            "the SYN is admitted before any DNS evidence exists"
+        );
+
+        // A binding appears between the SYN admission and proxy startup, so the same snapshot now
+        // reaches the domain rule and owes the flow a hostname decision.
+        shared.cache_resolved_hostname(
+            "allowed.example",
+            ResolvedHostnameFamily::Ipv4,
+            [addr.ip()],
+            StdDuration::from_secs(60),
+        );
+        assert!(
+            matches!(
+                policy.evaluate_egress_with_source(
+                    addr,
+                    Protocol::Tcp,
+                    &shared,
+                    HostnameSource::Deferred,
+                ),
+                EgressEvaluation::DeferUntilHostname
+            ),
+            "only the DNS cache moved, not the policy"
+        );
+
+        for (strict, reaches_upstream) in [(true, false), (false, true)] {
+            let (from_tx, from_rx) = mpsc::channel::<Bytes>(8);
+            let (to_tx, _to_rx) = mpsc::channel::<Bytes>(8);
+            // Server-first: the guest never sends the bytes a hostname peek waits for.
+            drop(from_tx);
+            let proxy = TcpProxy::new(
+                None,
+                addr,
+                UpstreamTcpTarget::direct(addr),
+                from_rx,
+                to_tx,
+                Arc::clone(&shared),
+                NetworkPolicyHandle::new(NetworkPolicy::allow_all()),
+                FlowPolicy::Admitted(Arc::clone(&policy)),
+                Arc::new(SecretsConfig::default()),
+                None,
+                strict,
+                Arc::new(ProxyConnectState::new()),
+                NetworkExtensions::default(),
+                None,
+            );
+            let task = tokio::spawn(proxy.try_run());
+            let accepted = tokio::time::timeout(
+                if reaches_upstream {
+                    Duration::from_secs(5)
+                } else {
+                    Duration::from_millis(300)
+                },
+                listener.accept(),
+            )
+            .await
+            .is_ok();
+            task.abort();
+            assert_eq!(
+                accepted, reaches_upstream,
+                "strict={strict}: the hostname re-walk must still run for an admitted flow"
+            );
+        }
+    }
+
     /// Relay `chunks` as separate guest reads through a proxy with one domain
     /// rule and no secrets. The guest side stays open, so the proxy must close
     /// the connection by itself. Returns the bytes upstream received and
@@ -2529,7 +2919,8 @@ mod tests {
             from_rx,
             to_tx,
             shared,
-            policy,
+            NetworkPolicyHandle::new(NetworkPolicy::clone(&policy)),
+            FlowPolicy::Admitted(policy),
             Arc::new(SecretsConfig::default()),
             None,
             false,
@@ -2798,7 +3189,8 @@ mod tests {
             from_rx,
             to_tx,
             shared,
-            policy,
+            NetworkPolicyHandle::new(NetworkPolicy::clone(&policy)),
+            FlowPolicy::Admitted(policy),
             Arc::new(SecretsConfig::default()),
             None,
             true,
@@ -2841,7 +3233,8 @@ mod tests {
             from_rx,
             to_tx,
             shared,
-            policy,
+            NetworkPolicyHandle::new(NetworkPolicy::clone(&policy)),
+            FlowPolicy::Admitted(policy),
             Arc::new(SecretsConfig::default()),
             None,
             true,
@@ -2945,7 +3338,8 @@ mod tests {
             from_rx,
             to_tx,
             Arc::new(SharedState::new(4)),
-            Arc::new(NetworkPolicy::default()),
+            NetworkPolicyHandle::new(NetworkPolicy::default()),
+            FlowPolicy::Admitted(Arc::new(NetworkPolicy::default())),
             Arc::new(secrets),
             None,
             false,
@@ -3020,7 +3414,8 @@ mod tests {
             from_rx,
             to_tx,
             Arc::new(shared),
-            Arc::new(NetworkPolicy::default()),
+            NetworkPolicyHandle::new(NetworkPolicy::default()),
+            FlowPolicy::Admitted(Arc::new(NetworkPolicy::default())),
             Arc::new(secrets),
             None,
             false,
@@ -3126,7 +3521,8 @@ mod tests {
             from_rx,
             to_tx,
             Arc::new(SharedState::new(4)),
-            Arc::new(NetworkPolicy::default()),
+            NetworkPolicyHandle::new(NetworkPolicy::default()),
+            FlowPolicy::Admitted(Arc::new(NetworkPolicy::default())),
             Arc::new(secrets),
             None,
             false,
@@ -3141,5 +3537,223 @@ mod tests {
         let wire = String::from_utf8_lossy(&sink.await.unwrap()).into_owned();
         assert!(wire.contains(&body), "got {} bytes", wire.len());
         assert!(!wire.contains("$MSB_KEY"), "got: {wire:?}");
+    }
+
+    //----------------------------------------------------------------------------------------------
+    // CONNECT tunnels: the outer admission authorizes, the strict check only restricts
+    //----------------------------------------------------------------------------------------------
+
+    /// A TLS state with no intercepted ports, so a CONNECT target takes the plain tunnel path
+    /// instead of the TLS-substitution path.
+    fn non_intercepting_tls_state() -> Arc<TlsState> {
+        // Both rustls providers are enabled in this workspace, so a test that builds a TlsState
+        // has to pick one before rustls resolves it (matching the other direct callers here).
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        Arc::new(
+            TlsState::new(
+                microsandbox_types::TlsConfig::default(),
+                crate::secrets::handle::SecretsHandle::new(SecretsConfig::default()),
+                false,
+            )
+            .unwrap(),
+        )
+    }
+
+    /// The loopback endpoint the gateway dials for a CONNECT test. It accepts one connection,
+    /// records what the gateway sends, and answers `200 Connection Established` when `answer` is
+    /// set. A refused tunnel forwards nothing, so the record ends up empty after the EOF.
+    async fn spawn_connect_endpoint(answer: bool) -> (SocketAddr, JoinHandle<Vec<u8>>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut received = Vec::new();
+            let mut buf = [0u8; 1024];
+            loop {
+                // Generous: a shared machine can stall a loopback dial for seconds.
+                let read = tokio::time::timeout(Duration::from_secs(30), stream.read(&mut buf))
+                    .await
+                    .expect("the gateway neither forwarded nor closed the tunnel")
+                    .unwrap();
+                if read == 0 {
+                    break;
+                }
+                received.extend_from_slice(&buf[..read]);
+                if received.windows(4).any(|window| window == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            if answer {
+                stream
+                    .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+                    .await
+                    .unwrap();
+                stream.flush().await.unwrap();
+            }
+            received
+        });
+        (addr, handle)
+    }
+
+    /// Drive the real `handle_connect_tunnel` for one complete CONNECT request with `strict`
+    /// mode on, and report the connection status plus every byte the guest would receive.
+    async fn run_connect_tunnel(
+        connect_request: &'static [u8],
+        guest_dst: SocketAddr,
+        proxy_addr: SocketAddr,
+        shared: Arc<SharedState>,
+        policy_handle: NetworkPolicyHandle,
+    ) -> (ProxyConnectStatus, Vec<u8>) {
+        let (from_tx, from_rx) = mpsc::channel::<Bytes>(8);
+        let (to_tx, mut to_rx) = mpsc::channel::<Bytes>(8);
+        from_tx
+            .send(Bytes::from_static(connect_request))
+            .await
+            .unwrap();
+        drop(from_tx);
+        let proxy_connect = Arc::new(ProxyConnectState::new());
+
+        tokio::time::timeout(
+            Duration::from_secs(30),
+            handle_connect_tunnel(
+                guest_dst,
+                UpstreamTcpTarget::direct(proxy_addr),
+                connect_request.to_vec(),
+                from_rx,
+                to_tx,
+                shared,
+                policy_handle,
+                non_intercepting_tls_state(),
+                true,
+                Arc::clone(&proxy_connect),
+                NetworkExtensions::default(),
+                None,
+                None,
+            ),
+        )
+        .await
+        .expect("the CONNECT path must finish")
+        .expect("the CONNECT path must not fail");
+
+        let mut guest_bytes = Vec::new();
+        while let Ok(chunk) = to_rx.try_recv() {
+            guest_bytes.extend_from_slice(&chunk);
+        }
+        (proxy_connect.status(), guest_bytes)
+    }
+
+    /// Documented limitation, **not** an endorsement (operator decision of 2026-11-04, option b):
+    /// a CONNECT tunnel is admitted by its outer connection only. The outer flow here was admitted
+    /// under the allowing revision-1 snapshot; the handle is then replaced with
+    /// `NetworkPolicy::none()` before the CONNECT request arrives, and the tunnel is still
+    /// forwarded. This test exists to keep the non-revocation explicit rather than implied.
+    #[tokio::test]
+    async fn connect_tunnel_is_not_revoked_by_a_replace_documented_limitation() {
+        let (proxy_addr, endpoint) = spawn_connect_endpoint(true).await;
+        let shared = Arc::new(shared_with("example.com", "127.0.0.1"));
+        // The outer flow was admitted here, at revision 1. Nothing re-reads that snapshot for the
+        // inner target.
+        let policy_handle = NetworkPolicyHandle::new(NetworkPolicy::allow_all());
+        assert_eq!(policy_handle.replace(NetworkPolicy::none()), Ok(2));
+
+        let (status, guest_bytes) = run_connect_tunnel(
+            b"CONNECT example.com:80 HTTP/1.1\r\nHost: example.com:80\r\n\r\n",
+            proxy_addr,
+            proxy_addr,
+            shared,
+            policy_handle,
+        )
+        .await;
+
+        assert!(
+            !endpoint.await.unwrap().is_empty(),
+            "the tunnel is forwarded, so the proxy endpoint sees a CONNECT request"
+        );
+        assert_eq!(
+            guest_bytes, b"HTTP/1.1 200 Connection Established\r\n\r\n",
+            "documented limitation, not an endorsement: a replacement does not revoke a CONNECT \
+             tunnel, because the strict CONNECT check is not the tunnel's admission"
+        );
+        assert_eq!(status, ProxyConnectStatus::Connected);
+    }
+
+    /// The strict CONNECT check reads the policy current at the CONNECT request, so a replacement
+    /// decides whether the opaque-hostname restriction applies to it. Under a policy that allows
+    /// the target only by hostname, the tunnel is refused; once a replacement removes that rule,
+    /// the same CONNECT shape is forwarded. Without this live read, passing the outer flow's
+    /// snapshot instead of the handle would go unnoticed.
+    #[tokio::test]
+    async fn strict_connect_restriction_reads_the_live_policy() {
+        let request = b"CONNECT example.com:80 HTTP/1.1\r\nHost: example.com:80\r\n\r\n";
+        let shared = Arc::new(shared_with("example.com", "127.0.0.1"));
+        // Allowed only by a hostname rule, which a tunnel cannot be inspected against.
+        let policy_handle = NetworkPolicyHandle::new(NetworkPolicy {
+            default_egress: Action::Deny,
+            default_ingress: Action::Allow,
+            rules: vec![allow_tcp("example.com", 80)],
+        });
+
+        let (proxy_addr, endpoint) = spawn_connect_endpoint(true).await;
+        let (status, guest_bytes) = run_connect_tunnel(
+            request,
+            proxy_addr,
+            proxy_addr,
+            Arc::clone(&shared),
+            policy_handle.clone(),
+        )
+        .await;
+
+        assert_eq!(
+            status,
+            ProxyConnectStatus::PolicyDenied,
+            "a hostname-only allow must refuse an opaque tunnel while that rule is current"
+        );
+        assert!(guest_bytes.is_empty(), "a refused tunnel sends no response");
+        assert!(
+            endpoint.await.unwrap().is_empty(),
+            "a refused tunnel must not forward the CONNECT request"
+        );
+
+        assert_eq!(policy_handle.replace(NetworkPolicy::none()), Ok(2));
+
+        let (proxy_addr, endpoint) = spawn_connect_endpoint(true).await;
+        let (status, guest_bytes) =
+            run_connect_tunnel(request, proxy_addr, proxy_addr, shared, policy_handle).await;
+
+        assert!(
+            !endpoint.await.unwrap().is_empty(),
+            "the restriction no longer applies after the replace, so the tunnel is forwarded"
+        );
+        assert_eq!(
+            guest_bytes, b"HTTP/1.1 200 Connection Established\r\n\r\n",
+            "the strict check read the replaced policy, which no longer allows the target by hostname"
+        );
+        assert_eq!(status, ProxyConnectStatus::Connected);
+    }
+
+    /// An IP-literal target carries no expected SNI, so the strict opaque-hostname restriction
+    /// never applies: the tunnel passes the check as it always has, even against a deny-all
+    /// handle. The check is not an admission decision.
+    #[tokio::test]
+    async fn strict_connect_check_lets_an_ip_literal_target_through() {
+        let (proxy_addr, endpoint) = spawn_connect_endpoint(true).await;
+        let shared = Arc::new(SharedState::new(4));
+        let policy_handle = NetworkPolicyHandle::new(NetworkPolicy::none());
+
+        let (status, guest_bytes) = run_connect_tunnel(
+            b"CONNECT 127.0.0.1:80 HTTP/1.1\r\nHost: 127.0.0.1:80\r\n\r\n",
+            proxy_addr,
+            proxy_addr,
+            shared,
+            policy_handle,
+        )
+        .await;
+
+        assert!(
+            !endpoint.await.unwrap().is_empty(),
+            "an IP-literal target skips the strict hostname check and is forwarded"
+        );
+        assert_eq!(guest_bytes, b"HTTP/1.1 200 Connection Established\r\n\r\n");
+        assert_eq!(status, ProxyConnectStatus::Connected);
     }
 }

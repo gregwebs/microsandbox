@@ -36,7 +36,37 @@ In framed mode, clones reuse one connection. Automatic JSON mode rediscovers bef
 
 `connection.capabilities()` borrows the released generation-1 discovery projection without network I/O, while `connection.runtime_capabilities()` exposes the complete discovered facility set. `GetCapabilities` remains available for a fresh generation-1-compatible observation and `GetRuntimeCapabilities` requests the complete record on generation 2. `closed().await` observes shared closure, including an idle framed disconnect; a successful JSON exchange ending in EOF does not close the session.
 
-Generation 1 remains the released capabilities, memory, CPU, and secrets surface. Generation 2 adds `CreateCheckpoint`, `CreateDiskCheckpoint`, `CreateBranch`, `PauseRuntime`, `ResumeRuntime`, `GetPauseState`, `GrowRootDisk`, and `CompactDisks`. `ControlConnection` talking to a framed generation-1 runtime selects the historical JSON representation for these checked operations before sending anything; it never retries a mutation after a framed failure. The explicit `ControlClient` instead returns a not-sent unsupported-operation error. Linux descriptor-backed branch creation remains an SDK-level JSON/`SCM_RIGHTS` exception because ordinary framed messages cannot transfer file descriptors.
+Generation 1 remains the released capabilities, memory, CPU, and secrets surface. Generation 2 adds `CreateCheckpoint`, `CreateDiskCheckpoint`, `CreateBranch`, `PauseRuntime`, `ResumeRuntime`, `GetPauseState`, `GrowRootDisk`, `CompactDisks`, and `ReplaceNetworkPolicy`. `ControlConnection` talking to a framed generation-1 runtime selects the historical JSON representation for these checked operations before sending anything; it never retries a mutation after a framed failure. The explicit `ControlClient` instead returns a not-sent unsupported-operation error. Linux descriptor-backed branch creation remains an SDK-level JSON/`SCM_RIGHTS` exception because ordinary framed messages cannot transfer file descriptors.
+
+`ReplaceNetworkPolicy` carries the whole tenant policy and returns the runtime's new revision; the launch policy is revision 1, and a reply that reports it is rejected as invalid. Decide whether the peer can serve the operation from `connection.runtime_capabilities().network_policy_update` before sending a replacement.
+
+```rust,no_run
+use microsandbox_control_client::{ControlClient, NetworkPolicyReplace, ReplaceNetworkPolicy};
+use microsandbox_types::{Action, Destination, Direction, NetworkPolicy, Protocol, Rule};
+
+async fn allow_one_hostname(path: &std::path::Path) -> Result<(), Box<dyn std::error::Error>> {
+    let client = ControlClient::connect(path).await?;
+    let revision = client
+        .request_typed(&ReplaceNetworkPolicy(NetworkPolicyReplace {
+            policy: NetworkPolicy {
+                default_egress: Action::Deny,
+                default_ingress: Action::Deny,
+                rules: vec![Rule {
+                    direction: Direction::Egress,
+                    destination: Destination::Domain("probe.example".into()),
+                    protocols: vec![Protocol::Tcp],
+                    ports: Vec::new(),
+                    action: Action::Allow,
+                }],
+            },
+        }))
+        .await?
+        .revision;
+    println!("policy revision {revision}");
+    client.close().await;
+    Ok(())
+}
+```
 
 Enable `uds` for Unix endpoint connections or `named-pipe` for Windows endpoint connections. Caller-owned transports and connectors can be used without either native feature. Endpoint paths are accepted verbatim.
 

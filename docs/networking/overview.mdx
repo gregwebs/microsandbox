@@ -61,7 +61,7 @@ Ruby exposes network disablement, host/port allowlists, proxies, and basic TLS i
 
 ## Deployment profiles
 
-Local sandboxes use `single-tenant` by default. Use `multi-tenant` for shared hosts: it enforces public-network access, DNS rebinding protection, and stricter limits. Sandbox policies can restrict access further. Cloud chooses its own profile.
+Local sandboxes use `single-tenant` by default. Use `multi-tenant` for shared hosts: the host then applies a fixed *platform floor* to every sandbox on the machine — public destinations and DNS are allowed, private ranges and the host gateway are not, and egress is denied by default. The floor sits beside each sandbox's own policy instead of inside it, so a sandbox policy can restrict access further but can never relax it, and the host configuration is authoritative on create and restart. `multi-tenant` also forces DNS rebinding protection and stricter connection limits. Cloud chooses its own profile.
 
 <CodeGroup>
 ```typescript TypeScript
@@ -401,6 +401,57 @@ Domain and domain-suffix rules start with the hostname microsandbox can observe.
 For plaintext HTTP, microsandbox can inspect the `Host` header and require it to match the hostname that policy allowed. For HTTPS without TLS interception, or for a host that is configured to bypass interception, the HTTP `Host` header and HTTP/2 `:authority` value are encrypted. In that case microsandbox cannot prove which application hostname the request is using after the TLS session starts.
 
 Strict hostname policy mode is enabled by default: hostname allowlists fail closed unless microsandbox can inspect the request authority. In strict mode, hostname-based allow rules still work for plaintext HTTP and TLS-intercepted HTTPS. Non-intercepted HTTPS is denied when it would otherwise be allowed only by a hostname rule. IP, CIDR, group, and default allow rules are not treated as hostname-based allows. Set `--net-strict=false` or `network.strict: false` in sandbox configuration to opt out.
+
+</Accordion>
+
+<span id="live-policy-replacement" />
+
+## Replacing a running sandbox's policy
+
+A running local sandbox's policy can be replaced in place, without a restart. The Rust SDK exposes this as [`update_network_policy()`](/sdk/rust/sandbox#sb-update_network_policy); the request travels over the sandbox's existing local control endpoint, and there is no `msb` command for it.
+
+```rust
+use microsandbox::{NetworkPolicy, Sandbox};
+
+let launch = NetworkPolicy::builder().default_deny().build()?;
+
+let sb = Sandbox::builder("egress")
+    .image("python")
+    .network(|n| n.policy(launch))
+    .create()
+    .await?;
+
+let policy = NetworkPolicy::builder()
+    .default_deny()
+    .egress(|e| e.tcp().port(443).allow_domains(["api.github.com"]))
+    .egress(|e| e.udp().tcp().port(53).allow_host())
+    .build()?;
+
+let revision = sb.update_network_policy(policy).await?;
+```
+
+The call returns the revision of the policy now in force. The launch policy is revision `1` and every accepted replacement returns the next number; a rejected document leaves the previous policy and revision untouched. There is no compare-and-swap: the launcher is the only writer.
+
+### What a replacement affects
+
+Each reader takes the policy when it makes its own decision, so the scope of a replacement follows from where those decisions happen:
+
+- **DNS queries** are checked per query, so the next lookup the forwarder answers follows the new policy.
+- **TCP** is checked when a flow is admitted: the SYN for a plain flow, the proxy's hostname decision for a hostname-deferred flow, and the SNI decision for TLS-intercepted traffic. A connection admitted before the replacement keeps running under the policy it was admitted with, and a `CONNECT` tunnel is authorized by that outer connection alone.
+- **UDP datagrams and ICMP echoes** are checked per packet, so a revoke applies from the next datagram and an established UDP session is not cut.
+- **Published ports** are checked per accepted inbound connection and per inbound datagram.
+
+A hostname decision still pending when a replacement removes every domain rule still happens, against the new policy, and still fails closed.
+
+<Accordion title="Limits of a replacement">
+
+An admitted TCP connection is never cut by a replacement, and its per-request plain-HTTP secret authority checks keep the policy it was admitted under. A host that a replacement revokes can therefore still receive an injected secret on a connection admitted before it, until that connection closes.
+
+A `CONNECT` tunnel is not revoked either. The strict `CONNECT` check only refuses a tunnel whose target the policy at that moment allows by hostname alone, because a tunnel cannot be inspected; it never authorizes the tunnel's target. A tunnel is authorized by its outer connection's admission, so a target revoked by a replacement stays reachable through an already-admitted proxy connection, and a new tunnel opened on that connection is not re-authorized.
+
+The platform floor of a `multi-tenant` deployment is not part of the sandbox policy and cannot be relaxed by a replacement: traffic the floor refused, such as the host gateway or private ranges, stays refused after replacing the sandbox policy with `NetworkPolicy::allow_all()`.
+
+The replacement is not persisted. The sandbox record keeps the launch policy, so restart, restore, and fork start again from that policy at revision `1`, and a launcher that needs the replacement to survive has to send it again. Intercepted ports, TLS settings and the bypass list, strict mode, DNS configuration, rebind protection, published ports, the outbound proxy, and rate limits stay fixed at launch; only destination and port policy is replaceable.
 
 </Accordion>
 

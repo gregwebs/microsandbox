@@ -32,5 +32,6 @@ pub use protocol::{ControlClient, ControlProtocol, ControlReady};
 pub use request::{
     CompactDisks, CreateBranch, CreateCheckpoint, CreateDiskCheckpoint, GetCapabilities,
     GetCpuState, GetMemoryState, GetPauseState, GetRuntimeCapabilities, GrowRootDisk, ManageJob,
-    PauseRuntime, ResumeRuntime, SetCpuTarget, SetMemoryTarget, UpdateSecrets,
+    PauseRuntime, ReplaceNetworkPolicy, ResumeRuntime, SetCpuTarget, SetMemoryTarget,
+    UpdateSecrets,
 };

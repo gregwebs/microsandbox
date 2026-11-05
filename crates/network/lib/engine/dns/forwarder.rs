@@ -52,6 +52,7 @@ use crate::netstack::{
     poll::GatewayIps,
     shared::{ResolvedHostnameFamily, SharedState},
 };
+use crate::policy::handle::NetworkPolicyHandle;
 use crate::policy::{Action, DomainName, NetworkPolicy};
 
 //--------------------------------------------------------------------------------------------------
@@ -97,9 +98,9 @@ pub(crate) struct DnsForwarder {
     /// the configured upstream; queries to other IPs go through the
     /// direct path subject to network egress policy.
     gateway_ips: Arc<HashSet<IpAddr>>,
-    /// Network policy. Direct-path queries consult this for outbound
-    /// permission to the chosen `@target` resolver IP.
-    network_policy: Arc<NetworkPolicy>,
+    /// Live tenant policy. Every query loads it, so a replacement applies to the next query.
+    /// Direct-path queries consult it for outbound permission to the chosen `@target` resolver IP.
+    network_policy: NetworkPolicyHandle,
     /// Optional host-owned policy floor. Direct resolvers and private DNS
     /// answers must pass this policy in addition to the tenant policy.
     platform_policy: Option<Arc<NetworkPolicy>>,
@@ -286,11 +287,15 @@ impl DnsForwarder {
         let domain = question.name().to_string();
         let domain = domain.trim_end_matches('.').to_owned();
 
+        // One load per query: a replacement that has already returned applies to this query, and
+        // every decision it makes uses the same snapshot.
+        let network_policy = self.network_policy.load();
+
         // Refuse queries denied by the network policy. DNS is evaluated
         // as egress over the guest-facing DNS transport, so deny-by-
         // default policies fail closed unless a rule allows the name or
         // the DNS protocol/port.
-        if decide_dns_action(&self.network_policy, &domain, transport).is_deny() {
+        if decide_dns_action(&network_policy, &domain, transport).is_deny() {
             tracing::debug!(domain = %domain, "DNS query denied by network policy");
             // NXDOMAIN, not REFUSED: stub resolvers (e.g. glibc) don't
             // fail-fast on REFUSED, so a denied lookup hangs the guest in a
@@ -324,7 +329,10 @@ impl DnsForwarder {
         // upstreams in order so a timeout or transport failure falls
         // over to the next one; the guest was handed the gateway as its
         // only nameserver, so it cannot retry elsewhere itself.
-        let response = match self.select_upstream(original_dst, transport, sni).await {
+        let response = match self
+            .select_upstream(&network_policy, original_dst, transport, sni)
+            .await
+        {
             UpstreamChoice::PolicyDenied => {
                 tracing::debug!(
                     domain = %domain,
@@ -360,7 +368,7 @@ impl DnsForwarder {
                 };
                 if private_addr.is_some_and(|addr| {
                     !policies_allow_rebind_address(
-                        &self.network_policy,
+                        &network_policy,
                         self.platform_policy.as_deref(),
                         &self.shared,
                         addr,
@@ -423,13 +431,14 @@ impl DnsForwarder {
     /// matters.
     async fn select_upstream(
         &self,
+        network_policy: &NetworkPolicy,
         original_dst: Option<IpAddr>,
         transport: Transport,
         sni: Option<&str>,
     ) -> UpstreamChoice {
         match decide_upstream_with_platform(
             &self.gateway_ips,
-            &self.network_policy,
+            network_policy,
             self.platform_policy.as_deref(),
             &self.shared,
             original_dst,
@@ -579,7 +588,7 @@ impl DnsForwarder {
         handle: &tokio::runtime::Handle,
         config: Arc<NormalizedDnsConfig>,
         gateway_ips: Arc<HashSet<IpAddr>>,
-        network_policy: Arc<NetworkPolicy>,
+        network_policy: NetworkPolicyHandle,
         platform_policy: Option<Arc<NetworkPolicy>>,
         shared: Arc<SharedState>,
         gateway: GatewayIps,
@@ -611,7 +620,7 @@ impl DnsForwarder {
     async fn build(
         config: Arc<NormalizedDnsConfig>,
         gateway_ips: Arc<HashSet<IpAddr>>,
-        network_policy: Arc<NetworkPolicy>,
+        network_policy: NetworkPolicyHandle,
         platform_policy: Option<Arc<NetworkPolicy>>,
         shared: Arc<SharedState>,
         gateway: GatewayIps,
@@ -737,7 +746,7 @@ impl DnsForwarder {
                 tcp: OnceCell::new(),
             }]),
             gateway_ips,
-            network_policy: Arc::new(NetworkPolicy::allow_all()),
+            network_policy: NetworkPolicyHandle::new(NetworkPolicy::allow_all()),
             platform_policy: None,
             shared,
             gateway,
@@ -1091,6 +1100,20 @@ mod tests {
     /// Build a forwarder over `upstreams` with a short query timeout, as
     /// the gateway path uses it. No microVM or host resolver involved.
     async fn forwarder_over(upstreams: &[SocketAddr]) -> Arc<DnsForwarder> {
+        forwarder_over_policy(
+            upstreams,
+            NetworkPolicy::from_profiles([NetworkProfile::Public]),
+        )
+        .await
+        .0
+    }
+
+    /// Same forwarder, with the tenant policy supplied and its handle returned so a test can
+    /// replace it while queries are being served.
+    async fn forwarder_over_policy(
+        upstreams: &[SocketAddr],
+        policy: NetworkPolicy,
+    ) -> (Arc<DnsForwarder>, NetworkPolicyHandle) {
         let config = Arc::new(NormalizedDnsConfig {
             rebind_protection: false,
             nameservers: Vec::new(),
@@ -1107,10 +1130,11 @@ mod tests {
             });
         }
         let gateway_ip: IpAddr = "10.0.0.1".parse().unwrap();
-        Arc::new(DnsForwarder {
+        let policy = NetworkPolicyHandle::new(policy);
+        let forwarder = Arc::new(DnsForwarder {
             configured: ConfiguredResolver::Direct(configured),
             gateway_ips: Arc::new(HashSet::from([gateway_ip])),
-            network_policy: Arc::new(NetworkPolicy::from_profiles([NetworkProfile::Public])),
+            network_policy: policy.clone(),
             platform_policy: None,
             shared: Arc::new(SharedState::new(4)),
             gateway: GatewayIps {
@@ -1118,7 +1142,40 @@ mod tests {
                 ipv6: None,
             },
             config,
-        })
+        });
+        (forwarder, policy)
+    }
+
+    /// Each query loads the tenant policy: a denied lookup answers NXDOMAIN without touching the
+    /// upstream, and the next lookup after a replace succeeds.
+    #[tokio::test]
+    async fn denied_lookup_succeeds_after_a_replace() {
+        let expected = Ipv4Addr::new(203, 0, 113, 9);
+        let (upstream, hits) = responding_udp(expected).await;
+        let (forwarder, policy) = forwarder_over_policy(&[upstream], NetworkPolicy::none()).await;
+
+        assert_eq!(
+            resolve_via_gateway(&forwarder).await,
+            None,
+            "a denied lookup must answer NXDOMAIN"
+        );
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            0,
+            "a denied lookup must not reach the upstream"
+        );
+
+        assert_eq!(policy.replace(NetworkPolicy::allow_all()), Ok(2));
+
+        assert_eq!(
+            resolve_via_gateway(&forwarder).await,
+            Some(expected),
+            "the next lookup must use the replaced policy"
+        );
+        assert!(
+            hits.load(Ordering::SeqCst) > 0,
+            "an allowed lookup must reach the upstream"
+        );
     }
 
     /// Resolve `example.com` through the gateway path and return the
@@ -1146,7 +1203,7 @@ mod tests {
         let (upstream, hits) = responding_udp(expected).await;
         let mut forwarder = forwarder_over(&[upstream]).await;
         let forwarder_mut = Arc::get_mut(&mut forwarder).expect("unique test forwarder");
-        forwarder_mut.network_policy = Arc::new(NetworkPolicy::none());
+        forwarder_mut.network_policy = NetworkPolicyHandle::new(NetworkPolicy::none());
         forwarder_mut.config = Arc::new(NormalizedDnsConfig {
             rebind_protection: true,
             nameservers: Vec::new(),

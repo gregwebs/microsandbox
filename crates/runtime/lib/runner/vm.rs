@@ -461,6 +461,12 @@ type NetworkSecretsHandle = microsandbox_network::secrets::handle::SecretsHandle
 type NetworkSecretsHandle = ();
 
 #[cfg(feature = "net")]
+type NetworkPolicyHandle = microsandbox_network::policy::handle::NetworkPolicyHandle;
+
+#[cfg(not(feature = "net"))]
+type NetworkPolicyHandle = ();
+
+#[cfg(feature = "net")]
 type NetworkActivationHandle = microsandbox_network::network::NetworkActivationHandle;
 
 #[cfg(not(feature = "net"))]
@@ -471,6 +477,7 @@ type VmBuildOutput = (
     Option<NetworkTerminationHandle>,
     Option<NetworkMetricsHandle>,
     Option<NetworkSecretsHandle>,
+    Option<NetworkPolicyHandle>,
     Option<NetworkActivationHandle>,
     Option<Vec<u8>>,
     GuestBootstrap,
@@ -1166,6 +1173,7 @@ fn run(
         _network_termination_handle,
         network_metrics_handle,
         _network_secrets_handle,
+        _network_policy_handle,
         network_activation_handle,
         bootstrap_frame,
         resolved_bootstrap,
@@ -1236,6 +1244,8 @@ fn run(
         let control = vm.control_handle();
         #[cfg(feature = "net")]
         let secrets = _network_secrets_handle.clone();
+        #[cfg(feature = "net")]
+        let network_policy = _network_policy_handle.clone();
         #[cfg(not(feature = "net"))]
         let secrets: Option<()> = None;
         let control_sock_path = crate::control::control_socket_path_for(&config.agent_sock_path);
@@ -1243,6 +1253,8 @@ fn run(
             control,
             #[cfg(feature = "net")]
             secrets,
+            #[cfg(feature = "net")]
+            network_policy,
             &config.runtime_dir,
             &config.vm,
             &resolved_bootstrap,
@@ -2658,6 +2670,9 @@ fn build_vm(
     let mut network_termination_handle = None;
     let mut network_metrics_handle = None;
     let mut network_secrets_handle = None;
+    // Set only by a networked boot; the non-`net` build keeps the unit-typed placeholder.
+    #[cfg_attr(not(feature = "net"), allow(unused_mut))]
+    let mut network_policy_handle: Option<NetworkPolicyHandle> = None;
     #[cfg(feature = "net")]
     let mut network_activation_handle = None;
     #[cfg_attr(not(all(feature = "net", unix)), allow(unused_mut, unused_variables))]
@@ -2796,6 +2811,8 @@ fn build_vm(
         if !vm.network.config().secrets.secrets.is_empty() {
             network_secrets_handle = Some(network.secrets_handle());
         }
+        // Unlike secrets, every networked boot has a tenant policy to replace.
+        network_policy_handle = Some(network.network_policy_handle());
 
         if vm.checkpoint_restore.is_some() {
             network_activation_handle = Some(network.defer_activation());
@@ -2972,6 +2989,7 @@ fn build_vm(
         network_termination_handle,
         network_metrics_handle,
         network_secrets_handle,
+        network_policy_handle,
         network_activation_handle,
         bootstrap_frame,
         bootstrap,

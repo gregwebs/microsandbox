@@ -1,13 +1,14 @@
 import { inspect } from "node:util";
 import { expect, it } from "vitest";
+import type { NetworkPolicy } from "@microsandbox/types";
 import {
   ClientError, decodeEnvelope, encodeEnvelope, encodeFrame, encodeRecord,
   type ByteTransport, type ConnectContext, type Connector,
 } from "@microsandbox/protocol-client";
 import {
   ControlClientError, ControlConnection, GetCapabilities, GetCpuState, GetMemoryState,
-  JsonControlClient, JsonNumber, JsonReply, MiB, PauseRuntime, SetCpuTarget, SetMemoryTarget,
-  UpdateSecrets,
+  JsonControlClient, JsonNumber, JsonReply, MiB, PauseRuntime, ReplaceNetworkPolicy,
+  SetCpuTarget, SetMemoryTarget, UpdateSecrets,
   encodedMessage, typedMessage, type VerifiedControlConnector,
 } from "../src/index.js";
 
@@ -381,4 +382,64 @@ it("nonempty EOF and first-line replies preserve the legacy delimiters", async (
     expect(client.isClosed()).toBe(false);
     await client.close();
   }
+});
+
+const probePolicy = {
+  default_egress: "deny", default_ingress: "allow",
+  rules: [{
+    direction: "egress", destination: { domain: "probe.example" },
+    protocols: ["tcp"], ports: [{ start: 443, end: 443 }], action: "allow",
+  }],
+} satisfies NetworkPolicy;
+const probeLine = '{"op":"network_policy_replace","policy":{"default_egress":"deny","default_ingress":"allow","rules":[{"direction":"egress","destination":{"domain":"probe.example"},"protocols":["tcp"],"ports":[{"start":443,"end":443}],"action":"allow"}]}}\n';
+
+it("writes the pinned network-policy replacement line and requires a new revision", async () => {
+  const writes: string[] = [];
+  const client = JsonControlClient.fromConnector(jsonDialer([
+    '{"ok":true,"network_policy":{"revision":7}}\n',
+    '{"ok":true,"network_policy":{"revision":1}}\n',
+    '{"ok":true}\n',
+    '{"ok":false,"error_code":"invalid_network_policy","error":"refused"}\n',
+  ], line => writes.push(line)));
+  const request = new ReplaceNetworkPolicy(probePolicy);
+  expect(await client.requestTyped(request)).toEqual({ revision: 7n });
+  expect(writes).toEqual([probeLine]);
+  for (const outcome of [
+    expect.objectContaining({ code: "invalid_json_response" }),
+    expect.objectContaining({ code: "invalid_json_response" }),
+    expect.objectContaining({ code: "legacy_remote" }),
+  ]) await expect(client.requestTyped(request)).rejects.toEqual(outcome);
+  expect(writes).toEqual([probeLine, probeLine, probeLine, probeLine]);
+  await client.close();
+});
+
+it("discovery reports the network-policy capability and routes a generation-one peer to JSON", async () => {
+  for (const [field, expected] of [["", false], [",\"network_policy_update\":true", true], [",\"network_policy_update\":false", false]] as const) {
+    const discovery = JSON.stringify({ ok: true, capabilities: { ...caps, ...(field ? { network_policy_update: field.includes("true") } : {}) } }) + "\n";
+    const client = await ControlConnection.connectConnector(jsonDialer([discovery, cpu]));
+    expect(client.runtimeCapabilities.network_policy_update).toBe(expected);
+    await client.close();
+  }
+
+  const writes: string[] = [];
+  const dialer = new Dialer(index => new Transport((data, transport) => {
+    if (index === 0 || index === 2) {
+      writes.push(text(data));
+      transport.feed(bytes(cborCaps));
+      return;
+    }
+    if (index === 1) {
+      expect(decodeEnvelope(data.subarray(9)).t).toBe("control.hello");
+      transport.feed(packet(0, "control.welcome", {
+        protocol: "msb.control", generation: 1, max_frame_size: 4096, max_in_flight: 4,
+      }));
+      return;
+    }
+    writes.push(text(data));
+    transport.feed(bytes('{"ok":true,"network_policy":{"revision":2}}\n'));
+  }));
+  const client = await ControlConnection.connectConnector(dialer);
+  expect(await client.requestTyped(new ReplaceNetworkPolicy(probePolicy))).toEqual({ revision: 2n });
+  expect(writes).toEqual(['{"op":"capabilities"}\n', '{"op":"capabilities"}\n', probeLine]);
+  await client.close();
 });

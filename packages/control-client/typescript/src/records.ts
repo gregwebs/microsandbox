@@ -18,6 +18,7 @@ export const CONTROL_GENERATION_TWO_MESSAGES = [
   "control.branch.create", "control.branch.result", "control.pause", "control.resume",
   "control.pause.state", "control.root-disk.grow", "control.root-disk.state",
   "control.disk.compact", "control.disk.compact.result",
+  "control.network-policy.replace", "control.network-policy.result",
 ] as const;
 
 export type ControlHello = {
@@ -32,6 +33,7 @@ export type RuntimeCapabilities = Capabilities & {
   guest_flush_policy?: boolean; optional_disk_integrity?: boolean; branch_create?: boolean;
   branch_memfd?: boolean; pause_resume?: boolean; disk_compact?: boolean;
   disk_compact_owned?: boolean; checkpoint_create?: boolean; disk_checkpoint_create?: boolean;
+  network_policy_update?: boolean;
 };
 /** Every memory observation is bigint, including zero and small values. */
 export type MemoryState = { boot_mib: bigint; target_mib: bigint; current_mib: bigint; max_mib: bigint };
@@ -74,6 +76,8 @@ export type RootDiskGrow = { size_bytes: bigint };
 export type RootDiskState = {
   filesystem_bytes: bigint; device_bytes: bigint; total_us: bigint; pause_us: bigint; guest_us: bigint;
 };
+/** Tenant policy revision in force after a successful replacement; 1 is the launch policy. */
+export type NetworkPolicyResult = { revision: bigint };
 export type DiskCompactionTarget =
   | { kind: "all" }
   | { kind: "root" }
@@ -101,6 +105,7 @@ export const ControlMessageType = {
   Pause: "control.pause", Resume: "control.resume", PauseState: "control.pause.state",
   RootDiskGrow: "control.root-disk.grow", RootDiskState: "control.root-disk.state",
   DiskCompact: "control.disk.compact", DiskCompactResult: "control.disk.compact.result",
+  NetworkPolicyReplace: "control.network-policy.replace", NetworkPolicyResult: "control.network-policy.result",
 } as const;
 
 type Fields = Map<string, Uint8Array>;
@@ -165,6 +170,7 @@ export function decodeRuntimeCapabilities(bytes: Uint8Array): RuntimeCapabilitie
     cpu_resize: readBool(required(fields, "cpu_resize")), memory_resize: readBool(required(fields, "memory_resize")),
     secrets_update: readBool(required(fields, "secrets_update")), checkpoint_create: optional("checkpoint_create"),
     disk_checkpoint_create: optional("disk_checkpoint_create"),
+    network_policy_update: optional("network_policy_update"),
   };
 }
 export function decodeMemoryState(bytes: Uint8Array): MemoryState {
@@ -256,6 +262,10 @@ export function decodeRootDiskState(bytes: Uint8Array): RootDiskState {
     device_bytes: readUint(required(fields, "device_bytes"), 64), total_us: readUint(required(fields, "total_us"), 64),
     pause_us: readUint(required(fields, "pause_us"), 64), guest_us: readUint(required(fields, "guest_us"), 64),
   };
+}
+
+export function decodeNetworkPolicyResult(bytes: Uint8Array): NetworkPolicyResult {
+  return { revision: readUint(required(readRecord(bytes), "revision"), 64) };
 }
 
 export function decodeDiskCompactionResult(bytes: Uint8Array): DiskCompactionResult {

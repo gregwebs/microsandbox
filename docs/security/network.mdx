@@ -126,6 +126,24 @@ Where DNS integrity matters, pair DoT interception with a policy that denies egr
 
 TLS inspection uses an auto-generated CA the guest trusts. A separate option, `trust_host_cas`, additionally ships your host's trusted root CAs into the guest so outbound TLS keeps working behind a corporate MITM proxy. It is **off by default** for a reason: anything in your host trust store becomes trusted inside every sandbox, so a CA an attacker managed to plant on your host would be trusted by your guests too. Leave it off unless you specifically need it. See [TLS inspection](/networking/tls).
 
+## Live policy replacement
+
+A running local sandbox's policy can be replaced without a restart. A revoke is a forward-looking control, so it is worth being exact about what it covers.
+
+It applies to decisions made after the replacement returns: new connections at their admission point (the SYN, the hostname decision, or the SNI decision) and every new DNS query. UDP datagrams and ICMP echoes are checked per packet, so a revoke reaches the next datagram even inside an established UDP session. A hostname decision that is still pending when its rules disappear is made against the new policy and fails closed.
+
+It does not cut an already-admitted TCP connection. That connection keeps the policy it was admitted under, including its per-request plain-HTTP secret authority checks, so a host revoked mid-connection can still receive an injected secret on it until the connection closes. Only that connection closing, or the sandbox stopping, ends that exposure.
+
+A `CONNECT` tunnel opened through an already-admitted proxy connection is not revoked either. The strict `CONNECT` check only refuses a target the current policy allows by hostname alone, because a tunnel cannot be inspected; it does not authorize the target. The tunnel is authorized by the outer connection, so a tunnel to a revoked host keeps working until that connection closes.
+
+Two things sit outside a replacement, and they decide how to treat the call.
+
+The platform floor is the policy a `multi-tenant` host applies to every sandbox on the machine: public destinations and DNS are allowed, private ranges and the host gateway are not, and egress is denied by default. It is fixed for the sandbox's lifetime, evaluated beside the sandbox policy rather than inside it, and no control request can reach it. So a replacement cannot grant access the floor withholds, even when the replacement allows everything. See [Deployment profiles](/networking/overview#deployment-profiles).
+
+The replacement is not persisted. A sandbox keeps the policy it was created with, so restart, restore, and fork all start again from that policy at revision `1`. A launcher that needs a replaced policy to survive one of those starts must send it again; a replacement lasts only as long as the sandbox that accepted it.
+
+See [Replacing a running sandbox's policy](/networking/overview#live-policy-replacement) for the API and per-reader details.
+
 ## Out of scope
 
 The network stack does not try to defend against:

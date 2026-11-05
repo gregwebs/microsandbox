@@ -13,6 +13,7 @@ use tokio_util::sync::CancellationToken;
 
 use super::dispatch::{Dispatcher, Input, Job, MAX_QUEUED, RUNTIME_BYTES};
 use super::handler::{Handler, Reply, Response};
+use crate::control::ControlResponse as RuntimeControlResponse;
 
 #[test]
 fn concurrent_job_replies_fit_the_connection_budget() {
@@ -1080,4 +1081,333 @@ async fn windows_cancelled_reply_drain_releases_its_flush_worker() {
         .unwrap()
         .unwrap();
     drop(client);
+}
+
+#[test]
+fn reply_for_maps_policy_results_refusal_effects_and_capabilities() {
+    let applied = super::handler::reply_for(
+        RuntimeControlResponse {
+            ok: true,
+            network_policy: Some(NetworkPolicyResult { revision: 2 }),
+            ..Default::default()
+        },
+        true,
+        2,
+    );
+    assert_eq!(
+        applied.envelope(2).unwrap().t,
+        "control.network-policy.result"
+    );
+    match applied {
+        Reply::NetworkPolicy(result) => assert_eq!(result.revision, 2),
+        _ => panic!("expected a policy revision reply"),
+    }
+
+    // A refusal that declares no mutation reports `none` for a mutation request.
+    let refused = super::handler::reply_for(
+        RuntimeControlResponse {
+            ok: false,
+            error_code: Some("invalid_network_policy".into()),
+            error: Some("artificial refusal".into()),
+            error_effect: Some(ErrorEffect::None),
+            ..Default::default()
+        },
+        true,
+        2,
+    );
+    match refused {
+        Reply::Error(error) => {
+            assert_eq!(error.code, "invalid_network_policy");
+            assert_eq!(error.effect, ErrorEffect::None);
+        }
+        _ => panic!("expected a refusal"),
+    }
+
+    // Without an explicit effect a mutation keeps the blanket `unknown`.
+    let unexplained = super::handler::reply_for(
+        RuntimeControlResponse {
+            ok: false,
+            error_code: Some("runtime_busy".into()),
+            ..Default::default()
+        },
+        true,
+        2,
+    );
+    match unexplained {
+        Reply::Error(error) => assert_eq!(error.effect, ErrorEffect::Unknown),
+        _ => panic!("expected a refusal"),
+    }
+
+    // The policy flag is projected onto the generation-two record only.
+    let capabilities = RuntimeControlResponse {
+        ok: true,
+        capabilities: Some(crate::control::ControlCapabilities {
+            network_policy_update: true,
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    match super::handler::reply_for(capabilities.clone(), false, 2) {
+        Reply::RuntimeCapabilities(capabilities) => assert!(capabilities.network_policy_update),
+        _ => panic!("expected generation-two capabilities"),
+    }
+    match super::handler::reply_for(capabilities, false, 1) {
+        Reply::Capabilities(capabilities) => {
+            // The frozen generation-one record has no such field at all.
+            assert!(!capabilities.secrets_update);
+        }
+        _ => panic!("expected generation-one capabilities"),
+    }
+}
+
+/// Replacement against a real handle, plus the boot-decode differential.
+#[cfg(feature = "net")]
+mod network_policy {
+    use super::*;
+    use microsandbox_network::config::NetworkConfig;
+    use microsandbox_network::policy::handle::{
+        INITIAL_NETWORK_POLICY_REVISION, NetworkPolicyHandle,
+    };
+    use microsandbox_network::policy::{Action, NetworkPolicy, Rule};
+
+    use super::super::handler::apply_network_policy_replace;
+
+    fn replace(
+        handle: &NetworkPolicyHandle,
+        document: serde_json::Value,
+    ) -> crate::control::ControlResponse {
+        let policy: microsandbox_types::NetworkPolicy =
+            serde_json::from_value(document).expect("the wire twin accepts the document");
+        apply_network_policy_replace(Some(handle), policy)
+    }
+
+    #[test]
+    fn a_boot_decodable_policy_is_swapped_and_advances_the_revision() {
+        let handle = NetworkPolicyHandle::new(NetworkPolicy::none());
+        let grant = serde_json::json!({
+            "default_egress": "deny",
+            "default_ingress": "allow",
+            "rules": [{
+                "direction": "egress",
+                "destination": {"domain": "probe.example"},
+                "protocols": ["tcp"],
+                "ports": [{"start": 443, "end": 443}],
+                "action": "allow",
+            }],
+        });
+
+        let response = replace(&handle, grant);
+
+        assert!(response.ok, "refusal: {:?}", response.error_code);
+        assert_eq!(
+            response.network_policy,
+            Some(NetworkPolicyResult { revision: 2 })
+        );
+        assert_eq!(handle.revision(), 2);
+        let current = handle.load();
+        assert_eq!(current.rules.len(), 1);
+        assert_eq!(current.default_ingress, Action::Allow);
+
+        // A later replace advances again, and an equal policy still consumes a revision.
+        let response = replace(&handle, serde_json::json!({"rules": []}));
+        assert_eq!(
+            response.network_policy,
+            Some(NetworkPolicyResult { revision: 3 })
+        );
+        assert!(handle.load().rules.is_empty());
+    }
+
+    #[test]
+    fn a_policy_the_engine_would_not_boot_is_refused_without_a_change() {
+        let handle = NetworkPolicyHandle::new(NetworkPolicy::none());
+        let before = handle.load();
+
+        let response = replace(
+            &handle,
+            serde_json::json!({"rules": [{
+                "direction": "egress",
+                "destination": {"domain": "not a domain!"},
+                "action": "allow",
+            }]}),
+        );
+
+        assert!(!response.ok);
+        assert_eq!(
+            response.error_code.as_deref(),
+            Some("invalid_network_policy")
+        );
+        assert_eq!(
+            response.error_effect,
+            Some(ErrorEffect::None),
+            "the refusal precedes any change"
+        );
+        assert_eq!(handle.revision(), INITIAL_NETWORK_POLICY_REVISION);
+        assert_eq!(
+            handle.load().rules.len(),
+            before.rules.len(),
+            "the previous policy stays in force"
+        );
+    }
+
+    #[test]
+    fn a_runtime_without_a_handle_reports_the_policy_as_unavailable() {
+        let response = apply_network_policy_replace(
+            None,
+            microsandbox_types::NetworkPolicy {
+                default_egress: microsandbox_types::Action::Deny,
+                default_ingress: microsandbox_types::Action::Deny,
+                rules: Vec::new(),
+            },
+        );
+
+        assert!(!response.ok);
+        assert_eq!(
+            response.error_code.as_deref(),
+            Some("network_policy_unavailable")
+        );
+        assert_eq!(response.error_effect, Some(ErrorEffect::None));
+        assert!(response.network_policy.is_none());
+    }
+
+    #[test]
+    fn replacement_accepts_exactly_what_the_boot_decode_accepts() {
+        // Boot decodes the launch JSON's `policy` with this type's `Deserialize` and validates no
+        // further. Every document here is compared by outcome, not by stored bytes: the engine
+        // canonicalizes domain names while the wire twin does not.
+        let documents = [
+            serde_json::json!({"rules": []}),
+            serde_json::json!({
+                "default_egress": "allow",
+                "default_ingress": "allow",
+                "rules": [{
+                    "direction": "egress",
+                    "destination": {"domain": "probe.example"},
+                    "action": "allow",
+                }],
+            }),
+            serde_json::json!({
+                "rules": [{
+                    "direction": "egress",
+                    "destination": {"domain": "PROBE.Example"},
+                    "action": "allow",
+                }],
+            }),
+            serde_json::json!({
+                "rules": [{
+                    "direction": "egress",
+                    "destination": {"domain": "probe.example."},
+                    "action": "allow",
+                }],
+            }),
+            serde_json::json!({
+                "rules": [{
+                    "direction": "egress",
+                    "destination": {"domain": "not a domain!"},
+                    "action": "allow",
+                }],
+            }),
+            serde_json::json!({
+                "rules": [{
+                    "direction": "egress",
+                    "destination": {"domain": "probe..example"},
+                    "action": "allow",
+                }],
+            }),
+            serde_json::json!({
+                "rules": [{
+                    "direction": "egress",
+                    "destination": {"domain":"-leading.example"},
+                    "action": "allow",
+                }],
+            }),
+            serde_json::json!({
+                "rules": [{
+                    "direction": "egress",
+                    "destination": {"cidr": "10.0.0.0/8"},
+                    "ports": [{"start": 443, "end": 80}],
+                    "action": "allow",
+                }],
+            }),
+            serde_json::json!({
+                "rules": [{
+                    "direction": "ingress",
+                    "destination": "any",
+                    "protocols": ["icmpv4"],
+                    "action": "allow",
+                }],
+            }),
+            serde_json::json!({
+                "rules": [{
+                    "direction": "egress",
+                    "destination": {"cidr": "not-a-network"},
+                    "action": "allow",
+                }],
+            }),
+            serde_json::json!({
+                "rules": [],
+                "future_policy_field": {"nested": [1, 2]},
+            }),
+        ];
+
+        for document in documents {
+            let boot =
+                serde_json::from_value::<NetworkConfig>(serde_json::json!({"policy": document}))
+                    .is_ok();
+            let handle = NetworkPolicyHandle::new(NetworkPolicy::none());
+
+            // A document the wire twin itself cannot express never reaches the runtime: the
+            // control decoder refuses it structurally, so only the pair below is comparable.
+            match serde_json::from_value::<microsandbox_types::NetworkPolicy>(document.clone()) {
+                Ok(policy) => {
+                    let response = apply_network_policy_replace(Some(&handle), policy);
+                    assert_eq!(response.ok, boot, "boot and replacement disagree");
+                    if boot {
+                        continue;
+                    }
+                    assert_eq!(
+                        response.error_code.as_deref(),
+                        Some("invalid_network_policy")
+                    );
+                }
+                Err(_) => assert!(!boot, "a document boot accepts must be expressible"),
+            }
+            assert_eq!(
+                handle.revision(),
+                INITIAL_NETWORK_POLICY_REVISION,
+                "a refused replacement consumes no revision"
+            );
+        }
+    }
+
+    #[test]
+    fn the_stored_policy_is_the_engine_decoded_document() {
+        let handle = NetworkPolicyHandle::new(NetworkPolicy::none());
+        let response = replace(
+            &handle,
+            serde_json::json!({"rules": [{
+                "direction": "egress",
+                "destination": {"domain": "Probe.Example."},
+                "action": "allow",
+            }]}),
+        );
+        assert!(response.ok);
+
+        // The engine canonicalizes the name; the wire twin carried it verbatim.
+        let current = handle.load();
+        let Rule {
+            direction,
+            destination,
+            protocols,
+            ports,
+            action,
+        } = current.rules.as_slice()[0].clone();
+        assert_eq!(direction, microsandbox_network::policy::Direction::Egress);
+        let microsandbox_network::policy::Destination::Domain(name) = destination else {
+            panic!("expected an exact domain destination");
+        };
+        assert_eq!(name.as_str(), "probe.example");
+        assert!(protocols.is_empty() && ports.is_empty());
+        assert_eq!(action, Action::Allow);
+        assert_eq!(current.rules.len(), 1);
+    }
 }

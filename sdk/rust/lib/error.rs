@@ -442,6 +442,8 @@ pub enum Operation {
     SandboxMetricsStream,
     /// `Sandbox::modify`.
     SandboxModify,
+    /// `Sandbox::update_network_policy`.
+    SandboxUpdateNetworkPolicy,
     /// `Sandbox::fs`.
     SandboxFs,
     /// The free function `all_sandbox_metrics`.
@@ -655,6 +657,7 @@ impl Operation {
             Operation::SandboxMetrics => "Sandbox::metrics",
             Operation::SandboxMetricsStream => "Sandbox::metrics_stream",
             Operation::SandboxModify => "Sandbox::modify",
+            Operation::SandboxUpdateNetworkPolicy => "Sandbox::update_network_policy",
             Operation::SandboxFs => "Sandbox::fs",
             Operation::AllSandboxMetrics => "all_sandbox_metrics",
             Operation::AgentConnect => "agent connections",

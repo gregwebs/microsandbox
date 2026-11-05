@@ -884,3 +884,79 @@ async fn mismatched_connected_peer_is_runtime_changed_before_any_operation_bytes
     assert_eq!(connector.dials.load(Ordering::SeqCst), 2);
     peer.await.unwrap();
 }
+
+/// The tenant policy named by the pinned network-policy replacement line.
+fn probe_policy() -> microsandbox_types::NetworkPolicy {
+    microsandbox_types::NetworkPolicy {
+        default_egress: microsandbox_types::Action::Deny,
+        default_ingress: microsandbox_types::Action::Allow,
+        rules: vec![microsandbox_types::Rule {
+            direction: microsandbox_types::Direction::Egress,
+            destination: microsandbox_types::Destination::Domain("probe.example".into()),
+            protocols: vec![microsandbox_types::Protocol::Tcp],
+            ports: vec![microsandbox_types::PortRange {
+                start: 443,
+                end: 443,
+            }],
+            action: microsandbox_types::Action::Allow,
+        }],
+    }
+}
+
+#[test]
+fn network_policy_replace_pins_its_json_line_and_requires_a_revision() {
+    let request = ReplaceNetworkPolicy(NetworkPolicyReplace {
+        policy: probe_policy(),
+    });
+    assert_eq!(request.min_generation(), 2);
+    assert_eq!(
+        std::str::from_utf8(&request.compatibility_json_bytes().unwrap()).unwrap(),
+        r#"{"op":"network_policy_replace","policy":{"default_egress":"deny","default_ingress":"allow","rules":[{"action":"allow","destination":{"domain":"probe.example"},"direction":"egress","ports":[{"end":443,"start":443}],"protocols":["tcp"]}]}}"#
+    );
+
+    let reply = |line: &str| JsonReply::parse(line.as_bytes().to_vec()).unwrap();
+    assert_eq!(
+        request
+            .decode_compatibility_json(reply(r#"{"ok":true,"network_policy":{"revision":7}}"#))
+            .unwrap(),
+        NetworkPolicyResult { revision: 7 }
+    );
+    // A replacement can never report the launch revision, and success needs a revision.
+    for line in [
+        r#"{"ok":true,"network_policy":{"revision":1}}"#,
+        r#"{"ok":true,"network_policy":{"revision":0}}"#,
+        r#"{"ok":true,"network_policy":{}}"#,
+        r#"{"ok":true}"#,
+    ] {
+        assert!(
+            matches!(
+                request.decode_compatibility_json(reply(line)),
+                Err(ControlClientError::InvalidJsonResponse { .. })
+            ),
+            "{line}"
+        );
+    }
+    assert!(matches!(
+        request.decode_compatibility_json(reply(
+            r#"{"ok":false,"error_code":"invalid_network_policy","error":"refused"}"#
+        )),
+        Err(ControlClientError::LegacyRemote { .. })
+    ));
+}
+
+#[test]
+fn discovery_line_carries_the_network_policy_capability() {
+    for (field, expected) in [
+        ("", false),
+        (r#","network_policy_update":true"#, true),
+        (r#","network_policy_update":false"#, false),
+    ] {
+        let line = format!(
+            r#"{{"ok":true,"capabilities":{{"cpu_resize":true,"memory_resize":true,"secrets_update":true{field}}}}}"#
+        );
+        let capabilities = GetRuntimeCapabilities
+            .decode_compatibility_json(JsonReply::parse(line.into_bytes()).unwrap())
+            .unwrap();
+        assert_eq!(capabilities.network_policy_update, expected, "{field}");
+    }
+}

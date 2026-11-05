@@ -6,10 +6,12 @@ import {
 import {
   CompactDisks, ControlClientError, CreateBranch, CreateCheckpoint, CreateDiskCheckpoint,
   GetCapabilities, GetCpuState, GetMemoryState, GetPauseState, GetRuntimeCapabilities,
-  GrowRootDisk, PauseRuntime, ResumeRuntime, SetCpuTarget, SetMemoryTarget, UpdateSecrets,
-  MiB, GiB, KiB, decodeCapabilities, decodeControlError, decodeCpuState, decodeHello,
-  decodeMemoryState, decodeSecretsResult, decodeSecretsUpdate, decodeWelcome,
+  GrowRootDisk, PauseRuntime, ReplaceNetworkPolicy, ResumeRuntime, SetCpuTarget, SetMemoryTarget,
+  UpdateSecrets, MiB, GiB, KiB, decodeCapabilities, decodeControlError, decodeCpuState,
+  decodeHello, decodeMemoryState, decodeNetworkPolicyResult, decodeSecretsResult,
+  decodeSecretsUpdate, decodeWelcome,
 } from "../src/index.js";
+import type { NetworkPolicy } from "@microsandbox/types";
 
 const fixtures = JSON.parse(readFileSync(new URL("../../../protocol-fixtures/control-v1.json", import.meta.url), "utf8")) as {
   cases: Array<{ name: string; type: string; frame_hex: string; payload_hex: string }>;
@@ -183,4 +185,34 @@ it("rejects malformed generation-two requests before transport admission", () =>
   expect(() => new CompactDisks({
     target: { kind: "disk", guest_path: "bad\ud800" }, dry_run: false,
   })).toThrow(WireError);
+});
+
+const probePolicy = {
+  default_egress: "deny", default_ingress: "allow",
+  rules: [{
+    direction: "egress", destination: { domain: "probe.example" },
+    protocols: ["tcp"], ports: [{ start: 443, end: 443 }], action: "allow",
+  }],
+} satisfies NetworkPolicy;
+
+it("replaces the tenant policy and pins the same golden bytes as the Rust client", () => {
+  const request = new ReplaceNetworkPolicy(probePolicy);
+  expect(request.minGeneration).toBe(2);
+  expect(request.message().type).toBe("control.network-policy.replace");
+  // Byte-identical to the protocol crate's pinned request payload.
+  expect(Buffer.from(request.message().payload).toString("hex")).toBe(
+    "a166706f6c696379a36e64656661756c745f6567726573736464656e796f64656661756c745f696e677265737365616c6c6f776572756c657381a569646972656374696f6e666567726573736b64657374696e6174696f6ea166646f6d61696e6d70726f62652e6578616d706c656970726f746f636f6c73816374637065706f72747381a26573746172741901bb63656e641901bb66616374696f6e65616c6c6f77",
+  );
+  // The protocol crate's pinned reply payload decodes to the same revision.
+  expect(decodeNetworkPolicyResult(Buffer.from("a1687265766973696f6e02", "hex"))).toEqual({ revision: 2n });
+  expect(request.decode(frame("control.network-policy.result", { revision: 2 }, 1, 2))).toEqual({ revision: 2n });
+  // A replacement can never report the launch revision.
+  for (const revision of [0, 1]) {
+    expect(() => request.decode(frame("control.network-policy.result", { revision }, 1, 2))).toThrow(ControlClientError);
+  }
+  expect(request.decode(frame("control.network-policy.result", { revision: 0xffffffffffffffffn }, 1, 2)))
+    .toEqual({ revision: 0xffffffffffffffffn });
+  expect(() => request.decode(frame("control.network-policy.result", { revision: 2 }, 1, 1))).toThrow(ControlClientError);
+  try { request.decode(frame("control.error", { code: "invalid_network_policy", message: "refused", effect: "none" }, 1, 2)); throw new Error("expected rejection"); }
+  catch (error) { expect(error).toMatchObject({ code: "peer", peerError: { code: "invalid_network_policy" } }); }
 });

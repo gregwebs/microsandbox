@@ -563,6 +563,55 @@ Explicitly refresh the running sandbox's idle timer. This sends `core.touch`; us
   </div>
 </div>
 
+#### <span className="msb-recv">sb.</span><span className="msb-hn">update_network_policy()</span>
+
+<Tooltip tip="Not available on microsandbox cloud."><span className="msb-badge-local">Local-only <Icon icon="circle-info" size={11} /></span></Tooltip>
+
+```rust
+async fn update_network_policy(&self, policy: NetworkPolicy) -> MicrosandboxResult<u64>
+```
+
+<Accordion title="Example">
+
+```rust
+use microsandbox::NetworkPolicy;
+
+let policy = NetworkPolicy::builder()
+    .default_deny()
+    .egress(|e| e.tcp().port(443).allow_domains(["api.example.com"]))
+    .egress(|e| e.udp().tcp().port(53).allow_host())
+    .build()?;
+
+let revision = sb.update_network_policy(policy).await?;
+println!("policy revision {revision}");
+```
+
+</Accordion>
+
+Replace the running sandbox's policy without a restart.
+
+Only decisions made after the call returns use the new policy, an admitted TCP connection keeps the policy it was admitted under — including a `CONNECT` tunnel it opens, which the strict `CONNECT` check never re-authorizes — and the replacement is not persisted. See [Replacing a running sandbox's policy](/networking/overview#live-policy-replacement).
+
+<p className="msb-label">Parameters</p>
+
+<div className="msb-params">
+  <div className="msb-param">
+    <div className="msb-param-key"><code>policy</code><a className="msb-type" href="/sdk/rust/networking#networkpolicy">NetworkPolicy</a></div>
+    <div className="msb-param-desc">Complete replacement policy. It is checked exactly as a launch policy is.</div>
+  </div>
+</div>
+
+<p className="msb-label">Returns</p>
+
+<div className="msb-params">
+  <div className="msb-param">
+    <div className="msb-param-key"><span className="msb-type">u64</span></div>
+    <div className="msb-param-desc">Revision of the policy now in force, advanced by every accepted replacement. The launch policy is revision <code>1</code>.</div>
+  </div>
+</div>
+
+Returns `MicrosandboxError::Unsupported` when the runtime advertises no `network_policy_update` capability or the sandbox has no control endpoint, and `MicrosandboxError::ControlClient` when the runtime refuses the replacement. A refused replacement leaves the previous policy and revision in force.
+
 #### <span className="msb-recv">sb.</span><span className="msb-hn">modify()</span>
 
 <Tooltip tip="modify is not available on microsandbox cloud; recreate the sandbox with the new configuration."><span className="msb-badge-local">Local-only <Icon icon="circle-info" size={11} /></span></Tooltip>
