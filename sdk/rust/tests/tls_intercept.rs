@@ -5,13 +5,13 @@ use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::Arc;
 use std::time::Duration;
 
-use microsandbox::sandbox::SecretSource;
-use microsandbox::{NetworkPolicy, Sandbox};
+use microsandbox::sandbox::{DeploymentProfile, SecretSource};
+use microsandbox::{MicrosandboxError, NetworkPolicy, Operation, Sandbox};
 use microsandbox_network::config::InterfaceOverrides;
 use rcgen::CertificateParams;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 use test_utils::msb_test;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::task::JoinHandle;
 use tokio_rustls::TlsAcceptor;
@@ -23,9 +23,22 @@ use tokio_rustls::TlsAcceptor;
 const LARGE_POST_BODY_LEN: usize = 135_000; // 135 kb, above the old ~128 kib failure threshold.
 const LARGE_SECRET_PAD_LEN: usize = 1024 * 1024; // 1 MiB on each side of the placeholder.
 const CURL_IMAGE: &str = "mirror.gcr.io/curlimages/curl";
+const PYTHON_IMAGE: &str = "mirror.gcr.io/library/python:3.12-alpine";
 const REAL_SECRET: &[u8] = b"real-secret";
 const IPV6_GUEST: &str = "fd42:6d73:62:ffff::2";
 const IPV6_GATEWAY: &str = "fd42:6d73:62:ffff::1";
+const HOST_GATEWAY_IPV4: &str = "172.30.255.1";
+/// Hostname the live-policy tests allow and revoke; [`HostDns`] answers it with the gateway.
+const PROBE_DOMAIN: &str = "probe.example";
+/// Upper bound on every fixture-side wait, so a stuck probe fails instead of hanging.
+const FIXTURE_TIMEOUT: Duration = Duration::from_secs(30);
+/// How long the keep-alive fixture waits for one more upstream connection before the count is
+/// final. Long enough for a wrongly admitted dial to complete its handshake, short enough not to
+/// slow the test down.
+const KEEPALIVE_QUIET_PERIOD: Duration = Duration::from_secs(2);
+const KEEPALIVE_READY_PATH: &str = "/tmp/keepalive-ready";
+const KEEPALIVE_GATE_PATH: &str = "/tmp/go";
+const KEEPALIVE_SECOND_PATH: &str = "/tmp/keepalive-second";
 
 //--------------------------------------------------------------------------------------------------
 // Types
@@ -47,6 +60,32 @@ struct ReceivedRequest {
     peer: SocketAddr,
     headers: Vec<u8>,
     body: Vec<u8>,
+}
+
+/// HTTPS fixture that serves *several* requests per connection.
+///
+/// [`HostHttps`] accepts exactly one connection and [`HostHttpsSequence`] closes
+/// after one request (both write `Connection: close`), so neither can prove that
+/// a request which arrives after a state change came in on the *same* upstream
+/// connection. This fixture accepts an explicitly counted number of connections
+/// and reports `(connection_id, request_index, body)` for every request, with
+/// one-based connection ids and zero-based request indexes.
+struct HostHttpsKeepAlive {
+    port: u16,
+    reports: tokio::sync::mpsc::Receiver<(usize, usize, Vec<u8>)>,
+    /// One entry per accepted upstream connection, in accept order.
+    accepts: tokio::sync::mpsc::Receiver<usize>,
+    handle: Option<JoinHandle<io::Result<()>>>,
+}
+
+/// Minimal plain-HTTP fixture on IPv4 loopback.
+///
+/// It answers every accepted connection with a fixed body, so a connection the
+/// platform floor should have refused is distinguishable from one that was
+/// merely slow: a refused connection never reaches the listener at all.
+struct HostHttp {
+    port: u16,
+    handle: Option<JoinHandle<()>>,
 }
 
 //--------------------------------------------------------------------------------------------------
@@ -268,6 +307,159 @@ impl Drop for HostHttpsSequence {
     }
 }
 
+impl HostHttpsKeepAlive {
+    /// Bind once and keep serving every connection for the fixture's whole life.
+    ///
+    /// The listener never stops accepting, so an upstream connection the policy should have
+    /// refused is not left waiting in the backlog where it can pass for a timeout: it completes
+    /// TLS, sends its request and is recorded here. `expected` is the number of connections the
+    /// test intends to see; the first unexpected one fails the fixture instead of being absorbed.
+    async fn start(expected: usize) -> io::Result<Self> {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+
+        let v4_listener = TcpListener::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0))).await?;
+        let port = v4_listener.local_addr()?.port();
+        let v6_listener = TcpListener::bind(SocketAddr::from((Ipv6Addr::LOCALHOST, port))).await?;
+        let acceptor = TlsAcceptor::from(test_server_config());
+        let (reports, received) = tokio::sync::mpsc::channel(expected * 4);
+        let (accepts, accepted) = tokio::sync::mpsc::channel(expected + 8);
+
+        let handle = tokio::spawn(async move {
+            let mut serving = tokio::task::JoinSet::new();
+            let mut connection_id = 0;
+            loop {
+                let accepted = tokio::select! {
+                    accept = v4_listener.accept() => accept,
+                    accept = v6_listener.accept() => accept,
+                };
+                let (stream, _) = accepted?;
+                connection_id += 1;
+                if connection_id > expected {
+                    return Err(io::Error::other(format!(
+                        "upstream accepted unexpected connection {connection_id} (expected {expected})"
+                    )));
+                }
+                if accepts.send(connection_id).await.is_err() {
+                    return Ok(());
+                }
+                serving.spawn(serve_keep_alive_connection(
+                    acceptor.clone(),
+                    stream,
+                    connection_id,
+                    reports.clone(),
+                ));
+                // Surface a panicking or failed connection task instead of discarding it, so a
+                // broken fixture fails the test rather than the guest's probe.
+                while let Some(joined) = serving.try_join_next() {
+                    if let Err(error) = joined {
+                        return Err(io::Error::other(format!(
+                            "keep-alive connection task failed: {error}"
+                        )));
+                    }
+                }
+            }
+        });
+
+        Ok(Self {
+            port,
+            reports: received,
+            accepts: accepted,
+            handle: Some(handle),
+        })
+    }
+
+    fn port(&self) -> u16 {
+        self.port
+    }
+
+    /// Next request in arrival order: `(connection_id, request_index, body)`.
+    async fn next_report(&mut self) -> Option<(usize, usize, Vec<u8>)> {
+        tokio::time::timeout(FIXTURE_TIMEOUT, self.reports.recv())
+            .await
+            .ok()
+            .flatten()
+    }
+
+    /// Assert the fixture accepted exactly `expected` upstream connections, in order.
+    ///
+    /// The listener is still open and still accepting, so "exactly two" is checked rather than
+    /// assumed: every accept is recorded, a third one fails the fixture, and a bounded quiet
+    /// window after the test's last probe is what makes the count final. The fixture task's own
+    /// failure (an unexpected accept, or a broken connection task) is propagated here.
+    async fn assert_accepted_exactly(mut self, expected: usize) {
+        let mut accepted = Vec::new();
+        while let Ok(Some(connection_id)) =
+            tokio::time::timeout(KEEPALIVE_QUIET_PERIOD, self.accepts.recv()).await
+        {
+            accepted.push(connection_id);
+        }
+
+        if let Some(handle) = self.handle.take()
+            && handle.is_finished()
+        {
+            match handle.await {
+                Ok(Ok(())) => panic!("keep-alive fixture stopped before the test finished"),
+                Ok(Err(error)) => panic!("keep-alive fixture failed: {error}"),
+                Err(error) => panic!("keep-alive fixture panicked: {error}"),
+            }
+        }
+
+        assert_eq!(
+            accepted,
+            (1..=expected).collect::<Vec<_>>(),
+            "the fixture must accept exactly {expected} upstream connections, in order"
+        );
+    }
+}
+
+impl Drop for HostHttpsKeepAlive {
+    fn drop(&mut self) {
+        if let Some(handle) = self.handle.take() {
+            handle.abort();
+        }
+    }
+}
+
+impl HostHttp {
+    async fn start() -> io::Result<Self> {
+        let listener = TcpListener::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0))).await?;
+        let port = listener.local_addr()?.port();
+
+        let handle = tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    return;
+                };
+                tokio::spawn(async move {
+                    let _ = stream
+                        .write_all(
+                            b"HTTP/1.1 200 OK\r\nContent-Length: 9\r\nConnection: close\r\n\r\nfloor-ok!",
+                        )
+                        .await;
+                    let _ = stream.shutdown().await;
+                });
+            }
+        });
+
+        Ok(Self {
+            port,
+            handle: Some(handle),
+        })
+    }
+
+    fn port(&self) -> u16 {
+        self.port
+    }
+}
+
+impl Drop for HostHttp {
+    fn drop(&mut self) {
+        if let Some(handle) = self.handle.take() {
+            handle.abort();
+        }
+    }
+}
+
 //--------------------------------------------------------------------------------------------------
 // Functions
 //--------------------------------------------------------------------------------------------------
@@ -476,6 +668,125 @@ fn find_header_end(buf: &[u8]) -> Option<usize> {
     buf.windows(4).position(|window| window == b"\r\n\r\n")
 }
 
+/// Serve every request that arrives on one keep-alive upstream connection.
+///
+/// Responses use `Content-Length` and never `Connection: close`, so the client
+/// may send its next request on the same connection — the property the live
+/// policy-replace test needs to observe.
+async fn serve_keep_alive_connection(
+    acceptor: TlsAcceptor,
+    stream: TcpStream,
+    connection_id: usize,
+    reports: tokio::sync::mpsc::Sender<(usize, usize, Vec<u8>)>,
+) {
+    let Ok(mut tls) = acceptor.accept(stream).await else {
+        return;
+    };
+
+    let mut request_index = 0;
+    loop {
+        let mut received = Vec::new();
+        let header_end = loop {
+            if let Some(position) = find_header_end(&received) {
+                break position;
+            }
+            let mut chunk = [0; 8192];
+            match tls.read(&mut chunk).await {
+                // A client that closes between requests is the normal end of a
+                // keep-alive connection, not a fixture failure.
+                Ok(0) | Err(_) => return,
+                Ok(n) => received.extend_from_slice(&chunk[..n]),
+            }
+        };
+
+        let headers = received[..header_end].to_vec();
+        let Ok(content_length) = parse_content_length(&headers) else {
+            return;
+        };
+        let mut body = received[header_end + 4..].to_vec();
+        while body.len() < content_length {
+            let mut chunk = [0; 8192];
+            match tls.read(&mut chunk).await {
+                Ok(0) | Err(_) => return,
+                Ok(n) => body.extend_from_slice(&chunk[..n]),
+            }
+        }
+        body.truncate(content_length);
+
+        if reports
+            .send((connection_id, request_index, body))
+            .await
+            .is_err()
+        {
+            return;
+        }
+        request_index += 1;
+
+        if tls
+            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")
+            .await
+            .is_err()
+            || tls.flush().await.is_err()
+        {
+            return;
+        }
+    }
+}
+
+/// Run one [`policy_probe.py`](fixtures/policy_probe.py) question in the guest.
+async fn policy_probe(sb: &Sandbox, arguments: &str) -> String {
+    let out = sb
+        .shell(format!("python3 /tmp/policy_probe.py {arguments}"))
+        .await
+        .expect("run policy probe");
+    assert!(
+        out.status().success,
+        "policy probe `{arguments}` failed: stdout {:?}, stderr: {:?}",
+        out.stdout().unwrap_or_default(),
+        out.stderr().unwrap_or_default()
+    );
+    out.stdout().expect("utf8 stdout").trim().to_owned()
+}
+
+/// Poll the guest filesystem until `path` exists, or panic after `deadline`.
+///
+/// Each read is bounded by what is left of `deadline`: the deadline bounds the wait, not just the
+/// gaps between calls, so one stalled filesystem request cannot outlive it.
+async fn wait_for_guest_file(sb: &Sandbox, path: &str, deadline: Duration) -> String {
+    let started = tokio::time::Instant::now();
+    loop {
+        let remaining = deadline.saturating_sub(started.elapsed());
+        assert!(
+            !remaining.is_zero(),
+            "guest file {path} did not appear within {deadline:?}"
+        );
+        match tokio::time::timeout(remaining, sb.fs().read_to_string(path)).await {
+            Ok(Ok(contents)) => return contents,
+            Ok(Err(_)) => {}
+            Err(_) => panic!("reading guest file {path} did not complete within {deadline:?}"),
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+/// Upload the two guest-side policy fixtures used by the live-replace tests.
+async fn write_policy_fixtures(sb: &Sandbox) {
+    sb.fs()
+        .write(
+            "/tmp/policy_probe.py",
+            include_str!("fixtures/policy_probe.py"),
+        )
+        .await
+        .expect("upload policy probe");
+    sb.fs()
+        .write(
+            "/tmp/policy_keepalive.py",
+            include_str!("fixtures/policy_keepalive.py"),
+        )
+        .await
+        .expect("upload keep-alive client");
+}
+
 fn parse_content_length(headers: &[u8]) -> io::Result<usize> {
     let headers =
         std::str::from_utf8(headers).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
@@ -634,6 +945,61 @@ fn test_server_config_and_certificate() -> (Arc<rustls::ServerConfig>, Vec<u8>) 
 //--------------------------------------------------------------------------------------------------
 // Tests
 //--------------------------------------------------------------------------------------------------
+
+/// The keep-alive fixture's own contract, which the live policy test's "exactly two upstream
+/// connections" claim rests on: it counts every connection it accepts, keeps serving after the
+/// expected count, and fails on one more instead of absorbing it.
+///
+/// Runs without a sandbox: it only exercises the fixture.
+#[tokio::test]
+async fn keep_alive_fixture_counts_every_upstream_connection_and_rejects_one_more() {
+    // Exactly the expected connections are counted, in order, and the fixture stays alive.
+    let fixture = HostHttpsKeepAlive::start(2)
+        .await
+        .expect("keep-alive fixture");
+    let port = fixture.port();
+    let first = TcpStream::connect((Ipv4Addr::LOCALHOST, port))
+        .await
+        .expect("first upstream connection");
+    let second = TcpStream::connect((Ipv4Addr::LOCALHOST, port))
+        .await
+        .expect("second upstream connection");
+    drop((first, second));
+    fixture.assert_accepted_exactly(2).await;
+
+    // One connection more than expected fails the fixture. A fixture that merely stopped
+    // accepting would report nothing here and let the extra dial pass as a guest-side timeout.
+    let fixture = HostHttpsKeepAlive::start(1)
+        .await
+        .expect("keep-alive fixture");
+    let port = fixture.port();
+    let first = TcpStream::connect((Ipv4Addr::LOCALHOST, port))
+        .await
+        .expect("expected upstream connection");
+    let extra = TcpStream::connect((Ipv4Addr::LOCALHOST, port))
+        .await
+        .expect("unexpected upstream connection");
+    drop((first, extra));
+    let failure = tokio::spawn(async move { fixture.assert_accepted_exactly(1).await })
+        .await
+        .expect_err("an unexpected upstream connection must fail the fixture");
+    let message = panic_text(failure.into_panic());
+    assert!(
+        message.contains("unexpected connection"),
+        "the fixture must name the extra connection, got: {message}"
+    );
+}
+
+/// The text of a caught panic, for assertions on which failure fired.
+fn panic_text(payload: Box<dyn std::any::Any + Send>) -> String {
+    match payload.downcast::<String>() {
+        Ok(message) => *message,
+        Err(payload) => match payload.downcast::<&str>() {
+            Ok(message) => (*message).to_string(),
+            Err(_) => String::from("<non-string panic>"),
+        },
+    }
+}
 
 #[msb_test]
 async fn tls_intercept_large_post_to_host_https_server() {
@@ -1770,4 +2136,529 @@ async fn run_tls_legacy_bypass_and_malformed_hello_matrix(ipv6: bool) {
             }
         }
     }
+}
+//--------------------------------------------------------------------------------------------------
+// Live network-policy replacement
+//--------------------------------------------------------------------------------------------------
+
+/// AC1, AC2 and AC6: a replace adds one exact hostname, then a second replace
+/// removes it — without a restart.
+///
+/// The five steps below are the whole point of the test, so the DNS signal and
+/// the TLS signal are asked separately (`policy_probe.py`): a denied lookup must
+/// never be able to stand in for TLS enforcement, and the revoke is checked
+/// twice — once through DNS and once through a fresh IP-and-SNI connection that
+/// does not resolve the name at all.
+///
+/// Needs no internet access: both upstreams are host-local fixtures.
+#[msb_test]
+async fn network_policy_replace_adds_then_removes_exact_hostname() {
+    let mut dns = HostDns::start().await;
+    let mut upstream = HostHttpsKeepAlive::start(2)
+        .await
+        .expect("https keep-alive fixture");
+    let port = upstream.port();
+    let name = "network-policy-replace-exact-hostname";
+    let sb = Sandbox::builder(name)
+        .image(PYTHON_IMAGE)
+        .cpus(1)
+        .memory(256)
+        .replace()
+        .network(|n| {
+            n.dns(|d| d.nameservers([dns.address]).rebind_protection(false))
+                .policy(NetworkPolicy::none())
+                .strict(true)
+                .interface(probe_interface(false))
+                .tls(|t| t.intercepted_ports(vec![port]).verify_upstream(false))
+                // This test asks one question — admitted or refused — so a denial must be a
+                // reset. Left at its default, the gateway would answer the intercepted port with
+                // a readable 403 and the probe would report `ok:403` instead of `refused`.
+                .http(|h| h.deny_response(false))
+        })
+        .create()
+        .await
+        .expect("create sandbox");
+    write_policy_fixtures(&sb).await;
+
+    let dns_probe = format!("dns {PROBE_DOMAIN}");
+    let tls_probe = format!("tls {HOST_GATEWAY_IPV4} {port} {PROBE_DOMAIN}");
+
+    // 1. The launch policy refuses the hostname, by both signals.
+    assert_eq!(
+        policy_probe(&sb, &dns_probe).await,
+        "nxdomain",
+        "a denied name must not resolve"
+    );
+    assert_eq!(
+        policy_probe(&sb, &tls_probe).await,
+        "refused",
+        "a denied SNI must not be admitted"
+    );
+
+    // 2. One exact hostname rule, revision 2 (the launch policy is revision 1).
+    let revision = sb
+        .update_network_policy(
+            NetworkPolicy::none()
+                .allow_domain(PROBE_DOMAIN)
+                .expect("domain"),
+        )
+        .await
+        .expect("replace adds the exact hostname");
+    assert_eq!(revision, 2, "each successful replace adds one");
+    assert_eq!(
+        policy_probe(&sb, &dns_probe).await,
+        format!("ok:{HOST_GATEWAY_IPV4}"),
+        "the added rule must answer the lookup without a restart"
+    );
+    assert_eq!(
+        policy_probe(&sb, &tls_probe).await,
+        "ok:200",
+        "the added rule must admit the SNI without a restart"
+    );
+    // The admitted probe is upstream connection 1: the two refusals above never
+    // reached the fixture, so it never consumes an accept.
+    assert_eq!(
+        upstream.next_report().await.map(|(c, r, _)| (c, r)),
+        Some((1, 0)),
+        "the admitted probe must be the fixture's first connection"
+    );
+
+    // 3. A keep-alive client opens one connection, makes request 1 and waits.
+    let port_text = port.to_string();
+    let job = sb
+        .exec_detached(
+            "python3",
+            [
+                "/tmp/policy_keepalive.py",
+                HOST_GATEWAY_IPV4,
+                &port_text,
+                PROBE_DOMAIN,
+                KEEPALIVE_READY_PATH,
+                KEEPALIVE_GATE_PATH,
+                KEEPALIVE_SECOND_PATH,
+            ],
+        )
+        .await
+        .expect("start the keep-alive client");
+    let ready = wait_for_guest_file(&sb, KEEPALIVE_READY_PATH, FIXTURE_TIMEOUT).await;
+    assert_eq!(
+        ready.trim(),
+        "first:200",
+        "the keep-alive client's first request must be admitted (second file: {:?})",
+        sb.fs().read_to_string(KEEPALIVE_SECOND_PATH).await
+    );
+    assert_eq!(
+        upstream.next_report().await.map(|(c, r, _)| (c, r)),
+        Some((2, 0)),
+        "the keep-alive client must open a second, fresh upstream connection"
+    );
+
+    // 4. Remove the rule: new lookups and new connections are refused, and the
+    //    IP-and-SNI probe proves that without depending on DNS.
+    let revision = sb
+        .update_network_policy(NetworkPolicy::none())
+        .await
+        .expect("replace removes the exact hostname");
+    assert_eq!(revision, 3, "successive replaces count 2, 3, ...");
+    assert_eq!(
+        policy_probe(&sb, &dns_probe).await,
+        "nxdomain",
+        "the removed rule must stop answering the lookup"
+    );
+    assert_eq!(
+        policy_probe(&sb, &tls_probe).await,
+        "refused",
+        "a fresh IP-and-SNI connection must be refused once the rule is gone"
+    );
+
+    // 5. Release the already-admitted connection: it must keep working, and
+    //    request 2 must arrive on the same upstream connection as request 1.
+    sb.fs()
+        .write(KEEPALIVE_GATE_PATH, b"1")
+        .await
+        .expect("open the keep-alive gate");
+    let second = wait_for_guest_file(&sb, KEEPALIVE_SECOND_PATH, FIXTURE_TIMEOUT).await;
+    assert_eq!(
+        second.trim(),
+        "second:200",
+        "an already-admitted connection must keep running across the replace"
+    );
+    let exit = tokio::time::timeout(FIXTURE_TIMEOUT, job.wait())
+        .await
+        .expect("keep-alive client deadline")
+        .expect("keep-alive client job");
+    assert!(
+        exit.success,
+        "the keep-alive client must exit cleanly, code {}",
+        exit.code
+    );
+    assert_eq!(
+        upstream.next_report().await.map(|(c, r, _)| (c, r)),
+        Some((2, 1)),
+        "request 2 must arrive on the connection request 1 used, not a reconnect"
+    );
+
+    // The fixture kept accepting throughout, so anything that reached it is
+    // recorded. Neither refused probe nor an implicit reconnect may appear here:
+    // exactly two upstream connections are allowed.
+    upstream.assert_accepted_exactly(2).await;
+    dns.assert_running().await;
+
+    teardown(sb, name).await;
+}
+
+/// AC4: the multi-tenant platform floor is independent of the tenant policy, so
+/// replacing that policy with `allow_all()` cannot reach a host-only destination.
+///
+/// The public control case proves the replace took effect (the same guest had
+/// no public access under the launch policy), while the host alias stays refused
+/// — which the floor, not the tenant policy, decides.
+///
+/// Requires internet access for the public control case; the host destination is
+/// a local fixture.
+#[msb_test]
+async fn network_policy_replace_cannot_relax_multi_tenant_floor() {
+    let server = HostHttp::start().await.expect("host http fixture");
+    let url = format!("http://host.microsandbox.internal:{}/", server.port());
+    let name = "network-policy-replace-floor";
+    let sb = Sandbox::builder(name)
+        .image(CURL_IMAGE)
+        .cpus(1)
+        .memory(256)
+        .user("0")
+        .deployment_profile(DeploymentProfile::MultiTenant)
+        .replace()
+        .network(|n| n.policy(NetworkPolicy::none()))
+        .create()
+        .await
+        .expect("create multi-tenant sandbox");
+
+    // The launch policy denies public egress too, so the control case below
+    // cannot be satisfied by anything but the replace.
+    let before = public_control_probe(&sb).await;
+    assert!(
+        !before.contains("code=200"),
+        "the launch policy must deny public egress, got: {before}"
+    );
+
+    assert_host_alias_refused(&sb, &url, "before the replace").await;
+
+    let revision = sb
+        .update_network_policy(NetworkPolicy::allow_all())
+        .await
+        .expect("replace with allow_all");
+    assert_eq!(revision, 2, "the launch policy is revision 1");
+
+    // The same host destination is still refused after the tenant policy allows
+    // everything, because the floor denies it independently.
+    assert_host_alias_refused(&sb, &url, "after the replace").await;
+
+    // Control: the replace did take effect.
+    let after = public_control_probe(&sb).await;
+    assert!(
+        after.contains("code=200"),
+        "the replace must restore public egress, got: {after}"
+    );
+
+    teardown(sb, name).await;
+}
+
+/// Fetch a public page from the guest; reports curl's status code and exit status.
+async fn public_control_probe(sb: &Sandbox) -> String {
+    let out = sb
+        .shell(
+            "curl -sS --max-time 30 -o /dev/null -w 'code=%{http_code}' https://example.com\n\
+             echo \" status=$?\"",
+        )
+        .await
+        .expect("curl public control case");
+    out.stdout().expect("utf8 stdout").trim().to_owned()
+}
+
+/// The host-alias probe for AC4: a refused connection must neither report
+/// success nor leak the fixture's body.
+async fn assert_host_alias_refused(sb: &Sandbox, url: &str, stage: &str) {
+    let out = sb
+        .shell(format!(
+            r#"curl -sS --max-time 10 -o /tmp/floor-body -w 'code=%{{http_code}}' '{url}'
+echo " status=$?"
+printf 'body='; head -c 64 /tmp/floor-body 2>/dev/null || true
+"#
+        ))
+        .await
+        .expect("curl host alias");
+    let stdout = out.stdout().expect("utf8 stdout");
+    let stderr = out.stderr().unwrap_or_default();
+    assert!(
+        !stdout.contains("status=0"),
+        "{stage}: the platform floor must refuse the host alias, got: {stdout:?} (stderr: {stderr})"
+    );
+    assert!(
+        !stdout.contains("floor-ok!"),
+        "{stage}: the host fixture's body leaked through the platform floor: {stdout:?}"
+    );
+}
+
+/// R10: a replace is a mutation, so the lifecycle gate refuses it while the runtime is paused,
+/// and the refusal consumes no revision — which the next replace, after `resume`, proves.
+///
+/// The refusal arrives as `ControlClient(Peer { code: "runtime_busy" })`, not as `Unsupported`:
+/// this runtime advertises the operation, it simply cannot run it against a paused lifecycle. That
+/// distinction is the point of the test — a decode or transport failure would also be an error,
+/// so the assertion is on the runtime's own code and on the effect it claims.
+///
+/// The last step sends the *same* policy again: R3 counts every successful replace, changed or not.
+#[msb_test]
+async fn network_policy_replace_is_refused_while_paused() {
+    let name = "network-policy-replace-lifecycle-gate";
+    let sb = Sandbox::builder(name)
+        .image(CURL_IMAGE)
+        .cpus(1)
+        .memory(256)
+        .replace()
+        .network(|n| n.policy(NetworkPolicy::none()))
+        .create()
+        .await
+        .expect("create sandbox");
+
+    let policy = NetworkPolicy::none()
+        .allow_domain(PROBE_DOMAIN)
+        .expect("domain");
+
+    // 1. Pause through the public SDK, then read back the pause the gate will enforce.
+    tokio::time::timeout(FIXTURE_TIMEOUT, sb.pause())
+        .await
+        .expect("pause deadline")
+        .expect("pause");
+    let paused = tokio::time::timeout(FIXTURE_TIMEOUT, sb.pause_state())
+        .await
+        .expect("pause_state deadline")
+        .expect("pause_state");
+    assert!(
+        paused.paused,
+        "the runtime must hold a user pause: {paused:?}"
+    );
+
+    // 2. The mutation gate refuses it: an error, not a success, and the runtime's own code.
+    let refused = tokio::time::timeout(FIXTURE_TIMEOUT, sb.update_network_policy(policy.clone()))
+        .await
+        .expect("paused replace deadline")
+        .expect_err("a paused runtime must not apply a mutation");
+    match &refused {
+        MicrosandboxError::ControlClient(source) => match source.as_ref() {
+            microsandbox_control_client::ControlClientError::Peer { error, .. } => {
+                assert_eq!(
+                    error.code, "runtime_busy",
+                    "the refusal must be the lifecycle gate, not a decode or transport failure: \
+                     {error:?}"
+                );
+                // R9 requires `effect: none` for the four refusals it names
+                // (`network_policy_unavailable`, `invalid_network_policy`, both
+                // `revision_exhausted`s). `runtime_busy` comes from the gate this operation shares
+                // with `SecretsUpdate`, whose refusal keeps the blanket `Unknown` for a mutation
+                // failure (handler.rs:227). Pinned here so the value is a decision, not a surprise.
+                assert_eq!(
+                    error.effect,
+                    microsandbox_protocol::control::ErrorEffect::Unknown,
+                    "the shared lifecycle gate reports `unknown` for a busy mutation: {error:?}"
+                );
+            }
+            other => panic!("expected the runtime's structured refusal, got: {other}"),
+        },
+        other => panic!("expected MicrosandboxError::ControlClient, got: {other}"),
+    }
+
+    // 3. Resume, and the same replace now lands at revision 2: the refusal consumed no number.
+    tokio::time::timeout(FIXTURE_TIMEOUT, sb.resume())
+        .await
+        .expect("resume deadline")
+        .expect("resume");
+    let revision = tokio::time::timeout(FIXTURE_TIMEOUT, sb.update_network_policy(policy.clone()))
+        .await
+        .expect("replace deadline")
+        .expect("replace after resume");
+    assert_eq!(
+        revision, 2,
+        "the launch policy is revision 1 and a refused replace consumes no number"
+    );
+
+    // 4. R3's other half: the same policy again still counts.
+    let revision = tokio::time::timeout(FIXTURE_TIMEOUT, sb.update_network_policy(policy))
+        .await
+        .expect("second replace deadline")
+        .expect("an identical replace is still a successful replace");
+    assert_eq!(
+        revision, 3,
+        "a successful replace adds one even when the policy did not change"
+    );
+
+    teardown(sb, name).await;
+}
+
+/// AC5 and AC3 at the wire, which the SDK cannot reach: `Sandbox::update_network_policy` takes a
+/// typed `NetworkPolicy`, so an undecodable document is not expressible through it, and
+/// capability discovery is internal. This test therefore speaks the legacy JSON control line
+/// directly to the sandbox's own control socket.
+///
+/// Requires `MSB_TEST_ISOLATE_HOME`, both because the socket is discovered under `MSB_HOME` and
+/// because the discovery insists on exactly one running sandbox runtime rather than guessing.
+#[cfg(unix)]
+#[msb_test]
+async fn network_policy_replace_capability_and_invalid_policy_on_the_wire() {
+    let Some(home) = std::env::var_os("MSB_HOME") else {
+        eprintln!(
+            "skipping raw control-socket check; set MSB_TEST_ISOLATE_HOME=1 so MSB_HOME names one \
+             sandbox home"
+        );
+        return;
+    };
+    let name = "network-policy-replace-wire";
+    let sb = Sandbox::builder(name)
+        .image(CURL_IMAGE)
+        .cpus(1)
+        .memory(256)
+        .replace()
+        .network(|n| n.policy(NetworkPolicy::none()))
+        .create()
+        .await
+        .expect("create sandbox");
+
+    let control = single_control_socket(std::path::Path::new(&home));
+
+    // AC5: a networked current runtime advertises the operation.
+    let capabilities = control_line(&control, "{\"op\":\"capabilities\"}").await;
+    assert_eq!(
+        capabilities.pointer("/capabilities/network_policy_update"),
+        Some(&serde_json::Value::Bool(true)),
+        "a networked runtime must advertise network_policy_update: {capabilities}"
+    );
+
+    // AC3: a document the wire type accepts but the engine would not decode at boot is refused
+    // by the runtime, leaving the revision where it was.
+    let refused = control_line(
+        &control,
+        r#"{"op":"network_policy_replace","policy":{"default_egress":"deny","default_ingress":"allow","rules":[{"direction":"egress","destination":{"domain":"not a domain!"},"protocols":["tcp"],"ports":[{"start":443,"end":443}],"action":"allow"}]}}"#,
+    )
+    .await;
+    assert_eq!(
+        refused.get("ok"),
+        Some(&serde_json::Value::Bool(false)),
+        "an undecodable policy must be refused: {refused}"
+    );
+    assert_eq!(
+        refused.get("error_code").and_then(|code| code.as_str()),
+        Some("invalid_network_policy"),
+        "the refusal must name the policy class: {refused}"
+    );
+
+    // AC6 at the wire: the refused attempt consumed no revision, so the next valid replace is 2.
+    let accepted = control_line(
+        &control,
+        r#"{"op":"network_policy_replace","policy":{"default_egress":"deny","default_ingress":"allow","rules":[{"direction":"egress","destination":{"domain":"wire.example"},"protocols":["tcp"],"ports":[{"start":443,"end":443}],"action":"allow"}]}}"#,
+    )
+    .await;
+    assert_eq!(
+        accepted.pointer("/network_policy/revision"),
+        Some(&serde_json::Value::from(2)),
+        "a refused replace must consume no revision: {accepted}"
+    );
+
+    teardown(sb, name).await;
+}
+
+/// The sandbox's control socket, requiring exactly one running sandbox runtime.
+///
+/// Guessing between several runtimes would test whichever socket the glob happened to return, so
+/// the count is an assertion rather than a preference.
+#[cfg(unix)]
+fn single_control_socket(home: &std::path::Path) -> std::path::PathBuf {
+    let sandboxes = home.join("run").join("sandboxes");
+    let mut found: Vec<std::path::PathBuf> = std::fs::read_dir(&sandboxes)
+        .unwrap_or_else(|error| panic!("read {}: {error}", sandboxes.display()))
+        .filter_map(|entry| entry.ok().map(|entry| entry.path().join("control.sock")))
+        .filter(|path| path.exists())
+        .collect();
+    found.sort();
+    assert_eq!(
+        found.len(),
+        1,
+        "expected exactly one running sandbox runtime under {}, found {found:?}",
+        sandboxes.display()
+    );
+    found.pop().expect("checked one")
+}
+
+/// Send one legacy JSON control line and read the one-line reply.
+#[cfg(unix)]
+async fn control_line(path: &std::path::Path, request: &str) -> serde_json::Value {
+    let mut stream = tokio::net::UnixStream::connect(path)
+        .await
+        .unwrap_or_else(|error| panic!("connect {}: {error}", path.display()));
+    stream
+        .write_all(format!("{request}\n").as_bytes())
+        .await
+        .expect("write control request");
+    stream.flush().await.expect("flush control request");
+    let mut reader = tokio::io::BufReader::new(stream);
+    let mut reply = String::new();
+    tokio::time::timeout(Duration::from_secs(10), reader.read_line(&mut reply))
+        .await
+        .expect("control reply deadline")
+        .expect("read control reply");
+    assert!(!reply.trim().is_empty(), "empty control reply");
+    serde_json::from_str(reply.trim())
+        .unwrap_or_else(|error| panic!("control reply is not JSON ({error}): {reply:?}"))
+}
+
+/// AC7 against a runtime that predates the capability: the SDK refuses with
+/// `Unsupported` and sends no operation request.
+///
+/// Skipped unless `MSB_PATH` points at a pre-change `msb` build. Do not combine
+/// this test with `MSB_TEST_ISOLATE_HOME`: the isolation helper overwrites
+/// `MSB_PATH` with the installed binary, which would silently test the new
+/// build against itself.
+#[msb_test]
+async fn network_policy_replace_reports_unsupported() {
+    if std::env::var_os("MSB_PATH").is_none() {
+        eprintln!(
+            "skipping cross-version network-policy check; set MSB_PATH to a pre-change msb build"
+        );
+        return;
+    }
+    if std::env::var_os(test_utils::ISOLATE_HOME_ENV).is_some() {
+        eprintln!(
+            "skipping cross-version network-policy check; MSB_TEST_ISOLATE_HOME overwrites MSB_PATH"
+        );
+        return;
+    }
+
+    let name = "network-policy-replace-unsupported";
+    let sb = Sandbox::builder(name)
+        .image(CURL_IMAGE)
+        .cpus(1)
+        .memory(256)
+        .user("0")
+        .replace()
+        .network(|n| n.policy(NetworkPolicy::none()))
+        .create()
+        .await
+        .expect("create sandbox");
+
+    let error = sb
+        .update_network_policy(NetworkPolicy::allow_all())
+        .await
+        .expect_err("a runtime without the capability must not accept a replace");
+
+    teardown(sb, name).await;
+
+    assert!(
+        matches!(
+            error,
+            MicrosandboxError::Unsupported {
+                op: Operation::SandboxUpdateNetworkPolicy,
+                ..
+            }
+        ),
+        "expected Unsupported for Sandbox::update_network_policy, got: {error}"
+    );
 }

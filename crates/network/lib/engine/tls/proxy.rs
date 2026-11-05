@@ -23,7 +23,8 @@ use crate::extensions::{
     AuthorizedRouteRequestStream, AuthorizedTlsRoute, NetworkExtensions, RequestAction,
 };
 use crate::netstack::shared::SharedState;
-use crate::policy::{EgressEvaluation, HostnameSource, NetworkPolicy, Protocol};
+use crate::policy::handle::NetworkPolicyHandle;
+use crate::policy::{EgressEvaluation, HostnameSource, Protocol};
 use crate::proxy::ResolvedOutboundProxy;
 use crate::secrets::config::SecretViolationAction;
 use crate::secrets::handler::SecretsHandler;
@@ -51,7 +52,8 @@ pub(crate) struct TlsProxy {
     to_smoltcp: mpsc::Sender<Bytes>,
     shared: Arc<SharedState>,
     tls_state: Arc<TlsState>,
-    network_policy: Arc<NetworkPolicy>,
+    /// Live tenant policy, loaded once at the SNI decision.
+    network_policy: NetworkPolicyHandle,
     strict: bool,
     proxy_connect: Arc<ProxyConnectState>,
     extensions: NetworkExtensions,
@@ -83,7 +85,7 @@ impl TlsProxy {
         to_smoltcp: mpsc::Sender<Bytes>,
         shared: Arc<SharedState>,
         tls_state: Arc<TlsState>,
-        network_policy: Arc<NetworkPolicy>,
+        network_policy: NetworkPolicyHandle,
         strict: bool,
         proxy_connect: Arc<ProxyConnectState>,
         extensions: NetworkExtensions,
@@ -179,6 +181,10 @@ impl TlsProxy {
         .await
         .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "ClientHello timed out"))?;
         let (sni_name, initial_buf) = sni_name?;
+
+        // The SNI decision is this flow's admission, so it reads the policy that is current now,
+        // not one captured when the task was spawned. Everything below uses this snapshot.
+        let network_policy = network_policy.load();
 
         // Without SNI, authenticate the original destination IP, never a cached
         // DNS name or the host-side address used for gateway forwarding.
@@ -977,6 +983,7 @@ mod tests {
     use crate::extensions::AuthorizedRouteRequestExtension;
     use crate::intercept::InterceptExtension;
     use crate::intercept::config::{InterceptConfig, InterceptRule};
+    use crate::policy::NetworkPolicy;
     use crate::secrets::config::{HostPattern, SecretEntry, SecretSubstitution, SecretsConfig};
     use crate::secrets::credential::ResolvedHeaderCredential;
     use crate::secrets::handle::SecretsHandle;
@@ -1376,7 +1383,9 @@ mod tests {
                 to_tx,
                 shared,
                 state,
-                Arc::new(NetworkPolicy::none().allow_domain("example.com").unwrap()),
+                NetworkPolicyHandle::new(
+                    NetworkPolicy::none().allow_domain("example.com").unwrap(),
+                ),
                 true,
                 Arc::new(ProxyConnectState::new()),
                 NetworkExtensions::default(),
@@ -1581,7 +1590,7 @@ mod tests {
             to_tx,
             shared,
             state,
-            Arc::new(policy),
+            NetworkPolicyHandle::new(policy),
             strict,
             Arc::new(ProxyConnectState::new()),
             NetworkExtensions::default(),
@@ -1592,6 +1601,110 @@ mod tests {
             .unwrap()
             .unwrap();
         server.await.unwrap()
+    }
+
+    //----------------------------------------------------------------------------------------------
+    // The SNI decision reads the live tenant policy
+    //----------------------------------------------------------------------------------------------
+
+    /// The SNI decision loads the policy *after* `read_client_hello` returns.
+    ///
+    /// Discrimination method: the ClientHello is delivered minus its last byte, so the proxy is
+    /// blocked inside `read_client_hello` when the replace lands; the last byte is written only
+    /// afterwards. A proxy that sampled the policy at spawn would decide under the old policy.
+    #[tokio::test]
+    async fn sni_decision_loads_the_policy_after_the_client_hello() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        // (policy at spawn, replacement, whether the flow must reach upstream)
+        let cases: [(&str, NetworkPolicy, NetworkPolicy, bool); 2] = [
+            (
+                "grant lands during the ClientHello",
+                NetworkPolicy::none(),
+                NetworkPolicy::none().allow_domain("example.com").unwrap(),
+                true,
+            ),
+            (
+                "revoke lands during the ClientHello",
+                NetworkPolicy::none().allow_domain("example.com").unwrap(),
+                NetworkPolicy::none(),
+                false,
+            ),
+        ];
+
+        for (label, initial, replacement, reaches_upstream) in cases {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let upstream = listener.local_addr().unwrap();
+            let shared = Arc::new(SharedState::new(8));
+            shared.set_http_config(microsandbox_types::HttpConfig {
+                deny_response: false,
+                ..Default::default()
+            });
+            // A `Domain` allow must be corroborated by the DNS-index binding for the destination
+            // IP, exactly as a real guest would have produced it before connecting.
+            shared.cache_resolved_hostname(
+                "example.com",
+                crate::netstack::shared::ResolvedHostnameFamily::Ipv4,
+                [upstream.ip()],
+                Duration::from_secs(60),
+            );
+            // Bypass the client's SNI so a denied flow closes silently instead of trying to
+            // terminate TLS for a raw ClientHello fixture.
+            let state = Arc::new(isolated_tls_state(
+                TlsConfig {
+                    bypass: vec!["example.com".to_string()],
+                    ..Default::default()
+                },
+                SecretsHandle::new(SecretsConfig::default()),
+            ));
+            let policy_handle = NetworkPolicyHandle::new(initial);
+
+            let hello = legacy_client_hello(Some("example.com"));
+            let (last, head) = hello.split_last().unwrap();
+            let (tx, rx) = mpsc::channel::<Bytes>(8);
+            let (to_tx, _to_rx) = mpsc::channel::<Bytes>(1);
+            let proxy = TlsProxy::new(
+                // No pre-connected upstream: the proxy dials only after the SNI decision.
+                None,
+                upstream,
+                UpstreamTcpTarget::direct(upstream),
+                rx,
+                to_tx,
+                shared,
+                state,
+                policy_handle.clone(),
+                false,
+                Arc::new(ProxyConnectState::new()),
+                NetworkExtensions::default(),
+                None,
+            );
+            let task = tokio::spawn(proxy.try_run());
+
+            tx.send(Bytes::copy_from_slice(head)).await.unwrap();
+            // The proxy is now blocked waiting for the rest of the ClientHello.
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            assert_eq!(policy_handle.replace(replacement), Ok(2));
+            tx.send(Bytes::copy_from_slice(&[*last])).await.unwrap();
+            drop(tx);
+
+            // The bypass relay stays open once it dials, so the observable is the dial itself.
+            let dialed = tokio::time::timeout(Duration::from_millis(500), listener.accept()).await;
+            assert_eq!(
+                dialed.is_ok(),
+                reaches_upstream,
+                "{label}: the SNI decision must use the policy current at the decision"
+            );
+
+            if reaches_upstream {
+                task.abort();
+            } else {
+                // A refused flow closes on its own without dialing.
+                tokio::time::timeout(Duration::from_secs(5), task)
+                    .await
+                    .expect("proxy did not finish")
+                    .unwrap()
+                    .unwrap();
+            }
+        }
     }
 
     fn guest_client(tls_state: &TlsState) -> rustls::ClientConnection {
@@ -2539,7 +2652,7 @@ mod tests {
             to_tx,
             shared,
             tls_state,
-            Arc::new(NetworkPolicy::allow_all()),
+            NetworkPolicyHandle::new(NetworkPolicy::allow_all()),
             false,
             Arc::new(ProxyConnectState::new()),
             extensions,

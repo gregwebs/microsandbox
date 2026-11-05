@@ -9,6 +9,9 @@ use microsandbox_protocol::{
     message::{Message, MessageType},
     wire::{self, Envelope, WireError},
 };
+use microsandbox_types::{
+    Action, Destination, Direction, NetworkPolicy, PortRange, Protocol, Rule,
+};
 use serde_json::{Value as JsonValue, json};
 
 //--------------------------------------------------------------------------------------------------
@@ -25,6 +28,44 @@ fn field(name: &str, value: Value) -> (Value, Value) {
 
 fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+/// The tenant policy pinned by the network-policy-replace golden bytes.
+fn probe_policy() -> NetworkPolicy {
+    NetworkPolicy {
+        default_egress: Action::Deny,
+        default_ingress: Action::Allow,
+        rules: vec![Rule {
+            direction: Direction::Egress,
+            destination: Destination::Domain("probe.example".into()),
+            protocols: vec![Protocol::Tcp],
+            ports: vec![PortRange {
+                start: 443,
+                end: 443,
+            }],
+            action: Action::Allow,
+        }],
+    }
+}
+
+/// One `control.network-policy.replace` payload shaped exactly as `fields` describes.
+fn policy_envelope(policy: Value) -> Envelope {
+    Envelope {
+        v: 2,
+        t: "control.network-policy.replace".into(),
+        p: bytes(&Value::Map(vec![field("policy", policy)])),
+    }
+}
+
+fn probe_rule() -> Value {
+    Value::Map(vec![
+        field("direction", "egress".into()),
+        field(
+            "destination",
+            Value::Map(vec![field("domain", "probe.example".into())]),
+        ),
+        field("action", "allow".into()),
+    ])
 }
 
 fn case(name: &str, envelope: Envelope, id: u32, flags: u8) -> JsonValue {
@@ -635,6 +676,14 @@ fn generation_two_inventory_and_requests_are_additive() {
             },
         )
         .unwrap(),
+        Envelope::new(
+            2,
+            "control.network-policy.replace",
+            &NetworkPolicyReplace {
+                policy: probe_policy(),
+            },
+        )
+        .unwrap(),
     ];
     for request in requests {
         assert!(ControlOperation::from_envelope(&request, 2).is_ok());
@@ -662,5 +711,151 @@ fn generation_two_rejects_duplicate_nested_compaction_selectors() {
     assert_eq!(
         ControlOperation::from_envelope(&envelope, 2).unwrap_err(),
         WireError::DuplicateKey
+    );
+}
+
+#[test]
+fn network_policy_replace_payload_bytes_are_pinned() {
+    let replace = NetworkPolicyReplace {
+        policy: probe_policy(),
+    };
+    let request = Envelope::new(2, "control.network-policy.replace", &replace).unwrap();
+    assert_eq!(
+        hex(&request.p),
+        "a166706f6c696379a36e64656661756c745f6567726573736464656e796f64656661756c745f696e677265737365616c6c6f776572756c657381a569646972656374696f6e666567726573736b64657374696e6174696f6ea166646f6d61696e6d70726f62652e6578616d706c656970726f746f636f6c73816374637065706f72747381a26573746172741901bb63656e641901bb66616374696f6e65616c6c6f77"
+    );
+    assert_eq!(
+        hex(&request.encode().unwrap()),
+        "a36176026174781e636f6e74726f6c2e6e6574776f726b2d706f6c6963792e7265706c616365617058a2a166706f6c696379a36e64656661756c745f6567726573736464656e796f64656661756c745f696e677265737365616c6c6f776572756c657381a569646972656374696f6e666567726573736b64657374696e6174696f6ea166646f6d61696e6d70726f62652e6578616d706c656970726f746f636f6c73816374637065706f72747381a26573746172741901bb63656e641901bb66616374696f6e65616c6c6f77"
+    );
+
+    let result = NetworkPolicyResult { revision: 2 };
+    let reply = Envelope::new(2, "control.network-policy.result", &result).unwrap();
+    assert_eq!(hex(&reply.p), "a1687265766973696f6e02");
+    assert_eq!(
+        hex(&reply.encode().unwrap()),
+        "a36176026174781d636f6e74726f6c2e6e6574776f726b2d706f6c6963792e726573756c7461704ba1687265766973696f6e02"
+    );
+
+    // The pinned request payload decodes back to the same operation.
+    let ControlOperation::NetworkPolicyReplace(decoded) =
+        ControlOperation::from_envelope(&request, 2).unwrap()
+    else {
+        panic!("expected a network-policy replacement");
+    };
+    assert_eq!(decoded, replace);
+}
+
+#[test]
+fn network_policy_replace_rejects_duplicate_known_record_keys() {
+    // The assertion is the error code, not the rejection: serde's derive refuses every document
+    // below on its own, as `InvalidRecord`. Validating the known record layers first is what makes
+    // the refusal precise enough to report `DuplicateKey`, so that is what this test pins.
+    let duplicated_policy = Value::Map(vec![
+        field("rules", Value::Array(vec![probe_rule()])),
+        field("default_egress", "allow".into()),
+        field("default_egress", "deny".into()),
+    ]);
+    let duplicated_rule = Value::Map(vec![
+        field("direction", "egress".into()),
+        field(
+            "destination",
+            Value::Map(vec![field("domain", "probe.example".into())]),
+        ),
+        field("action", "allow".into()),
+        field("action", "deny".into()),
+    ]);
+    let duplicated_destination = Value::Map(vec![
+        field("direction", "egress".into()),
+        field(
+            "destination",
+            Value::Map(vec![
+                field("domain", "probe.example".into()),
+                field("domain", "other.example".into()),
+            ]),
+        ),
+        field("action", "allow".into()),
+    ]);
+    for policy in [
+        duplicated_policy,
+        Value::Map(vec![field("rules", Value::Array(vec![duplicated_rule]))]),
+        Value::Map(vec![field(
+            "rules",
+            Value::Array(vec![duplicated_destination]),
+        )]),
+    ] {
+        assert_eq!(
+            ControlOperation::from_envelope(&policy_envelope(policy), 2).unwrap_err(),
+            WireError::DuplicateKey
+        );
+    }
+}
+
+#[test]
+fn network_policy_replace_leaves_unknown_field_values_opaque() {
+    // Only the policy map, each rule and each rule's destination are known records. An unknown
+    // field may legally hold a map that `validate_record` itself would refuse, such as one with a
+    // non-text key, and that must not reject the replacement.
+    let extension = Value::Map(vec![(Value::Integer(1.into()), Value::Text("x".into()))]);
+    let rule = Value::Map(vec![
+        field("direction", "egress".into()),
+        field(
+            "destination",
+            Value::Map(vec![field("domain", "probe.example".into())]),
+        ),
+        field("action", "allow".into()),
+        field("future_rule_field", extension.clone()),
+    ]);
+    let policy = Value::Map(vec![
+        field("rules", Value::Array(vec![rule])),
+        field("default_ingress", "allow".into()),
+        field("future_policy_field", extension.clone()),
+    ]);
+
+    let operation = ControlOperation::from_envelope(&policy_envelope(policy), 2).unwrap();
+    let ControlOperation::NetworkPolicyReplace(replace) = operation else {
+        panic!("expected a network-policy replacement");
+    };
+    assert_eq!(replace.policy.rules.len(), 1);
+}
+
+#[test]
+fn runtime_capabilities_omit_the_policy_flag_when_false() {
+    let absent = wire::decode_value(&wire::encode(&RuntimeCapabilities::default()).unwrap())
+        .expect("capabilities are a record");
+    let Value::Map(fields) = absent else {
+        panic!("expected a record")
+    };
+    assert!(
+        fields
+            .iter()
+            .all(|(key, _)| key.as_text() != Some("network_policy_update")),
+        "a false flag must not change the bytes older readers already accept"
+    );
+
+    let present = RuntimeCapabilities {
+        network_policy_update: true,
+        ..Default::default()
+    };
+    let encoded = wire::decode_value(&wire::encode(&present).unwrap()).unwrap();
+    let Value::Map(fields) = encoded else {
+        panic!("expected a record")
+    };
+    assert!(fields.iter().any(|(key, value)| {
+        key.as_text() == Some("network_policy_update") && matches!(value, Value::Bool(true))
+    }));
+
+    // The frozen generation-one record keeps its four fields only.
+    let generation_one = present.generation_one();
+    assert_eq!(generation_one, Capabilities::default());
+    let frozen = wire::decode_value(&wire::encode(&generation_one).unwrap()).unwrap();
+    let Value::Map(fields) = frozen else {
+        panic!("expected a record")
+    };
+    assert!(
+        fields
+            .iter()
+            .all(|(key, _)| key.as_text() != Some("network_policy_update")),
+        "the generation-one projection has no policy flag"
     );
 }

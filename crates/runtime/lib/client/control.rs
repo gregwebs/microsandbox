@@ -135,6 +135,12 @@ pub enum ControlRequest {
         changes: Vec<SecretLiveChange>,
     },
 
+    /// Replace the running tenant network policy; replies with the new policy revision.
+    NetworkPolicyReplace {
+        /// Complete replacement, validated exactly as at boot.
+        policy: microsandbox_types::NetworkPolicy,
+    },
+
     /// Produce one same-epoch full checkpoint and return the source to its prior running
     /// state after root-last publication.
     CheckpointCreate {
@@ -196,6 +202,9 @@ pub struct ControlResponse {
     /// In-process completion metadata for the framed adapter; never emitted in JSON.
     #[serde(skip)]
     pub secret_result: Option<microsandbox_protocol::control::SecretsResult>,
+    /// Mutation certainty for a refusal that provably precedes the change; never emitted in JSON.
+    #[serde(skip)]
+    pub error_effect: Option<microsandbox_protocol::control::ErrorEffect>,
     /// Available transports on this same endpoint.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub control_protocols: Option<Vec<String>>,
@@ -241,6 +250,9 @@ pub struct ControlResponse {
     /// Sealed disk-only capture, with no RAM or execution-state closure.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub disk_checkpoint: Option<DiskCheckpointControlState>,
+    /// Tenant policy revision in force after a successful replacement.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub network_policy: Option<microsandbox_protocol::control::NetworkPolicyResult>,
 }
 
 /// Published checkpoint information returned by the runtime control executor.
@@ -335,6 +347,9 @@ pub struct ControlCapabilities {
     /// Disk-only live capture is available without full-state admission.
     #[serde(default)]
     pub disk_checkpoint_create: bool,
+    /// Live tenant network-policy replacement is available.
+    #[serde(default)]
+    pub network_policy_update: bool,
 }
 
 /// Host-confirmed resident suspension state.
@@ -526,6 +541,7 @@ mod tests {
                 pause_resume: true,
                 disk_compact: true,
                 disk_compact_owned: true,
+                network_policy_update: true,
             }),
             ..Default::default()
         };

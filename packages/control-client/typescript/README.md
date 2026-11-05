@@ -22,7 +22,19 @@ async function inspectAndResize(path: string) {
 }
 ```
 
-Generation-1 checked helpers cover capabilities, memory state/target, CPU state/target, and ordered secret updates. Generation 2 adds `GetRuntimeCapabilities`, `CreateCheckpoint`, `CreateDiskCheckpoint`, `CreateBranch`, `PauseRuntime`, `ResumeRuntime`, `GetPauseState`, `GrowRootDisk`, and `CompactDisks`. They validate replies and retain the actual response on `ControlClientError`. Generic message requests return peer error frames directly. A target reply reports acceptance and observation; it does not establish guest convergence. Secret batches stop at the first failure and retain earlier completed changes.
+Generation-1 checked helpers cover capabilities, memory state/target, CPU state/target, and ordered secret updates. Generation 2 adds `GetRuntimeCapabilities`, `CreateCheckpoint`, `CreateDiskCheckpoint`, `CreateBranch`, `PauseRuntime`, `ResumeRuntime`, `GetPauseState`, `GrowRootDisk`, `CompactDisks`, and `ReplaceNetworkPolicy`. They validate replies and retain the actual response on `ControlClientError`. Generic message requests return peer error frames directly. A target reply reports acceptance and observation; it does not establish guest convergence. Secret batches stop at the first failure and retain earlier completed changes.
+
+`ReplaceNetworkPolicy` sends the whole tenant policy and returns the new revision as `bigint`; the launch policy is revision 1, and a reply that reports it is rejected.
+
+```ts
+import { type ControlClient, ReplaceNetworkPolicy } from "@microsandbox/control-client";
+import type { NetworkPolicy } from "@microsandbox/types";
+
+async function allowOneHostname(client: ControlClient, policy: NetworkPolicy) {
+  const { revision } = await client.requestTyped(new ReplaceNetworkPolicy(policy));
+  return revision; // bigint
+}
+```
 
 Use `connectControl` for automatic discovery on the same endpoint. It sends the existing read-only JSON capabilities request, closes that exchange, and opens a fresh framed connection only after an affirmative CBOR advertisement. Setup has one total deadline across both connections. Malformed discovery, timeout, EOF without a reply, or a failed welcome never trigger fallback or replay.
 

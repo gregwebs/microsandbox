@@ -3,7 +3,7 @@ import { ControlClientError } from "./error.js";
 import { jsonObject, jsonUint, parseJson, type JsonObject, type JsonValue } from "./json-value.js";
 import type {
   BranchResult, Capabilities, CheckpointState, DiskCheckpointState, DiskCompactionResult,
-  PauseState, RootDiskState, RuntimeCapabilities, CpuState, MemoryState,
+  NetworkPolicyResult, PauseState, RootDiskState, RuntimeCapabilities, CpuState, MemoryState,
 } from "./records.js";
 
 export type ControlMode = "cbor" | "json";
@@ -70,6 +70,7 @@ export function jsonRuntimeCapabilities(value: JsonValue | undefined): RuntimeCa
     cpu_resize: boolean("cpu_resize"), memory_resize: boolean("memory_resize"),
     secrets_update: boolean("secrets_update"), checkpoint_create: optional("checkpoint_create"),
     disk_checkpoint_create: optional("disk_checkpoint_create"),
+    network_policy_update: optional("network_policy_update"),
   };
 }
 export function jsonMemory(value: JsonValue | undefined): MemoryState {
@@ -121,6 +122,10 @@ export function jsonRootDisk(value: JsonValue | undefined): RootDiskState {
     filesystem_bytes: uint("filesystem_bytes"), device_bytes: uint("device_bytes"), total_us: uint("total_us"),
     pause_us: uint("pause_us"), guest_us: uint("guest_us"),
   };
+}
+
+export function jsonNetworkPolicy(value: JsonValue | undefined): NetworkPolicyResult {
+  return { revision: jsonUint(jsonObject(value).get("revision"), 64) };
 }
 
 export function jsonDiskCompaction(value: JsonValue | undefined): DiskCompactionResult {

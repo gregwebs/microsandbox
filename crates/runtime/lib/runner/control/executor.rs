@@ -15,6 +15,7 @@ use crate::relay::RelayIdleState;
 use crate::runner::jobs::JobManager;
 use crate::vm::VmConfig;
 use microsandbox_protocol::bootstrap::GuestBootstrap;
+use microsandbox_protocol::control::ErrorEffect;
 
 //--------------------------------------------------------------------------------------------------
 // Constants
@@ -38,6 +39,9 @@ pub struct RuntimeControlExecutor {
     vm: msb_krun::VmControl,
     #[cfg(feature = "net")]
     secrets: Option<microsandbox_network::secrets::handle::SecretsHandle>,
+    /// Live tenant policy, absent when this build or boot has no network stack to hold one.
+    #[cfg(feature = "net")]
+    network_policy: Option<microsandbox_network::policy::handle::NetworkPolicyHandle>,
     state: Mutex<ExecutorState>,
 }
 
@@ -57,6 +61,16 @@ struct DedupEntry {
     response: ControlEnvelopeResponse,
 }
 
+/// What one mutation attempt leaves behind: the lifecycle and revision it ends at, and its reply.
+///
+/// Passed by value so the gate, the preflight, the dispatch and the increment can be exercised as
+/// one unit without borrowing the executor's real state.
+struct MutationOutcome {
+    lifecycle: RuntimeLifecycle,
+    revision: u64,
+    response: ControlResponse,
+}
+
 //--------------------------------------------------------------------------------------------------
 // Methods
 //--------------------------------------------------------------------------------------------------
@@ -73,6 +87,9 @@ impl RuntimeControlExecutor {
         vm: msb_krun::VmControl,
         #[cfg(feature = "net")] secrets: Option<
             microsandbox_network::secrets::handle::SecretsHandle,
+        >,
+        #[cfg(feature = "net")] network_policy: Option<
+            microsandbox_network::policy::handle::NetworkPolicyHandle,
         >,
         runtime_dir: &Path,
         vm_config: &VmConfig,
@@ -127,6 +144,8 @@ impl RuntimeControlExecutor {
             vm,
             #[cfg(feature = "net")]
             secrets,
+            #[cfg(feature = "net")]
+            network_policy,
             state: Mutex::new(ExecutorState {
                 runtime_boot_id,
                 revision: 0,
@@ -353,6 +372,7 @@ impl RuntimeControlExecutor {
                 | ControlRequest::RootDiskGrow { .. }
                 | ControlRequest::CpuTarget { .. }
                 | ControlRequest::SecretsUpdate { .. }
+                | ControlRequest::NetworkPolicyReplace { .. }
                 | ControlRequest::CheckpointCreate { .. }
                 | ControlRequest::DiskCheckpointCreate { .. }
                 | ControlRequest::BranchCreate { .. }
@@ -373,18 +393,43 @@ impl RuntimeControlExecutor {
                     | ControlRequest::BranchCreate { .. }
                     | ControlRequest::BranchCreateMemfd { .. }
             );
-        if mutation && state.lifecycle != RuntimeLifecycle::Running && !resident_operation {
-            return control_error(
-                "runtime_busy",
-                "runtime lifecycle does not currently admit mutations",
-            );
-        }
+        // The gate, the revision preflight, the dispatch and the bookkeeping tail run through one
+        // function so their order is exercised by a test, not just by review.
+        let outcome = admit_mutation(
+            mutation,
+            resident_operation,
+            state.lifecycle,
+            state.revision,
+            &self.resident_paused,
+            || {
+                let pause_policy = match &request {
+                    ControlRequest::PauseWithGuestFlush { guest_flush } => Some(*guest_flush),
+                    _ => None,
+                };
+                let response = self.dispatch(state, request, pause_policy, memory_backing);
+                (state.lifecycle, response)
+            },
+        );
+        state.lifecycle = outcome.lifecycle;
+        state.revision = outcome.revision;
+        outcome.response
+    }
 
-        let pause_policy = match &request {
-            ControlRequest::PauseWithGuestFlush { guest_flush } => Some(*guest_flush),
-            _ => None,
-        };
-        let response = match request {
+    /// Run one request that the executor has already admitted past its lifecycle gate.
+    ///
+    /// A `return` inside this function leaves `dispatch`, not `execute_locked`: the
+    /// `resident_paused` store and the revision-increment check in `admit_mutation` still run for
+    /// it, exactly as they do for a normal return. An early-return arm added here therefore keeps
+    /// that bookkeeping; give it different semantics only by returning a different lifecycle and
+    /// response, never by skipping the tail.
+    fn dispatch(
+        &self,
+        state: &mut ExecutorState,
+        request: ControlRequest,
+        pause_policy: Option<microsandbox_types::GuestFlush>,
+        memory_backing: Option<Arc<std::fs::File>>,
+    ) -> ControlResponse {
+        match request {
             ControlRequest::DiskCheckpointCreate {
                 checkpoint_id,
                 guest_flush,
@@ -614,32 +659,7 @@ impl RuntimeControlExecutor {
                 }
             }
             request => self.handle_request(request),
-        };
-        self.resident_paused.store(
-            state.lifecycle != RuntimeLifecycle::Running,
-            std::sync::atomic::Ordering::Release,
-        );
-        // A partially applied secret batch changes authoritative state too.
-        let partial = matches!(
-            response.secret_result,
-            Some(microsandbox_protocol::control::SecretsResult::Failed {
-                applied_count: 1..,
-                ..
-            })
-        );
-        if mutation && (response.ok || partial) {
-            match state.revision.checked_add(1) {
-                Some(revision) => state.revision = revision,
-                None => {
-                    state.lifecycle = RuntimeLifecycle::Retiring;
-                    return control_error(
-                        "revision_exhausted",
-                        "runtime mutation revision is exhausted",
-                    );
-                }
-            }
         }
-        response
     }
 
     fn handle_request(&self, request: ControlRequest) -> ControlResponse {
@@ -694,6 +714,7 @@ impl RuntimeControlExecutor {
                     disk_compact_owned: true,
                     root_disk_grow: true,
                     pause_resume: self.vm.clock_sync_supported(),
+                    network_policy_update: self.network_policy_update_supported(),
                 }),
                 ..Default::default()
             },
@@ -712,6 +733,9 @@ impl RuntimeControlExecutor {
             }
             ControlRequest::CpuState => cpu(self.vm.cpu_state()),
             ControlRequest::SecretsUpdate { changes } => self.handle_secrets_update(changes),
+            ControlRequest::NetworkPolicyReplace { policy } => {
+                self.handle_network_policy_replace(policy)
+            }
             ControlRequest::CheckpointCreate { .. }
             | ControlRequest::DiskCheckpointCreate { .. }
             | ControlRequest::BranchCreate { .. }
@@ -736,6 +760,41 @@ impl RuntimeControlExecutor {
         {
             false
         }
+    }
+
+    /// Whether a live tenant policy can be replaced. True if and only if this runtime holds one.
+    fn network_policy_update_supported(&self) -> bool {
+        #[cfg(feature = "net")]
+        {
+            self.network_policy.is_some()
+        }
+        #[cfg(not(feature = "net"))]
+        {
+            false
+        }
+    }
+
+    #[cfg(feature = "net")]
+    fn handle_network_policy_replace(
+        &self,
+        policy: microsandbox_types::NetworkPolicy,
+    ) -> ControlResponse {
+        super::handler::apply_network_policy_replace(self.network_policy.as_ref(), policy)
+    }
+
+    #[cfg(not(feature = "net"))]
+    fn handle_network_policy_replace(
+        &self,
+        _policy: microsandbox_types::NetworkPolicy,
+    ) -> ControlResponse {
+        // The same refusal a `net` runtime with no handle gives: nothing was mutated, so the peer
+        // must not read the effect as unknown.
+        let mut refused = control_error(
+            "network_policy_unavailable",
+            "this runtime was built without network support",
+        );
+        refused.error_effect = Some(ErrorEffect::None);
+        refused
     }
 
     #[cfg(feature = "net")]
@@ -789,6 +848,87 @@ impl RuntimeControlExecutor {
 //--------------------------------------------------------------------------------------------------
 // Functions
 //--------------------------------------------------------------------------------------------------
+
+/// Run the mutation gate, the revision preflight, one dispatch and the bookkeeping tail, in that
+/// order.
+///
+/// Split out of `execute_locked` so the order itself is testable: a test can hand this function a
+/// terminal revision and a dispatcher that would change real state, and prove the dispatcher never
+/// ran. `dispatch` reports the lifecycle it leaves behind, because the resident-pause flag mirrors
+/// the lifecycle the request ended at.
+fn admit_mutation<F>(
+    mutation: bool,
+    resident_operation: bool,
+    lifecycle: RuntimeLifecycle,
+    revision: u64,
+    resident_paused: &std::sync::atomic::AtomicBool,
+    dispatch: F,
+) -> MutationOutcome
+where
+    F: FnOnce() -> (RuntimeLifecycle, ControlResponse),
+{
+    if mutation && lifecycle != RuntimeLifecycle::Running && !resident_operation {
+        return MutationOutcome {
+            lifecycle,
+            revision,
+            response: control_error(
+                "runtime_busy",
+                "runtime lifecycle does not currently admit mutations",
+            ),
+        };
+    }
+    // Refuse an exhausted bookkeeping revision before dispatch, so a swap can never be applied and
+    // then reported as a failure that loses the new revision. This moves the `u64::MAX` refusal
+    // ahead of dispatch for every mutation, which is unreachable in practice.
+    if let Some(refused) = exhausted_mutation_refusal(mutation, revision) {
+        return MutationOutcome {
+            lifecycle: RuntimeLifecycle::Retiring,
+            revision,
+            response: refused,
+        };
+    }
+
+    let (lifecycle, response) = dispatch();
+    resident_paused.store(
+        lifecycle != RuntimeLifecycle::Running,
+        std::sync::atomic::Ordering::Release,
+    );
+    // A partially applied secret batch changes authoritative state too.
+    let partial = matches!(
+        response.secret_result,
+        Some(microsandbox_protocol::control::SecretsResult::Failed {
+            applied_count: 1..,
+            ..
+        })
+    );
+    let revision = if mutation && (response.ok || partial) {
+        // The preflight above proved this cannot overflow.
+        revision + 1
+    } else {
+        revision
+    };
+    MutationOutcome {
+        lifecycle,
+        revision,
+        response,
+    }
+}
+
+/// Refusal for a mutation whose bookkeeping revision cannot advance.
+///
+/// Runs under the state mutex after the lifecycle gate and before dispatch, so a refusal can
+/// never follow a change. `effect: none` tells the framed peer nothing was mutated.
+fn exhausted_mutation_refusal(mutation: bool, revision: u64) -> Option<ControlResponse> {
+    if !mutation || revision.checked_add(1).is_some() {
+        return None;
+    }
+    let mut refused = control_error(
+        "revision_exhausted",
+        "runtime mutation revision is exhausted",
+    );
+    refused.error_effect = Some(ErrorEffect::None);
+    Some(refused)
+}
 
 fn unsupported_lifecycle_request(
     request: &ControlRequest,
@@ -961,6 +1101,100 @@ mod tests {
         // Observation remains safe without a kernel clock callback.
         assert!(unsupported_lifecycle_request(&ControlRequest::PauseState, false).is_none());
         assert!(unsupported_lifecycle_request(&ControlRequest::Capabilities, false).is_none());
+    }
+
+    #[test]
+    fn an_exhausted_mutation_revision_is_refused_before_dispatch() {
+        let refused = exhausted_mutation_refusal(true, u64::MAX).expect("the terminal revision");
+        assert!(!refused.ok);
+        assert_eq!(refused.error_code.as_deref(), Some("revision_exhausted"));
+        assert_eq!(
+            refused.error_effect,
+            Some(ErrorEffect::None),
+            "the preflight precedes any change"
+        );
+
+        // The last usable revision still dispatches, and observation never advances the counter.
+        assert!(exhausted_mutation_refusal(true, u64::MAX - 1).is_none());
+        assert!(exhausted_mutation_refusal(false, u64::MAX).is_none());
+    }
+
+    /// A refused preflight never reaches the swap point, so the policy keeps its revision.
+    ///
+    /// The dispatcher is the real one (`apply_network_policy_replace` against a real handle), and
+    /// it reports whether it ran at all: if the preflight were dropped or moved after dispatch,
+    /// the policy would change here and the test would see it.
+    #[cfg(feature = "net")]
+    #[test]
+    fn a_refused_preflight_leaves_the_network_policy_untouched() {
+        use std::cell::Cell;
+        use std::sync::atomic::AtomicBool;
+
+        use microsandbox_network::policy::NetworkPolicy;
+        use microsandbox_network::policy::handle::NetworkPolicyHandle;
+
+        use super::super::handler::apply_network_policy_replace;
+
+        let handle = NetworkPolicyHandle::new(NetworkPolicy::none());
+        let replacement = microsandbox_types::NetworkPolicy {
+            default_egress: microsandbox_types::Action::Deny,
+            default_ingress: microsandbox_types::Action::Allow,
+            rules: Vec::new(),
+        };
+        let dispatched = Cell::new(false);
+
+        let outcome = admit_mutation(
+            true,
+            false,
+            RuntimeLifecycle::Running,
+            u64::MAX,
+            &AtomicBool::new(false),
+            || {
+                dispatched.set(true);
+                (
+                    RuntimeLifecycle::Running,
+                    apply_network_policy_replace(Some(&handle), replacement.clone()),
+                )
+            },
+        );
+
+        assert!(!dispatched.get(), "the preflight must precede dispatch");
+        assert!(!outcome.response.ok);
+        assert_eq!(
+            outcome.response.error_code.as_deref(),
+            Some("revision_exhausted")
+        );
+        assert_eq!(
+            outcome.response.error_effect,
+            Some(ErrorEffect::None),
+            "the refusal precedes any change"
+        );
+        assert_eq!(outcome.lifecycle, RuntimeLifecycle::Retiring);
+        assert_eq!(outcome.revision, u64::MAX);
+        assert_eq!(handle.revision(), 1, "the policy must be untouched");
+        assert!(handle.load().rules.is_empty());
+
+        // One revision below the terminal value the same dispatcher runs, the swap lands and the
+        // bookkeeping revision advances: the tail is part of the same unit.
+        let outcome = admit_mutation(
+            true,
+            false,
+            RuntimeLifecycle::Running,
+            u64::MAX - 1,
+            &AtomicBool::new(false),
+            || {
+                dispatched.set(true);
+                (
+                    RuntimeLifecycle::Running,
+                    apply_network_policy_replace(Some(&handle), replacement),
+                )
+            },
+        );
+
+        assert!(dispatched.get());
+        assert!(outcome.response.ok, "{:?}", outcome.response.error_code);
+        assert_eq!(outcome.revision, u64::MAX);
+        assert_eq!(handle.revision(), 2);
     }
 
     #[test]

@@ -38,6 +38,8 @@ mod patch;
 pub(crate) use patch::{
     windows_mark_delete, windows_open_relative_for_removal, windows_remove_open_entry,
 };
+#[cfg(all(feature = "local", feature = "net"))]
+mod network_policy;
 #[cfg(feature = "local")]
 pub(crate) mod pause;
 #[cfg(all(feature = "local", windows))]

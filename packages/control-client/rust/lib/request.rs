@@ -4,8 +4,8 @@ use microsandbox_protocol::{
     control::{
         BranchCreate, BranchResult, Capabilities, CheckpointCreate, CheckpointResult, ControlError,
         CpuState, CpuTarget, DiskCheckpointCreate, DiskCheckpointState, DiskCompact, Empty,
-        MemoryState, MemoryTarget, Pause, PauseState, RootDiskGrow, RootDiskState,
-        RuntimeCapabilities, SecretChange, SecretsResult,
+        MemoryState, MemoryTarget, NetworkPolicyReplace, NetworkPolicyResult, Pause, PauseState,
+        RootDiskGrow, RootDiskState, RuntimeCapabilities, SecretChange, SecretsResult,
     },
     wire,
 };
@@ -76,6 +76,9 @@ pub struct GrowRootDisk(pub RootDiskGrow);
 /// Compact selected owned disk chains.
 #[derive(Debug, Clone)]
 pub struct CompactDisks(pub DiskCompact);
+/// Replace the running tenant network policy and receive its new revision.
+#[derive(Debug, Clone)]
+pub struct ReplaceNetworkPolicy(pub NetworkPolicyReplace);
 
 /// Capability-probed managed-job extension. No legacy mutation fallback exists.
 #[derive(Debug, Clone)]
@@ -305,6 +308,26 @@ v2_request!(
     "control.disk.compact.result"
 );
 
+impl Request<ControlProtocol> for ReplaceNetworkPolicy {
+    type Response = NetworkPolicyResult;
+    type Error = ControlClientError;
+
+    fn message(&self) -> ControlClientResult<EncodedMessage> {
+        prepared("control.network-policy.replace", &self.0)
+    }
+
+    fn decode(&self, response: Message) -> ControlClientResult<Self::Response> {
+        // A replacement can never report the launch revision.
+        checked_with(response, 2, "control.network-policy.result", |bytes| {
+            let result = wire::decode_record::<NetworkPolicyResult>(bytes)?;
+            if result.revision < 2 {
+                return Err(wire::WireError::InvalidRecord);
+            }
+            Ok(result)
+        })
+    }
+}
+
 impl Request<ControlProtocol> for ResumeRuntime {
     type Response = PauseState;
     type Error = ControlClientError;
@@ -425,6 +448,14 @@ compatible_v2!(
     |reply| decode_json_field(reply, "compaction")
 );
 
+compatible_v2!(
+    ReplaceNetworkPolicy,
+    |request: &ReplaceNetworkPolicy| serde_json::json!({
+        "op": "network_policy_replace", "policy": request.0.policy,
+    }),
+    decode_network_policy_json
+);
+
 impl CompatibleControlRequest for ResumeRuntime {
     fn min_generation(&self) -> u8 {
         2
@@ -516,6 +547,16 @@ fn decode_json_field<T: DeserializeOwned>(reply: JsonReply, field: &str) -> Cont
         .and_then(|value| value.get(field).cloned())
         .and_then(|value| serde_json::from_value(value).ok());
     reply.checked(|_| decoded)
+}
+
+fn decode_network_policy_json(reply: JsonReply) -> ControlClientResult<NetworkPolicyResult> {
+    let revision = serde_json::from_slice::<serde_json::Value>(reply.raw())
+        .ok()
+        .and_then(|value| value.get("network_policy").cloned())
+        .and_then(|value| serde_json::from_value::<NetworkPolicyResult>(value).ok())
+        // A replacement can never report the launch revision.
+        .filter(|result| result.revision >= 2);
+    reply.checked(|_| revision)
 }
 
 fn decode_branch_json(reply: JsonReply) -> ControlClientResult<BranchResult> {

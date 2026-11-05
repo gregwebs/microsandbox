@@ -87,6 +87,7 @@ pub(crate) enum Reply {
     Pause(PauseState),
     RootDisk(RootDiskState),
     DiskCompact(DiskCompactionResult),
+    NetworkPolicy(NetworkPolicyResult),
     Error(ControlError),
 }
 
@@ -139,6 +140,9 @@ impl Reply {
             Self::DiskCompact(value) => {
                 Envelope::new(generation, "control.disk.compact.result", value)
             }
+            Self::NetworkPolicy(value) => {
+                Envelope::new(generation, "control.network-policy.result", value)
+            }
             Self::Error(value) => Envelope::new(generation, "control.error", value),
         }
     }
@@ -190,112 +194,131 @@ impl Handler for ControlContext {
             Err(error) => return Response::error(error, "invalid control request payload"),
         };
         let result = self.executor.execute_legacy(command);
-        let error = || ControlError {
-            code: result
-                .error_code
-                .clone()
-                .unwrap_or_else(|| "operation_failed".into()),
-            message: result
-                .error
-                .clone()
-                .unwrap_or_else(|| "control operation failed".into()),
-            effect: if mutation {
-                ErrorEffect::Unknown
-            } else {
-                ErrorEffect::None
-            },
-        };
-        let framed = if let Some(secrets) = result.secret_result.clone() {
-            Reply::Secrets(secrets)
-        } else if let Some(checkpoint) = result.checkpoint.clone() {
-            Reply::Checkpoint(CheckpointResult {
-                checkpoint: Some(CheckpointState {
-                    checkpoint_id: checkpoint.checkpoint_id,
-                    checkpoint_root: checkpoint.checkpoint_root,
-                    path: checkpoint.path,
-                    memory_mode: checkpoint.memory_mode,
-                    memory_logical_bytes: checkpoint.memory_logical_bytes,
-                    memory_emitted_bytes: checkpoint.memory_emitted_bytes,
-                }),
-                recovery_error: (!result.ok).then(|| result.error.clone()).flatten(),
-            })
-        } else if !result.ok {
-            Reply::Error(error())
-        } else if let Some(caps) = result.capabilities {
-            let capabilities = RuntimeCapabilities {
-                root_disk_grow: caps.root_disk_grow,
-                guest_flush_policy: caps.guest_flush_policy,
-                optional_disk_integrity: caps.optional_disk_integrity,
-                branch_create: caps.branch_create,
-                branch_memfd: caps.branch_memfd,
-                pause_resume: caps.pause_resume,
-                disk_compact: caps.disk_compact,
-                disk_compact_owned: caps.disk_compact_owned,
-                cpu_resize: caps.cpu_resize,
-                memory_resize: caps.memory_resize,
-                secrets_update: caps.secrets_update,
-                checkpoint_create: caps.checkpoint_create,
-                disk_checkpoint_create: caps.disk_checkpoint_create,
-            };
-            if generation >= 2 {
-                Reply::RuntimeCapabilities(capabilities)
-            } else {
-                Reply::Capabilities(capabilities.generation_one())
-            }
-        } else if let Some(state) = result.memory {
-            Reply::Memory(MemoryState {
-                boot_mib: state.boot_mib,
-                target_mib: state.target_mib,
-                current_mib: state.current_mib,
-                max_mib: state.max_mib,
-            })
-        } else if let Some(state) = result.cpu {
-            Reply::Cpu(CpuState {
-                possible: state.possible,
-                requested_online: state.requested_online,
-                actual_online: state.actual_online,
-                enforced: state.enforced,
-            })
-        } else if let Some(state) = result.disk_checkpoint {
-            Reply::DiskCheckpoint(DiskCheckpointState {
-                checkpoint_id: state.checkpoint_id,
-                path: state.path,
-                disk: state.disk,
-                owned_volumes: state.owned_volumes,
-            })
-        } else if let Some(path) = result.branch {
-            Reply::Branch(BranchResult { path })
-        } else if let Some(state) = result.pause {
-            Reply::Pause(PauseState {
-                paused: state.paused,
-                recovery_required: state.recovery_required,
-                capture_unavailable: state.capture_unavailable,
-            })
-        } else if let Some(state) = result.root_disk {
-            Reply::RootDisk(RootDiskState {
-                filesystem_bytes: state.filesystem_bytes,
-                device_bytes: state.device_bytes,
-                total_us: state.total_us,
-                pause_us: state.pause_us,
-                guest_us: state.guest_us,
-            })
-        } else if let Some(result) = result.compaction {
-            Reply::DiskCompact(result)
-        } else {
-            Reply::Error(ControlError::rejected(
-                "invalid_response",
-                "runtime omitted control result",
-            ))
-        };
         Response {
             json: JsonControlResponse::default(),
-            framed,
+            framed: reply_for(result, mutation, generation),
         }
     }
 }
 
 //--------------------------------------------------------------------------------------------------
 // Functions
+//--------------------------------------------------------------------------------------------------
+
+/// Map one executor result to its framed reply.
+///
+/// Split out of the handler so the mapping is exercisable without a VM.
+pub(super) fn reply_for(
+    result: crate::control::ControlResponse,
+    mutation: bool,
+    generation: u8,
+) -> Reply {
+    let error = || ControlError {
+        code: result
+            .error_code
+            .clone()
+            .unwrap_or_else(|| "operation_failed".into()),
+        message: result
+            .error
+            .clone()
+            .unwrap_or_else(|| "control operation failed".into()),
+        // A refusal that provably precedes the change reports `none`; every other failure of a
+        // mutation keeps the blanket `unknown`.
+        effect: result.error_effect.unwrap_or(if mutation {
+            ErrorEffect::Unknown
+        } else {
+            ErrorEffect::None
+        }),
+    };
+    if let Some(secrets) = result.secret_result.clone() {
+        Reply::Secrets(secrets)
+    } else if let Some(checkpoint) = result.checkpoint.clone() {
+        Reply::Checkpoint(CheckpointResult {
+            checkpoint: Some(CheckpointState {
+                checkpoint_id: checkpoint.checkpoint_id,
+                checkpoint_root: checkpoint.checkpoint_root,
+                path: checkpoint.path,
+                memory_mode: checkpoint.memory_mode,
+                memory_logical_bytes: checkpoint.memory_logical_bytes,
+                memory_emitted_bytes: checkpoint.memory_emitted_bytes,
+            }),
+            recovery_error: (!result.ok).then(|| result.error.clone()).flatten(),
+        })
+    } else if !result.ok {
+        Reply::Error(error())
+    } else if let Some(policy) = result.network_policy {
+        Reply::NetworkPolicy(policy)
+    } else if let Some(caps) = result.capabilities {
+        let capabilities = RuntimeCapabilities {
+            root_disk_grow: caps.root_disk_grow,
+            guest_flush_policy: caps.guest_flush_policy,
+            optional_disk_integrity: caps.optional_disk_integrity,
+            branch_create: caps.branch_create,
+            branch_memfd: caps.branch_memfd,
+            pause_resume: caps.pause_resume,
+            disk_compact: caps.disk_compact,
+            disk_compact_owned: caps.disk_compact_owned,
+            cpu_resize: caps.cpu_resize,
+            memory_resize: caps.memory_resize,
+            secrets_update: caps.secrets_update,
+            checkpoint_create: caps.checkpoint_create,
+            disk_checkpoint_create: caps.disk_checkpoint_create,
+            network_policy_update: caps.network_policy_update,
+        };
+        if generation >= 2 {
+            Reply::RuntimeCapabilities(capabilities)
+        } else {
+            Reply::Capabilities(capabilities.generation_one())
+        }
+    } else if let Some(state) = result.memory {
+        Reply::Memory(MemoryState {
+            boot_mib: state.boot_mib,
+            target_mib: state.target_mib,
+            current_mib: state.current_mib,
+            max_mib: state.max_mib,
+        })
+    } else if let Some(state) = result.cpu {
+        Reply::Cpu(CpuState {
+            possible: state.possible,
+            requested_online: state.requested_online,
+            actual_online: state.actual_online,
+            enforced: state.enforced,
+        })
+    } else if let Some(state) = result.disk_checkpoint {
+        Reply::DiskCheckpoint(DiskCheckpointState {
+            checkpoint_id: state.checkpoint_id,
+            path: state.path,
+            disk: state.disk,
+            owned_volumes: state.owned_volumes,
+        })
+    } else if let Some(path) = result.branch {
+        Reply::Branch(BranchResult { path })
+    } else if let Some(state) = result.pause {
+        Reply::Pause(PauseState {
+            paused: state.paused,
+            recovery_required: state.recovery_required,
+            capture_unavailable: state.capture_unavailable,
+        })
+    } else if let Some(state) = result.root_disk {
+        Reply::RootDisk(RootDiskState {
+            filesystem_bytes: state.filesystem_bytes,
+            device_bytes: state.device_bytes,
+            total_us: state.total_us,
+            pause_us: state.pause_us,
+            guest_us: state.guest_us,
+        })
+    } else if let Some(result) = result.compaction {
+        Reply::DiskCompact(result)
+    } else {
+        Reply::Error(ControlError::rejected(
+            "invalid_response",
+            "runtime omitted control result",
+        ))
+    }
+}
+
+//--------------------------------------------------------------------------------------------------
+// Functions: Helpers
 //--------------------------------------------------------------------------------------------------
 
 fn operation_to_legacy(
@@ -370,7 +393,66 @@ fn operation_to_legacy(
                 })?,
             dry_run: request.dry_run,
         },
+        ControlOperation::NetworkPolicyReplace(request) => Legacy::NetworkPolicyReplace {
+            policy: request.policy,
+        },
     })
+}
+
+/// Shared replacement path for both transports, also exercised against a real handle.
+#[cfg(feature = "net")]
+pub(super) fn apply_network_policy_replace(
+    handle: Option<&microsandbox_network::policy::handle::NetworkPolicyHandle>,
+    policy: microsandbox_types::NetworkPolicy,
+) -> crate::control::ControlResponse {
+    use microsandbox_network::policy::NetworkPolicy;
+
+    let Some(handle) = handle else {
+        return refused(
+            "network_policy_unavailable",
+            "this sandbox has no network policy to replace",
+        );
+    };
+
+    // Boot decodes the launch JSON's `network.policy` with this same `Deserialize`; reusing it
+    // accepts a replacement exactly when that document would boot, and invents no new rules.
+    let decoded = serde_json::to_value(&policy).and_then(serde_json::from_value::<NetworkPolicy>);
+    let policy = match decoded {
+        Ok(policy) => policy,
+        Err(error) => {
+            // The wire value is not secret, but errors stay fixed strings: the detail is for
+            // operators reading debug logs, never for the reply.
+            tracing::debug!(%error, "rejected network policy replacement");
+            return refused(
+                "invalid_network_policy",
+                "network policy failed boot-time validation",
+            );
+        }
+    };
+
+    match handle.replace(policy) {
+        Ok(revision) => crate::control::ControlResponse {
+            ok: true,
+            network_policy: Some(NetworkPolicyResult { revision }),
+            ..Default::default()
+        },
+        Err(_) => refused(
+            "network_policy_revision_exhausted",
+            "network policy revision is exhausted",
+        ),
+    }
+}
+
+/// A refusal known to precede any change to the state the operation targets.
+#[cfg(feature = "net")]
+fn refused(code: &str, message: impl Into<String>) -> crate::control::ControlResponse {
+    crate::control::ControlResponse {
+        ok: false,
+        error_code: Some(code.to_string()),
+        error: Some(message.into()),
+        error_effect: Some(ErrorEffect::None),
+        ..Default::default()
+    }
 }
 
 /// Shared execution path, also exercised against the actual host secret store.

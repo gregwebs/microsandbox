@@ -28,7 +28,8 @@ use tokio::task::AbortHandle;
 
 use crate::config::{ConnectionLimit, PortProtocol, PublishedPort, TcpAcceptQueueSize};
 use crate::netstack::shared::SharedState;
-use crate::policy::{NetworkPolicy, Protocol};
+use crate::policy::Protocol;
+use crate::policy::handle::NetworkPolicyHandle;
 use crate::tcp::deferred_close::DeferredClose;
 use crate::udp::relay::{construct_udp_response, extract_udp_payload};
 
@@ -87,8 +88,8 @@ pub struct PortPublisher {
     /// `--publish` listeners and runtime-added ones from [`PortCommand::Add`]
     /// (auto-publish). Also keeps the channel open.
     inbound_tx: mpsc::Sender<InboundConnection>,
-    /// Network policy used to gate runtime-added listeners' ingress.
-    policy: Arc<NetworkPolicy>,
+    /// Live tenant policy, loaded per accepted connection and per inbound datagram.
+    policy: NetworkPolicyHandle,
     /// Runtime add/remove command receiver. `SmoltcpNetwork` owns the
     /// matching sender (`port_handle()`), so callers can add/remove host
     /// listeners at runtime (auto-publish) without the publisher owning the
@@ -233,10 +234,9 @@ impl PortPublisher {
     ///
     /// Listeners are only spawned when at least one of `guest_ipv4` /
     /// `guest_ipv6` is `Some`; published ports need a smoltcp dial target.
-    /// Each TCP listener task gates accepted connections through the
-    /// supplied [`NetworkPolicy`]'s `evaluate_ingress` before queuing
-    /// them; rejected connections drop with TCP RST (zero-linger) so
-    /// the peer observes `ECONNRESET`.
+    /// Each TCP listener task loads the supplied [`NetworkPolicyHandle`] and gates accepted
+    /// connections through `evaluate_ingress` before queuing them; rejected connections drop
+    /// with TCP RST (zero-linger) so the peer observes `ECONNRESET`.
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         ports: &[PublishedPort],
@@ -248,7 +248,7 @@ impl PortPublisher {
         gateway_ipv6: Option<Ipv6Addr>,
         gateway_mac: [u8; 6],
         guest_mac: [u8; 6],
-        policy: Arc<NetworkPolicy>,
+        policy: NetworkPolicyHandle,
         shared: Arc<SharedState>,
         tokio_handle: &tokio::runtime::Handle,
         cmd_rx: mpsc::UnboundedReceiver<PortCommand>,
@@ -691,7 +691,7 @@ impl PortPublisher {
         ephemeral_port: Arc<AtomicU16>,
         gateway_mac: [u8; 6],
         guest_mac: [u8; 6],
-        policy: Arc<NetworkPolicy>,
+        policy: NetworkPolicyHandle,
         shared: Arc<SharedState>,
         tokio_handle: &tokio::runtime::Handle,
     ) {
@@ -872,7 +872,7 @@ async fn tcp_listener_task(
     backlog: TcpAcceptQueueSize,
     guest_port: u16,
     inbound_tx: mpsc::Sender<InboundConnection>,
-    policy: Arc<NetworkPolicy>,
+    policy: NetworkPolicyHandle,
     shared: Arc<SharedState>,
 ) -> std::io::Result<()> {
     let listener = bind_listener(bind_addr, backlog)?;
@@ -888,7 +888,7 @@ fn spawn_accept_task(
     listener: TcpListener,
     guest_port: u16,
     inbound_tx: mpsc::Sender<InboundConnection>,
-    policy: Arc<NetworkPolicy>,
+    policy: NetworkPolicyHandle,
     shared: Arc<SharedState>,
     tokio_handle: &tokio::runtime::Handle,
 ) -> AbortHandle {
@@ -908,7 +908,7 @@ async fn run_accept_loop(
     listener: TcpListener,
     guest_port: u16,
     inbound_tx: mpsc::Sender<InboundConnection>,
-    policy: Arc<NetworkPolicy>,
+    policy: NetworkPolicyHandle,
     shared: Arc<SharedState>,
 ) {
     let mut backoff = ACCEPT_BACKOFF_INITIAL;
@@ -926,7 +926,10 @@ async fn run_accept_loop(
             }
         };
 
-        let action = policy.evaluate_ingress(peer, guest_port, Protocol::Tcp, &shared);
+        // Loaded per accepted connection: a replace applies to the next inbound connection.
+        let action = policy
+            .load()
+            .evaluate_ingress(peer, guest_port, Protocol::Tcp, &shared);
         if action.is_deny() {
             tracing::debug!(peer = %peer, guest_port, "ingress denied by policy; sending RST");
             reject_with_rst(&stream);
@@ -952,7 +955,7 @@ async fn udp_listener_task(
     mut outbound_rx: mpsc::Receiver<PublishedUdpOutbound>,
     peers: Arc<Mutex<PublishedUdpPeers>>,
     ephemeral_port: Arc<AtomicU16>,
-    policy: Arc<NetworkPolicy>,
+    policy: NetworkPolicyHandle,
     shared: Arc<SharedState>,
     gateway_mac: EthernetAddress,
     guest_mac: EthernetAddress,
@@ -965,7 +968,10 @@ async fn udp_listener_task(
         tokio::select! {
             inbound = socket.recv_from(&mut buf) => {
                 let (n, peer) = inbound?;
-                let action = policy.evaluate_ingress(peer, guest_port, Protocol::Udp, &shared);
+                // Loaded per inbound datagram: a replace applies to the next datagram.
+                let action = policy
+                    .load()
+                    .evaluate_ingress(peer, guest_port, Protocol::Udp, &shared);
                 if action.is_deny() {
                     tracing::debug!(
                         peer = %peer,
@@ -1312,6 +1318,7 @@ mod tests {
     use smoltcp::wire::{IpAddress, IpCidr};
 
     use super::*;
+    use crate::policy::NetworkPolicy;
 
     const TEST_GUEST_PORT: u16 = 8080;
 
@@ -1367,7 +1374,7 @@ mod tests {
             let publisher = PortPublisher {
                 inbound_rx,
                 inbound_tx,
-                policy: Arc::new(NetworkPolicy::default()),
+                policy: NetworkPolicyHandle::new(NetworkPolicy::default()),
                 cmd_rx,
                 listener_handles: HashMap::new(),
                 connections: Vec::new(),
@@ -1542,7 +1549,7 @@ mod tests {
                 None,
                 [2, 0, 0, 0, 0, 1],
                 [2, 0, 0, 0, 0, 2],
-                Arc::new(NetworkPolicy::default()),
+                NetworkPolicyHandle::new(NetworkPolicy::default()),
                 Arc::new(SharedState::new(4)),
                 &tokio::runtime::Handle::current(),
                 cmd_rx,
@@ -1586,6 +1593,58 @@ mod tests {
                 .check_drain(|sockets| publisher.relay_data(sockets), &payload, stalled)
                 .await;
         }
+    }
+
+    /// The accept loop loads the tenant policy per accepted connection, so a replace applies to
+    /// the next inbound connection without restarting the listener (R5, R6).
+    #[tokio::test]
+    async fn ingress_denial_is_re_evaluated_per_connection() {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (inbound_tx, mut inbound_rx) = mpsc::channel(4);
+        let shared = Arc::new(SharedState::new(4));
+        let policy = NetworkPolicyHandle::new(NetworkPolicy::none());
+
+        tokio::spawn(run_accept_loop(
+            listener,
+            TEST_GUEST_PORT,
+            inbound_tx,
+            policy.clone(),
+            shared.clone(),
+        ));
+
+        // Denied: the peer is reset and nothing reaches the guest. On loopback the reset can
+        // beat `connect()`, so both outcomes are checked.
+        match TcpStream::connect(addr).await {
+            Ok(mut denied) => {
+                let mut byte = [0u8; 1];
+                let error = tokio::time::timeout(Duration::from_secs(1), denied.read(&mut byte))
+                    .await
+                    .expect("a denied peer must not be left hanging")
+                    .expect_err("a denied peer must be reset, not served");
+                assert_eq!(error.kind(), std::io::ErrorKind::ConnectionReset);
+            }
+            Err(error) => assert_eq!(
+                error.kind(),
+                std::io::ErrorKind::ConnectionReset,
+                "a denied peer must be reset"
+            ),
+        }
+        assert!(
+            tokio::time::timeout(Duration::from_millis(300), inbound_rx.recv())
+                .await
+                .is_err(),
+            "a denied inbound connection must not be queued"
+        );
+
+        // Allowed: the next connection is accepted, with no listener restart.
+        assert_eq!(policy.replace(NetworkPolicy::allow_all()), Ok(2));
+        let _allowed = TcpStream::connect(addr).await.unwrap();
+        let queued = tokio::time::timeout(Duration::from_secs(2), inbound_rx.recv())
+            .await
+            .expect("an allowed inbound connection must be queued")
+            .expect("the accept loop must still be running");
+        assert_eq!(queued.guest_port, TEST_GUEST_PORT);
     }
 
     /// Admission reclaims a completed flow even before the periodic cleanup tick.
@@ -1857,7 +1916,7 @@ mod tests {
                 None,
                 [2, 0, 0, 0, 0, 1],
                 [2, 0, 0, 0, 0, 2],
-                Arc::new(NetworkPolicy::default()),
+                NetworkPolicyHandle::new(NetworkPolicy::default()),
                 h.shared.clone(),
                 &tokio::runtime::Handle::current(),
                 cmd_rx,
@@ -2251,7 +2310,7 @@ mod tests {
         let publisher = PortPublisher {
             inbound_rx,
             inbound_tx,
-            policy: Arc::new(NetworkPolicy::default()),
+            policy: NetworkPolicyHandle::new(NetworkPolicy::default()),
             cmd_rx,
             listener_handles: HashMap::new(),
             connections: Vec::new(),
@@ -2303,7 +2362,7 @@ mod tests {
         let publisher = PortPublisher {
             inbound_rx,
             inbound_tx,
-            policy: Arc::new(NetworkPolicy::default()),
+            policy: NetworkPolicyHandle::new(NetworkPolicy::default()),
             cmd_rx,
             listener_handles: HashMap::new(),
             connections: Vec::new(),

@@ -17,6 +17,7 @@ use smoltcp::wire::IpListenEndpoint;
 use tokio::net::TcpStream;
 use tokio::sync::mpsc;
 
+use crate::policy::NetworkPolicy;
 use crate::proxy::ResolvedOutboundProxy;
 use crate::tcp::deferred_close::DeferredClose;
 use crate::tcp::pending::PendingConnect;
@@ -102,6 +103,26 @@ pub enum TcpAcceptMode {
     Reject,
 }
 
+/// Egress authorization decided once at the guest SYN and carried to the proxy task.
+#[derive(Clone)]
+pub enum FlowPolicy {
+    /// The SYN decision allowed the flow; it keeps this snapshot for its later checks.
+    Admitted(Arc<NetworkPolicy>),
+    /// The SYN deferred the decision to the hostname. It has not been made yet, and it must
+    /// be made against the policy current when the guest's first bytes arrive.
+    PendingHostname,
+    /// The SYN denied the flow; answer with a denial and never dial.
+    Denied,
+    /// The flow belongs to a port the engine proxies itself: plain DNS, or DoT when TLS
+    /// interception is configured. No egress decision was made at the SYN, so the flow makes no
+    /// hostname decision of its own: the DNS interceptor and forwarder apply the live policy per
+    /// query. Two exceptions keep this from being the whole story. If the port is also in
+    /// `tls.intercepted_ports`, the poll loop's intercepted-port branch runs first and hands the
+    /// flow to the TLS MITM proxy, which decides on the SNI instead. And a DoT port without TLS
+    /// interception is refused outright, so it is `Denied`, never `PortProxy`.
+    PortProxy,
+}
+
 /// Ownership of an optional connect-before-accept host socket.
 enum UpstreamConnection {
     /// The handshake does not require a host dial here; the proxy dials if needed.
@@ -148,9 +169,9 @@ struct Connection {
     read_buf: Option<Bytes>,
     /// Progress deadline while draining after the host task exits.
     deferred_close: DeferredClose,
-    /// Egress policy already denied this flow at SYN time; the connection
-    /// was accepted only so an HTTP/HTTPS client can be answered with 403.
-    policy_denied: bool,
+    /// Egress authorization decided at the guest SYN. A denied flow was accepted only so an
+    /// HTTP/HTTPS client can be answered with 403; a pending one still owes its hostname check.
+    policy: FlowPolicy,
     /// Frozen egress route chosen once at the guest SYN.
     ///
     /// `None` means direct. Holding the choice here keeps later DNS-index or
@@ -183,9 +204,10 @@ pub struct NewConnection {
     pub to_smoltcp: mpsc::Sender<Bytes>,
     /// Status the proxy task updates before it exits.
     pub proxy_connect: Arc<ProxyConnectState>,
-    /// Egress policy already denied this flow at SYN time. The dispatcher
-    /// must answer it (HTTP 403) and never dial upstream.
-    pub policy_denied: bool,
+    /// Egress authorization decided at the guest SYN, carried to the proxy task.
+    /// [`FlowPolicy::Denied`] never reaches the proxy: the dispatcher answers it (HTTP 403) and
+    /// never dials upstream.
+    pub policy: FlowPolicy,
     /// Egress route frozen at the guest SYN: `None` is direct, otherwise the
     /// connection keeps this proxy for both the upstream dial and the proxy task.
     pub outbound_proxy: Option<Arc<ResolvedOutboundProxy>>,
@@ -327,7 +349,8 @@ impl TcpConnectionTracker {
     }
 
     /// Create a destination-bound socket using the policy's handshake mode.
-    /// `src` and `dst` are guest-visible addresses; `mode` is the policy decision.
+    /// `src` and `dst` are guest-visible addresses; `mode` is the policy decision and `policy`
+    /// the authorization that decision produced for the flow behind it.
     /// Returns `false` when the mode rejects the connection or the budget is full.
     pub fn create_tcp_socket(
         &mut self,
@@ -335,8 +358,9 @@ impl TcpConnectionTracker {
         dst: SocketAddr,
         sockets: &mut SocketSet<'_>,
         mode: TcpAcceptMode,
+        policy: FlowPolicy,
     ) -> bool {
-        self.create_tcp_socket_with_proxy(src, dst, sockets, mode, None)
+        self.create_tcp_socket_with_proxy(src, dst, sockets, mode, policy, None)
     }
 
     /// Create a socket and attach the egress route frozen for this flow.
@@ -349,14 +373,21 @@ impl TcpConnectionTracker {
         dst: SocketAddr,
         sockets: &mut SocketSet<'_>,
         mode: TcpAcceptMode,
+        policy: FlowPolicy,
         outbound_proxy: Option<Arc<ResolvedOutboundProxy>>,
     ) -> bool {
         if matches!(mode, TcpAcceptMode::Reject) {
             return false;
         }
+        // Accepting a handshake only to answer it is meaningful for a denied flow; any other
+        // pair would answer a client the policy did not deny.
+        debug_assert!(
+            !matches!(mode, TcpAcceptMode::RespondWithDenial)
+                || matches!(policy, FlowPolicy::Denied),
+            "a denial response requires a denied flow"
+        );
 
         let pause_synack = matches!(mode, TcpAcceptMode::WaitForUpstream);
-        let policy_denied = matches!(mode, TcpAcceptMode::RespondWithDenial);
         if self
             .max_tcp_connections
             .is_some_and(|max| self.connections.len() >= max.get())
@@ -422,7 +453,7 @@ impl TcpConnectionTracker {
                 write_buf: None,
                 read_buf: None,
                 deferred_close: DeferredClose::default(),
-                policy_denied,
+                policy,
                 outbound_proxy,
             },
         );
@@ -572,7 +603,7 @@ impl TcpConnectionTracker {
                         from_smoltcp: channels.from_smoltcp,
                         to_smoltcp: channels.to_smoltcp,
                         proxy_connect: conn.proxy_connect.clone(),
-                        policy_denied: conn.policy_denied,
+                        policy: conn.policy.clone(),
                         outbound_proxy: conn.outbound_proxy.clone(),
                     });
                 }
@@ -690,6 +721,45 @@ fn write_proxy_data(socket: &mut tcp::Socket<'_>, conn: &mut Connection) {
 mod tests {
     use super::*;
 
+    /// The tracker carries a denied admission to the dispatcher unchanged, and never dials for it.
+    ///
+    /// This is the seam the poll loop reads: `NewConnection::policy` is asserted here, and the
+    /// dispatcher's own answer (the deny responder and the 403 it serves) is covered by
+    /// `tcp::deny` and the live policy tests. No live handle is involved because the tracker never
+    /// consults one, so no replace can reach this value.
+    #[tokio::test(start_paused = true)]
+    async fn denied_admission_survives_to_the_new_connection_and_never_dials() {
+        use crate::tcp::test_support::TestNetwork;
+
+        let src: SocketAddr = "10.0.0.1:12345".parse().unwrap();
+        let dst: SocketAddr = "10.0.0.2:8099".parse().unwrap();
+        let mut network = TestNetwork::new(true);
+        let mut tracker = TcpConnectionTracker::new(None);
+
+        assert!(tracker.create_tcp_socket_with_proxy(
+            src,
+            dst,
+            &mut network.sockets,
+            TcpAcceptMode::RespondWithDenial,
+            FlowPolicy::Denied,
+            None,
+        ));
+        for _ in 0..16 {
+            network.poll();
+        }
+
+        let mut connections = tracker.take_new_connections(&mut network.sockets);
+        assert_eq!(connections.len(), 1);
+        assert!(
+            matches!(connections.remove(0).policy, FlowPolicy::Denied),
+            "the dispatcher must still take the deny-responder path"
+        );
+        assert!(
+            tracker.poll_connects(&mut network.sockets).is_empty(),
+            "a denied flow must never dial upstream"
+        );
+    }
+
     /// The route chosen at the SYN is stored on the connection and handed to the
     /// proxy task unchanged, and the legacy public entry point attaches none.
     #[tokio::test(start_paused = true)]
@@ -710,6 +780,7 @@ mod tests {
             dst,
             &mut network.sockets,
             TcpAcceptMode::AcceptImmediately,
+            FlowPolicy::PendingHostname,
             Some(Arc::clone(&proxy)),
         ));
         for _ in 0..16 {
@@ -730,6 +801,7 @@ mod tests {
             dst,
             &mut network.sockets,
             TcpAcceptMode::AcceptImmediately,
+            FlowPolicy::PendingHostname,
         ));
         for _ in 0..16 {
             network.poll();
@@ -751,6 +823,7 @@ mod tests {
                 "10.0.0.2:8099".parse().unwrap(),
                 &mut network.sockets,
                 TcpAcceptMode::AcceptImmediately,
+                FlowPolicy::PendingHostname,
             ));
             for _ in 0..16 {
                 network.poll();
@@ -784,7 +857,8 @@ mod tests {
                 src,
                 dst,
                 &mut sockets,
-                TcpAcceptMode::AcceptImmediately
+                TcpAcceptMode::AcceptImmediately,
+                FlowPolicy::PendingHostname
             ));
         }
         assert_eq!(tracker.connections.len(), 300);

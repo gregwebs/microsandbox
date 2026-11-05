@@ -1,4 +1,5 @@
 import { ClientError, type OutboundMessage, type Request } from "@microsandbox/protocol-client";
+import type { NetworkPolicy } from "@microsandbox/types";
 import { ControlClientError } from "./error.js";
 import type { JsonReply } from "./json-reply.js";
 import {
@@ -21,6 +22,7 @@ export type ExtendedLegacyControlRequest = LegacyControlRequest
   | ({ op: "pause_with_guest_flush" } & Required<Pause>)
   | { op: "pause" | "resume" | "pause_state" }
   | { op: "root_disk_grow"; size_bytes: bigint }
+  | { op: "network_policy_replace"; policy: NetworkPolicy }
   | ({ op: "disk_compact" } & DiskCompact);
 
 /** Prepared operations can decode either actual response representation. */
@@ -86,6 +88,7 @@ export function encodeJsonRequest(request: ExtendedLegacyControlRequest): Uint8A
     case "pause_with_guest_flush": line = JSON.stringify(request); break;
     case "pause": case "resume": case "pause_state": line = JSON.stringify({ op: request.op }); break;
     case "root_disk_grow": line = '{"op":"root_disk_grow","size_bytes":' + uint(request.size_bytes, 64).toString() + "}"; break;
+    case "network_policy_replace": line = JSON.stringify({ op: request.op, policy: request.policy }); break;
     case "disk_compact": {
       const layers = request.layers === undefined ? "" : ',"layers":' + uint(request.layers, 64).toString();
       line = '{"op":"disk_compact","target":' + JSON.stringify(request.target) + layers + ',"dry_run":' + request.dry_run + "}";

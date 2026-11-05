@@ -115,3 +115,27 @@ fn old_and_new_result_serializers_preserve_errors_and_full_width_values() {
         assert_eq!(serde_json::to_vec(&new).unwrap(), old_wire);
     }
 }
+
+#[test]
+fn historical_reader_ignores_the_live_network_policy_capability() {
+    // A current runtime's discovery line, including the additive capability the historical reader
+    // predates. Absence of `deny_unknown_fields` is what keeps an old SDK working against it.
+    let line = concat!(
+        r#"{"ok":true,"capabilities":{"guest_flush_policy":true,"optional_disk_integrity":true,"#,
+        r#""branch_create":true,"branch_memfd":false,"pause_resume":true,"root_disk_grow":true,"#,
+        r#""disk_compact":true,"disk_compact_owned":true,"cpu_resize":true,"memory_resize":true,"#,
+        r#""secrets_update":true,"checkpoint_create":true,"disk_checkpoint_create":true,"#,
+        r#""network_policy_update":true},"control_protocols":["json","cbor"]}"#,
+    );
+    let old: historical::ControlResponse = serde_json::from_str(line).unwrap();
+    assert!(old.ok);
+    let capabilities = old.capabilities.unwrap();
+    assert!(capabilities.cpu_resize);
+    assert!(capabilities.memory_resize);
+    assert!(capabilities.secrets_update);
+
+    // And the same line without the flag still parses, so the field stays additive.
+    let without = line.replace(r#","network_policy_update":true"#, "");
+    let old: historical::ControlResponse = serde_json::from_str(&without).unwrap();
+    assert!(old.capabilities.unwrap().secrets_update);
+}

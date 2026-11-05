@@ -1,10 +1,11 @@
 import { encodedMessage, encodeRecord, WireError, type EncodedMessage, type InboundFrame } from "@microsandbox/protocol-client";
+import type { NetworkPolicy } from "@microsandbox/types";
 import type { Mebibytes } from "@microsandbox/types/size";
 import { ControlClientError } from "./error.js";
 import {
   jsonBranch, jsonCapabilities, jsonCheckpoint, jsonCpu, jsonDiskCheckpoint,
-  jsonDiskCompaction, jsonMemory, jsonPause, jsonRootDisk, jsonRuntimeCapabilities,
-  type JsonReply,
+  jsonDiskCompaction, jsonMemory, jsonNetworkPolicy, jsonPause, jsonRootDisk,
+  jsonRuntimeCapabilities, type JsonReply,
 } from "./json-reply.js";
 import {
   snapshotChanges, type CheckedControlRequest, type CompatibleControlRequest,
@@ -13,11 +14,12 @@ import {
 import {
   CONTROL_GENERATION, checkedUint, decodeBranchResult, decodeCapabilities, decodeCheckpointResult,
   decodeControlError, decodeCpuState, decodeDiskCheckpointState, decodeDiskCompactionResult,
-  decodeMemoryState, decodePauseState, decodeRootDiskState, decodeRuntimeCapabilities,
-  decodeSecretsResult, type BranchCreate, type BranchResult, type Capabilities,
-  type CheckpointCreate, type CheckpointResult, type CpuState, type DiskCheckpointCreate,
-  type DiskCheckpointState, type DiskCompact, type DiskCompactionResult, type MemoryState,
-  type Pause, type PauseState, type RootDiskGrow, type RootDiskState, type RuntimeCapabilities,
+  decodeMemoryState, decodeNetworkPolicyResult, decodePauseState, decodeRootDiskState,
+  decodeRuntimeCapabilities, decodeSecretsResult, type BranchCreate, type BranchResult,
+  type Capabilities, type CheckpointCreate, type CheckpointResult, type CpuState,
+  type DiskCheckpointCreate, type DiskCheckpointState, type DiskCompact,
+  type DiskCompactionResult, type MemoryState, type NetworkPolicyResult, type Pause,
+  type PauseState, type RootDiskGrow, type RootDiskState, type RuntimeCapabilities,
   type SecretChange, type SecretsResult,
 } from "./records.js";
 
@@ -240,6 +242,29 @@ export class CompactDisks extends GenerationTwoRequest<DiskCompactionResult> {
   jsonRequest(): ExtendedLegacyControlRequest { return { op: "disk_compact", ...this.value }; }
   decodeJson(reply: JsonReply): DiskCompactionResult {
     return reply.checked(value => jsonDiskCompaction(value.get("compaction")));
+  }
+}
+
+export class ReplaceNetworkPolicy extends GenerationTwoRequest<NetworkPolicyResult> {
+  readonly policy: NetworkPolicy;
+  constructor(policy: NetworkPolicy) { super(); this.policy = policy; }
+  message(): EncodedMessage { return encodedMessage("control.network-policy.replace", encodeRecord({ policy: this.policy })); }
+  decode(frame: InboundFrame): NetworkPolicyResult {
+    return checked(frame, "control.network-policy.result", bytes => {
+      const result = decodeNetworkPolicyResult(bytes);
+      // A replacement can never report the launch revision.
+      if (result.revision < 2n) throw new WireError("invalid_record");
+      return result;
+    }, 2);
+  }
+  jsonRequest(): ExtendedLegacyControlRequest { return { op: "network_policy_replace", policy: this.policy }; }
+  decodeJson(reply: JsonReply): NetworkPolicyResult {
+    return reply.checked(value => {
+      const result = jsonNetworkPolicy(value.get("network_policy"));
+      // A replacement can never report the launch revision.
+      if (result.revision < 2n) throw new WireError("invalid_record");
+      return result;
+    });
   }
 }
 
