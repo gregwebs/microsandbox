@@ -2977,7 +2977,7 @@ mod tests {
                 warning
                     .getattr("category")
                     .unwrap()
-                    .is(&py.get_type::<pyo3::exceptions::PyDeprecationWarning>())
+                    .is(py.get_type::<pyo3::exceptions::PyDeprecationWarning>())
             );
             assert!(
                 warning
@@ -3032,6 +3032,38 @@ mod tests {
                     modules.del_item(name).unwrap();
                 }
             }
+        });
+    }
+
+    /// Repeated removals reach the Rust patch as given, so the Rust planner
+    /// refuses them; configured secrets are keyed by name, one spec each.
+    #[test]
+    fn python_secret_names_reach_rust_patch_without_dedup() {
+        Python::initialize();
+        Python::attach(|py| {
+            let secrets = HashMap::from([
+                ("API_KEY".to_string(), HashMap::new()),
+                ("DB_PASS".to_string(), HashMap::new()),
+            ]);
+            let secrets = build_secret_patches(py, Some(secrets)).unwrap();
+            let names: Vec<_> = secrets.iter().map(|patch| patch.name.as_str()).collect();
+            assert_eq!(names, ["API_KEY", "DB_PASS"]);
+
+            let patch = build_modify_patch(
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                secrets,
+                Some(vec!["OLD".to_string(), "OLD".to_string()]),
+            );
+            assert_eq!(patch.secrets_remove, ["OLD", "OLD"]);
         });
     }
 
