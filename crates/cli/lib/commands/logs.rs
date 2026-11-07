@@ -4,7 +4,8 @@
 //! translates CLI filters into SDK options, then renders the returned entries
 //! per `design/runtime/sandbox-logs.md` D5.
 //!
-//! Supports filtering by source (stdout/stderr/system), time window,
+//! Supports filtering by source (stdout/stderr/output/system, plus the opt-in
+//! `network` refusal records), time window,
 //! tail count, regex search, follow mode (filesystem-watch driven),
 //! and JSON-Lines passthrough. ANSI escape sequences are passed
 //! through to TTYs and stripped on pipes by default (matching
@@ -64,8 +65,9 @@ pub struct LogsArgs {
     pub timestamps: bool,
 
     /// Sources to include. Repeat or comma-separate to include
-    /// multiple. Defaults to `stdout,stderr` (the captured
-    /// user-program output).
+    /// multiple. Defaults to `stdout,stderr,output` (the captured
+    /// user-program output). `network` reads egress refusal records and
+    /// is never part of the default or of `all`.
     #[arg(long, value_enum, value_delimiter = ',')]
     pub source: Vec<SourceFilter>,
 
@@ -117,6 +119,11 @@ pub enum SourceFilter {
     /// (lifecycle markers) plus runtime/kernel diagnostics merged at
     /// read time.
     System,
+
+    /// Egress refusal records from `network.log`, one JSON line per entry,
+    /// written by the runtime for a local sandbox. Not included in the
+    /// default source set or in `all`.
+    Network,
 
     /// All sources: `stdout`, `stderr`, `output`, and `system`.
     All,
@@ -247,6 +254,7 @@ fn resolve_sources(picked: &[SourceFilter]) -> SourceMask {
             stderr: true,
             output: true,
             system: false,
+            network: false,
         };
     }
     let mut mask = SourceMask::default();
@@ -256,6 +264,7 @@ fn resolve_sources(picked: &[SourceFilter]) -> SourceMask {
             SourceFilter::Stderr => mask.stderr = true,
             SourceFilter::Output => mask.output = true,
             SourceFilter::System => mask.system = true,
+            SourceFilter::Network => mask.network = true,
             SourceFilter::All => {
                 mask.stdout = true;
                 mask.stderr = true;
@@ -273,13 +282,14 @@ struct SourceMask {
     stderr: bool,
     output: bool,
     system: bool,
+    network: bool,
 }
 
 impl SourceMask {
     /// Translate the mask into the engine's flat source list. Order
-    /// is fixed (stdout, stderr, output, system) for stable behavior.
+    /// is fixed (stdout, stderr, output, system, network) for stable behavior.
     fn to_engine_sources(self) -> Vec<LogSource> {
-        let mut out = Vec::with_capacity(4);
+        let mut out = Vec::with_capacity(5);
         if self.stdout {
             out.push(LogSource::Stdout);
         }
@@ -291,6 +301,9 @@ impl SourceMask {
         }
         if self.system {
             out.push(LogSource::System);
+        }
+        if self.network {
+            out.push(LogSource::Network);
         }
         out
     }
@@ -334,6 +347,7 @@ fn engine_entry_to_cli(entry: &EngineLogEntry) -> LogEntry {
         LogSource::Stderr => "stderr",
         LogSource::Output => "output",
         LogSource::System => "system",
+        LogSource::Network => "network",
     };
     let (d, e) = match std::str::from_utf8(&entry.data) {
         Ok(text) => (text.to_string(), None),
@@ -352,8 +366,23 @@ fn engine_entry_to_cli(entry: &EngineLogEntry) -> LogEntry {
     }
 }
 
+/// Refuse a source that is not scoped to one job.
+///
+/// Egress refusals are sandbox-wide records, so `--job` cannot select them.
+fn ensure_job_sources_are_sandbox_wide(mask: SourceMask) -> anyhow::Result<()> {
+    if mask.network {
+        anyhow::bail!(
+            "`--source network` reads sandbox-wide refusals and cannot be combined with `--job`"
+        );
+    }
+
+    Ok(())
+}
+
 /// Job selection keeps sandbox-wide logs unchanged and delegates replay/follow to the SDK.
 async fn run_job_logs(args: LogsArgs) -> anyhow::Result<()> {
+    ensure_job_sources_are_sandbox_wide(resolve_sources(&args.source))?;
+
     let id = args.job.as_deref().expect("job branch requires a selector");
     let job = microsandbox::Sandbox::get(&args.name)
         .await?
@@ -368,6 +397,7 @@ async fn run_job_logs(args: LogsArgs) -> anyhow::Result<()> {
                 LogSource::Stderr => "stderr",
                 LogSource::Output => "output",
                 LogSource::System => "system",
+                LogSource::Network => "network",
             }
             .to_string()
         })
@@ -720,9 +750,75 @@ mod tests {
     }
 
     #[test]
+    fn default_excludes_network() {
+        let mask = resolve_sources(&[]);
+        assert!(!mask.network, "the default must not include network");
+        assert_eq!(
+            mask.to_engine_sources(),
+            vec![LogSource::Stdout, LogSource::Stderr, LogSource::Output],
+        );
+    }
+
+    #[test]
     fn source_mask_all() {
         let mask = resolve_sources(&[SourceFilter::All]);
         assert!(mask.stdout && mask.stderr && mask.output && mask.system);
+    }
+
+    #[test]
+    fn resolve_sources_all_excludes_network() {
+        let mask = resolve_sources(&[SourceFilter::All]);
+        assert!(!mask.network, "`all` keeps its documented meaning");
+        assert!(
+            !mask.to_engine_sources().contains(&LogSource::Network),
+            "`all` must not select network entries"
+        );
+    }
+
+    #[test]
+    fn resolve_sources_network_only() {
+        let mask = resolve_sources(&[SourceFilter::Network]);
+        assert!(mask.network && !mask.stdout && !mask.stderr && !mask.output && !mask.system);
+
+        assert_eq!(mask.to_engine_sources(), vec![LogSource::Network]);
+    }
+
+    #[test]
+    fn resolve_sources_network_is_last_when_combined() {
+        let mask = resolve_sources(&[SourceFilter::Network, SourceFilter::Stdout]);
+        assert_eq!(
+            mask.to_engine_sources(),
+            vec![LogSource::Stdout, LogSource::Network],
+        );
+    }
+
+    #[test]
+    fn job_with_network_source_is_refused() {
+        let mask = resolve_sources(&[SourceFilter::Network]);
+        let error = ensure_job_sources_are_sandbox_wide(mask).unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("cannot be combined with `--job`"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn job_with_sandbox_wide_sources_is_allowed() {
+        for sources in [
+            vec![],
+            vec![SourceFilter::Stdout],
+            vec![SourceFilter::All],
+            vec![SourceFilter::System],
+        ] {
+            let mask = resolve_sources(&sources);
+            assert!(
+                ensure_job_sources_are_sandbox_wide(mask).is_ok(),
+                "sources {sources:?} must stay usable with --job"
+            );
+        }
     }
 
     #[test]
@@ -750,6 +846,7 @@ mod tests {
             stderr: false,
             output: true,
             system: true,
+            network: false,
         };
         assert_eq!(
             mask.to_engine_sources(),

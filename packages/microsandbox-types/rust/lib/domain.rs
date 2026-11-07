@@ -1376,6 +1376,11 @@ pub enum LogSource {
 
     /// Synthetic system entry: lifecycle markers, runtime diagnostics, kernel console output.
     System,
+
+    /// Egress refusal records the runtime writes to `network.log` (local sandboxes only). The
+    /// entry's data is one JSON line that deserializes as
+    /// [`NetworkLogRecord`](crate::NetworkLogRecord). Never part of the default source set.
+    Network,
 }
 
 //--------------------------------------------------------------------------------------------------
@@ -1805,6 +1810,9 @@ impl RlimitResource {
 
 impl LogSource {
     /// Apply the empty-means-default rule used by log readers.
+    ///
+    /// The default and `all` selections never include [`LogSource::Network`]: refusal records are
+    /// opt-in only.
     pub fn effective(requested: &[Self]) -> Vec<Self> {
         if requested.is_empty() {
             vec![Self::Stdout, Self::Stderr, Self::Output]
@@ -1815,6 +1823,7 @@ impl LogSource {
                 Self::Stderr => 1,
                 Self::Output => 2,
                 Self::System => 3,
+                Self::Network => 4,
             });
             sources.dedup();
             sources
@@ -4588,6 +4597,34 @@ mod tests {
         assert_eq!(
             LogSource::effective(&[LogSource::System, LogSource::Stdout, LogSource::System]),
             vec![LogSource::Stdout, LogSource::System]
+        );
+    }
+
+    #[test]
+    fn log_source_effective_never_adds_network() {
+        assert!(
+            !LogSource::effective(&[]).contains(&LogSource::Network),
+            "the default source set must not include network"
+        );
+    }
+
+    #[test]
+    fn log_source_effective_keeps_network_last() {
+        assert_eq!(
+            LogSource::effective(&[LogSource::Network, LogSource::Stdout, LogSource::Network]),
+            vec![LogSource::Stdout, LogSource::Network]
+        );
+    }
+
+    #[test]
+    fn log_source_network_serializes_as_the_network_tag() {
+        assert_eq!(
+            serde_json::to_string(&LogSource::Network).unwrap(),
+            "\"network\""
+        );
+        assert_eq!(
+            serde_json::from_str::<LogSource>("\"network\"").unwrap(),
+            LogSource::Network
         );
     }
 

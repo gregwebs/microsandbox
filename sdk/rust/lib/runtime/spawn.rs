@@ -536,6 +536,15 @@ pub async fn spawn_sandbox(
         tokio::fs::create_dir_all(&scripts_dir),
     )?;
 
+    // Every local launch passes here: create, start, restart, restore and fork
+    // children. Refuse a writable caller bind of this sandbox's own directory
+    // before any mount reaches the runtime, now that the log directory exists to
+    // compare against. The mount paths are measured, never rewritten.
+    crate::backend::local::host_paths::check_writable_binds_do_not_expose_sandbox_dir(
+        &sandbox_dir,
+        &config.spec.mounts,
+    )?;
+
     // Stopped-safe preparation: a `--next-start` upper grow persists only the
     // desired size, so the file itself grows here, before any virtio device
     // attaches the image.
@@ -3651,6 +3660,7 @@ mod tests {
         auto_block_writeback_pool_bytes, resolve_linux_block_writeback_policy,
     };
     use super::{block_writeback_policy, is_owned_restored_disk, machine_cli_args};
+    use crate::runtime::spawn::ResolvedNamedVolume;
     use crate::{
         LogLevel,
         backend::LocalBackend,
@@ -5086,6 +5096,150 @@ mod tests {
         );
         assert_eq!(handoff.cwd.as_deref(), Some("/opt/hermes"));
         assert!(launch.startup.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_no_msb_managed_share_contains_the_log_dir() {
+        // No msb-managed guest share may contain `<sandbox_dir>/logs`. A writable
+        // caller bind there is refused by the launch guard; the shares msb renders
+        // itself (owned volumes, named volumes, the runtime directory) must stay
+        // outside it by construction, which is what this pins.
+        let temp = tempdir().unwrap();
+        let home = temp.path().join("msb-home");
+        let local = LocalBackend::builder()
+            .config_path(home.join("config.json"))
+            .managed_config_path(home.join("managed.json"))
+            .home(&home)
+            .build()
+            .await
+            .unwrap();
+        let sandbox_dir = local.sandboxes_dir().join("shared");
+        let log_dir = sandbox_dir.join("logs");
+        let runtime_dir = sandbox_dir.join("runtime");
+
+        let workspace = temp.path().join("workspace");
+        std::fs::create_dir_all(&workspace).unwrap();
+        let mut config = SandboxConfig::default();
+        config.spec.name = "shared".into();
+        config.spec.image = RootfsSource::Bind {
+            path: temp.path().join("rootfs"),
+            follow_root_symlinks: false,
+        };
+        config.spec.mounts = vec![
+            VolumeMount::Bind {
+                host: workspace.clone(),
+                guest: "/workspace".into(),
+                options: MountOptions::default(),
+                stat_virtualization: StatVirtualization::Strict,
+                host_permissions: HostPermissions::Private,
+                follow_root_symlinks: false,
+                quota_mib: Some(128),
+            },
+            VolumeMount::Owned {
+                guest: "/owned".into(),
+                storage: microsandbox_types::OwnedVolumeStorage::Directory {
+                    quota_mib: Some(256),
+                },
+                options: MountOptions::default(),
+                stat_virtualization: StatVirtualization::Strict,
+                host_permissions: HostPermissions::Private,
+            },
+            VolumeMount::Named {
+                name: "shared-data".into(),
+                guest: "/named".into(),
+                create: None,
+                options: MountOptions::default(),
+                stat_virtualization: StatVirtualization::Strict,
+                host_permissions: HostPermissions::Private,
+                follow_root_symlinks: false,
+            },
+            VolumeMount::Tmpfs {
+                guest: "/scratch".into(),
+                size_mib: Some(64),
+                options: MountOptions::default(),
+            },
+        ];
+        let mut named_volumes = HashMap::new();
+        named_volumes.insert(
+            "shared-data".to_string(),
+            ResolvedNamedVolume {
+                kind: VolumeKind::Directory,
+                path: local.volume_path("shared-data"),
+                format: None,
+                fstype: None,
+                quota_mib: None,
+            },
+        );
+
+        let (_, launch) = machine_cli_args(
+            &local,
+            &config,
+            42,
+            #[cfg(feature = "net")]
+            test_network_slot(),
+            #[cfg(feature = "net")]
+            test_resolved_network(&config),
+            Path::new("msb.db"),
+            30,
+            &log_dir,
+            &runtime_dir,
+            Path::new("agent.sock"),
+            Path::new("libkrunfw.dylib"),
+            &HashMap::new(),
+            &named_volumes,
+            None,
+            None,
+            None,
+            None,
+        );
+
+        // Every host directory that becomes a guest share: the rendered directory
+        // mounts (caller binds, owned directory volumes, named directory volumes),
+        // each owned volume's backing path, and the runtime share.
+        let mut shares: Vec<PathBuf> = launch
+            .mounts
+            .iter()
+            .map(|spec| mount_spec_host_path(spec))
+            .collect();
+        for volume in &launch.owned_volumes {
+            if let VolumeMount::Owned { guest, storage, .. } = volume {
+                shares.push(crate::runtime::owned_volumes::backing_path(
+                    &sandbox_dir,
+                    guest,
+                    storage,
+                ));
+            }
+        }
+        shares.push(launch.runtime_dir.clone());
+
+        // The plain caller bind is the control: it proves the collector sees binds.
+        assert!(shares.contains(&workspace), "{shares:?}");
+        // msb's own shares live inside the sandbox directory but never at or above
+        // the log directory.
+        assert!(
+            shares
+                .iter()
+                .any(|share| share.starts_with(&sandbox_dir) && share != &sandbox_dir),
+            "{shares:?}"
+        );
+        for share in &shares {
+            assert!(
+                !log_dir.starts_with(share),
+                "share {} contains the log directory {}",
+                share.display(),
+                log_dir.display()
+            );
+        }
+    }
+
+    /// Extract the host path from a rendered `tag:host_path[:opts]` mount spec.
+    fn mount_spec_host_path(spec: &str) -> PathBuf {
+        let (_tag, rest) = spec
+            .split_once(':')
+            .expect("a rendered mount spec keeps its tag");
+        // A host path holds no option separator, so the trailing option block, when
+        // present, follows the last `:`; a Windows drive letter stays inside it.
+        PathBuf::from(rest.rsplit_once(':').map_or(rest, |(host, _options)| host))
     }
 
     #[tokio::test]

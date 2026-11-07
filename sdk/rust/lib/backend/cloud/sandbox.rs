@@ -340,6 +340,11 @@ impl SandboxBackend for CloudBackend {
         opts: &'a LogOptions,
     ) -> BoxFuture<'a, MicrosandboxResult<LogStream>> {
         Box::pin(async move {
+            super::http::refuse_local_only_log_sources(
+                Operation::SandboxFollowLogs,
+                &opts.sources,
+            )?;
+
             if opts.tail.is_some() || opts.since.is_some() || opts.until.is_some() {
                 return Err(MicrosandboxError::unsupported(
                     Operation::SandboxFollowLogs,
@@ -847,6 +852,7 @@ mod tests {
 
     use super::*;
     use crate::backend::{Backend, SandboxBackend};
+    use crate::logs::LogSource;
     use crate::sandbox::{EnvVar, OciRootfsSource, RootDisk, SandboxBuilder, SandboxSpec};
     use crate::snapshot::SnapshotReference;
     use microsandbox_types::CloudSnapshotLocation;
@@ -1141,6 +1147,67 @@ mod tests {
                 } if reason == "bounded cloud log follow filters are not yet available"
             ));
         }
+    }
+
+    #[tokio::test]
+    async fn cloud_log_requests_for_the_network_source_are_refused_before_http() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let backend = Arc::new(
+            crate::test_support::cloud_backend(
+                format!("http://{}", listener.local_addr().unwrap()),
+                "test-key",
+            )
+            .unwrap(),
+        );
+
+        let stream_options = LogStreamOptions {
+            sources: vec![LogSource::Network],
+            follow: true,
+            ..Default::default()
+        };
+        let error = backend
+            .log_stream("cloud-sandbox", &stream_options)
+            .await
+            .err()
+            .expect("a network log_stream must be refused");
+        assert!(
+            matches!(
+                error,
+                MicrosandboxError::Unsupported {
+                    op: Operation::SandboxLogStream,
+                    reason: UnsupportedReason::NotAvailable(ref reason),
+                } if reason == "the network log source is local-only"
+            ),
+            "{error:?}"
+        );
+
+        let follow_options = LogOptions {
+            sources: vec![LogSource::Network],
+            ..Default::default()
+        };
+        let backend_dyn: Arc<dyn Backend> = backend.clone();
+        let error = backend
+            .follow_logs(backend_dyn, "cloud-sandbox", &follow_options)
+            .await
+            .err()
+            .expect("a network follow_logs must be refused");
+        assert!(
+            matches!(
+                error,
+                MicrosandboxError::Unsupported {
+                    op: Operation::SandboxFollowLogs,
+                    reason: UnsupportedReason::NotAvailable(ref reason),
+                } if reason == "the network log source is local-only"
+            ),
+            "{error:?}"
+        );
+
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), listener.accept())
+                .await
+                .is_err(),
+            "the cloud backend must not send an HTTP request for a local-only source"
+        );
     }
 
     #[tokio::test]

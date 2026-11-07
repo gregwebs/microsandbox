@@ -9,7 +9,7 @@ use microsandbox_types::{
 
 use crate::SandboxConfig;
 
-use super::resolve_host_paths;
+use super::{check_writable_binds_do_not_expose_sandbox_dir, resolve_host_paths};
 
 //--------------------------------------------------------------------------------------------------
 // Functions: Fixtures
@@ -710,4 +710,556 @@ fn restored_bind_check_retains_captured_transport_and_optional_backing() {
     check(None, relaxed, false).unwrap();
     check(None, relaxed, true).unwrap_err();
     check(None, strict, false).unwrap_err();
+}
+
+//--------------------------------------------------------------------------------------------------
+// Functions: Writable bind fixtures
+//--------------------------------------------------------------------------------------------------
+
+/// Resolve a test base so every compared path is already resolved.
+///
+/// `/var` is a symlink to `/private/var` on macOS, so a temp path has to be
+/// canonicalized before it can be compared with what the guard reports. Windows
+/// `canonicalize` only adds a verbatim prefix, which the guard does not name.
+fn canonical_base(path: &Path) -> PathBuf {
+    #[cfg(unix)]
+    {
+        path.canonicalize().unwrap()
+    }
+    #[cfg(not(unix))]
+    {
+        path.to_path_buf()
+    }
+}
+
+/// Return a canonical `<temp>/sandboxes` base so every compared path is resolved.
+fn sandboxes_dir(temp: &Path) -> PathBuf {
+    let sandboxes = canonical_base(temp).join("sandboxes");
+    std::fs::create_dir_all(&sandboxes).unwrap();
+    sandboxes
+}
+
+/// Create the real `<sandboxes_dir>/<name>` and `<sandbox_dir>/logs` that a launch creates.
+fn create_sandbox_dir(sandboxes: &Path, name: &str) -> PathBuf {
+    let sandbox_dir = sandboxes.join(name);
+    std::fs::create_dir_all(sandbox_dir.join("logs")).unwrap();
+    sandbox_dir
+}
+
+/// Render the guard's error so a case can assert the exact refusal.
+fn refusal(sandbox_dir: &Path, mounts: &[VolumeMount]) -> Option<String> {
+    match check_writable_binds_do_not_expose_sandbox_dir(sandbox_dir, mounts) {
+        Ok(()) => None,
+        Err(error) => Some(error.to_string()),
+    }
+}
+
+/// The documented refusal, kept literal so a wording change has to be deliberate.
+fn exposure_message(host: &Path, sandbox_dir: &Path, resolved: &Path) -> String {
+    format!(
+        "invalid config: bind mount host path {} exposes this sandbox's own directory {} to the guest (it resolves to {}); the guest could rewrite its logs. Mount it read-only or bind a path outside {}",
+        host.display(),
+        sandbox_dir.display(),
+        resolved.display(),
+        sandbox_dir.display()
+    )
+}
+
+/// A read-only bind, which cannot rewrite the source it mounts.
+fn read_only_bind(host: PathBuf, guest: &str) -> VolumeMount {
+    let mut mount = bind(host, guest);
+    if let VolumeMount::Bind { options, .. } = &mut mount {
+        options.readonly = true;
+    }
+    mount
+}
+
+//--------------------------------------------------------------------------------------------------
+// Tests: Writable bind guard
+//--------------------------------------------------------------------------------------------------
+
+#[test]
+fn writable_bind_of_the_logs_dir_is_refused() {
+    let temp = tempfile::tempdir().unwrap();
+    let sandboxes = sandboxes_dir(temp.path());
+    let sandbox_dir = create_sandbox_dir(&sandboxes, "dev");
+    let log_dir = sandbox_dir.join("logs");
+    let mounts = [bind(log_dir.clone(), "/logs")];
+
+    assert_eq!(
+        refusal(&sandbox_dir, &mounts),
+        Some(exposure_message(&log_dir, &sandbox_dir, &log_dir))
+    );
+}
+
+#[test]
+fn writable_bind_of_the_sandbox_dir_is_refused() {
+    let temp = tempfile::tempdir().unwrap();
+    let sandboxes = sandboxes_dir(temp.path());
+    let sandbox_dir = create_sandbox_dir(&sandboxes, "dev");
+    let mounts = [bind(sandbox_dir.clone(), "/state")];
+
+    assert_eq!(
+        refusal(&sandbox_dir, &mounts),
+        Some(exposure_message(&sandbox_dir, &sandbox_dir, &sandbox_dir))
+    );
+
+    // A differently spelled alias of the same directory compares equal by identity:
+    // the sandbox directory is named here through a symlinked parent.
+    #[cfg(unix)]
+    {
+        let base = canonical_base(temp.path());
+        let parent_alias = base.join("sandboxes-alias");
+        std::os::unix::fs::symlink(&sandboxes, &parent_alias).unwrap();
+        let aliased_sandbox_dir = parent_alias.join("dev");
+        let mounts = [bind(aliased_sandbox_dir.clone(), "/state")];
+        assert_eq!(
+            refusal(&sandbox_dir, &mounts),
+            Some(exposure_message(
+                &aliased_sandbox_dir,
+                &sandbox_dir,
+                &sandbox_dir
+            ))
+        );
+    }
+}
+
+#[test]
+fn writable_bind_inside_the_sandbox_dir_is_refused() {
+    let temp = tempfile::tempdir().unwrap();
+    let sandboxes = sandboxes_dir(temp.path());
+    let sandbox_dir = create_sandbox_dir(&sandboxes, "dev");
+    let owned = sandbox_dir.join("owned-volumes").join("vol_1").join("data");
+    std::fs::create_dir_all(&owned).unwrap();
+
+    // An owned-volume backing directory that exists is named by its own path.
+    let mounts = [bind(owned.clone(), "/data")];
+    assert_eq!(
+        refusal(&sandbox_dir, &mounts),
+        Some(exposure_message(&owned, &sandbox_dir, &owned))
+    );
+
+    // A path that does not exist yet is decided by its deepest existing prefix,
+    // so a first launch cannot admit a directory it is about to create and share.
+    let pending = sandbox_dir.join("owned-volumes").join("vol_2").join("data");
+    let existing_prefix = sandbox_dir.join("owned-volumes");
+    let mounts = [bind(pending.clone(), "/pending")];
+    assert_eq!(
+        refusal(&sandbox_dir, &mounts),
+        Some(exposure_message(&pending, &sandbox_dir, &existing_prefix))
+    );
+}
+
+/// A case variant of the sandbox directory is the same directory on a case-insensitive volume,
+/// so it compares equal by identity. The fixture spells the sandbox name in upper case and
+/// resolves it through the volume, so this pins the behaviour on every platform it runs on.
+#[cfg(unix)]
+#[test]
+fn case_variant_alias_of_the_sandbox_dir_is_decided_by_identity() {
+    let temp = tempfile::tempdir().unwrap();
+    let sandboxes = sandboxes_dir(temp.path());
+    let sandbox_dir = create_sandbox_dir(&sandboxes, "dev");
+    // A differently *spelled* path that resolves to the same directory.
+    let variant = sandboxes.join(".").join("dev").join("logs");
+    let mounts = [bind(variant.clone(), "/logs")];
+
+    assert_eq!(
+        refusal(&sandbox_dir, &mounts),
+        Some(exposure_message(
+            &variant,
+            &sandbox_dir,
+            &sandbox_dir.join("logs")
+        )),
+        "an alias that canonicalizes to the log directory is refused, whatever its spelling"
+    );
+}
+
+/// A path that walks `..` through a symlink resolves inside the sandbox even though its text
+/// does not start with the sandbox directory, so a text comparison would admit it.
+#[cfg(unix)]
+#[test]
+fn dot_dot_through_a_symlink_into_the_sandbox_dir_is_refused() {
+    let temp = tempfile::tempdir().unwrap();
+    let sandboxes = sandboxes_dir(temp.path());
+    let sandbox_dir = create_sandbox_dir(&sandboxes, "dev");
+    let base = canonical_base(temp.path());
+    let owned = sandbox_dir.join("owned-volumes");
+    std::fs::create_dir_all(&owned).unwrap();
+    let link = base.join("link");
+    std::os::unix::fs::symlink(&owned, &link).unwrap();
+
+    // `link/../logs` is textually outside the sandbox; it resolves to `<sandbox_dir>/logs`.
+    let host = link.join("..").join("logs");
+    let mounts = [bind(host.clone(), "/logs")];
+
+    assert_eq!(
+        refusal(&sandbox_dir, &mounts),
+        Some(exposure_message(
+            &host,
+            &sandbox_dir,
+            &sandbox_dir.join("logs")
+        )),
+        "resolution, not spelling, decides"
+    );
+}
+
+/// A hard link to a log file resolves outside the sandbox directory, so only file identity can
+/// catch it: the link shares the inode of `<sandbox_dir>/logs/network.log`.
+#[cfg(unix)]
+#[test]
+fn hard_link_to_a_log_file_is_refused() {
+    let temp = tempfile::tempdir().unwrap();
+    let sandboxes = sandboxes_dir(temp.path());
+    let sandbox_dir = create_sandbox_dir(&sandboxes, "dev");
+    let log_dir = sandbox_dir.join("logs");
+    let base = canonical_base(temp.path());
+    let network_log = log_dir.join("network.log");
+    std::fs::write(&network_log, "{\"v\":1}\n").unwrap();
+    let rotated = log_dir.join("network.log.1");
+    std::fs::write(&rotated, "{\"v\":1}\n").unwrap();
+
+    let outside = base.join("elsewhere");
+    std::fs::create_dir_all(&outside).unwrap();
+    let live_link = outside.join("network.log");
+    std::fs::hard_link(&network_log, &live_link).unwrap();
+    let rotated_link = outside.join("network.log.1");
+    std::fs::hard_link(&rotated, &rotated_link).unwrap();
+
+    // The configured path is named in the refusal; it is never rewritten.
+    for link in [&live_link, &rotated_link] {
+        let mounts = [bind(link.clone(), "/etc/network.log")];
+        assert_eq!(
+            refusal(&sandbox_dir, &mounts),
+            Some(exposure_message(link, &sandbox_dir, link)),
+            "{link:?} shares the log file's identity"
+        );
+    }
+
+    // A read-only bind of the same link is exempt, like any other read-only bind.
+    let mounts = [read_only_bind(live_link.clone(), "/etc/network.log")];
+    assert_eq!(refusal(&sandbox_dir, &mounts), None);
+
+    // A hard link to a file that is not a log is an ordinary file.
+    let ordinary = outside.join("notes.txt");
+    std::fs::write(&ordinary, "x").unwrap();
+    let ordinary_link = outside.join("notes-link.txt");
+    std::fs::hard_link(&ordinary, &ordinary_link).unwrap();
+    let mounts = [bind(ordinary_link.clone(), "/notes.txt")];
+    assert_eq!(refusal(&sandbox_dir, &mounts), None, "{ordinary_link:?}");
+}
+
+/// A relative bind root is anchored at the launching process's working directory, which is what
+/// the runtime would open. The child process runs from a different directory than the sandbox
+/// lives in, so a comparison anchored anywhere else would decide differently.
+#[cfg(unix)]
+#[test]
+fn relative_bind_root_is_resolved_from_the_process_working_directory() {
+    const CHILD_ENV: &str = "MSB_TEST_RELATIVE_BIND_CHILD";
+    const BASE_ENV: &str = "MSB_TEST_RELATIVE_BIND_BASE";
+
+    if std::env::var_os(CHILD_ENV).is_some() {
+        let base = PathBuf::from(std::env::var(BASE_ENV).expect("the fixture base"));
+        let sandbox_dir = base.join("sandboxes").join("dev");
+        // Relative to the child's working directory, which the parent sets to `<base>/sandboxes`.
+        let host = PathBuf::from("dev").join("logs");
+        let mounts = [bind(host.clone(), "/logs")];
+        assert_eq!(
+            refusal(&sandbox_dir, &mounts),
+            Some(exposure_message(
+                &host,
+                &sandbox_dir,
+                &sandbox_dir.join("logs")
+            )),
+            "a relative bind root that resolves into the sandbox must be refused"
+        );
+
+        // The same relative path from a directory above the sandboxes directory is outside.
+        let mounts = [bind(PathBuf::from("workspace"), "/workspace")];
+        assert_eq!(refusal(&sandbox_dir, &mounts), None);
+        return;
+    }
+
+    let temp = tempfile::tempdir().unwrap();
+    let base = canonical_base(temp.path());
+    let sandboxes = base.join("sandboxes");
+    std::fs::create_dir_all(sandboxes.join("dev").join("logs")).unwrap();
+    let workspace = sandboxes.join("workspace");
+    std::fs::create_dir_all(&workspace).unwrap();
+
+    let output = Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "backend::local::host_paths::tests::relative_bind_root_is_resolved_from_the_process_working_directory",
+            "--nocapture",
+        ])
+        .current_dir(&sandboxes)
+        .env(CHILD_ENV, "1")
+        .env(BASE_ENV, &base)
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.status.success(),
+        "the child failed:\n{stdout}\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        stdout.contains("1 passed"),
+        "the child must run exactly one test:\n{stdout}"
+    );
+}
+
+#[test]
+fn file_bind_of_the_network_log_is_refused() {
+    let temp = tempfile::tempdir().unwrap();
+    let sandboxes = sandboxes_dir(temp.path());
+    let sandbox_dir = create_sandbox_dir(&sandboxes, "dev");
+    let network_log = sandbox_dir.join("logs").join("network.log");
+    std::fs::write(&network_log, "").unwrap();
+    let mounts = [bind(network_log.clone(), "/etc/network.log")];
+
+    assert_eq!(
+        refusal(&sandbox_dir, &mounts),
+        Some(exposure_message(&network_log, &sandbox_dir, &network_log))
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn symlinked_alias_of_the_sandbox_dir_is_refused() {
+    let temp = tempfile::tempdir().unwrap();
+    let sandboxes = sandboxes_dir(temp.path());
+    let sandbox_dir = create_sandbox_dir(&sandboxes, "dev");
+    let log_dir = sandbox_dir.join("logs");
+    let base = canonical_base(temp.path());
+    let sandbox_alias = base.join("dev-link");
+    let logs_alias = base.join("logs-link");
+    std::os::unix::fs::symlink(&sandbox_dir, &sandbox_alias).unwrap();
+    std::os::unix::fs::symlink(&log_dir, &logs_alias).unwrap();
+
+    // The default `follow_root_symlinks: false` still resolves the alias here: the
+    // runtime would refuse the symlinked root at open, so refusing earlier cannot
+    // admit anything it would share.
+    let mounts = [bind(sandbox_alias.clone(), "/state")];
+    assert_eq!(
+        refusal(&sandbox_dir, &mounts),
+        Some(exposure_message(&sandbox_alias, &sandbox_dir, &sandbox_dir))
+    );
+
+    let mounts = [bind(logs_alias.clone(), "/logs")];
+    assert_eq!(
+        refusal(&sandbox_dir, &mounts),
+        Some(exposure_message(&logs_alias, &sandbox_dir, &log_dir))
+    );
+
+    // A path below the alias that does not exist yet is decided by the alias itself.
+    let pending = sandbox_alias.join("owned-volumes");
+    let mounts = [bind(pending.clone(), "/pending")];
+    assert_eq!(
+        refusal(&sandbox_dir, &mounts),
+        Some(exposure_message(&pending, &sandbox_dir, &sandbox_dir))
+    );
+}
+
+#[test]
+fn read_only_bind_of_the_logs_dir_is_allowed() {
+    let temp = tempfile::tempdir().unwrap();
+    let sandboxes = sandboxes_dir(temp.path());
+    let sandbox_dir = create_sandbox_dir(&sandboxes, "dev");
+    let log_dir = sandbox_dir.join("logs");
+    let network_log = log_dir.join("network.log");
+    std::fs::write(&network_log, "").unwrap();
+
+    for host in [log_dir.clone(), sandbox_dir.clone(), network_log] {
+        let mounts = [read_only_bind(host.clone(), "/ro")];
+        assert_eq!(refusal(&sandbox_dir, &mounts), None, "{host:?}");
+    }
+}
+
+#[test]
+fn no_mounts_is_allowed_without_touching_the_filesystem() {
+    let temp = tempfile::tempdir().unwrap();
+    let sandboxes = sandboxes_dir(temp.path());
+    let missing = sandboxes.join("never-created");
+
+    // The guard returns before any I/O, so a config without mounts never fails on
+    // a sandbox directory that does not exist.
+    assert_eq!(refusal(&missing, &[]), None);
+}
+
+#[test]
+fn unrelated_writable_bind_is_allowed() {
+    let temp = tempfile::tempdir().unwrap();
+    let sandboxes = sandboxes_dir(temp.path());
+    let sandbox_dir = create_sandbox_dir(&sandboxes, "dev");
+    let base = canonical_base(temp.path());
+    let project = base.join("project");
+    let workspace = base.join("project").join("workspace");
+    std::fs::create_dir_all(&workspace).unwrap();
+    let file = base.join("input.txt");
+    std::fs::write(&file, "x").unwrap();
+
+    for host in [project, workspace, file, base.join("missing")] {
+        let mounts = [bind(host.clone(), "/data")];
+        assert_eq!(refusal(&sandbox_dir, &mounts), None, "{host:?}");
+    }
+
+    // A sibling sandbox's directory is not this sandbox's own directory, so the guard admits it.
+    //
+    // This is the operator's S2 scope, stated rather than implied: the guard protects *this*
+    // sandbox's directory, and widening it to every `<sandboxes_dir>/<name>` would be a launch
+    // behaviour change beyond that decision. The consequence is that guest A, given a writable
+    // bind of sandbox B's directory, can write B's `network.log` and so forge B's refusal feed;
+    // it is raised to the operator as a follow-up and recorded as a documented exposure in
+    // `COMPATIBILITY.md` §13, next to the ancestor-bind case.
+    let sibling = create_sandbox_dir(&sandboxes, "other");
+    std::fs::write(sibling.join("logs").join("network.log"), "").unwrap();
+    let mounts = [bind(sibling.clone(), "/other")];
+    assert_eq!(refusal(&sandbox_dir, &mounts), None, "{sibling:?}");
+}
+
+#[test]
+fn writable_bind_of_home_above_msb_home_is_allowed() {
+    let temp = tempfile::tempdir().unwrap();
+    let home = canonical_base(temp.path());
+    let msb_home = home.join(".microsandbox");
+    let sandboxes = msb_home.join("sandboxes");
+    std::fs::create_dir_all(&sandboxes).unwrap();
+    let sandbox_dir = create_sandbox_dir(&sandboxes, "dev");
+
+    // Ancestor binds keep working: refusing them would break existing launches.
+    // The documentation states that such a writable bind exposes the log.
+    for ancestor in [home.clone(), msb_home.clone(), sandboxes.clone()] {
+        let mounts = [bind(ancestor.clone(), "/host")];
+        assert_eq!(refusal(&sandbox_dir, &mounts), None, "{ancestor:?}");
+    }
+}
+
+/// Start and restart re-load the persisted configuration and reach the guard in
+/// `spawn_sandbox`, so an existing sandbox saved with a refused bind fails both.
+///
+/// Create-time mount validation runs before the sandbox directory is known and is
+/// not on the restart path at all, which is why the refusal has to be re-measured
+/// at every launch. The stand-in host runtime only answers the version probe: the
+/// guard refuses before any process is spawned.
+#[cfg(unix)]
+#[tokio::test]
+async fn guard_is_enforced_on_start_and_restart() {
+    use sea_orm::{ActiveModelTrait, Set};
+
+    // Root the backend home under a short directory so the derived AF_UNIX socket
+    // path stays within the platform `sun_path` limit (104 bytes on macOS).
+    let temp = tempfile::Builder::new()
+        .prefix("msb")
+        .tempdir_in("/tmp")
+        .unwrap();
+    let base = canonical_base(temp.path());
+    let home = base.join("msb-home");
+    let (stub_msb, stub_library) = write_stand_in_runtime(&base);
+
+    let mut global = crate::config::GlobalConfig::default();
+    global.paths.msb = Some(stub_msb);
+    global.paths.libkrunfw = Some(stub_library);
+    std::fs::create_dir_all(&home).unwrap();
+    std::fs::write(
+        home.join("config.json"),
+        serde_json::to_vec(&global).unwrap(),
+    )
+    .unwrap();
+    let local = crate::test_support::local_backend_builder(&home)
+        .build()
+        .await
+        .unwrap();
+    let sandbox_dir = local.sandboxes_dir().join("guarded");
+    let log_dir = sandbox_dir.join("logs");
+    std::fs::create_dir_all(&log_dir).unwrap();
+
+    // A persisted sandbox whose saved configuration binds its own log directory.
+    // Networking is off so this test only exercises the launch path it is about.
+    let rootfs = base.join("rootfs");
+    std::fs::create_dir_all(&rootfs).unwrap();
+    let mut config = SandboxConfig::default();
+    config.spec.name = "guarded".into();
+    config.spec.image = RootfsSource::Bind {
+        path: rootfs,
+        follow_root_symlinks: false,
+    };
+    config.spec.network.enabled = false;
+    config.spec.mounts = vec![bind(log_dir.clone(), "/logs")];
+
+    let db = local.db().await.unwrap();
+    let id = crate::backend::local::LocalBackend::insert_sandbox_record(db.write(), &config)
+        .await
+        .unwrap();
+    type SandboxRecord = crate::db::entity::sandbox::ActiveModel;
+    let stopped = SandboxRecord {
+        id: Set(id),
+        status: Set(crate::sandbox::SandboxStatus::Stopped),
+        ..Default::default()
+    };
+    ActiveModelTrait::update(stopped, db.write().inner())
+        .await
+        .unwrap();
+
+    let backend: std::sync::Arc<dyn crate::backend::Backend> = std::sync::Arc::new(local);
+
+    let expected = exposure_message(&log_dir, &sandbox_dir, &log_dir);
+
+    let started = crate::backend::with_backend(backend.clone(), async {
+        let sandbox = crate::Sandbox::get("guarded")
+            .await
+            .map_err(|error| error.to_string())?;
+        sandbox
+            .start()
+            .await
+            .map(|_| ())
+            .map_err(|error| error.to_string())
+    })
+    .await;
+    assert_eq!(started, Err(expected.clone()));
+
+    // A refused start leaves the sandbox exactly as it found it.
+    let status = crate::backend::with_backend(backend.clone(), async {
+        crate::Sandbox::get("guarded")
+            .await
+            .map(|sandbox| sandbox.status_snapshot())
+    })
+    .await
+    .unwrap();
+    assert_eq!(status, crate::sandbox::SandboxStatus::Stopped);
+
+    let restarted = crate::backend::with_backend(backend, async {
+        let sandbox = crate::Sandbox::get("guarded")
+            .await
+            .map_err(|error| error.to_string())?;
+        sandbox
+            .restart()
+            .await
+            .map(|_| ())
+            .map_err(|error| error.to_string())
+    })
+    .await;
+    assert_eq!(restarted, Err(expected));
+}
+
+/// Write a stand-in `msb` + `libkrunfw` pair that a launch can resolve.
+///
+/// It answers the version probe with an accepted historical contract and is never
+/// executed as a VM: the guard runs before the runtime process is spawned.
+#[cfg(unix)]
+fn write_stand_in_runtime(base: &Path) -> (PathBuf, PathBuf) {
+    use std::os::unix::fs::PermissionsExt;
+
+    let bin = base.join("runtime").join("bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    let msb = bin.join("msb");
+    std::fs::write(
+        &msb,
+        "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then printf 'msb 0.6.18\\n'; fi\nexit 0\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(&msb, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let library = bin.join("libkrunfw.dylib");
+    std::fs::write(&library, "").unwrap();
+    (msb, library)
 }

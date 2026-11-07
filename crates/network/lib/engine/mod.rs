@@ -14,6 +14,7 @@ pub mod netstack;
 pub mod network;
 pub(crate) mod policy;
 pub mod ports;
+pub mod refusal;
 pub(crate) mod secrets;
 pub mod tcp;
 pub mod tls;

@@ -4081,6 +4081,7 @@ fn log_source_str(source: LogSource) -> &'static str {
         LogSource::Stderr => "stderr",
         LogSource::Output => "output",
         LogSource::System => "system",
+        LogSource::Network => "network",
     }
 }
 

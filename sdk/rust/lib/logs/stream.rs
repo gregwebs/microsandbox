@@ -104,13 +104,17 @@ impl RotationConfig {
 
     /// Append every existing rotated file (`.max_index` → `.1`) to
     /// `backfill` in oldest-first order so the reader drains
-    /// chronologically before reaching the live file.
+    /// chronologically before reaching the live file. Records each
+    /// queued file's generation in `queued` so a later rescan does
+    /// not queue it twice.
     async fn queue_all_rotated(
         &self,
         backfill: &mut VecDeque<FileHandle>,
+        queued: &mut Vec<u64>,
     ) -> MicrosandboxResult<()> {
         for index in (1..=self.max_index).rev() {
             if let Some(src) = FileHandle::open(&self.path(index)).await? {
+                queued.push(src.inode);
                 backfill.push_back(src);
             }
         }
@@ -504,6 +508,15 @@ struct Reader {
     backfill: VecDeque<FileHandle>,
     live: Option<FileHandle>,
     initial_live_offset: u64,
+    /// Whether the live file was absent when this reader was built, so rotated
+    /// siblings that appear before it is first attached have not been queued yet.
+    rescan_on_attach: bool,
+    /// Inode generations already queued from the rotation chain; a rescan skips them.
+    queued_generations: Vec<u64>,
+    /// Test hook: a test parks the first live attachment here, after the live file is opened and
+    /// before its rotated chain is scanned.
+    #[cfg(test)]
+    attach_barrier: Option<std::sync::Arc<tokio::sync::Barrier>>,
 }
 
 impl Reader {
@@ -533,10 +546,11 @@ impl Reader {
 
         let mut backfill = VecDeque::new();
         let mut initial_live_offset = 0u64;
+        let mut queued_generations = Vec::with_capacity(rotation.max_index);
+        let resuming_from_cursor =
+            matches!(start, LogStreamStart::From(_)) && initial_position != FilePosition::default();
 
         if rotation.rotates() {
-            let resuming_from_cursor = matches!(start, LogStreamStart::From(_))
-                && initial_position != FilePosition::default();
             if resuming_from_cursor {
                 let Some(index) = rotation.find_index(initial_position.generation).await else {
                     return Err(MicrosandboxError::InvalidCursor(format!(
@@ -558,11 +572,22 @@ impl Reader {
                     }
                 }
             } else {
-                rotation.queue_all_rotated(&mut backfill).await?;
+                rotation
+                    .queue_all_rotated(&mut backfill, &mut queued_generations)
+                    .await?;
             }
         } else {
             initial_live_offset = initial_position.offset;
         }
+
+        // A file created *and* rotated before this reader first attaches would lose its retained
+        // rotated history, because siblings are only enumerated once at construction. Remember to
+        // rescan the chain when the live file first appears in that case.
+        let rescan_on_attach = rotation.rotates()
+            && !resuming_from_cursor
+            && FileHandle::generation_of_path(&primary_path)
+                .await
+                .is_none();
 
         Ok(Self {
             primary_path,
@@ -571,6 +596,10 @@ impl Reader {
             backfill,
             live: None,
             initial_live_offset,
+            rescan_on_attach,
+            queued_generations,
+            #[cfg(test)]
+            attach_barrier: None,
         })
     }
 
@@ -582,6 +611,14 @@ impl Reader {
         &mut self,
         since: Option<DateTime<Utc>>,
     ) -> MicrosandboxResult<ParsedChunk> {
+        // The first live attachment and the rotated-chain scan are one operation: a file created
+        // *and* rotated between two separate opens would attach the live file with its retained
+        // history never scanned. Queueing happens before the backfill drain below, so the
+        // retained history is still read before the live file.
+        if self.live.is_none() {
+            self.attach_live().await?;
+        }
+
         while let Some(src) = self.backfill.front_mut() {
             let chunk = self
                 .parser
@@ -594,14 +631,10 @@ impl Reader {
         }
 
         if self.live.is_none() {
-            let Some(mut src) = FileHandle::open(&self.primary_path).await? else {
-                return Ok(ParsedChunk {
-                    entries: Vec::new(),
-                    position: None,
-                });
-            };
-            src.offset = self.initial_live_offset;
-            self.live = Some(src);
+            return Ok(ParsedChunk {
+                entries: Vec::new(),
+                position: None,
+            });
         }
 
         let live = self.live.as_mut().unwrap();
@@ -634,6 +667,47 @@ impl Reader {
         } else {
             self.replace_live().await
         }
+    }
+
+    /// Attach the live file, queueing any rotated sibling the reader has not seen yet, oldest
+    /// first, on the first attachment.
+    ///
+    /// One operation, not two: a scan that opens the file, then an attach that opens it again,
+    /// can lose the retained history of a file created *and* rotated in between. Once the chain
+    /// has been scanned for an attached file, [`Reader::rescan_on_attach`] is cleared, so the
+    /// scan runs at most once per reader.
+    async fn attach_live(&mut self) -> MicrosandboxResult<()> {
+        let Some(mut src) = FileHandle::open(&self.primary_path).await? else {
+            return Ok(());
+        };
+        let live_generation = src.inode;
+
+        if self.rescan_on_attach {
+            // Test hook: let a test create a rotation sibling between the live open and the
+            // chain scan, which is the window this operation closes.
+            #[cfg(test)]
+            if let Some(barrier) = &self.attach_barrier {
+                barrier.wait().await;
+            }
+
+            for index in (1..=self.rotation.max_index).rev() {
+                let Some(sibling) = FileHandle::open(&self.rotation.path(index)).await? else {
+                    continue;
+                };
+                if sibling.inode == live_generation
+                    || self.queued_generations.contains(&sibling.inode)
+                {
+                    continue;
+                }
+                self.queued_generations.push(sibling.inode);
+                self.backfill.push_back(sibling);
+            }
+            self.rescan_on_attach = false;
+        }
+
+        src.offset = self.initial_live_offset;
+        self.live = Some(src);
+        Ok(())
     }
 
     /// Live inode changed: locate where the formerly-live file
@@ -696,6 +770,8 @@ mod tests {
     use bytes::Bytes;
     use futures::StreamExt;
 
+    use super::super::types::NetworkLogRecord;
+
     const LOG_FILES: &[LogFileConfig] = &[
         LogFileConfig {
             filename: "exec.log",
@@ -719,6 +795,12 @@ mod tests {
             format: LogFileFormat::Text,
             max_rotation_index: 0,
             produces: &[LogSource::System],
+        },
+        LogFileConfig {
+            filename: "network.log",
+            format: LogFileFormat::Jsonl,
+            max_rotation_index: 4,
+            produces: &[LogSource::Network],
         },
     ];
 
@@ -953,6 +1035,371 @@ mod tests {
         assert_eq!(entries.len(), 2);
         assert_eq!(entries[0].data, Bytes::from("old".as_bytes()));
         assert_eq!(entries[1].data, Bytes::from("new".as_bytes()));
+    }
+
+    fn network_line(t: &str, site: &str, dst_port: u16) -> String {
+        format!(
+            r#"{{"v":1,"t":"{t}","s":"network","event":"refusal","site":"{site}","layer":"tenant","protocol":"tcp","dst_ip":"203.0.113.10","dst_port":{dst_port},"name_source":"none","revision":1}}"#
+        )
+    }
+
+    async fn collect_network(engine: LogEngine, timeout: Duration) -> Vec<LogEntry> {
+        collect_with_timeout(Box::pin(engine.into_stream()), timeout)
+            .await
+            .into_iter()
+            .map(|item| item.unwrap())
+            .collect()
+    }
+
+    fn network_options(start: LogStreamStart) -> LogStreamOptions {
+        LogStreamOptions {
+            sources: vec![LogSource::Network],
+            start,
+            follow: false,
+            ..Default::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn network_log_is_read_only_when_requested() {
+        let dir = tempfile::tempdir().unwrap();
+        write_lines(
+            &dir.path().join("exec.log"),
+            &[make_jsonl_line(
+                "2026-04-30T20:32:59.000Z",
+                "stdout",
+                "user-output",
+                Some(1),
+            )],
+        );
+        write_lines(
+            &dir.path().join("network.log"),
+            &[network_line("2026-11-05T14:03:07.412Z", "tcp-syn", 443)],
+        );
+
+        let network_only = make_state(
+            dir.path().to_path_buf(),
+            &network_options(LogStreamStart::Beginning),
+        )
+        .await
+        .unwrap();
+        let entries = collect_network(network_only, Duration::from_secs(2)).await;
+
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].source, LogSource::Network);
+        assert_eq!(entries[0].session_id, None);
+        assert!(entries[0].data.ends_with(b"}\n"));
+        assert!(serde_json::from_slice::<NetworkLogRecord>(&entries[0].data).is_ok());
+
+        let mixed = make_state(
+            dir.path().to_path_buf(),
+            &LogStreamOptions {
+                sources: vec![LogSource::Stdout, LogSource::Network],
+                follow: false,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        let mut sources: Vec<_> = collect_network(mixed, Duration::from_secs(2))
+            .await
+            .into_iter()
+            .map(|entry| entry.source)
+            .collect();
+        sources.sort_by_key(|source| format!("{source:?}"));
+        assert_eq!(sources, vec![LogSource::Network, LogSource::Stdout]);
+    }
+
+    #[tokio::test]
+    async fn default_sources_never_read_the_network_log() {
+        let dir = tempfile::tempdir().unwrap();
+        write_lines(
+            &dir.path().join("exec.log"),
+            &[make_jsonl_line(
+                "2026-04-30T20:32:59.000Z",
+                "stdout",
+                "user-output",
+                Some(1),
+            )],
+        );
+        write_lines(
+            &dir.path().join("network.log"),
+            &[network_line("2026-11-05T14:03:07.412Z", "tcp-syn", 443)],
+        );
+
+        let state = make_state(
+            dir.path().to_path_buf(),
+            &LogStreamOptions {
+                follow: false,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        let entries = collect_network(state, Duration::from_secs(2)).await;
+
+        assert_eq!(entries.len(), 1);
+        assert!(
+            entries.iter().all(|e| e.source != LogSource::Network),
+            "the default source set must not include network entries"
+        );
+    }
+
+    #[tokio::test]
+    async fn network_log_rotation_chain_is_read_oldest_first() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path();
+        write_lines(
+            &path.join("network.log.4"),
+            &[network_line("2026-11-05T14:00:00.000Z", "udp", 4)],
+        );
+        write_lines(
+            &path.join("network.log.3"),
+            &[network_line("2026-11-05T14:00:01.000Z", "udp", 3)],
+        );
+        write_lines(
+            &path.join("network.log.2"),
+            &[network_line("2026-11-05T14:00:02.000Z", "udp", 2)],
+        );
+        write_lines(
+            &path.join("network.log.1"),
+            &[network_line("2026-11-05T14:00:03.000Z", "udp", 1)],
+        );
+        write_lines(
+            &path.join("network.log"),
+            &[network_line("2026-11-05T14:00:04.000Z", "tcp-syn", 0)],
+        );
+
+        let state = make_state(
+            path.to_path_buf(),
+            &network_options(LogStreamStart::Beginning),
+        )
+        .await
+        .unwrap();
+        let entries = collect_network(state, Duration::from_secs(2)).await;
+
+        assert_eq!(entries.len(), 5);
+        assert_eq!(
+            entries
+                .iter()
+                .map(|entry| entry.timestamp.to_rfc3339())
+                .collect::<Vec<_>>(),
+            vec![
+                "2026-11-05T14:00:00+00:00",
+                "2026-11-05T14:00:01+00:00",
+                "2026-11-05T14:00:02+00:00",
+                "2026-11-05T14:00:03+00:00",
+                "2026-11-05T14:00:04+00:00",
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn network_log_created_and_rotated_before_first_attach_keeps_its_history() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().to_path_buf();
+        let state = make_state(path.clone(), &network_options(LogStreamStart::Beginning))
+            .await
+            .unwrap();
+
+        // The file is created *and* rotated before the reader first attaches to it.
+        write_lines(
+            &path.join("network.log.1"),
+            &[network_line("2026-11-05T14:03:07.412Z", "tcp-syn", 1)],
+        );
+        write_lines(
+            &path.join("network.log"),
+            &[network_line("2026-11-05T14:03:08.412Z", "tcp-syn", 2)],
+        );
+
+        let entries = collect_network(state, Duration::from_secs(2)).await;
+
+        assert_eq!(entries.len(), 2);
+        assert_eq!(
+            entries[0].timestamp.to_rfc3339(),
+            "2026-11-05T14:03:07.412+00:00"
+        );
+        assert_eq!(
+            entries[1].timestamp.to_rfc3339(),
+            "2026-11-05T14:03:08.412+00:00"
+        );
+    }
+
+    /// The window the first-attach rescan has to close, driven deterministically: the writer
+    /// rotates the file *while* the reader is attaching to it, after the live file is opened and
+    /// before its rotated chain is scanned.
+    ///
+    /// The scan is part of the attachment, so a sibling that appears in that window is still
+    /// accounted for and neither history nor a duplicate is lost.
+    #[tokio::test]
+    async fn rotation_during_the_first_attach_keeps_the_chain_in_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().to_path_buf();
+        let barrier = std::sync::Arc::new(tokio::sync::Barrier::new(2));
+        let network = LOG_FILES
+            .iter()
+            .find(|file| file.filename == "network.log")
+            .expect("network.log is a configured file");
+        let mut reader = Reader::open(
+            network,
+            &path,
+            &[LogSource::Network],
+            &LogStreamStart::Beginning,
+            FilePosition::default(),
+        )
+        .await
+        .unwrap();
+        assert!(
+            reader.rescan_on_attach,
+            "the live file is absent when the reader is built"
+        );
+        reader.attach_barrier = Some(std::sync::Arc::clone(&barrier));
+
+        // The writer creates the live file before the reader attaches.
+        write_lines(
+            &path.join("network.log"),
+            &[network_line("2026-11-05T14:03:07.412Z", "tcp-syn", 1)],
+        );
+
+        let (chunk, ()) = tokio::join!(reader.read_chunk(None), async {
+            // ... and rotates it while the attach holds the opened live file.
+            barrier.wait().await;
+            std::fs::rename(path.join("network.log"), path.join("network.log.1")).unwrap();
+            write_lines(
+                &path.join("network.log"),
+                &[network_line("2026-11-05T14:03:08.412Z", "tcp-syn", 2)],
+            );
+        });
+        let mut timestamps: Vec<String> = chunk
+            .unwrap()
+            .entries
+            .into_iter()
+            .map(|(entry, _)| entry.timestamp.to_rfc3339())
+            .collect();
+
+        // Drain whatever the rotation left for the next reads. A read that only reseats the live
+        // FD returns nothing, so two empty reads in a row are what ends it.
+        let mut idle = 0;
+        for _ in 0..8 {
+            let chunk = reader.read_chunk(None).await.unwrap();
+            if chunk.entries.is_empty() && chunk.position.is_none() {
+                idle += 1;
+                if idle == 2 {
+                    break;
+                }
+                continue;
+            }
+            idle = 0;
+            timestamps.extend(
+                chunk
+                    .entries
+                    .into_iter()
+                    .map(|(entry, _)| entry.timestamp.to_rfc3339()),
+            );
+        }
+
+        assert_eq!(
+            timestamps,
+            [
+                "2026-11-05T14:03:07.412+00:00",
+                "2026-11-05T14:03:08.412+00:00",
+            ],
+            "the pre-rotation record and the new live record, once each and in order"
+        );
+        assert!(
+            !reader.rescan_on_attach,
+            "the chain has been scanned for the attached file"
+        );
+    }
+
+    #[tokio::test]
+    async fn cursor_taken_before_the_network_log_exists_resumes_from_its_start() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().to_path_buf();
+        let state = make_state(path.clone(), &network_options(LogStreamStart::Beginning))
+            .await
+            .unwrap();
+        let empty = collect_network(state, Duration::from_millis(200)).await;
+        assert!(empty.is_empty());
+
+        write_lines(
+            &path.join("network.log"),
+            &[
+                network_line("2026-11-05T14:03:07.412Z", "tcp-syn", 1),
+                network_line("2026-11-05T14:03:08.412Z", "tcp-syn", 2),
+            ],
+        );
+
+        let drained = make_state(path.clone(), &network_options(LogStreamStart::Beginning))
+            .await
+            .unwrap();
+        let entries = collect_network(drained, Duration::from_secs(2)).await;
+        assert_eq!(entries.len(), 2);
+        let cursor_before_second = entries[0].cursor.clone();
+
+        let resumed = make_state(
+            path,
+            &network_options(LogStreamStart::From(cursor_before_second)),
+        )
+        .await
+        .unwrap();
+        let resumed_entries = collect_network(resumed, Duration::from_secs(2)).await;
+
+        assert_eq!(resumed_entries.len(), 1);
+        assert_eq!(
+            resumed_entries[0].timestamp.to_rfc3339(),
+            "2026-11-05T14:03:08.412+00:00"
+        );
+    }
+
+    #[tokio::test]
+    async fn existing_selection_cursor_is_unchanged_by_the_network_log() {
+        let dir = tempfile::tempdir().unwrap();
+        write_lines(
+            &dir.path().join("exec.log"),
+            &[make_jsonl_line(
+                "2026-04-30T20:32:59.000Z",
+                "stdout",
+                "user-output",
+                Some(1),
+            )],
+        );
+        let without_network = make_state(
+            dir.path().to_path_buf(),
+            &LogStreamOptions {
+                sources: vec![LogSource::Stdout],
+                follow: false,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        let without = collect_network(without_network, Duration::from_secs(2)).await;
+
+        write_lines(
+            &dir.path().join("network.log"),
+            &[network_line("2026-11-05T14:03:07.412Z", "tcp-syn", 443)],
+        );
+        let with_network = make_state(
+            dir.path().to_path_buf(),
+            &LogStreamOptions {
+                sources: vec![LogSource::Stdout],
+                follow: false,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        let with = collect_network(with_network, Duration::from_secs(2)).await;
+
+        assert_eq!(without.len(), 1);
+        assert_eq!(with.len(), 1);
+        assert_eq!(
+            without[0].cursor.to_string(),
+            with[0].cursor.to_string(),
+            "a stdout-only cursor must not move because network.log exists"
+        );
+        assert_eq!(without[0].cursor.positions.len(), 1);
     }
 
     #[tokio::test]

@@ -16,6 +16,7 @@ mod guest_flush;
 #[doc(hidden)]
 pub mod helpers;
 pub mod modify;
+mod network_log;
 mod registry;
 mod secret;
 pub mod snapshot;
@@ -74,6 +75,10 @@ pub use modify::{
     ModificationPolicy, ModificationWarning, PlannedChange, ResourceConvergenceState, ResourceKind,
     ResourceResizeStatus, SandboxModificationPatch, SandboxModificationPlan, SecretChangeKind,
     SecretModificationPatch, SecretPlannedChange, SecretSource,
+};
+pub use network_log::{
+    NETWORK_LOG_FORMAT_VERSION, NameSource, NetworkLogEvent, NetworkLogRecord, NetworkRefusal,
+    NetworkSuppressed, RefusalLayer, RefusalSite,
 };
 pub use registry::RegistryAuth;
 pub use secret::SecretValue;

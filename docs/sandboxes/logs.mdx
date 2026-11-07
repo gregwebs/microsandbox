@@ -29,6 +29,8 @@ msb logs devbox --source all
 ```
 </CodeGroup>
 
+`all` means `stdout`, `stderr`, `output`, and `system`. It does not include `network`; request that source by name.
+
 ## Read from the SDK
 
 <CodeGroup>
@@ -106,8 +108,11 @@ recent = sb.logs(tail: 50, sources: [:stdout, :stderr])
 | `stderr` | Captured from a non-interactive session's stderr |
 | `output` | Captured from a PTY session, where stdout and stderr are merged |
 | `system` | Lifecycle markers plus runtime and kernel diagnostics |
+| `network` | Egress refusal records from `network.log`, one JSON line per refused decision. Local sandboxes only; available in the Rust SDK and in `msb logs --source network`, and never part of the default sources. |
 
 Interactive sessions use a PTY, so stdout and stderr are merged before microsandbox receives them. Non-interactive `exec` calls keep the streams separate.
+
+A `network` entry's body is the record's own JSON line rather than plain output text, so parse it as JSON. See [Refusal log](/networking/overview#refusal-log) for the record fields, sites, and rate limits.
 
 ## Diagnostic flows
 
@@ -141,6 +146,7 @@ Sandbox logs live under `<sandbox-dir>/logs/`:
 | File | Contents |
 |------|----------|
 | `exec.log` | User-program output as JSON Lines |
+| `network.log` | Egress refusal records as JSON Lines, written only for a sandbox with networking enabled |
 | `runtime.log` | Sandbox runtime diagnostics |
 | `kernel.log` | Guest kernel and agent console output |
 | `boot-error.json` | Structured startup failure details, when boot fails early |

@@ -37,6 +37,7 @@ use hickory_net::proto::rr::rdata::{A, AAAA, CNAME};
 use hickory_net::proto::rr::{Name, RData, Record, RecordType};
 use hickory_net::proto::serialize::binary::{BinDecodable, BinEncodable};
 use hickory_net::xfer::DnsHandle;
+use microsandbox_types::{RefusalLayer, RefusalSite};
 use tokio::sync::{OnceCell, watch};
 
 use super::client::{Client, build_direct_client, build_tcp_client, build_udp_client};
@@ -52,8 +53,9 @@ use crate::netstack::{
     poll::GatewayIps,
     shared::{ResolvedHostnameFamily, SharedState},
 };
-use crate::policy::handle::NetworkPolicyHandle;
+use crate::policy::handle::{NetworkPolicyHandle, PolicySnapshot};
 use crate::policy::{Action, DomainName, NetworkPolicy};
+use crate::refusal::{self, Denial, NameEvidence};
 
 //--------------------------------------------------------------------------------------------------
 // Constants
@@ -153,7 +155,13 @@ enum UpstreamChoice {
     /// to failover: substituting a different server would silently
     /// redirect a query the guest addressed deliberately.
     Direct(Client),
-    PolicyDenied,
+    /// The tenant policy or the platform floor denied the guest's chosen resolver.
+    PolicyDenied {
+        /// Which configuration owned the refusal.
+        layer: RefusalLayer,
+        /// The resolver the guest aimed at, with this transport's port.
+        resolver: SocketAddr,
+    },
     ServFail,
 }
 
@@ -167,8 +175,14 @@ enum UpstreamDecision {
     /// Forward directly to this resolver IP over the matching transport.
     Direct(SocketAddr),
     /// Network policy denied egress to the chosen resolver — synthesize
-    /// an NXDOMAIN denial.
-    PolicyDenied,
+    /// an NXDOMAIN denial. The resolver and the owning layer travel with the
+    /// decision so the refusal it produces reports both.
+    PolicyDenied {
+        /// Which configuration owned the refusal.
+        layer: RefusalLayer,
+        /// The resolver the guest aimed at, with this transport's port.
+        resolver: SocketAddr,
+    },
 }
 
 impl DnsForwarder {
@@ -287,15 +301,29 @@ impl DnsForwarder {
         let domain = question.name().to_string();
         let domain = domain.trim_end_matches('.').to_owned();
 
-        // One load per query: a replacement that has already returned applies to this query, and
-        // every decision it makes uses the same snapshot.
-        let network_policy = self.network_policy.load();
+        // One snapshot per query: a replacement that has already returned applies to this query,
+        // every decision it makes uses the same policy, and a refusal reports that policy's
+        // revision.
+        let network_policy = self.network_policy.snapshot();
 
         // Refuse queries denied by the network policy. DNS is evaluated
         // as egress over the guest-facing DNS transport, so deny-by-
         // default policies fail closed unless a rule allows the name or
         // the DNS protocol/port.
         if decide_dns_action(&network_policy, &domain, transport).is_deny() {
+            // The resolver the guest aimed at is absent only when the stack could not record it.
+            refusal::record(
+                &self.shared,
+                Denial {
+                    site: RefusalSite::DnsQuery,
+                    layer: RefusalLayer::Tenant,
+                    protocol: transport.policy_protocol(),
+                    dst_ip: original_dst,
+                    dst_port: Some(transport.upstream_port()),
+                    name: NameEvidence::DnsQuery(&domain),
+                    revision: network_policy.revision(),
+                },
+            );
             tracing::debug!(domain = %domain, "DNS query denied by network policy");
             // NXDOMAIN, not REFUSED: stub resolvers (e.g. glibc) don't
             // fail-fast on REFUSED, so a denied lookup hangs the guest in a
@@ -333,7 +361,19 @@ impl DnsForwarder {
             .select_upstream(&network_policy, original_dst, transport, sni)
             .await
         {
-            UpstreamChoice::PolicyDenied => {
+            UpstreamChoice::PolicyDenied { layer, resolver } => {
+                refusal::record(
+                    &self.shared,
+                    Denial {
+                        site: RefusalSite::DnsResolver,
+                        layer,
+                        protocol: transport.policy_protocol(),
+                        dst_ip: Some(resolver.ip()),
+                        dst_port: Some(resolver.port()),
+                        name: NameEvidence::DnsQuery(&domain),
+                        revision: network_policy.revision(),
+                    },
+                );
                 tracing::debug!(
                     domain = %domain,
                     ?original_dst,
@@ -366,19 +406,16 @@ impl DnsForwarder {
                     }
                     _ => None,
                 };
-                if private_addr.is_some_and(|addr| {
-                    !policies_allow_rebind_address(
+                if let Some(addr) = private_addr
+                    && let Some(response) = self.refuse_rebind_answer(
                         &network_policy,
-                        self.platform_policy.as_deref(),
-                        &self.shared,
+                        &query_msg,
+                        &domain,
+                        transport,
                         addr,
                     )
-                }) {
-                    tracing::debug!(
-                        domain = %domain,
-                        "DNS rebind protection: response contains private IP"
-                    );
-                    return build_status_response(&query_msg, ResponseCode::NXDomain);
+                {
+                    return Some(response);
                 }
             }
         }
@@ -424,6 +461,45 @@ impl DnsForwarder {
         Some(Bytes::from(response_bytes))
     }
 
+    /// Refuse a private DNS answer when rebind protection does not admit it, recording the
+    /// refusal once, and return the synthesized NXDOMAIN.
+    ///
+    /// `None` means the answer is admitted and the caller keeps the response.
+    fn refuse_rebind_answer(
+        &self,
+        network_policy: &PolicySnapshot,
+        query_msg: &Message,
+        domain: &str,
+        transport: Transport,
+        addr: IpAddr,
+    ) -> Option<Bytes> {
+        // The snapshot is the one this query already decided with, so the record reports that
+        // revision rather than a newer one.
+        let layer = rebind_refusal(
+            network_policy,
+            self.platform_policy.as_deref(),
+            &self.shared,
+            addr,
+        )?;
+        refusal::record(
+            &self.shared,
+            Denial {
+                site: RefusalSite::DnsRebind,
+                layer,
+                protocol: transport.policy_protocol(),
+                dst_ip: Some(addr),
+                dst_port: None,
+                name: NameEvidence::DnsQuery(domain),
+                revision: network_policy.revision(),
+            },
+        );
+        tracing::debug!(
+            domain = %domain,
+            "DNS rebind protection: response contains private IP"
+        );
+        build_status_response(query_msg, ResponseCode::NXDomain)
+    }
+
     /// Resolve a routing decision into a concrete upstream client.
     /// Per-query client build for the direct path. UDP socket bind is
     /// cheap; TCP pays a handshake. Pooling is intentionally omitted —
@@ -445,7 +521,9 @@ impl DnsForwarder {
             transport,
         ) {
             UpstreamDecision::Configured => UpstreamChoice::Configured,
-            UpstreamDecision::PolicyDenied => UpstreamChoice::PolicyDenied,
+            UpstreamDecision::PolicyDenied { layer, resolver } => {
+                UpstreamChoice::PolicyDenied { layer, resolver }
+            }
             UpstreamDecision::Direct(addr) => {
                 match build_direct_client(addr, transport, sni, self.config.query_timeout).await {
                     Some(client) => UpstreamChoice::Direct(client),
@@ -766,27 +844,42 @@ fn policy_allows_rebind_address(
     shared: &SharedState,
     addr: IpAddr,
 ) -> bool {
-    policies_allow_rebind_address(policy, None, shared, addr)
+    rebind_refusal(policy, None, shared, addr).is_none()
 }
 
-/// Return whether both the platform floor and tenant policy admit a private answer.
-fn policies_allow_rebind_address(
+/// Decide whether a private DNS answer must be refused, and which layer owns the refusal.
+///
+/// The answer is allowed when either address-only protocol is admitted by both the platform
+/// floor and the tenant policy. When it is refused, the floor owns the refusal only if it denies
+/// the address for *both* protocols — an address the floor still admits somewhere was refused by
+/// the tenant policy.
+fn rebind_refusal(
     policy: &NetworkPolicy,
     platform_policy: Option<&NetworkPolicy>,
     shared: &SharedState,
     addr: IpAddr,
-) -> bool {
-    [crate::policy::Protocol::Tcp, crate::policy::Protocol::Udp]
-        .into_iter()
-        .any(|protocol| {
-            let platform_allows = platform_policy.is_none_or(|platform| {
-                platform
-                    .evaluate_egress_ip(addr, protocol, shared)
-                    .is_allow()
-            });
-            platform_allows
-                && policy.evaluate_explicit_egress_ip(addr, protocol, shared) == Some(Action::Allow)
-        })
+) -> Option<RefusalLayer> {
+    let mut allowed = false;
+    let mut platform_denies_everything = true;
+
+    for protocol in [crate::policy::Protocol::Tcp, crate::policy::Protocol::Udp] {
+        let platform_allows = platform_policy.is_none_or(|platform| {
+            platform
+                .evaluate_egress_ip(addr, protocol, shared)
+                .is_allow()
+        });
+        platform_denies_everything &= !platform_allows;
+        allowed |= platform_allows
+            && policy.evaluate_explicit_egress_ip(addr, protocol, shared) == Some(Action::Allow);
+    }
+
+    if allowed {
+        None
+    } else if platform_denies_everything {
+        Some(RefusalLayer::Platform)
+    } else {
+        Some(RefusalLayer::Tenant)
+    }
 }
 
 //--------------------------------------------------------------------------------------------------
@@ -828,15 +921,27 @@ fn decide_upstream_with_platform(
     // the egress policy for that resolver IP over the transport's
     // corresponding port and protocol.
     let policy_dst = SocketAddr::new(dst, transport.upstream_port());
-    if platform_policy.is_some_and(|platform| {
+    // The floor is evaluated first and owns the refusal when it denies: that is the layer the
+    // record reports, and the tenant policy is not consulted once the floor has refused.
+    let layer = if platform_policy.is_some_and(|platform| {
         platform
             .evaluate_egress(policy_dst, transport.policy_protocol(), shared)
             .is_deny()
-    }) || policy
+    }) {
+        Some(RefusalLayer::Platform)
+    } else if policy
         .evaluate_egress(policy_dst, transport.policy_protocol(), shared)
         .is_deny()
     {
-        return UpstreamDecision::PolicyDenied;
+        Some(RefusalLayer::Tenant)
+    } else {
+        None
+    };
+    if let Some(layer) = layer {
+        return UpstreamDecision::PolicyDenied {
+            layer,
+            resolver: policy_dst,
+        };
     }
     UpstreamDecision::Direct(policy_dst)
 }
@@ -1030,6 +1135,7 @@ mod tests {
     use crate::policy::{Action, Destination, NetworkProfile, Protocol, Rule};
     use hickory_net::proto::op::{Edns, MessageType, OpCode, Query};
     use hickory_net::proto::rr::{DNSClass, Name, RecordType};
+    use microsandbox_types::{NameSource, NetworkRefusal};
     use std::net::Ipv4Addr;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -1114,6 +1220,17 @@ mod tests {
         upstreams: &[SocketAddr],
         policy: NetworkPolicy,
     ) -> (Arc<DnsForwarder>, NetworkPolicyHandle) {
+        let shared = Arc::new(SharedState::new(4));
+        forwarder_over_shared(upstreams, policy, shared).await
+    }
+
+    /// The same forwarder over a caller-supplied shared state, so a test can install a refusal
+    /// sink on it first.
+    async fn forwarder_over_shared(
+        upstreams: &[SocketAddr],
+        policy: NetworkPolicy,
+        shared: Arc<SharedState>,
+    ) -> (Arc<DnsForwarder>, NetworkPolicyHandle) {
         let config = Arc::new(NormalizedDnsConfig {
             rebind_protection: false,
             nameservers: Vec::new(),
@@ -1136,7 +1253,7 @@ mod tests {
             gateway_ips: Arc::new(HashSet::from([gateway_ip])),
             network_policy: policy.clone(),
             platform_policy: None,
-            shared: Arc::new(SharedState::new(4)),
+            shared,
             gateway: GatewayIps {
                 ipv4: Some("10.0.0.1".parse().unwrap()),
                 ipv6: None,
@@ -1146,13 +1263,29 @@ mod tests {
         (forwarder, policy)
     }
 
+    /// A forwarder whose refusals are collected, so a test can assert the record a site produces.
+    async fn recording_forwarder_over_policy(
+        upstreams: &[SocketAddr],
+        policy: NetworkPolicy,
+    ) -> (
+        Arc<DnsForwarder>,
+        NetworkPolicyHandle,
+        Arc<crate::refusal::test_support::CollectingSink>,
+    ) {
+        let (shared, sink) = crate::refusal::test_support::recording_state(4);
+        let (forwarder, handle) = forwarder_over_shared(upstreams, policy, shared).await;
+        (forwarder, handle, sink)
+    }
+
     /// Each query loads the tenant policy: a denied lookup answers NXDOMAIN without touching the
     /// upstream, and the next lookup after a replace succeeds.
     #[tokio::test]
     async fn denied_lookup_succeeds_after_a_replace() {
         let expected = Ipv4Addr::new(203, 0, 113, 9);
         let (upstream, hits) = responding_udp(expected).await;
-        let (forwarder, policy) = forwarder_over_policy(&[upstream], NetworkPolicy::none()).await;
+        let (shared, refusals) = crate::refusal::test_support::recording_state(4);
+        let (forwarder, policy) =
+            forwarder_over_shared(&[upstream], NetworkPolicy::none(), shared).await;
 
         assert_eq!(
             resolve_via_gateway(&forwarder).await,
@@ -1163,6 +1296,22 @@ mod tests {
             hits.load(Ordering::SeqCst),
             0,
             "a denied lookup must not reach the upstream"
+        );
+        // The denied lookup is one record at the query's own snapshot revision.
+        let recorded = refusals.take();
+        assert_eq!(recorded.len(), 1);
+        assert_eq!(
+            recorded[0],
+            NetworkRefusal {
+                site: RefusalSite::DnsQuery,
+                layer: RefusalLayer::Tenant,
+                protocol: microsandbox_types::Protocol::Udp,
+                dst_ip: Some("10.0.0.1".parse().unwrap()),
+                dst_port: Some(53),
+                name: Some("example.com".to_owned()),
+                name_source: NameSource::DnsQuery,
+                revision: 1,
+            }
         );
 
         assert_eq!(policy.replace(NetworkPolicy::allow_all()), Ok(2));
@@ -1195,6 +1344,242 @@ mod tests {
             RData::A(a) => Some(Ipv4Addr::from(*a)),
             _ => None,
         })
+    }
+
+    /// `dns-query`: a query the tenant policy refuses is recorded with the queried name, the
+    /// transport's protocol and port, and the addressed resolver — or no address, when the stack
+    /// could not record one.
+    #[tokio::test]
+    async fn denied_dns_query_is_recorded() {
+        let (upstream, hits) = responding_udp(Ipv4Addr::new(203, 0, 113, 9)).await;
+        let (forwarder, _, refusals) =
+            recording_forwarder_over_policy(&[upstream], NetworkPolicy::none()).await;
+        let gateway: IpAddr = "10.0.0.1".parse().unwrap();
+        let raw = make_query("Blocked.Example.", RecordType::A)
+            .to_bytes()
+            .expect("encode query");
+
+        for (transport, protocol, port) in [
+            (Transport::Udp, microsandbox_types::Protocol::Udp, 53),
+            (Transport::Dot, microsandbox_types::Protocol::Tcp, 853),
+        ] {
+            let bytes = forwarder
+                .forward(&raw, Some(gateway), transport, None)
+                .await
+                .expect("a synthesized response");
+            let msg = Message::from_bytes(&bytes).expect("parse response");
+            assert_eq!(msg.metadata.response_code, ResponseCode::NXDomain);
+
+            assert_eq!(
+                refusals.take(),
+                vec![NetworkRefusal {
+                    site: RefusalSite::DnsQuery,
+                    layer: RefusalLayer::Tenant,
+                    protocol,
+                    dst_ip: Some(gateway),
+                    dst_port: Some(port),
+                    name: Some("blocked.example".to_owned()),
+                    name_source: NameSource::DnsQuery,
+                    revision: 1,
+                }],
+                "one record per refused query"
+            );
+        }
+        assert_eq!(hits.load(Ordering::SeqCst), 0, "a denied query never dials");
+
+        // A query whose addressed resolver the stack could not determine is the one case with no
+        // destination address; the refusal itself is unchanged.
+        let bytes = forwarder
+            .forward(&raw, None, Transport::Udp, None)
+            .await
+            .expect("a synthesized response");
+        assert_eq!(
+            Message::from_bytes(&bytes).unwrap().metadata.response_code,
+            ResponseCode::NXDomain
+        );
+        let recorded = refusals.take();
+        assert_eq!(recorded.len(), 1);
+        assert_eq!(recorded[0].dst_ip, None);
+        assert_eq!(recorded[0].dst_port, Some(53));
+    }
+
+    /// `dns-resolver`: a guest-chosen resolver the policy refuses is recorded with the resolver
+    /// address and the owning layer — `tenant` for a tenant rule, `platform` for the floor.
+    #[tokio::test]
+    async fn denied_dns_resolver_is_recorded_with_its_layer() {
+        // The query itself must stay allowed, so only the resolver is refused.
+        let tenant = NetworkPolicy {
+            default_egress: Action::Allow,
+            default_ingress: Action::Allow,
+            rules: vec![Rule {
+                direction: crate::policy::Direction::Egress,
+                destination: Destination::Cidr("203.0.113.53/32".parse().unwrap()),
+                protocols: Vec::new(),
+                ports: Vec::new(),
+                action: Action::Deny,
+            }],
+        };
+        let (forwarder, _, refusals) = recording_forwarder_over_policy(&[], tenant).await;
+        let raw = make_query("example.com.", RecordType::A)
+            .to_bytes()
+            .expect("encode query");
+        let resolver: IpAddr = "203.0.113.53".parse().unwrap();
+
+        let bytes = forwarder
+            .forward(&raw, Some(resolver), Transport::Udp, None)
+            .await
+            .expect("a synthesized response");
+        assert_eq!(
+            Message::from_bytes(&bytes).unwrap().metadata.response_code,
+            ResponseCode::NXDomain
+        );
+        assert_eq!(
+            refusals.take(),
+            vec![NetworkRefusal {
+                site: RefusalSite::DnsResolver,
+                layer: RefusalLayer::Tenant,
+                protocol: microsandbox_types::Protocol::Udp,
+                dst_ip: Some(resolver),
+                dst_port: Some(53),
+                name: Some("example.com".to_owned()),
+                name_source: NameSource::DnsQuery,
+                revision: 1,
+            }]
+        );
+
+        // Now let the tenant allow the resolver and put a public floor in front of it: the floor
+        // alone refuses, so the record says `platform`.
+        let mut forwarder = forwarder;
+        {
+            let forwarder = Arc::get_mut(&mut forwarder).expect("unique test forwarder");
+            forwarder.platform_policy = Some(Arc::new(NetworkPolicy::from_profiles([
+                NetworkProfile::Public,
+            ])));
+        }
+        let private_resolver: IpAddr = "10.0.0.53".parse().unwrap();
+        let bytes = forwarder
+            .forward(&raw, Some(private_resolver), Transport::Udp, None)
+            .await
+            .expect("a synthesized response");
+        assert_eq!(
+            Message::from_bytes(&bytes).unwrap().metadata.response_code,
+            ResponseCode::NXDomain
+        );
+        let recorded = refusals.take();
+        assert_eq!(recorded.len(), 1);
+        assert_eq!(recorded[0].site, RefusalSite::DnsResolver);
+        assert_eq!(recorded[0].layer, RefusalLayer::Platform);
+        assert_eq!(recorded[0].dst_ip, Some(private_resolver));
+        assert_eq!(recorded[0].dst_port, Some(53));
+    }
+
+    /// `dns-rebind`: a private answer is refused with the answer's address and no port; the floor
+    /// owns the refusal only when it denies the address for both protocols.
+    ///
+    /// The deny site is driven directly: the rebind check runs on an *answer*, and no upstream
+    /// can produce one in this environment (the recorded baseline DNS timing failures). The
+    /// decision it makes is the same `rebind_refusal` the `forward_query` loop calls.
+    #[tokio::test]
+    async fn rebind_refusal_is_recorded_with_its_layer() {
+        let private_answer = Ipv4Addr::new(10, 20, 30, 40);
+        let (forwarder, _, refusals) =
+            recording_forwarder_over_policy(&[], NetworkPolicy::allow_all()).await;
+        let query = make_query("example.com.", RecordType::A);
+        let snapshot = PolicySnapshot::new(Arc::new(NetworkPolicy::allow_all()), 4);
+        let addr = IpAddr::V4(private_answer);
+
+        // `allow_all` has no explicit address rule, so rebind protection refuses and the tenant
+        // policy owns it.
+        let response = forwarder
+            .refuse_rebind_answer(&snapshot, &query, "example.com", Transport::Udp, addr)
+            .expect("a refused answer produces a response");
+        assert_eq!(
+            Message::from_bytes(&response)
+                .unwrap()
+                .metadata
+                .response_code,
+            ResponseCode::NXDomain
+        );
+        assert_eq!(
+            refusals.take(),
+            vec![NetworkRefusal {
+                site: RefusalSite::DnsRebind,
+                layer: RefusalLayer::Tenant,
+                protocol: microsandbox_types::Protocol::Udp,
+                dst_ip: Some(addr),
+                dst_port: None,
+                name: Some("example.com".to_owned()),
+                name_source: NameSource::DnsQuery,
+                revision: 4,
+            }]
+        );
+
+        // A tenant that explicitly allows the private address still cannot pass a floor that
+        // denies it over both protocols, so the floor owns that refusal.
+        let mut forwarder = forwarder;
+        {
+            let forwarder = Arc::get_mut(&mut forwarder).expect("unique test forwarder");
+            forwarder.platform_policy = Some(Arc::new(NetworkPolicy::from_profiles([
+                NetworkProfile::Public,
+            ])));
+        }
+        let tenant_allows = PolicySnapshot::new(
+            Arc::new(NetworkPolicy {
+                default_egress: Action::Allow,
+                default_ingress: Action::Allow,
+                rules: vec![Rule {
+                    direction: crate::policy::Direction::Egress,
+                    destination: Destination::Cidr("10.20.30.40/32".parse().unwrap()),
+                    protocols: Vec::new(),
+                    ports: Vec::new(),
+                    action: Action::Allow,
+                }],
+            }),
+            5,
+        );
+        let _ = forwarder
+            .refuse_rebind_answer(&tenant_allows, &query, "example.com", Transport::Tcp, addr)
+            .expect("the floor still refuses the private answer");
+        let recorded = refusals.take();
+        assert_eq!(recorded.len(), 1);
+        assert_eq!(recorded[0].site, RefusalSite::DnsRebind);
+        assert_eq!(recorded[0].layer, RefusalLayer::Platform);
+        assert_eq!(recorded[0].protocol, microsandbox_types::Protocol::Tcp);
+        assert_eq!(recorded[0].revision, 5);
+
+        // An admitted private answer produces no response and no record.
+        let admitted = PolicySnapshot::new(
+            Arc::new(NetworkPolicy {
+                default_egress: Action::Allow,
+                default_ingress: Action::Allow,
+                rules: vec![Rule {
+                    direction: crate::policy::Direction::Egress,
+                    destination: Destination::Cidr("10.20.30.40/32".parse().unwrap()),
+                    protocols: Vec::new(),
+                    ports: Vec::new(),
+                    action: Action::Allow,
+                }],
+            }),
+            6,
+        );
+        let mut allowed_forwarder =
+            recording_forwarder_over_policy(&[], NetworkPolicy::allow_all())
+                .await
+                .0;
+        {
+            let forwarder = Arc::get_mut(&mut allowed_forwarder).expect("unique test forwarder");
+            forwarder.platform_policy = None;
+        }
+        assert!(
+            allowed_forwarder
+                .refuse_rebind_answer(&admitted, &query, "example.com", Transport::Udp, addr)
+                .is_none(),
+            "an explicitly allowed private answer is kept"
+        );
+        assert!(
+            refusals.take().is_empty(),
+            "an allowed answer records nothing"
+        );
     }
 
     #[tokio::test]
@@ -1547,12 +1932,67 @@ mod tests {
         let platform = NetworkPolicy::from_profiles([NetworkProfile::Public]);
         let shared = SharedState::new(4);
 
-        assert!(!policies_allow_rebind_address(
-            &tenant,
-            Some(&platform),
-            &shared,
-            "10.0.0.7".parse().unwrap(),
-        ));
+        assert_eq!(
+            rebind_refusal(
+                &tenant,
+                Some(&platform),
+                &shared,
+                "10.0.0.7".parse().unwrap()
+            ),
+            Some(RefusalLayer::Platform),
+            "a floor that denies the address for both protocols owns the refusal"
+        );
+    }
+
+    /// A floor that still admits the address over one protocol leaves the refusal to the tenant
+    /// policy: `platform` means the floor alone refused.
+    #[test]
+    fn rebind_refusal_is_tenant_when_the_floor_still_admits_one_protocol() {
+        let tenant = NetworkPolicy::none();
+        let platform = NetworkPolicy {
+            default_egress: Action::Deny,
+            default_ingress: Action::Allow,
+            rules: vec![Rule {
+                direction: crate::policy::Direction::Egress,
+                destination: Destination::Cidr("10.0.0.0/8".parse().unwrap()),
+                protocols: vec![Protocol::Udp],
+                ports: Vec::new(),
+                action: Action::Allow,
+            }],
+        };
+        let shared = SharedState::new(4);
+
+        assert_eq!(
+            rebind_refusal(
+                &tenant,
+                Some(&platform),
+                &shared,
+                "10.0.0.7".parse().unwrap()
+            ),
+            Some(RefusalLayer::Tenant)
+        );
+    }
+
+    /// A tenant allow over one address-only protocol is enough when nothing denies it.
+    #[test]
+    fn rebind_refusal_is_none_when_the_tenant_admits_one_protocol() {
+        let tenant = NetworkPolicy {
+            default_egress: Action::Deny,
+            default_ingress: Action::Allow,
+            rules: vec![Rule {
+                direction: crate::policy::Direction::Egress,
+                destination: Destination::Cidr("10.0.0.0/8".parse().unwrap()),
+                protocols: vec![Protocol::Udp],
+                ports: Vec::new(),
+                action: Action::Allow,
+            }],
+        };
+        let shared = SharedState::new(4);
+
+        assert_eq!(
+            rebind_refusal(&tenant, None, &shared, "10.0.0.7".parse().unwrap()),
+            None
+        );
     }
 
     #[test]
@@ -1856,6 +2296,14 @@ mod tests {
         ])
     }
 
+    /// The `PolicyDenied` outcome for resolver `dst` over `transport`, owned by `layer`.
+    fn policy_denied(dst: IpAddr, transport: Transport, layer: RefusalLayer) -> UpstreamDecision {
+        UpstreamDecision::PolicyDenied {
+            layer,
+            resolver: SocketAddr::new(dst, transport.upstream_port()),
+        }
+    }
+
     #[test]
     fn decide_upstream_configured_when_dst_is_gateway_v4() {
         let gw = gateway_set();
@@ -1885,7 +2333,11 @@ mod tests {
                 dst,
                 Transport::Udp,
             ),
-            UpstreamDecision::PolicyDenied
+            policy_denied(
+                IpAddr::V4("10.0.0.53".parse().unwrap()),
+                Transport::Udp,
+                RefusalLayer::Platform,
+            )
         );
     }
 
@@ -1939,7 +2391,11 @@ mod tests {
         let dst = Some(IpAddr::V4(std::net::Ipv4Addr::new(192, 168, 1, 53)));
         assert_eq!(
             decide_upstream(&gw, &policy, &shared, dst, Transport::Udp),
-            UpstreamDecision::PolicyDenied
+            policy_denied(
+                IpAddr::V4(std::net::Ipv4Addr::new(192, 168, 1, 53)),
+                Transport::Udp,
+                RefusalLayer::Tenant,
+            )
         );
     }
 
@@ -1954,7 +2410,11 @@ mod tests {
         let dst = Some(IpAddr::V4(std::net::Ipv4Addr::new(1, 1, 1, 1)));
         assert_eq!(
             decide_upstream(&gw, &policy, &shared, dst, Transport::Tcp),
-            UpstreamDecision::PolicyDenied
+            policy_denied(
+                IpAddr::V4(std::net::Ipv4Addr::new(1, 1, 1, 1)),
+                Transport::Tcp,
+                RefusalLayer::Tenant,
+            )
         );
         // But aiming at the gateway still works.
         let gw_dst = Some(IpAddr::V4(std::net::Ipv4Addr::new(10, 0, 0, 1)));
@@ -1991,7 +2451,11 @@ mod tests {
         );
         assert_eq!(
             decide_upstream(&gw, &policy, &shared, dst, Transport::Tcp),
-            UpstreamDecision::PolicyDenied
+            policy_denied(
+                IpAddr::V4(std::net::Ipv4Addr::new(8, 8, 8, 8)),
+                Transport::Tcp,
+                RefusalLayer::Tenant,
+            )
         );
     }
 
@@ -2040,7 +2504,11 @@ mod tests {
         let dst = Some(IpAddr::V4(std::net::Ipv4Addr::new(1, 1, 1, 1)));
         assert_eq!(
             decide_upstream(&gw, &policy, &shared, dst, Transport::Dot),
-            UpstreamDecision::PolicyDenied
+            policy_denied(
+                IpAddr::V4(std::net::Ipv4Addr::new(1, 1, 1, 1)),
+                Transport::Dot,
+                RefusalLayer::Tenant,
+            )
         );
     }
 

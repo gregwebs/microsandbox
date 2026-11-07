@@ -22,6 +22,12 @@
 //!   `System` is in the requested sources. Does not rotate.
 //! - `kernel.log`: plain text, guest kernel console. Only read when
 //!   `System` is in the requested sources. Does not rotate.
+//! - `network.log` + rotated siblings (`network.log.1` ... `network.log.4`):
+//!   JSON Lines, egress refusal records written by the runtime. Rotates at
+//!   10 MiB per file, retains up to four historical files. Only read when
+//!   `Network` is in the requested sources, which is never the default; each
+//!   entry's body is the record's own JSON line and deserializes as
+//!   [`NetworkLogRecord`].
 //!
 //! Adding a new log file type is one entry in `LOG_FILES`.
 //!
@@ -72,7 +78,10 @@ pub use microsandbox_runtime::boot_error::{BootError, BootErrorStage};
 pub use stream::{LogStreamOptions, LogStreamStart};
 #[cfg(not(feature = "local"))]
 pub use types::{BootError, BootErrorStage};
-pub use types::{LogEntry, LogOptions, LogSource};
+pub use types::{
+    LogEntry, LogOptions, LogSource, NETWORK_LOG_FORMAT_VERSION, NameSource, NetworkLogEvent,
+    NetworkLogRecord, NetworkRefusal, NetworkSuppressed, RefusalLayer, RefusalSite,
+};
 pub use watch::{LogRegistration, LogRegistry, RegistryStatsSnapshot};
 
 #[cfg(feature = "local")]
@@ -123,6 +132,12 @@ const LOG_FILES: &[LogFileConfig] = &[
         format: LogFileFormat::Text,
         max_rotation_index: 0,
         produces: &[LogSource::System],
+    },
+    LogFileConfig {
+        filename: "network.log",
+        format: LogFileFormat::Jsonl,
+        max_rotation_index: 4,
+        produces: &[LogSource::Network],
     },
 ];
 

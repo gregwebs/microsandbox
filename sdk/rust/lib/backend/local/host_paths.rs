@@ -1,6 +1,6 @@
 //! Pin caller-supplied host paths before a local sandbox is persisted or launched.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use microsandbox_types::{Patch, RootDisk, RootfsSource, VolumeMount};
 
@@ -8,6 +8,13 @@ use crate::{MicrosandboxError, MicrosandboxResult, SandboxConfig, snapshot::Snap
 
 #[cfg(test)]
 mod tests;
+
+//--------------------------------------------------------------------------------------------------
+// Constants
+//--------------------------------------------------------------------------------------------------
+
+/// Prefix Windows `canonicalize` adds; it identifies nothing a reader needs.
+const VERBATIM_PATH_PREFIX: &str = r"\\?\";
 
 //--------------------------------------------------------------------------------------------------
 // Functions
@@ -122,6 +129,52 @@ pub(crate) fn check_bind_roots_do_not_follow_symlinks(
 pub(crate) fn check_bind_roots_do_not_follow_symlinks(
     _config: &SandboxConfig,
 ) -> MicrosandboxResult<()> {
+    Ok(())
+}
+
+/// Refuse a writable caller bind that would expose this sandbox's own directory.
+///
+/// `<sandbox_dir>` holds `logs/`, where the runtime appends the sandbox's own
+/// refusal records, so a writable bind of that directory or of a path inside it
+/// would let the guest rewrite its own log. Only `VolumeMount::Bind` roots that
+/// are not read-only are measured; owned volumes, named volumes and tmpfs mounts
+/// are msb-managed and never resolve there, and a writable bind of an *ancestor*
+/// (`$HOME`, `MSB_HOME`, the sandboxes directory) stays allowed as a documented
+/// exposure. Call this once `sandbox_dir` exists, immediately before the runtime
+/// process is spawned, so the comparison has a file identity to compare against.
+///
+/// Resolution is for comparison only. The configured path and its symlink policy
+/// are never rewritten: a symlink is followed here whether or not the mount opts
+/// into `follow_root_symlinks`, because the runtime either follows it too or
+/// refuses it at open, so this can only refuse earlier.
+pub(crate) fn check_writable_binds_do_not_expose_sandbox_dir(
+    sandbox_dir: &Path,
+    mounts: &[VolumeMount],
+) -> MicrosandboxResult<()> {
+    for mount in mounts {
+        let VolumeMount::Bind { host, options, .. } = mount else {
+            continue;
+        };
+        if options.readonly {
+            continue;
+        }
+        let resolved = resolve_bind_root_for_comparison(host)?;
+        // A directory or a path inside it is caught by walking ancestors; a hard link resolves
+        // outside the directory, so the files the log directory holds are compared by identity
+        // too.
+        if !resolved_root_is_inside_sandbox_dir(sandbox_dir, &resolved)?
+            && !resolved_root_aliases_a_log_file(sandbox_dir, &resolved)?
+        {
+            continue;
+        }
+        return Err(MicrosandboxError::InvalidConfig(format!(
+            "bind mount host path {} exposes this sandbox's own directory {} to the guest (it resolves to {}); the guest could rewrite its logs. Mount it read-only or bind a path outside {}",
+            host.display(),
+            sandbox_dir.display(),
+            resolved_path_text(&resolved),
+            sandbox_dir.display()
+        )));
+    }
     Ok(())
 }
 
@@ -243,4 +296,171 @@ fn visit_host_paths(
         }
     }
     Ok(())
+}
+
+/// Locate the host path a bind root would open, without rewriting the configured path.
+///
+/// The path is anchored the same way `resolve_host_paths` anchors it (no symlink is
+/// followed and the target need not exist), then the deepest existing prefix is
+/// canonicalized the way `check_bind_roots_do_not_follow_symlinks` names the resolved
+/// path. A tail that does not exist yet cannot be a symlink, so the prefix decides
+/// which location the runtime would open. `/` always exists, so this terminates.
+fn resolve_bind_root_for_comparison(host: &Path) -> MicrosandboxResult<PathBuf> {
+    let anchored = std::path::absolute(host).map_err(|error| {
+        MicrosandboxError::InvalidConfig(format!(
+            "cannot resolve bind mount host path {}: {error}",
+            host.display()
+        ))
+    })?;
+    for candidate in anchored.ancestors() {
+        match std::fs::canonicalize(candidate) {
+            Ok(resolved) => return Ok(resolved),
+            Err(error) if is_absent(&error) => {}
+            Err(error) => {
+                return Err(MicrosandboxError::InvalidConfig(format!(
+                    "cannot resolve bind mount host path {}: {error}",
+                    candidate.display()
+                )));
+            }
+        }
+    }
+    Err(MicrosandboxError::InvalidConfig(format!(
+        "cannot resolve bind mount host path {}: no existing ancestor",
+        host.display()
+    )))
+}
+
+/// Render a resolved path for a message, without the verbatim prefix Windows adds.
+fn resolved_path_text(resolved: &Path) -> String {
+    let text = resolved.to_string_lossy();
+    text.strip_prefix(VERBATIM_PATH_PREFIX)
+        .unwrap_or(&text)
+        .to_string()
+}
+
+/// Whether a canonicalization failure only means "this prefix does not exist yet".
+fn is_absent(error: &std::io::Error) -> bool {
+    matches!(
+        error.kind(),
+        std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+    )
+}
+
+/// Whether a resolved bind root is the sandbox directory or lies inside it.
+///
+/// File identity is compared instead of path text, so a case-insensitive volume
+/// (default APFS) or a differently spelled alias of the same directory is caught.
+#[cfg(unix)]
+fn resolved_root_is_inside_sandbox_dir(
+    sandbox_dir: &Path,
+    resolved: &Path,
+) -> MicrosandboxResult<bool> {
+    use std::os::unix::fs::MetadataExt;
+
+    let sandbox = std::fs::metadata(sandbox_dir).map_err(|error| {
+        MicrosandboxError::InvalidConfig(format!(
+            "cannot inspect sandbox directory {}: {error}",
+            sandbox_dir.display()
+        ))
+    })?;
+    // A canonical prefix exists, so every ancestor of it exists too; a candidate
+    // that vanished under a concurrent deletion cannot be the shared directory.
+    for candidate in resolved.ancestors() {
+        let Ok(metadata) = std::fs::metadata(candidate) else {
+            break;
+        };
+        if metadata.dev() == sandbox.dev() && metadata.ino() == sandbox.ino() {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+/// Whether a resolved bind root is the sandbox directory or lies inside it.
+#[cfg(not(unix))]
+fn resolved_root_is_inside_sandbox_dir(
+    sandbox_dir: &Path,
+    resolved: &Path,
+) -> MicrosandboxResult<bool> {
+    let sandbox = std::fs::canonicalize(sandbox_dir).map_err(|error| {
+        MicrosandboxError::InvalidConfig(format!(
+            "cannot inspect sandbox directory {}: {error}",
+            sandbox_dir.display()
+        ))
+    })?;
+    Ok(components_start_with(resolved, &sandbox))
+}
+
+/// Whether a resolved bind root is one of the files the sandbox's log directory holds.
+///
+/// A hard link to `<sandbox_dir>/logs/network.log` created outside the sandbox keeps that
+/// external pathname through canonicalization, so the ancestor comparison above cannot see it and
+/// the guest could still overwrite the refusal feed. File identity is what the link shares.
+///
+/// Bounded: one `read_dir` and one stat per entry, and only when the bind root is an existing
+/// file. Residual, documented exposure: a hard link to a log file created *after* this check is
+/// not caught, and a writable bind of an ancestor directory still exposes the logs (S2).
+#[cfg(unix)]
+fn resolved_root_aliases_a_log_file(
+    sandbox_dir: &Path,
+    resolved: &Path,
+) -> MicrosandboxResult<bool> {
+    use std::os::unix::fs::MetadataExt;
+
+    // A bind root that does not exist yet, or is a directory, holds no file identity to match.
+    let Ok(bound) = std::fs::metadata(resolved) else {
+        return Ok(false);
+    };
+    if !bound.is_file() {
+        return Ok(false);
+    }
+
+    // A sandbox whose log directory is not there yet has no log to protect.
+    let Ok(logs) = std::fs::read_dir(sandbox_dir.join("logs")) else {
+        return Ok(false);
+    };
+    for entry in logs.flatten() {
+        // `DirEntry::metadata` does not follow a symlink, and a link is not a log file.
+        let Ok(log) = entry.metadata() else {
+            continue;
+        };
+        if log.is_file() && log.dev() == bound.dev() && log.ino() == bound.ino() {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+/// Whether a resolved bind root is one of the sandbox's log files.
+///
+/// Windows has no portable file identity to compare a bind root against (the same limitation the
+/// canonical-path sidecar already has), so only the path comparison above applies there.
+#[cfg(not(unix))]
+fn resolved_root_aliases_a_log_file(
+    _sandbox_dir: &Path,
+    _resolved: &Path,
+) -> MicrosandboxResult<bool> {
+    Ok(false)
+}
+
+/// Compare two canonical paths component-wise, ASCII-case-insensitively.
+#[cfg(not(unix))]
+fn components_start_with(path: &Path, base: &Path) -> bool {
+    let mut components = path.components();
+    base.components().all(|expected| {
+        components
+            .next()
+            .is_some_and(|actual| component_eq_ignore_ascii_case(&actual, &expected))
+    })
+}
+
+/// Compare one path component the way a case-insensitive volume would.
+#[cfg(not(unix))]
+fn component_eq_ignore_ascii_case(
+    left: &std::path::Component<'_>,
+    right: &std::path::Component<'_>,
+) -> bool {
+    left.as_os_str()
+        .to_string_lossy()
+        .eq_ignore_ascii_case(&right.as_os_str().to_string_lossy())
 }

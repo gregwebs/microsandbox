@@ -11,6 +11,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 use bytes::Bytes;
+use microsandbox_types::{RefusalLayer, RefusalSite};
 use rustls::pki_types::ServerName;
 use tokio::io::{AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
@@ -23,9 +24,10 @@ use crate::extensions::{
     AuthorizedRouteRequestStream, AuthorizedTlsRoute, NetworkExtensions, RequestAction,
 };
 use crate::netstack::shared::SharedState;
-use crate::policy::handle::NetworkPolicyHandle;
+use crate::policy::handle::{NetworkPolicyHandle, PolicySnapshot};
 use crate::policy::{EgressEvaluation, HostnameSource, Protocol};
 use crate::proxy::ResolvedOutboundProxy;
+use crate::refusal::{self, Denial, NameEvidence};
 use crate::secrets::config::SecretViolationAction;
 use crate::secrets::handler::SecretsHandler;
 use crate::tcp::{connection::ProxyConnectState, upstream::UpstreamTcpTarget};
@@ -66,6 +68,13 @@ pub(crate) struct TlsProxy {
     via_connect: bool,
     /// ClientHello bytes already consumed from the guest stream.
     initial_buf: Vec<u8>,
+    /// The socket the guest actually addressed, for refusal records.
+    ///
+    /// It is `guest_dst` unless this proxy was reached through a proxy-side rewrite (an HTTP
+    /// CONNECT tunnel), where `guest_dst` carries the tunnel target the policy must decide on but
+    /// the guest's own socket was the outer connection. Policy always uses `guest_dst`; only what a
+    /// record reports comes from here.
+    refusal_dst: SocketAddr,
 }
 
 //--------------------------------------------------------------------------------------------------
@@ -107,7 +116,18 @@ impl TlsProxy {
             expected_sni: None,
             via_connect: false,
             initial_buf: Vec::new(),
+            refusal_dst: guest_dst,
         }
+    }
+
+    /// Report refusals against `dst`, the socket the guest actually addressed.
+    ///
+    /// Set when this proxy serves an HTTP CONNECT tunnel: the tunnel target is what the policy
+    /// decides on, but the guest addressed the outer proxy connection, and a record must not pair
+    /// the proxy address with a port the guest never used.
+    pub(crate) fn with_refusal_destination(mut self, dst: SocketAddr) -> Self {
+        self.refusal_dst = dst;
+        self
     }
 
     /// Mark this proxy as an HTTP CONNECT handoff and optionally verify its hostname authority.
@@ -165,6 +185,7 @@ impl TlsProxy {
             expected_sni,
             via_connect,
             initial_buf,
+            refusal_dst,
         } = self;
         let connect_dst = connect_target.primary();
         // A hostname CONNECT authority is proven by the proxy against the
@@ -183,8 +204,9 @@ impl TlsProxy {
         let (sni_name, initial_buf) = sni_name?;
 
         // The SNI decision is this flow's admission, so it reads the policy that is current now,
-        // not one captured when the task was spawned. Everything below uses this snapshot.
-        let network_policy = network_policy.load();
+        // not one captured when the task was spawned. Everything below uses this snapshot, and
+        // its revision is the one a refusal here reports.
+        let network_policy = network_policy.snapshot();
 
         // Without SNI, authenticate the original destination IP, never a cached
         // DNS name or the host-side address used for gateway forwarding.
@@ -196,6 +218,23 @@ impl TlsProxy {
         if let Some(expected) = expected_sni.as_deref()
             && !sni_name.eq_ignore_ascii_case(expected.trim_end_matches('.'))
         {
+            // The IP text that stands in for a missing SNI is never recorded as a name.
+            refusal::record(
+                &shared,
+                Denial {
+                    site: RefusalSite::TlsConnectMismatch,
+                    layer: RefusalLayer::Tenant,
+                    protocol: Protocol::Tcp,
+                    dst_ip: Some(refusal_dst.ip()),
+                    dst_port: Some(refusal_dst.port()),
+                    name: if has_sni {
+                        NameEvidence::Sni(&sni_name)
+                    } else {
+                        NameEvidence::None
+                    },
+                    revision: network_policy.revision(),
+                },
+            );
             tracing::debug!(
                 sni = %sni_name,
                 expected = %expected,
@@ -221,6 +260,18 @@ impl TlsProxy {
             hostname_source,
         );
         if !matches!(eval, EgressEvaluation::Allow) {
+            refusal::record(
+                &shared,
+                Denial {
+                    site: RefusalSite::TlsSni,
+                    layer: RefusalLayer::Tenant,
+                    protocol: Protocol::Tcp,
+                    dst_ip: Some(refusal_dst.ip()),
+                    dst_port: Some(refusal_dst.port()),
+                    name: tls_name_evidence(has_sni, &sni_name, refusal_dst),
+                    revision: network_policy.revision(),
+                },
+            );
             tracing::debug!(
                 sni = %sni_name,
                 dst = %guest_dst,
@@ -257,6 +308,18 @@ impl TlsProxy {
                 hostname_source,
             )
         {
+            refusal::record(
+                &shared,
+                Denial {
+                    site: RefusalSite::TlsStrictBypass,
+                    layer: RefusalLayer::Tenant,
+                    protocol: Protocol::Tcp,
+                    dst_ip: Some(refusal_dst.ip()),
+                    dst_port: Some(refusal_dst.port()),
+                    name: tls_name_evidence(has_sni, &sni_name, refusal_dst),
+                    revision: network_policy.revision(),
+                },
+            );
             tracing::debug!(
                 sni = %sni_name,
                 dst = %guest_dst,
@@ -284,10 +347,12 @@ impl TlsProxy {
             tracing::debug!(sni = %sni_name, dst = %connect_dst, guest_dst = %guest_dst, "TLS intercept");
             intercept_relay(
                 guest_dst,
+                refusal_dst,
                 connect_target,
                 &sni_name,
                 via_connect,
                 has_connect_hostname_authority,
+                network_policy,
                 initial_buf,
                 from_smoltcp,
                 to_smoltcp,
@@ -435,6 +500,20 @@ async fn complete_guest_handshake(
     .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "TLS handshake timed out"))?
 }
 
+/// Name evidence for a TLS decision: the ClientHello SNI when the guest sent one, otherwise the
+/// names the guest's own DNS answers bound to the destination address.
+fn tls_name_evidence<'a>(
+    has_sni: bool,
+    sni_name: &'a str,
+    guest_dst: SocketAddr,
+) -> NameEvidence<'a> {
+    if has_sni {
+        NameEvidence::Sni(sni_name)
+    } else {
+        NameEvidence::CachedFor(guest_dst.ip())
+    }
+}
+
 /// Bypass mode: plain TCP splice, no TLS termination.
 #[allow(clippy::too_many_arguments)]
 async fn bypass_relay(
@@ -498,10 +577,12 @@ async fn bypass_relay(
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn intercept_relay(
     guest_dst: SocketAddr,
+    refusal_dst: SocketAddr,
     connect_target: UpstreamTcpTarget,
     sni_name: &str,
     via_connect: bool,
     has_connect_hostname_authority: bool,
+    network_policy: PolicySnapshot,
     initial_buf: Vec<u8>,
     mut from_smoltcp: mpsc::Receiver<Bytes>,
     to_smoltcp: mpsc::Sender<Bytes>,
@@ -522,7 +603,8 @@ pub(crate) async fn intercept_relay(
         SecretsHandler::new_tls_intercepted(&secrets, sni_name, guest_dst.ip(), &shared)
     }
     .with_header_credentials(tls_state.header_credentials().to_vec())
-    .with_guest_dst(guest_dst);
+    .with_guest_dst(guest_dst)
+    .with_refusal_reporting(Arc::clone(&shared), refusal_dst, &network_policy);
     let mut request_stream =
         open_authorized_request_stream(&extensions, guest_dst, sni_name, via_connect);
 
@@ -984,10 +1066,13 @@ mod tests {
     use crate::intercept::InterceptExtension;
     use crate::intercept::config::{InterceptConfig, InterceptRule};
     use crate::policy::NetworkPolicy;
+    use crate::policy::handle::INITIAL_NETWORK_POLICY_REVISION;
+    use crate::refusal::test_support::{cache_name, recording_state};
     use crate::secrets::config::{HostPattern, SecretEntry, SecretSubstitution, SecretsConfig};
     use crate::secrets::credential::ResolvedHeaderCredential;
     use crate::secrets::handle::SecretsHandle;
     use crate::tls::state::TlsState;
+    use microsandbox_types::{NameSource, NetworkRefusal};
 
     fn isolated_tls_state(mut config: TlsConfig, secrets: SecretsHandle) -> TlsState {
         static NEXT_CA: AtomicUsize = AtomicUsize::new(0);
@@ -1302,17 +1387,12 @@ mod tests {
         for (allowed, strict) in [(true, false), (false, false), (true, true), (false, true)] {
             let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
             let upstream = listener.local_addr().unwrap();
-            let shared = Arc::new(SharedState::new(8));
+            let (shared, refusals) = recording_state(8);
             shared.set_http_config(microsandbox_types::HttpConfig {
                 deny_response: false,
                 ..Default::default()
             });
-            shared.cache_resolved_hostname(
-                "example.com",
-                crate::netstack::shared::ResolvedHostnameFamily::Ipv4,
-                [upstream.ip()],
-                Duration::from_secs(60),
-            );
+            cache_name(&shared, "example.com", upstream.ip());
             let policy = if allowed {
                 NetworkPolicy::none().allow_domain("example.com").unwrap()
             } else {
@@ -1345,8 +1425,188 @@ mod tests {
                     hello
                 } else {
                     Vec::new()
-                }
+                },
+                "allowed={allowed}, strict={strict}"
             );
+            // A ClientHello without SNI must never be recorded as an `sni` name: the evidence is
+            // the guest's own DNS binding for the destination address.
+            let expected = if !allowed {
+                Some((RefusalSite::TlsSni, NameSource::DnsCache))
+            } else if strict {
+                Some((RefusalSite::TlsStrictBypass, NameSource::DnsCache))
+            } else {
+                None
+            };
+            let recorded = refusals.take();
+            match expected {
+                Some((site, name_source)) => {
+                    assert_eq!(
+                        recorded,
+                        vec![NetworkRefusal {
+                            site,
+                            layer: RefusalLayer::Tenant,
+                            protocol: microsandbox_types::Protocol::Tcp,
+                            dst_ip: Some(upstream.ip()),
+                            dst_port: Some(upstream.port()),
+                            name: Some("example.com".to_owned()),
+                            name_source,
+                            revision: INITIAL_NETWORK_POLICY_REVISION,
+                        }],
+                        "allowed={allowed}, strict={strict}"
+                    );
+                }
+                None => assert!(
+                    recorded.is_empty(),
+                    "an allowed flow records nothing: allowed={allowed}, strict={strict}"
+                ),
+            }
+        }
+    }
+
+    /// Drive `TlsProxy::try_run` for one ClientHello against `policy`, and return everything the
+    /// guest would receive plus what the proxy recorded.
+    async fn run_tls_probe(
+        hello: Vec<u8>,
+        expected_sni: Option<&str>,
+        policy: NetworkPolicy,
+        deny_response: bool,
+        state: Arc<TlsState>,
+    ) -> (Vec<u8>, Vec<NetworkRefusal>) {
+        let (shared, sink) = recording_state(8);
+        let destination: SocketAddr = "203.0.113.10:443".parse().unwrap();
+        shared.set_http_config(microsandbox_types::HttpConfig {
+            deny_response,
+            deny_response_format: microsandbox_types::HttpDenyResponseFormat::Json,
+            ..Default::default()
+        });
+        let (from_tx, from_rx) = mpsc::channel::<Bytes>(8);
+        let (to_tx, mut to_rx) = mpsc::channel::<Bytes>(8);
+        from_tx.send(Bytes::from(hello)).await.unwrap();
+        drop(from_tx);
+        let mut proxy = TlsProxy::new(
+            None,
+            destination,
+            UpstreamTcpTarget::direct(destination),
+            from_rx,
+            to_tx,
+            Arc::clone(&shared),
+            state,
+            NetworkPolicyHandle::new(policy),
+            false,
+            Arc::new(ProxyConnectState::new()),
+            NetworkExtensions::default(),
+            None,
+        );
+        if let Some(expected) = expected_sni {
+            proxy = proxy.with_connect_authority(Some(expected.to_string()));
+        }
+        tokio::time::timeout(Duration::from_secs(5), proxy.try_run())
+            .await
+            .expect("the refused flow must finish")
+            .expect("a refusal is not an I/O failure");
+        let mut guest = Vec::new();
+        while let Ok(chunk) = to_rx.try_recv() {
+            guest.extend_from_slice(&chunk);
+        }
+        (guest, sink.take())
+    }
+
+    /// A real rustls ClientHello for `name`, so the proxy's own SNI parser sees what a guest
+    /// would send.
+    fn client_hello_for(state: &TlsState, name: &str) -> Vec<u8> {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let mut roots = rustls::RootCertStore::empty();
+        roots.add(state.intercept_ca.cert_der.clone()).unwrap();
+        let config = rustls::ClientConfig::builder()
+            .with_root_certificates(roots)
+            .with_no_client_auth();
+        let mut client = rustls::ClientConnection::new(
+            Arc::new(config),
+            ServerName::try_from(name.to_owned()).unwrap(),
+        )
+        .unwrap();
+        let mut hello = Vec::new();
+        client.write_tls(&mut hello).unwrap();
+        hello
+    }
+
+    /// `tls-sni`: one record per refused decision, with the ClientHello's name, at the revision
+    /// the SNI decision consulted. The in-tunnel deny response is a presentation of that decision
+    /// and adds nothing.
+    #[tokio::test]
+    async fn tls_sni_denial_is_recorded_once() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        for deny_response in [false, true] {
+            let state = test_tls_state(SecretsConfig::default());
+            let hello = client_hello_for(&state, "blocked.example");
+            let (guest, recorded) =
+                run_tls_probe(hello, None, NetworkPolicy::none(), deny_response, state).await;
+
+            assert_eq!(
+                recorded,
+                vec![NetworkRefusal {
+                    site: RefusalSite::TlsSni,
+                    layer: RefusalLayer::Tenant,
+                    protocol: microsandbox_types::Protocol::Tcp,
+                    dst_ip: Some("203.0.113.10".parse().unwrap()),
+                    dst_port: Some(443),
+                    name: Some("blocked.example".to_owned()),
+                    name_source: NameSource::Sni,
+                    revision: INITIAL_NETWORK_POLICY_REVISION,
+                }],
+                "deny_response={deny_response}: one record for the decision"
+            );
+            assert_eq!(
+                !guest.is_empty(),
+                deny_response,
+                "deny_response={deny_response}: the deny response is presentation only"
+            );
+        }
+    }
+
+    /// `tls-connect-mismatch`: the record names the ClientHello's SNI, and an IP that stands in
+    /// for a missing SNI is never recorded as a name.
+    #[tokio::test]
+    async fn tls_connect_mismatch_is_recorded_with_the_client_hello_sni() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        for (hello, expected_name) in [
+            (
+                Some("blocked.example"),
+                Some(("blocked.example", NameSource::Sni)),
+            ),
+            // A ClientHello without SNI: the mismatch still refuses, without name evidence.
+            (None, None),
+        ] {
+            let state = test_tls_state(SecretsConfig::default());
+            let hello = match hello {
+                Some(name) => client_hello_for(&state, name),
+                None => legacy_client_hello(None),
+            };
+            let (_, recorded) = run_tls_probe(
+                hello,
+                Some("allowed.example"),
+                NetworkPolicy::allow_all(),
+                false,
+                state,
+            )
+            .await;
+
+            assert_eq!(recorded.len(), 1, "one record for the mismatch");
+            assert_eq!(recorded[0].site, RefusalSite::TlsConnectMismatch);
+            assert_eq!(recorded[0].layer, RefusalLayer::Tenant);
+            match expected_name {
+                Some((name, name_source)) => {
+                    assert_eq!(recorded[0].name.as_deref(), Some(name));
+                    assert_eq!(recorded[0].name_source, name_source);
+                }
+                None => {
+                    assert_eq!(
+                        recorded[0].name, None,
+                        "the destination IP text is never recorded as a name"
+                    );
+                    assert_eq!(recorded[0].name_source, NameSource::Absent);
+                }
+            }
         }
     }
 
@@ -1634,19 +1894,14 @@ mod tests {
         for (label, initial, replacement, reaches_upstream) in cases {
             let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
             let upstream = listener.local_addr().unwrap();
-            let shared = Arc::new(SharedState::new(8));
+            let (shared, refusals) = recording_state(8);
             shared.set_http_config(microsandbox_types::HttpConfig {
                 deny_response: false,
                 ..Default::default()
             });
             // A `Domain` allow must be corroborated by the DNS-index binding for the destination
             // IP, exactly as a real guest would have produced it before connecting.
-            shared.cache_resolved_hostname(
-                "example.com",
-                crate::netstack::shared::ResolvedHostnameFamily::Ipv4,
-                [upstream.ip()],
-                Duration::from_secs(60),
-            );
+            cache_name(&shared, "example.com", upstream.ip());
             // Bypass the client's SNI so a denied flow closes silently instead of trying to
             // terminate TLS for a raw ClientHello fixture.
             let state = Arc::new(isolated_tls_state(
@@ -1696,6 +1951,10 @@ mod tests {
 
             if reaches_upstream {
                 task.abort();
+                assert!(
+                    refusals.take().is_empty(),
+                    "{label}: an admitted SNI records nothing"
+                );
             } else {
                 // A refused flow closes on its own without dialing.
                 tokio::time::timeout(Duration::from_secs(5), task)
@@ -1703,6 +1962,14 @@ mod tests {
                     .expect("proxy did not finish")
                     .unwrap()
                     .unwrap();
+                // The refusal reports the revision of the policy the SNI decision consulted —
+                // the one the replace published while the ClientHello was in flight.
+                let recorded = refusals.take();
+                assert_eq!(recorded.len(), 1, "{label}: one refusal, one record");
+                assert_eq!(recorded[0].site, RefusalSite::TlsSni, "{label}");
+                assert_eq!(recorded[0].revision, 2, "{label}");
+                assert_eq!(recorded[0].name.as_deref(), Some("example.com"), "{label}");
+                assert_eq!(recorded[0].name_source, NameSource::Sni, "{label}");
             }
         }
     }
@@ -2084,7 +2351,7 @@ mod tests {
                 let mut secrets = host_bound_secret_config();
                 secrets.secrets[0].allowed_hosts = vec![HostPattern::Exact("github.com".into())];
                 let tls_state = test_tls_state(secrets);
-                let shared = Arc::new(SharedState::new(8));
+                let (shared, refusals) = recording_state(8);
                 shared.set_http_config(microsandbox_types::HttpConfig {
                     deny_response: enabled,
                     deny_response_format: microsandbox_types::HttpDenyResponseFormat::Json,
@@ -2130,16 +2397,19 @@ mod tests {
                 let (to_tx, mut to_rx) = mpsc::channel(8);
                 let mut client = guest_client(&tls_state);
                 send_client_tls_output(&mut client, &from_tx).await;
+                let snapshot = PolicySnapshot::initial(Arc::new(NetworkPolicy::none()));
                 let relay = tokio::spawn(intercept_relay(
+                    "203.0.113.10:443".parse().unwrap(),
                     "203.0.113.10:443".parse().unwrap(),
                     UpstreamTcpTarget::direct(upstream),
                     "example.com",
                     true,
                     true,
+                    snapshot,
                     Vec::new(),
                     from_rx,
                     to_tx,
-                    shared,
+                    Arc::clone(&shared),
                     tls_state,
                     Arc::new(ProxyConnectState::new()),
                     NetworkExtensions::default(),
@@ -2227,6 +2497,17 @@ mod tests {
                         "must not append a denial: {response:?}"
                     );
                 }
+                // The in-tunnel denial is a presentation of the decision recorded here: exactly
+                // one `secret-violation`, attributed to the connection's admitted revision, and
+                // one per violation even when the guest retries the placeholder.
+                let recorded = refusals.take();
+                assert_eq!(recorded.len(), 1, "one violation, one record");
+                assert_eq!(recorded[0].site, RefusalSite::SecretViolation);
+                assert_eq!(recorded[0].layer, RefusalLayer::Tenant);
+                assert_eq!(recorded[0].revision, INITIAL_NETWORK_POLICY_REVISION);
+                // The request's own `Host` is the name evidence (R4), not the connection SNI.
+                assert_eq!(recorded[0].name.as_deref(), Some("example.com"));
+                assert_eq!(recorded[0].name_source, NameSource::HttpHost);
             }
         };
         tokio::time::timeout(Duration::from_secs(10), check)
@@ -2247,12 +2528,15 @@ mod tests {
         let (to_tx, mut to_rx) = mpsc::channel(4);
         let mut client = guest_client(&tls_state);
         send_client_tls_output(&mut client, &from_tx).await;
+        let snapshot = PolicySnapshot::initial(Arc::new(NetworkPolicy::none()));
         let relay = tokio::spawn(intercept_relay(
+            guest_destination,
             guest_destination,
             UpstreamTcpTarget::direct(upstream),
             "example.com",
             true,
             true,
+            snapshot,
             Vec::new(),
             from_rx,
             to_tx,
@@ -2334,12 +2618,15 @@ mod tests {
         let (to_tx, mut to_rx) = mpsc::channel(4);
         let mut client = guest_client(&tls_state);
         send_client_tls_output(&mut client, &from_tx).await;
+        let snapshot = PolicySnapshot::initial(Arc::new(NetworkPolicy::none()));
         let relay = tokio::spawn(intercept_relay(
+            guest_destination,
             guest_destination,
             UpstreamTcpTarget::direct(upstream),
             "example.com",
             true,
             true,
+            snapshot,
             Vec::new(),
             from_rx,
             to_tx,
@@ -2419,12 +2706,15 @@ mod tests {
         let extensions = NetworkExtensions::new().with_authorized_requests(Arc::new(
             InterceptExtension::new(github_style_intercept_config()),
         ));
+        let snapshot = PolicySnapshot::initial(Arc::new(NetworkPolicy::none()));
         let relay = tokio::spawn(intercept_relay(
+            "203.0.113.10:443".parse().unwrap(),
             "203.0.113.10:443".parse().unwrap(),
             UpstreamTcpTarget::direct(upstream),
             "example.com",
             false,
             false,
+            snapshot,
             Vec::new(),
             from_rx,
             to_tx,
@@ -2487,12 +2777,15 @@ mod tests {
         let extensions = NetworkExtensions::new().with_authorized_requests(Arc::new(
             InterceptExtension::new(github_style_intercept_config()),
         ));
+        let snapshot = PolicySnapshot::initial(Arc::new(NetworkPolicy::none()));
         let relay = tokio::spawn(intercept_relay(
+            "203.0.113.10:443".parse().unwrap(),
             "203.0.113.10:443".parse().unwrap(),
             UpstreamTcpTarget::direct(upstream),
             "example.com",
             false,
             false,
+            snapshot,
             Vec::new(),
             from_rx,
             to_tx,
@@ -2918,12 +3211,15 @@ mod tests {
         let mut client = no_sni_guest_client(&tls_state);
         send_client_tls_output(&mut client, &from_tx).await;
 
+        let snapshot = PolicySnapshot::initial(Arc::new(NetworkPolicy::none()));
         let relay = tokio::spawn(intercept_relay(
+            no_sni_destination(),
             no_sni_destination(),
             UpstreamTcpTarget::direct(upstream),
             NO_SNI_ROUTE_NAME,
             false,
             false,
+            snapshot,
             Vec::new(),
             from_rx,
             to_tx,

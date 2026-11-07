@@ -1927,7 +1927,7 @@ impl RubyLogEntry {
         self.inner.timestamp.to_rfc3339()
     }
     fn source(&self) -> String {
-        log_source_name(&self.inner.source).to_owned()
+        log_source_name(&self.inner.source)
     }
     fn data(&self) -> RString {
         current_ruby().str_from_slice(&self.inner.data)
@@ -2569,12 +2569,14 @@ fn volume_kind_name(kind: VolumeKind) -> &'static str {
     }
 }
 
-fn log_source_name(src: &LogSource) -> &'static str {
-    match src {
-        LogSource::Stdout => "stdout",
-        LogSource::Stderr => "stderr",
-        LogSource::Output => "output",
-        LogSource::System => "system",
+/// The source's wire name.
+///
+/// Goes through serde instead of naming variants: the standalone build links a published SDK
+/// whose `LogSource` may lack variants this checkout has.
+fn log_source_name(src: &LogSource) -> String {
+    match serde_json::to_value(src) {
+        Ok(serde_json::Value::String(name)) => name,
+        _ => "unknown".to_owned(),
     }
 }
 

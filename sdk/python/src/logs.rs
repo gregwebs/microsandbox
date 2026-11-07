@@ -124,6 +124,7 @@ pub fn convert_entry(entry: microsandbox::logs::LogEntry) -> PyLogEntry {
         microsandbox::logs::LogSource::Stderr => "stderr",
         microsandbox::logs::LogSource::Output => "output",
         microsandbox::logs::LogSource::System => "system",
+        microsandbox::logs::LogSource::Network => "network",
     };
     PyLogEntry {
         timestamp_ms: entry.timestamp.timestamp_millis() as f64,

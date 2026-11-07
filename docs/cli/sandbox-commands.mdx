@@ -777,7 +777,10 @@ msb logs devbox --color-sessions
 
 # Include runtime/kernel diagnostics
 msb logs devbox --source system
-msb logs devbox --source all                # everything, chronologically merged
+msb logs devbox --source all                # stdout, stderr, output and system, merged
+
+# Egress refusals (never in the default or in `all`)
+msb logs devbox --source network
 ```
 </CodeGroup>
 
@@ -790,7 +793,7 @@ msb logs devbox --source all                # everything, chronologically merged
 | `--until` | Show entries strictly before this time (same formats) |
 | `-f`, `--follow` | Follow new entries |
 | `--timestamps` | Prefix each line with the entry timestamp |
-| `--source` | Sources to include: `stdout`, `stderr`, `output`, `system`, `all`. Repeat or comma-separate. Default: `stdout,stderr,output` |
+| `--source` | Sources to include: `stdout`, `stderr`, `output`, `system`, `network`, `all`. Repeat or comma-separate. Default: `stdout,stderr,output`. `network` is egress refusal records; it is never in the default or in `all`. |
 | `--grep` | Client-side regex filter on the entry body |
 | `--json` | Emit raw JSON Lines without decoding (one entry per line) |
 | `--raw` | Opt into base64 encoding for non-UTF-8 bytes |
@@ -808,6 +811,9 @@ The `s` field in JSON output identifies the source:
 | `stdout`, `stderr` | Separate streams from commands run without a terminal |
 | `output` | Combined stdout and stderr from a terminal session |
 | `system` | Lifecycle markers and runtime/kernel diagnostics |
+| `network` | Egress refusal records from `network.log`: one JSON line per refused decision, written for local sandboxes with networking. `--job` refuses it because refusals are sandbox-wide; with `--json` the record line arrives as the `d` string. |
+
+See [Refusal log](/networking/overview#refusal-log) for the record fields and rate limits.
 
 </Accordion>
 

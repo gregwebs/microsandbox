@@ -11,6 +11,7 @@ use std::num::NonZeroUsize;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
+use microsandbox_types::{RefusalLayer, RefusalSite};
 #[cfg(windows)]
 use msb_krun_utils::event::{EventSet, EventSource, WaitContext, WaitEvent};
 use smoltcp::iface::{Config, Interface, SocketSet};
@@ -31,11 +32,12 @@ use crate::engine::dns::{
 use crate::engine::tls::{proxy::TlsProxy, state::TlsState};
 use crate::extensions::NetworkExtensions;
 use crate::icmp::relay::IcmpRelay;
-use crate::policy::handle::NetworkPolicyHandle;
+use crate::policy::handle::{NetworkPolicyHandle, PolicySnapshot};
 use crate::policy::{EgressEvaluation, HostnameSource, NetworkPolicy, Protocol};
 use crate::ports::PortPublisher;
 use crate::ports::publisher::PortCommand;
 use crate::proxy::{OutboundRouting, ResolvedOutboundProxy};
+use crate::refusal::{self, Denial, NameEvidence};
 use crate::secrets::handle::SecretsHandle;
 use crate::tcp::{
     connection::{FlowPolicy, TcpAcceptMode, TcpConnectionTracker},
@@ -397,11 +399,13 @@ pub fn smoltcp_poll_loop(
             match classify_frame(frame) {
                 FrameAction::TcpSyn { src, dst } => {
                     let dns_port_type = DnsPortType::from_tcp(dst.port());
-                    // A SYN is rare compared with a packet, so admission loads the handle
-                    // directly instead of using the cursor. Whichever snapshot is evaluated is
-                    // the one the flow keeps, so the two can never disagree.
-                    let (accept_mode, policy_admission) = classify_syn(
-                        network_policy.load(),
+                    // A SYN is rare compared with a packet, so admission takes a fresh snapshot
+                    // instead of using the cursor. Whichever snapshot is evaluated is the one the
+                    // flow keeps, so the two can never disagree.
+                    let syn_policy = network_policy.snapshot();
+                    let revision = syn_policy.revision();
+                    let (accept_mode, policy_admission, refusal) = classify_syn(
+                        syn_policy,
                         platform_policy.as_deref(),
                         dns_port_type,
                         dst,
@@ -413,6 +417,23 @@ pub fn smoltcp_poll_loop(
                     // including when both packets arrive in the same batch.
                     conn_tracker.cleanup_closed(&mut sockets);
                     if !conn_tracker.has_socket_for(&src, &dst) {
+                        // One record per refused decision: a retransmitted SYN, which the socket
+                        // that already answers the denial absorbs, is not a new decision.
+                        if let Some((site, layer)) = refusal {
+                            refusal::record(
+                                &shared,
+                                Denial {
+                                    site,
+                                    layer,
+                                    protocol: Protocol::Tcp,
+                                    dst_ip: Some(dst.ip()),
+                                    dst_port: Some(dst.port()),
+                                    name: NameEvidence::CachedFor(dst.ip()),
+                                    revision,
+                                },
+                            );
+                        }
+
                         // Freeze the egress route for this flow at the SYN. DNS, DoT,
                         // rejected and denial-only flows never take a proxy route.
                         let eligible = matches!(dns_port_type, DnsPortType::Other)
@@ -802,7 +823,7 @@ fn relay_udp_frame(
     src: SocketAddr,
     dst: SocketAddr,
     config: &PollLoopConfig,
-    network_policy: &NetworkPolicy,
+    network_policy: &PolicySnapshot,
     platform_policy: Option<&NetworkPolicy>,
     shared: &Arc<SharedState>,
     port_publisher: &mut PortPublisher,
@@ -818,29 +839,87 @@ fn relay_udp_frame(
         && tls.config.intercepted_ports.contains(&dst.port())
         && tls.config.block_quic_on_intercept
     {
+        refusal::record(
+            shared,
+            Denial {
+                site: RefusalSite::UdpQuic,
+                layer: RefusalLayer::Tenant,
+                protocol: Protocol::Udp,
+                dst_ip: Some(dst.ip()),
+                dst_port: Some(dst.port()),
+                name: NameEvidence::CachedFor(dst.ip()),
+                revision: network_policy.revision(),
+            },
+        );
         return;
     }
 
     match DnsPortType::from_udp(dst.port()) {
         // Dns: unreachable here — classify_transport routes UDP/53 to
         // FrameAction::Dns, not UdpRelay. Defensive drop covers regressions.
-        DnsPortType::Dns | DnsPortType::EncryptedDns => return,
+        DnsPortType::Dns | DnsPortType::EncryptedDns => {
+            refusal::record(
+                shared,
+                Denial {
+                    site: RefusalSite::UdpDnsPort,
+                    layer: RefusalLayer::Tenant,
+                    protocol: Protocol::Udp,
+                    dst_ip: Some(dst.ip()),
+                    dst_port: Some(dst.port()),
+                    name: NameEvidence::CachedFor(dst.ip()),
+                    revision: network_policy.revision(),
+                },
+            );
+            return;
+        }
         // Alternative DNS protocols on well-known UDP ports are dropped —
         // forces fall-back to UDP/53.
         DnsPortType::AlternativeDns => {
             tracing::debug!(%dst, "alternative-DNS UDP port dropped; stub should fall back to UDP/53");
+            refusal::record(
+                shared,
+                Denial {
+                    site: RefusalSite::UdpAltDns,
+                    layer: RefusalLayer::Tenant,
+                    protocol: Protocol::Udp,
+                    dst_ip: Some(dst.ip()),
+                    dst_port: Some(dst.port()),
+                    name: NameEvidence::CachedFor(dst.ip()),
+                    revision: network_policy.revision(),
+                },
+            );
             return;
         }
         DnsPortType::Other => {}
     }
 
-    // Policy is applied after reassembly, when the UDP destination port is known.
-    if platform_policy
+    // Policy is applied after reassembly, when the UDP destination port is known. The floor is
+    // evaluated first, so a refusal it alone would make is the platform's.
+    let layer = if platform_policy
         .is_some_and(|policy| policy.evaluate_egress(dst, Protocol::Udp, shared).is_deny())
-        || network_policy
-            .evaluate_egress(dst, Protocol::Udp, shared)
-            .is_deny()
     {
+        Some(RefusalLayer::Platform)
+    } else if network_policy
+        .evaluate_egress(dst, Protocol::Udp, shared)
+        .is_deny()
+    {
+        Some(RefusalLayer::Tenant)
+    } else {
+        None
+    };
+    if let Some(layer) = layer {
+        refusal::record(
+            shared,
+            Denial {
+                site: RefusalSite::Udp,
+                layer,
+                protocol: Protocol::Udp,
+                dst_ip: Some(dst.ip()),
+                dst_port: Some(dst.port()),
+                name: NameEvidence::CachedFor(dst.ip()),
+                revision: network_policy.revision(),
+            },
+        );
         return;
     }
 
@@ -859,7 +938,7 @@ fn handle_reassembled_udp_datagram(
     now: Instant,
     sockets: &mut SocketSet<'_>,
     config: &PollLoopConfig,
-    network_policy: &NetworkPolicy,
+    network_policy: &PolicySnapshot,
     platform_policy: Option<&NetworkPolicy>,
     shared: &Arc<SharedState>,
     port_publisher: &mut PortPublisher,
@@ -887,25 +966,37 @@ fn handle_reassembled_udp_datagram(
     device.drop_staged_frame();
 }
 
-/// Classify one guest TCP SYN into the socket mode and the admission the flow carries.
+/// Classify one guest TCP SYN into the socket mode, the admission the flow carries, and the
+/// refusal the decision represents when it refused one.
 ///
-/// The pair is decided once, against the snapshot the caller loaded from the live handle, and it
+/// The result is decided once, against the snapshot the caller read from the live handle, and it
 /// is never recomputed: an admitted flow keeps that snapshot, a hostname-deferred flow keeps none
 /// and decides again when the guest's first bytes arrive, a port-owned flow is the engine's own
 /// DNS proxy, and a denied flow carries nothing that could admit it.
+///
+/// The third element names the decision rule that refused, for the refusal record; it is `None`
+/// for every admission, so a caller never records an allowed flow.
 fn classify_syn(
-    policy: Arc<NetworkPolicy>,
+    policy: PolicySnapshot,
     platform_policy: Option<&NetworkPolicy>,
     port_type: DnsPortType,
     dst: SocketAddr,
     shared: &SharedState,
     tls_state: Option<&TlsState>,
-) -> (TcpAcceptMode, FlowPolicy) {
+) -> (
+    TcpAcceptMode,
+    FlowPolicy,
+    Option<(RefusalSite, RefusalLayer)>,
+) {
     match port_type {
         // Plain DNS: the interceptor enforces policy at the application
         // layer (block list + rebind protection); bypass the network egress
         // check.
-        DnsPortType::Dns => (TcpAcceptMode::AcceptImmediately, FlowPolicy::PortProxy),
+        DnsPortType::Dns => (
+            TcpAcceptMode::AcceptImmediately,
+            FlowPolicy::PortProxy,
+            None,
+        ),
         // DoT: intercept only when TLS MITM is configured. Without it, the
         // block list can't apply (traffic is encrypted end-to-end), so we
         // refuse to force a fall-back to plain TCP/53. When TLS MITM is
@@ -914,10 +1005,18 @@ fn classify_syn(
         // forwarder.
         DnsPortType::EncryptedDns => {
             if tls_state.is_some() {
-                (TcpAcceptMode::AcceptImmediately, FlowPolicy::PortProxy)
+                (
+                    TcpAcceptMode::AcceptImmediately,
+                    FlowPolicy::PortProxy,
+                    None,
+                )
             } else {
                 tracing::debug!(%dst, "DoT port refused (TLS interception not configured); stub should fall back to TCP/53");
-                (TcpAcceptMode::Reject, FlowPolicy::Denied)
+                (
+                    TcpAcceptMode::Reject,
+                    FlowPolicy::Denied,
+                    Some((RefusalSite::TcpDot, RefusalLayer::Tenant)),
+                )
             }
         }
         // Alternative DNS protocol we can't proxy: refuse outright — no
@@ -925,7 +1024,11 @@ fn classify_syn(
         // "upstream unavailable" and falls back to plain TCP/53.
         DnsPortType::AlternativeDns => {
             tracing::debug!(%dst, "alternative-DNS TCP port refused; stub should fall back to TCP/53");
-            (TcpAcceptMode::Reject, FlowPolicy::Denied)
+            (
+                TcpAcceptMode::Reject,
+                FlowPolicy::Denied,
+                Some((RefusalSite::TcpAltDns, RefusalLayer::Tenant)),
+            )
         }
         // Other: regular outbound — defer Domain rules to first-flight;
         // accept unless an IP-layer rule denies.
@@ -943,16 +1046,24 @@ fn classify_syn(
             );
 
             match (platform_allows, evaluation) {
-                (false, _) => (TcpAcceptMode::Reject, FlowPolicy::Denied),
-                (true, EgressEvaluation::Allow) => {
-                    (TcpAcceptMode::WaitForUpstream, FlowPolicy::Admitted(policy))
-                }
+                // The floor is evaluated first, so a refusal it alone would make is the platform's.
+                (false, _) => (
+                    TcpAcceptMode::Reject,
+                    FlowPolicy::Denied,
+                    Some((RefusalSite::TcpSyn, RefusalLayer::Platform)),
+                ),
+                (true, EgressEvaluation::Allow) => (
+                    TcpAcceptMode::WaitForUpstream,
+                    FlowPolicy::Admitted(policy),
+                    None,
+                ),
                 // Hostname rules need guest bytes before they can authorize a
                 // host connection, so the policy that will decide is not
                 // settled yet: the flow must not keep this snapshot.
                 (true, EgressEvaluation::DeferUntilHostname) => (
                     TcpAcceptMode::AcceptImmediately,
                     FlowPolicy::PendingHostname,
+                    None,
                 ),
                 // Only default denies may receive an HTTP response; explicit
                 // denies remain resets.
@@ -966,9 +1077,17 @@ fn classify_syn(
                             HostnameSource::Deferred,
                         ) =>
                 {
-                    (TcpAcceptMode::RespondWithDenial, FlowPolicy::Denied)
+                    (
+                        TcpAcceptMode::RespondWithDenial,
+                        FlowPolicy::Denied,
+                        Some((RefusalSite::TcpSyn, RefusalLayer::Tenant)),
+                    )
                 }
-                (true, EgressEvaluation::Deny) => (TcpAcceptMode::Reject, FlowPolicy::Denied),
+                (true, EgressEvaluation::Deny) => (
+                    TcpAcceptMode::Reject,
+                    FlowPolicy::Denied,
+                    Some((RefusalSite::TcpSyn, RefusalLayer::Tenant)),
+                ),
             }
         }
     }
@@ -1064,7 +1183,7 @@ fn handle_gateway_icmp_echo(
     frame: &[u8],
     config: &PollLoopConfig,
     shared: &SharedState,
-    network_policy: &NetworkPolicy,
+    network_policy: &PolicySnapshot,
     platform_policy: Option<&NetworkPolicy>,
 ) -> bool {
     let Ok(eth) = EthernetFrame::new_checked(frame) else {
@@ -1096,6 +1215,24 @@ fn handle_gateway_icmp_echo(
             tenant_denied,
             platform_denied,
             "gateway ICMP echo denied by policy",
+        );
+        refusal::record(
+            shared,
+            Denial {
+                site: RefusalSite::Icmp,
+                // The floor is evaluated first at every site that consults it, so a refusal it
+                // alone would make is the platform's.
+                layer: if platform_denied {
+                    RefusalLayer::Platform
+                } else {
+                    RefusalLayer::Tenant
+                },
+                protocol: reply.protocol,
+                dst_ip: Some(reply.dst),
+                dst_port: None,
+                name: NameEvidence::CachedFor(reply.dst),
+                revision: network_policy.revision(),
+            },
         );
         return true;
     }
@@ -1322,8 +1459,11 @@ mod tests {
         ArpOperation, ArpPacket, ArpRepr, EthernetRepr, Icmpv4Packet, Icmpv4Repr, Ipv4Repr,
     };
 
+    use microsandbox_types::{NameSource, NetworkRefusal, Protocol as WireProtocol};
+
     use super::super::{device::SmoltcpDevice, shared::SharedState};
     use crate::proxy::AmbientHttpProxy;
+    use crate::refusal::test_support::{cache_name, recording_state};
     use crate::tcp::connection::NewConnection;
 
     /// Build a minimal Ethernet + IPv4 + TCP SYN frame.
@@ -1610,13 +1750,8 @@ mod tests {
             now: Instant,
         ) {
             let frame = device.stage_next_frame().expect("expected staged frame");
-            if handle_gateway_icmp_echo(
-                frame,
-                poll_config,
-                shared,
-                &NetworkPolicy::allow_all(),
-                None,
-            ) {
+            let allow_all = PolicySnapshot::initial(Arc::new(NetworkPolicy::allow_all()));
+            if handle_gateway_icmp_echo(frame, poll_config, shared, &allow_all, None) {
                 device.drop_staged_frame();
                 return;
             }
@@ -1711,7 +1846,7 @@ mod tests {
 
     #[test]
     fn gateway_icmp_echo_respects_deny_policy() {
-        let shared = SharedState::new(4);
+        let (shared, sink) = recording_state(4);
         let poll_config = PollLoopConfig {
             gateway_mac: [0x02, 0x00, 0x00, 0x00, 0x00, 0x01],
             guest_mac: [0x02, 0x00, 0x00, 0x00, 0x00, 0x02],
@@ -1738,18 +1873,32 @@ mod tests {
             &frame,
             &poll_config,
             &shared,
-            &policy,
+            &PolicySnapshot::initial(Arc::new(policy)),
             None,
         ));
         assert!(
             shared.rx_ring.pop().is_none(),
             "denied gateway ICMP should not queue a reply"
         );
+        assert_eq!(
+            sink.take(),
+            vec![NetworkRefusal {
+                site: RefusalSite::Icmp,
+                layer: RefusalLayer::Tenant,
+                protocol: WireProtocol::Icmpv4,
+                dst_ip: Some(Ipv4Addr::new(100, 96, 0, 1).into()),
+                dst_port: None,
+                name: None,
+                name_source: NameSource::Absent,
+                revision: 1,
+            }],
+            "a refused gateway echo is recorded once, with no port and no name"
+        );
     }
 
     #[test]
     fn platform_public_floor_consumes_gateway_echo_without_replying() {
-        let shared = SharedState::new(4);
+        let (shared, sink) = recording_state(4);
         let gateway = Ipv4Addr::new(100, 96, 0, 1);
         let guest = Ipv4Addr::new(100, 96, 0, 2);
         shared.set_gateway_ips(Some(gateway), None);
@@ -1779,10 +1928,19 @@ mod tests {
             &frame,
             &config,
             &shared,
-            &NetworkPolicy::allow_all(),
+            &PolicySnapshot::initial(Arc::new(NetworkPolicy::allow_all())),
             Some(&platform),
         ));
         assert!(shared.rx_ring.pop().is_none());
+
+        let recorded = sink.take();
+        assert_eq!(recorded.len(), 1);
+        assert_eq!(
+            recorded[0].layer,
+            RefusalLayer::Platform,
+            "a refusal the floor alone makes is the platform's"
+        );
+        assert_eq!(recorded[0].site, RefusalSite::Icmp);
     }
 
     fn test_gateway() -> GatewayIps {
@@ -1934,10 +2092,11 @@ mod tests {
     }
 
     /// The SYN classification is the only place a flow receives its admission, so every arm is
-    /// pinned here. The proxy-level tests build [`FlowPolicy`] by hand and cannot see a wrong
-    /// classification upstream: a derived flow that kept the SYN snapshot would make its hostname
-    /// decision against a policy a replacement already displaced, and an admitted flow that kept
-    /// none would decide a second time.
+    /// pinned here, together with the decision rule it names when it refuses. The proxy-level
+    /// tests build [`FlowPolicy`] by hand and cannot see a wrong classification upstream: a
+    /// derived flow that kept the SYN snapshot would make its hostname decision against a policy
+    /// a replacement already displaced, and an admitted flow that kept none would decide a second
+    /// time.
     #[test]
     fn syn_classification_pins_every_admission_arm() {
         use microsandbox_types::HttpConfig;
@@ -1948,11 +2107,12 @@ mod tests {
         let shared = SharedState::new(4);
         let policy = Arc::new(NetworkPolicy::allow_all());
         let other: SocketAddr = "203.0.113.9:443".parse().unwrap();
+        let snapshot = || PolicySnapshot::initial(Arc::clone(&policy));
 
         // Plain DNS and intercepted DoT belong to the engine's own proxy: no egress decision and
         // no hostname decision of their own, so they are neither `PendingHostname` nor admitted.
-        let (mode, admission) = classify_syn(
-            Arc::clone(&policy),
+        let (mode, admission, refusal) = classify_syn(
+            snapshot(),
             None,
             DnsPortType::Dns,
             "203.0.113.9:53".parse().unwrap(),
@@ -1961,10 +2121,11 @@ mod tests {
         );
         assert!(matches!(mode, TcpAcceptMode::AcceptImmediately));
         assert!(matches!(admission, FlowPolicy::PortProxy));
+        assert_eq!(refusal, None, "a port-owned flow refuses nothing");
 
         let tls = tls_state_with_intercepted_ports(vec![853]);
-        let (mode, admission) = classify_syn(
-            Arc::clone(&policy),
+        let (mode, admission, refusal) = classify_syn(
+            snapshot(),
             None,
             DnsPortType::EncryptedDns,
             "203.0.113.9:853".parse().unwrap(),
@@ -1973,12 +2134,23 @@ mod tests {
         );
         assert!(matches!(mode, TcpAcceptMode::AcceptImmediately));
         assert!(matches!(admission, FlowPolicy::PortProxy));
+        assert_eq!(refusal, None, "an intercepted DoT flow refuses nothing");
 
         // DoT without TLS interception and an alternative DNS protocol are refused outright, so
-        // the guest's stub falls back to plain TCP/53.
-        for port_type in [DnsPortType::EncryptedDns, DnsPortType::AlternativeDns] {
-            let (mode, admission) = classify_syn(
-                Arc::clone(&policy),
+        // the guest's stub falls back to plain TCP/53. Each is its own site, so one cannot hide
+        // behind the other in a record.
+        for (port_type, expected) in [
+            (
+                DnsPortType::EncryptedDns,
+                (RefusalSite::TcpDot, RefusalLayer::Tenant),
+            ),
+            (
+                DnsPortType::AlternativeDns,
+                (RefusalSite::TcpAltDns, RefusalLayer::Tenant),
+            ),
+        ] {
+            let (mode, admission, refusal) = classify_syn(
+                snapshot(),
                 None,
                 port_type,
                 "203.0.113.9:853".parse().unwrap(),
@@ -1987,12 +2159,14 @@ mod tests {
             );
             assert!(matches!(mode, TcpAcceptMode::Reject));
             assert!(matches!(admission, FlowPolicy::Denied));
+            assert_eq!(refusal, Some(expected));
         }
 
-        // A platform-floor denial never carries an admissible policy, whatever the tenant says.
+        // A platform-floor denial never carries an admissible policy, whatever the tenant says,
+        // and it is the floor's refusal rather than the tenant's.
         let floor = NetworkPolicy::none();
-        let (mode, admission) = classify_syn(
-            Arc::clone(&policy),
+        let (mode, admission, refusal) = classify_syn(
+            snapshot(),
             Some(&floor),
             DnsPortType::Other,
             other,
@@ -2001,20 +2175,16 @@ mod tests {
         );
         assert!(matches!(mode, TcpAcceptMode::Reject));
         assert!(matches!(admission, FlowPolicy::Denied));
+        assert_eq!(refusal, Some((RefusalSite::TcpSyn, RefusalLayer::Platform)));
 
         // An allow is admitted at the SYN and carries the very snapshot that was evaluated.
-        let (mode, admission) = classify_syn(
-            Arc::clone(&policy),
-            None,
-            DnsPortType::Other,
-            other,
-            &shared,
-            None,
-        );
+        let (mode, admission, refusal) =
+            classify_syn(snapshot(), None, DnsPortType::Other, other, &shared, None);
         assert!(matches!(mode, TcpAcceptMode::WaitForUpstream));
+        assert_eq!(refusal, None, "an allowed SYN refuses nothing");
         match admission {
-            FlowPolicy::Admitted(snapshot) => assert!(
-                Arc::ptr_eq(&snapshot, &policy),
+            FlowPolicy::Admitted(admitted) => assert!(
+                Arc::ptr_eq(admitted.policy(), &policy),
                 "an admitted flow must keep the evaluated snapshot, not a copy"
             ),
             _ => panic!("an allowed SYN must be admitted"),
@@ -2027,16 +2197,23 @@ mod tests {
                 .deny_domain("blocked.example")
                 .expect("domain"),
         );
-        let (mode, admission) =
-            classify_syn(deferred, None, DnsPortType::Other, other, &shared, None);
+        let (mode, admission, refusal) = classify_syn(
+            PolicySnapshot::initial(deferred),
+            None,
+            DnsPortType::Other,
+            other,
+            &shared,
+            None,
+        );
         assert!(matches!(mode, TcpAcceptMode::AcceptImmediately));
         assert!(matches!(admission, FlowPolicy::PendingHostname));
+        assert_eq!(refusal, None, "a deferred decision has not refused yet");
 
         // A default deny is a reset unless the guest can be answered with a readable denial.
         let deny = Arc::new(NetworkPolicy::none());
         let http: SocketAddr = "203.0.113.9:80".parse().unwrap();
-        let (mode, admission) = classify_syn(
-            Arc::clone(&deny),
+        let (mode, admission, refusal) = classify_syn(
+            PolicySnapshot::initial(Arc::clone(&deny)),
             None,
             DnsPortType::Other,
             http,
@@ -2045,11 +2222,20 @@ mod tests {
         );
         assert!(matches!(mode, TcpAcceptMode::Reject));
         assert!(matches!(admission, FlowPolicy::Denied));
+        assert_eq!(refusal, Some((RefusalSite::TcpSyn, RefusalLayer::Tenant)));
 
         shared.set_http_config(HttpConfig::default());
-        let (mode, admission) = classify_syn(deny, None, DnsPortType::Other, http, &shared, None);
+        let (mode, admission, refusal) = classify_syn(
+            PolicySnapshot::initial(Arc::clone(&deny)),
+            None,
+            DnsPortType::Other,
+            http,
+            &shared,
+            None,
+        );
         assert!(matches!(mode, TcpAcceptMode::RespondWithDenial));
         assert!(matches!(admission, FlowPolicy::Denied));
+        assert_eq!(refusal, Some((RefusalSite::TcpSyn, RefusalLayer::Tenant)));
 
         // An explicit deny is always a reset, even with denial responses on for that port: only a
         // flow that fell through to `default_egress` gets the readable 403. The proxy tests build
@@ -2061,10 +2247,17 @@ mod tests {
                 .build()
                 .expect("explicit deny rule"),
         );
-        let (mode, admission) =
-            classify_syn(explicit, None, DnsPortType::Other, http, &shared, None);
+        let (mode, admission, refusal) = classify_syn(
+            PolicySnapshot::initial(explicit),
+            None,
+            DnsPortType::Other,
+            http,
+            &shared,
+            None,
+        );
         assert!(matches!(mode, TcpAcceptMode::Reject));
         assert!(matches!(admission, FlowPolicy::Denied));
+        assert_eq!(refusal, Some((RefusalSite::TcpSyn, RefusalLayer::Tenant)));
     }
 
     /// Build a disposable TLS state whose only persistent CA files live in an
@@ -2130,7 +2323,9 @@ mod tests {
             dst,
             &mut network.sockets,
             TcpAcceptMode::WaitForUpstream,
-            FlowPolicy::Admitted(Arc::new(NetworkPolicy::allow_all())),
+            FlowPolicy::Admitted(PolicySnapshot::initial(
+                Arc::new(NetworkPolicy::allow_all())
+            )),
             Some(Arc::clone(&selected)),
         ));
         for _ in 0..16 {
@@ -2154,7 +2349,9 @@ mod tests {
             dst,
             &mut network.sockets,
             TcpAcceptMode::WaitForUpstream,
-            FlowPolicy::Admitted(Arc::new(NetworkPolicy::allow_all())),
+            FlowPolicy::Admitted(PolicySnapshot::initial(
+                Arc::new(NetworkPolicy::allow_all())
+            )),
             None,
         ));
         for _ in 0..16 {
@@ -2178,13 +2375,8 @@ mod tests {
             now: Instant,
         ) {
             let frame = device.stage_next_frame().expect("expected staged frame");
-            if handle_gateway_icmp_echo(
-                frame,
-                poll_config,
-                shared,
-                &NetworkPolicy::allow_all(),
-                None,
-            ) {
+            let allow_all = PolicySnapshot::initial(Arc::new(NetworkPolicy::allow_all()));
+            if handle_gateway_icmp_echo(frame, poll_config, shared, &allow_all, None) {
                 device.drop_staged_frame();
                 return;
             }
@@ -3571,7 +3763,7 @@ mod tests {
     /// applies to the next echo request, and the platform floor is still independent of it.
     #[test]
     fn gateway_icmp_echo_follows_the_live_tenant_policy() {
-        let shared = SharedState::new(4);
+        let (shared, sink) = recording_state(4);
         let gateway = Ipv4Addr::new(100, 96, 0, 1);
         let guest = Ipv4Addr::new(100, 96, 0, 2);
         shared.set_gateway_ips(Some(gateway), None);
@@ -3611,6 +3803,13 @@ mod tests {
             shared.rx_ring.pop().is_none(),
             "a denying policy must not answer the echo"
         );
+        let recorded = sink.take();
+        assert_eq!(recorded.len(), 1, "the refused echo is recorded");
+        assert_eq!(recorded[0].layer, RefusalLayer::Tenant);
+        assert_eq!(
+            recorded[0].revision, 1,
+            "the revision the cursor decided with"
+        );
 
         assert_eq!(policy.replace(NetworkPolicy::allow_all()), Ok(2));
         assert!(handle_gateway_icmp_echo(
@@ -3624,6 +3823,7 @@ mod tests {
             shared.rx_ring.pop().is_some(),
             "the cursor must observe the replacement on the next frame"
         );
+        assert!(sink.take().is_empty(), "an allowed echo is not a refusal");
 
         // The floor is not reachable through the handle: a tenant allow never relaxes it.
         let floor = NetworkPolicy::from_profiles([crate::policy::NetworkProfile::Public]);
@@ -3637,6 +3837,828 @@ mod tests {
         assert!(
             shared.rx_ring.pop().is_none(),
             "the platform floor must still refuse the gateway echo"
+        );
+        let recorded = sink.take();
+        assert_eq!(recorded.len(), 1);
+        assert_eq!(recorded[0].layer, RefusalLayer::Platform);
+        assert_eq!(recorded[0].revision, 2, "the tenant revision in force");
+    }
+    // ─────────────────────────────────────────────────────────────────────
+    // Egress refusal records (R4 `tcp-syn`, `tcp-dot`, `tcp-alt-dns`, the
+    // steering drops, `udp` and the gateway `icmp` echo).
+    //
+    // The SYN sites live in the poll loop, which has no shutdown API, so they
+    // are driven through the real loop in a child process. The UDP and gateway
+    // echo sites each have their own function and are driven directly.
+    // ─────────────────────────────────────────────────────────────────────
+
+    /// Re-run this test in a child process, because the poll loop has no shutdown API.
+    ///
+    /// Returns `true` in the parent, after the child passed, so the caller can return.
+    fn run_poll_loop_in_child(test_name: &str, child_env: &str) -> bool {
+        if std::env::var_os(child_env).is_some() {
+            return false;
+        }
+
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", test_name, "--nocapture"])
+            .env(child_env, "1")
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            output.status.success(),
+            "poll-loop child failed:\n{stdout}\n{}",
+            String::from_utf8_lossy(&output.stderr),
+        );
+        // A mistyped `--exact` name would run zero tests and still exit 0.
+        assert!(
+            stdout.contains("1 passed"),
+            "the child must run exactly one test:\n{stdout}"
+        );
+
+        true
+    }
+
+    /// Start the real poll loop on its own thread, as the production engine does.
+    fn spawn_poll_loop(
+        shared: &Arc<SharedState>,
+        policy: NetworkPolicyHandle,
+        platform_policy: Option<NetworkPolicy>,
+    ) {
+        let loop_shared = shared.clone();
+        let handle = tokio::runtime::Handle::current();
+        std::thread::spawn(move || {
+            smoltcp_poll_loop(
+                loop_shared,
+                leak_poll_config(),
+                policy,
+                platform_policy,
+                DnsConfig::default(),
+                None,
+                vec![],
+                false,
+                None,
+                None,
+                TcpAcceptQueueSize::DEFAULT,
+                None,
+                handle,
+                SecretsHandle::new(Default::default()),
+                Arc::new(OutboundRouting::default()),
+                PollLoopHost::default(),
+            );
+        });
+    }
+
+    /// Wait until the guest receives a TCP reply, returning `(is_syn, is_rst)`.
+    async fn wait_for_tcp_reply(shared: &Arc<SharedState>) -> (bool, bool) {
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                if let Some((_, _, syn, _, rst)) = last_tcp_reply(shared) {
+                    return (syn, rst);
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("the guest never saw a TCP reply")
+    }
+
+    /// Push an ARP request behind the frames under test: its reply proves the poll loop drained
+    /// everything queued before it.
+    async fn wait_for_arp_fence(shared: &Arc<SharedState>) {
+        shared
+            .tx_ring
+            .push(build_arp_request_frame(GUEST_MAC, GUEST_IP, GATEWAY_IP))
+            .unwrap();
+        shared.tx_wake.wake();
+
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                let mut answered = false;
+                while let Some(frame) = shared.rx_ring.pop() {
+                    answered |= frame.len() >= 14 && frame[12..14] == [0x08, 0x06];
+                }
+                if answered {
+                    return;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("the ARP fence was never answered");
+    }
+
+    /// The refusal a refused SYN to `dst` produces, as the record contract states it.
+    fn syn_refusal(dst: SocketAddr, layer: RefusalLayer, name: Option<&str>) -> NetworkRefusal {
+        NetworkRefusal {
+            site: RefusalSite::TcpSyn,
+            layer,
+            protocol: WireProtocol::Tcp,
+            dst_ip: Some(dst.ip()),
+            dst_port: Some(dst.port()),
+            name: name.map(str::to_owned),
+            name_source: if name.is_some() {
+                NameSource::DnsCache
+            } else {
+                NameSource::Absent
+            },
+            revision: 1,
+        }
+    }
+
+    /// A refused SYN is one record per decision: the socket that answers the denial absorbs a
+    /// retransmitted SYN instead of deciding (and recording) again.
+    #[test]
+    fn denied_syn_is_recorded_once() {
+        if run_poll_loop_in_child(
+            "engine::netstack::poll::tests::denied_syn_is_recorded_once",
+            "MSB_TEST_DENIED_SYN_RECORD_CHILD",
+        ) {
+            return;
+        }
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            tokio::time::timeout(
+                std::time::Duration::from_secs(30),
+                check_denied_syn_records_once(),
+            )
+            .await
+            .expect("denied SYN recording timed out");
+        });
+    }
+
+    async fn check_denied_syn_records_once() {
+        use microsandbox_types::HttpConfig;
+
+        let (shared, sink) = recording_state(256);
+        // A default deny on a readable port keeps a socket on the refused flow, so the guest's
+        // retransmission reaches that socket.
+        shared.set_http_config(HttpConfig::default());
+        let dst = SocketAddr::new(Ipv4Addr::from(SERVER_IP).into(), 80);
+        // A cached name is evidence for the destination the guest used, normalized on the way out.
+        cache_name(&shared, "Api.Example.COM.", dst.ip());
+
+        let policy = NetworkPolicyHandle::new(NetworkPolicy::none());
+        spawn_poll_loop(&shared, policy.clone(), None);
+
+        // Resolve the gateway MAC first, so every reply can be addressed to the guest.
+        shared
+            .tx_ring
+            .push(build_arp_request_frame(GUEST_MAC, GUEST_IP, GATEWAY_IP))
+            .unwrap();
+        let syn = build_tcp_frame(54321, dst.port(), TcpControl::Syn, 1000, None, &[]);
+        shared.tx_ring.push(syn.clone()).unwrap();
+        shared.tx_wake.wake();
+
+        let (is_syn, is_rst) = wait_for_tcp_reply(&shared).await;
+        assert!(
+            is_syn && !is_rst,
+            "the denial socket must answer the refused SYN with a SYN-ACK"
+        );
+
+        shared.tx_ring.push(syn).unwrap();
+        wait_for_arp_fence(&shared).await;
+
+        let recorded = sink.take();
+        assert_eq!(
+            recorded,
+            vec![syn_refusal(
+                dst,
+                RefusalLayer::Tenant,
+                Some("api.example.com")
+            )],
+            "one record for the refused decision, and none for the retransmission"
+        );
+
+        // An admitted SYN is not a refusal. The gateway destination is dialed on loopback, so no
+        // guest traffic leaves the host.
+        assert_eq!(policy.replace(NetworkPolicy::allow_all()), Ok(2));
+        let guest_ip = IpAddress::Ipv4(Ipv4Addr::from(GUEST_IP));
+        let gateway_ip = IpAddress::Ipv4(Ipv4Addr::from(GATEWAY_IP));
+        let mut allowed = build_tcp_frame(54322, 8080, TcpControl::Syn, 2000, None, &[]);
+        let mut ipv4 = Ipv4Packet::new_unchecked(&mut allowed[14..34]);
+        ipv4.set_dst_addr(Ipv4Addr::from(GATEWAY_IP));
+        ipv4.fill_checksum();
+        TcpPacket::new_unchecked(&mut allowed[34..]).fill_checksum(&guest_ip, &gateway_ip);
+        shared.tx_ring.push(allowed).unwrap();
+        wait_for_arp_fence(&shared).await;
+
+        assert!(sink.take().is_empty(), "an admitted SYN is not recorded");
+    }
+
+    /// A `Reject` SYN installs no socket, so nothing can absorb a retransmission: each SYN is a
+    /// new refused decision and gets its own record.
+    ///
+    /// This is the plan's D3 and the specification's "one record per refused decision", stated
+    /// as behaviour rather than left implied. The per-site bucket bounds it, so a client that
+    /// retransmits costs at most that site's tokens.
+    #[test]
+    fn a_retransmitted_rejected_syn_is_a_new_record() {
+        if run_poll_loop_in_child(
+            "engine::netstack::poll::tests::a_retransmitted_rejected_syn_is_a_new_record",
+            "MSB_TEST_REJECTED_SYN_RECORD_CHILD",
+        ) {
+            return;
+        }
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            tokio::time::timeout(
+                std::time::Duration::from_secs(30),
+                check_retransmitted_rejected_syn_records_again(),
+            )
+            .await
+            .expect("rejected SYN recording timed out");
+        });
+    }
+
+    async fn check_retransmitted_rejected_syn_records_again() {
+        use microsandbox_types::HttpConfig;
+
+        let (shared, sink) = recording_state(256);
+        // The denial responder only answers readable ports; this one is refused outright, so the
+        // flow is a `Reject` and no socket is created for it.
+        shared.set_http_config(HttpConfig::default());
+        let dst = SocketAddr::new(Ipv4Addr::from(SERVER_IP).into(), 9999);
+
+        let policy = NetworkPolicyHandle::new(NetworkPolicy::none());
+        spawn_poll_loop(&shared, policy, None);
+
+        shared
+            .tx_ring
+            .push(build_arp_request_frame(GUEST_MAC, GUEST_IP, GATEWAY_IP))
+            .unwrap();
+        let syn = build_tcp_frame(54321, dst.port(), TcpControl::Syn, 1000, None, &[]);
+        shared.tx_ring.push(syn.clone()).unwrap();
+        shared.tx_wake.wake();
+
+        let (is_syn, is_rst) = wait_for_tcp_reply(&shared).await;
+        assert!(
+            is_rst && !is_syn,
+            "a rejected SYN must be answered with a reset, not a SYN-ACK"
+        );
+
+        // The same SYN again: a retransmission of a flow nothing tracks.
+        shared.tx_ring.push(syn).unwrap();
+        wait_for_arp_fence(&shared).await;
+
+        let recorded = sink.take();
+        assert_eq!(
+            recorded,
+            vec![
+                syn_refusal(dst, RefusalLayer::Tenant, None),
+                syn_refusal(dst, RefusalLayer::Tenant, None)
+            ],
+            "each rejected SYN is its own decision; only a socket absorbs a retransmission"
+        );
+    }
+
+    /// A SYN the platform floor refuses is the platform's refusal, even though the record carries
+    /// the tenant revision.
+    #[test]
+    fn platform_floor_syn_refusal_is_platform_layer() {
+        if run_poll_loop_in_child(
+            "engine::netstack::poll::tests::platform_floor_syn_refusal_is_platform_layer",
+            "MSB_TEST_PLATFORM_SYN_RECORD_CHILD",
+        ) {
+            return;
+        }
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            tokio::time::timeout(
+                std::time::Duration::from_secs(30),
+                check_platform_floor_syn_refusal(),
+            )
+            .await
+            .expect("platform-floor SYN recording timed out");
+        });
+    }
+
+    async fn check_platform_floor_syn_refusal() {
+        let (shared, sink) = recording_state(256);
+        // The tenant allows everything: only the floor refuses, and it refuses a private address.
+        let private = Ipv4Addr::new(10, 0, 0, 7);
+        let dst = SocketAddr::new(private.into(), 443);
+        let floor = NetworkPolicy::from_profiles([crate::policy::NetworkProfile::Public]);
+
+        spawn_poll_loop(
+            &shared,
+            NetworkPolicyHandle::new(NetworkPolicy::allow_all()),
+            Some(floor),
+        );
+
+        shared
+            .tx_ring
+            .push(build_arp_request_frame(GUEST_MAC, GUEST_IP, GATEWAY_IP))
+            .unwrap();
+        let mut syn = build_tcp_frame(54321, dst.port(), TcpControl::Syn, 1000, None, &[]);
+        let guest_ip = IpAddress::Ipv4(Ipv4Addr::from(GUEST_IP));
+        let dst_ip = IpAddress::Ipv4(private);
+        let mut ipv4 = Ipv4Packet::new_unchecked(&mut syn[14..34]);
+        ipv4.set_dst_addr(private);
+        ipv4.fill_checksum();
+        TcpPacket::new_unchecked(&mut syn[34..]).fill_checksum(&guest_ip, &dst_ip);
+        shared.tx_ring.push(syn).unwrap();
+        shared.tx_wake.wake();
+
+        wait_for_arp_fence(&shared).await;
+
+        assert_eq!(
+            sink.take(),
+            vec![syn_refusal(dst, RefusalLayer::Platform, None)],
+            "the floor's own refusal is recorded at the platform layer"
+        );
+    }
+
+    /// A steered TCP drop is recorded at its own site: DoT without TLS interception is `tcp-dot`,
+    /// not a policy refusal. (`tcp-alt-dns` has no reachable deny path today —
+    /// `DnsPortType::from_tcp` never returns `AlternativeDns` — so only the pure classification
+    /// test pins it.)
+    #[test]
+    fn steering_tcp_dot_is_recorded() {
+        if run_poll_loop_in_child(
+            "engine::netstack::poll::tests::steering_tcp_dot_is_recorded",
+            "MSB_TEST_TCP_DOT_RECORD_CHILD",
+        ) {
+            return;
+        }
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            tokio::time::timeout(
+                std::time::Duration::from_secs(30),
+                check_steering_tcp_dot_record(),
+            )
+            .await
+            .expect("DoT steering recording timed out");
+        });
+    }
+
+    async fn check_steering_tcp_dot_record() {
+        let (shared, sink) = recording_state(256);
+        // The tenant allows everything: only the steering rule refuses.
+        let dst = SocketAddr::new(Ipv4Addr::from(SERVER_IP).into(), 853);
+        spawn_poll_loop(
+            &shared,
+            NetworkPolicyHandle::new(NetworkPolicy::allow_all()),
+            None,
+        );
+
+        shared
+            .tx_ring
+            .push(build_arp_request_frame(GUEST_MAC, GUEST_IP, GATEWAY_IP))
+            .unwrap();
+        shared
+            .tx_ring
+            .push(build_tcp_frame(
+                54321,
+                dst.port(),
+                TcpControl::Syn,
+                1000,
+                None,
+                &[],
+            ))
+            .unwrap();
+        shared.tx_wake.wake();
+
+        wait_for_arp_fence(&shared).await;
+
+        assert_eq!(
+            sink.take(),
+            vec![NetworkRefusal {
+                site: RefusalSite::TcpDot,
+                layer: RefusalLayer::Tenant,
+                protocol: WireProtocol::Tcp,
+                dst_ip: Some(dst.ip()),
+                dst_port: Some(dst.port()),
+                name: None,
+                name_source: NameSource::Absent,
+                revision: 1,
+            }],
+            "a steering drop is its own site, and only one record"
+        );
+    }
+
+    /// The state `relay_udp_frame` needs, owning no published ports.
+    struct UdpDrive {
+        shared: Arc<SharedState>,
+        config: PollLoopConfig,
+        publisher: PortPublisher,
+        relay: UdpRelay,
+    }
+
+    impl UdpDrive {
+        fn new(shared: &Arc<SharedState>) -> Self {
+            let config = leak_poll_config();
+            let handle = tokio::runtime::Handle::current();
+            let (_commands, command_rx) = tokio::sync::mpsc::unbounded_channel();
+            let publisher = PortPublisher::new(
+                &[],
+                TcpAcceptQueueSize::DEFAULT,
+                None,
+                config.guest_ipv4,
+                config.guest_ipv6,
+                config.gateway.ipv4,
+                config.gateway.ipv6,
+                config.gateway_mac,
+                config.guest_mac,
+                NetworkPolicyHandle::new(NetworkPolicy::allow_all()),
+                shared.clone(),
+                &handle,
+                command_rx,
+            );
+            let relay = UdpRelay::new(
+                shared.clone(),
+                config.gateway_mac,
+                config.guest_mac,
+                config.mtu,
+                handle,
+                Arc::new(OutboundRouting::default()),
+            );
+
+            Self {
+                shared: shared.clone(),
+                config,
+                publisher,
+                relay,
+            }
+        }
+
+        /// Relay one guest datagram to `dst`.
+        fn relay(
+            &mut self,
+            dst: SocketAddr,
+            policy: &PolicySnapshot,
+            platform_policy: Option<&NetworkPolicy>,
+            tls_state: Option<&TlsState>,
+        ) {
+            let IpAddr::V4(dst_addr) = dst.ip() else {
+                panic!("the relay harness drives IPv4 datagrams");
+            };
+            let frame = build_udp_frame(GUEST_IP, dst_addr.octets(), 40000, dst.port());
+            let src = SocketAddr::new(Ipv4Addr::from(GUEST_IP).into(), 40000);
+
+            relay_udp_frame(
+                &frame,
+                src,
+                dst,
+                &self.config,
+                policy,
+                platform_policy,
+                &self.shared,
+                &mut self.publisher,
+                tls_state,
+                &mut self.relay,
+            );
+        }
+    }
+
+    /// The refusal a refused UDP datagram to `dst` produces at `site`.
+    fn udp_refusal(site: RefusalSite, dst: SocketAddr, name: Option<&str>) -> NetworkRefusal {
+        NetworkRefusal {
+            site,
+            layer: RefusalLayer::Tenant,
+            protocol: WireProtocol::Udp,
+            dst_ip: Some(dst.ip()),
+            dst_port: Some(dst.port()),
+            name: name.map(str::to_owned),
+            name_source: if name.is_some() {
+                NameSource::DnsCache
+            } else {
+                NameSource::Absent
+            },
+            revision: 1,
+        }
+    }
+
+    #[tokio::test]
+    async fn udp_policy_drop_is_recorded() {
+        let (shared, sink) = recording_state(8);
+        let dst: SocketAddr = "203.0.113.10:9999".parse().unwrap();
+        cache_name(&shared, "Blocked.Example.", dst.ip());
+        let policy = PolicySnapshot::initial(Arc::new(NetworkPolicy::none()));
+
+        UdpDrive::new(&shared).relay(dst, &policy, None, None);
+
+        assert_eq!(
+            sink.take(),
+            vec![udp_refusal(RefusalSite::Udp, dst, Some("blocked.example"))]
+        );
+    }
+
+    #[tokio::test]
+    async fn udp_allow_is_not_recorded() {
+        let (shared, sink) = recording_state(8);
+        // The gateway, so an allowed datagram is relayed to loopback instead of the real network.
+        let dst = SocketAddr::new(Ipv4Addr::from(GATEWAY_IP).into(), 9999);
+        let policy = PolicySnapshot::initial(Arc::new(NetworkPolicy::allow_all()));
+
+        UdpDrive::new(&shared).relay(dst, &policy, None, None);
+
+        assert!(
+            sink.take().is_empty(),
+            "an allowed datagram is not a refusal"
+        );
+    }
+
+    /// The floor is evaluated first at every site that consults it: a floor-only refusal is
+    /// `platform`, a tenant-only refusal is `tenant`, and when both refuse it is `platform`.
+    #[tokio::test]
+    async fn udp_refusal_layer_follows_the_floor() {
+        let floor = NetworkPolicy::from_profiles([crate::policy::NetworkProfile::Public]);
+        let private: SocketAddr = "10.0.0.7:9999".parse().unwrap();
+        let external: SocketAddr = "203.0.113.10:9999".parse().unwrap();
+
+        for (tenant, platform_denies, dst, expected) in [
+            (
+                NetworkPolicy::allow_all(),
+                true,
+                private,
+                RefusalLayer::Platform,
+            ),
+            (NetworkPolicy::none(), false, external, RefusalLayer::Tenant),
+            (NetworkPolicy::none(), true, private, RefusalLayer::Platform),
+        ] {
+            let (shared, sink) = recording_state(8);
+            let policy = PolicySnapshot::initial(Arc::new(tenant));
+            let platform = platform_denies.then_some(&floor);
+
+            UdpDrive::new(&shared).relay(dst, &policy, platform, None);
+
+            let recorded = sink.take();
+            assert_eq!(recorded.len(), 1, "exactly one refusal for {dst}");
+            assert_eq!(recorded[0].layer, expected, "layer for {dst}");
+        }
+    }
+
+    /// The steering drops are their own sites, so a retrying client cannot crowd out the policy
+    /// drop's records.
+    #[tokio::test]
+    async fn steering_udp_drops_are_recorded_at_their_own_sites() {
+        let (shared, sink) = recording_state(8);
+        let policy = PolicySnapshot::initial(Arc::new(NetworkPolicy::allow_all()));
+        // The intercepted-port TLS state needs the process-level crypto provider.
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let tls_state = tls_state_with_intercepted_ports(vec![443]);
+        let mut drive = UdpDrive::new(&shared);
+
+        // QUIC on an intercepted port, with name evidence from the guest's own DNS answer.
+        let quic: SocketAddr = "203.0.113.10:443".parse().unwrap();
+        cache_name(&shared, "quic.example", quic.ip());
+        drive.relay(quic, &policy, None, Some(&tls_state));
+        assert_eq!(
+            sink.take(),
+            vec![udp_refusal(
+                RefusalSite::UdpQuic,
+                quic,
+                Some("quic.example")
+            )]
+        );
+
+        // Alternative DNS protocols on well-known ports.
+        let alt_dns: SocketAddr = "203.0.113.10:5353".parse().unwrap();
+        drive.relay(alt_dns, &policy, None, None);
+        assert_eq!(
+            sink.take(),
+            vec![udp_refusal(
+                RefusalSite::UdpAltDns,
+                alt_dns,
+                Some("quic.example")
+            )]
+        );
+
+        // The defensive UDP/53 drop, which the DNS interceptor normally makes unreachable.
+        let dns: SocketAddr = "203.0.113.10:53".parse().unwrap();
+        drive.relay(dns, &policy, None, None);
+        assert_eq!(
+            sink.take(),
+            vec![udp_refusal(
+                RefusalSite::UdpDnsPort,
+                dns,
+                Some("quic.example")
+            )]
+        );
+    }
+
+    /// A UDP refusal reports the revision of the cursor snapshot the decision used, not the
+    /// revision in force when the datagram was sent.
+    #[tokio::test]
+    async fn udp_refusal_reports_the_cursor_revision_after_a_replace() {
+        let (shared, sink) = recording_state(8);
+        let policy = NetworkPolicyHandle::new(NetworkPolicy::none());
+        let mut cursor = policy.cursor();
+        let dst: SocketAddr = "203.0.113.10:9999".parse().unwrap();
+        let mut drive = UdpDrive::new(&shared);
+
+        drive.relay(dst, cursor.current(), None, None);
+        assert_eq!(sink.take(), vec![udp_refusal(RefusalSite::Udp, dst, None)]);
+
+        assert_eq!(policy.replace(NetworkPolicy::none()), Ok(2));
+        drive.relay(dst, cursor.current(), None, None);
+        assert_eq!(
+            sink.take(),
+            vec![NetworkRefusal {
+                revision: 2,
+                ..udp_refusal(RefusalSite::Udp, dst, None)
+            }]
+        );
+    }
+
+    /// Performance sanity for the refusal path: one refused datagram must not cost the poll thread
+    /// much more than a refusal-shaped no-op.
+    ///
+    /// The two runs differ only in whether a sink is installed, which isolates the record path —
+    /// the engine's `Denial` assembly, the name lookup and the sink call. The runtime's sink does no
+    /// I/O (it checks a per-site token bucket and enqueues without waiting), so a sink that only
+    /// collects is a fair stand-in and also the worst case: it keeps every record instead of
+    /// dropping all but 20 per second.
+    ///
+    /// Ignored because it is a measurement, not a behaviour: a shared machine is not a place to
+    /// fail a build on a stopwatch. Run it with
+    /// `cargo test -p microsandbox-network --lib -- --ignored udp_refusal_cost`.
+    #[tokio::test]
+    #[ignore = "performance sanity: measures per-datagram cost, run explicitly"]
+    async fn udp_refusal_cost_stays_within_three_times_the_sink_free_cost() {
+        use std::time::{Duration, Instant};
+
+        /// Large enough that per-call noise averages out, small enough to stay quick.
+        const DATAGRAMS: u32 = 20_000;
+        /// Independent rounds; the best of each configuration is compared, so a scheduling spike in
+        /// one round cannot fail the test.
+        const ROUNDS: usize = 3;
+        const WARMUP: u32 = 1_000;
+
+        fn per_datagram(
+            shared: &Arc<SharedState>,
+            policy: &PolicySnapshot,
+            dst: SocketAddr,
+        ) -> Duration {
+            let mut drive = UdpDrive::new(shared);
+            for _ in 0..WARMUP {
+                drive.relay(dst, policy, None, None);
+            }
+            let started = Instant::now();
+            for _ in 0..DATAGRAMS {
+                drive.relay(dst, policy, None, None);
+            }
+            started.elapsed() / DATAGRAMS
+        }
+
+        let dst: SocketAddr = "203.0.113.10:9999".parse().unwrap();
+        let policy = PolicySnapshot::initial(Arc::new(NetworkPolicy::none()));
+        let sink_free = Arc::new(SharedState::new(64));
+        let (sink_installed, sink) = recording_state(64);
+
+        let mut without = Duration::MAX;
+        let mut with = Duration::MAX;
+        for _ in 0..ROUNDS {
+            without = without.min(per_datagram(&sink_free, &policy, dst));
+            with = with.min(per_datagram(&sink_installed, &policy, dst));
+        }
+
+        // The measurement is only about the record path if the record path actually ran.
+        assert_eq!(
+            sink.take().len(),
+            ROUNDS * (WARMUP + DATAGRAMS) as usize,
+            "every denied datagram must reach the sink"
+        );
+        eprintln!(
+            "per refused datagram: without sink {without:?}, with sink {with:?} ({}x)",
+            with.as_secs_f64() / without.as_secs_f64()
+        );
+        assert!(
+            with <= without * 3,
+            "recording a refusal cost {with:?} per datagram against {without:?} without a sink; \
+             the plan's bound is 3x"
+        );
+    }
+
+    /// `RefusalSink` with the runtime's flood rule: `capacity` refusals admitted per round, the
+    /// rest suppressed. The record itself is dropped, as the runtime's queue drops one when full:
+    /// what this measures is the engine side — the admission check, the name evidence and the
+    /// call.
+    struct LimitedSink {
+        capacity: u64,
+        asked: std::sync::atomic::AtomicU64,
+        recorded: std::sync::atomic::AtomicU64,
+    }
+
+    impl LimitedSink {
+        fn new(capacity: u64) -> Arc<Self> {
+            Arc::new(Self {
+                capacity,
+                asked: std::sync::atomic::AtomicU64::new(0),
+                recorded: std::sync::atomic::AtomicU64::new(0),
+            })
+        }
+
+        fn reset(&self) {
+            self.asked.store(0, Ordering::Relaxed);
+            self.recorded.store(0, Ordering::Relaxed);
+        }
+    }
+
+    impl crate::refusal::RefusalSink for LimitedSink {
+        fn admits(&self, _site: RefusalSite) -> bool {
+            self.asked.fetch_add(1, Ordering::Relaxed) < self.capacity
+        }
+
+        fn record(&self, _refusal: NetworkRefusal) {
+            self.recorded.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// The cost of a refused-datagram flood when every destination has a live `dns-cache`
+    /// binding, measured against the same flood with no sink at all.
+    ///
+    /// This is the measurement the plan's §8.5 fallback exists for. Before the fallback the sink
+    /// resolved the cached name for *every* refused datagram, admitted or not, and this measured
+    /// 3.3x; with the limiter ahead of the evidence it stays at the sink-free cost because only
+    /// the admitted refusals do the lookup. The sink here applies the runtime's rule (bucket
+    /// capacity, no refill), so the ratio is what a real flood costs.
+    ///
+    /// Run it with
+    /// `cargo test -p microsandbox-network --lib -- --ignored udp_refusal_cost_with_a_cached_name`.
+    #[tokio::test]
+    #[ignore = "performance sanity: measures per-datagram cost, run explicitly"]
+    async fn udp_refusal_cost_with_a_cached_name_stays_within_three_times_the_sink_free_cost() {
+        use std::time::{Duration, Instant};
+
+        const DATAGRAMS: u32 = 20_000;
+        const ROUNDS: usize = 3;
+        const WARMUP: u32 = 1_000;
+        /// The runtime's per-site bucket, so the flood is suppressed the way production is.
+        const CAPACITY: u64 = 256;
+
+        fn per_datagram(
+            shared: &Arc<SharedState>,
+            policy: &PolicySnapshot,
+            dst: SocketAddr,
+        ) -> Duration {
+            let mut drive = UdpDrive::new(shared);
+            for _ in 0..WARMUP {
+                drive.relay(dst, policy, None, None);
+            }
+            let started = Instant::now();
+            for _ in 0..DATAGRAMS {
+                drive.relay(dst, policy, None, None);
+            }
+            started.elapsed() / DATAGRAMS
+        }
+
+        let dst: SocketAddr = "203.0.113.10:9999".parse().unwrap();
+        let policy = PolicySnapshot::initial(Arc::new(NetworkPolicy::none()));
+        // Both configurations carry the same live binding, so the only difference between them is
+        // whether a sink is installed.
+        let sink_free = Arc::new(SharedState::new(64));
+        cache_name(&sink_free, "blocked.example", dst.ip());
+        let limited = LimitedSink::new(CAPACITY);
+        let sink_installed = Arc::new(SharedState::new(64));
+        cache_name(&sink_installed, "blocked.example", dst.ip());
+        sink_installed.set_refusal_sink(limited.clone());
+
+        let mut without = Duration::MAX;
+        let mut with = Duration::MAX;
+        for _ in 0..ROUNDS {
+            limited.reset();
+            without = without.min(per_datagram(&sink_free, &policy, dst));
+            with = with.min(per_datagram(&sink_installed, &policy, dst));
+            assert_eq!(
+                limited.asked.load(Ordering::Relaxed),
+                u64::from(WARMUP + DATAGRAMS),
+                "every refused datagram must reach the sink's admission check"
+            );
+            assert_eq!(
+                limited.recorded.load(Ordering::Relaxed),
+                CAPACITY,
+                "only the bucket's worth of refusals may build a record"
+            );
+        }
+
+        let ratio = with.as_secs_f64() / without.as_secs_f64();
+        eprintln!(
+            "per refused datagram with a cached name: without sink {without:?}, with a \
+             {CAPACITY}-record bucket {with:?} ({ratio}x)"
+        );
+        assert!(
+            with <= without * 3,
+            "a suppressed cached-name refusal cost {with:?} per datagram against {without:?} \
+             without a sink ({ratio}x); the plan's bound is 3x"
         );
     }
 }

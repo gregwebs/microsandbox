@@ -12,6 +12,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use bytes::Bytes;
+use microsandbox_types::{RefusalLayer, RefusalSite};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::sync::mpsc;
@@ -27,9 +28,10 @@ use crate::engine::tls::sni;
 use crate::engine::tls::state::TlsState;
 use crate::extensions::NetworkExtensions;
 use crate::netstack::shared::SharedState;
-use crate::policy::handle::NetworkPolicyHandle;
+use crate::policy::handle::{NetworkPolicyHandle, PolicySnapshot};
 use crate::policy::{EgressEvaluation, HostnameSource, NetworkPolicy, Protocol};
 use crate::proxy::ResolvedOutboundProxy;
+use crate::refusal::{self, Denial, NameEvidence};
 use crate::secrets::config::{SecretViolationAction, SecretsConfig};
 use crate::secrets::handler::{
     SecretsHandler, first_line_is_not_http_request, looks_like_http_request_prefix,
@@ -225,7 +227,7 @@ impl TcpProxy {
         // from the live policy: a replace that removes every domain rule must not erase a
         // pending hostname check. `FlowPolicy::Denied` never reaches this task; the dispatcher
         // answers it and continues.
-        let admitted: Option<Arc<NetworkPolicy>> = match policy_admission {
+        let admitted: Option<PolicySnapshot> = match policy_admission {
             FlowPolicy::PendingHostname => None,
             FlowPolicy::Admitted(snapshot) => Some(snapshot),
             // Neither state is ever dispatched to this task: the poll loop answers `Denied`
@@ -235,6 +237,20 @@ impl TcpProxy {
             // path is deliberately behaviour, not a debug assertion: a release build must fail
             // closed too.
             FlowPolicy::Denied | FlowPolicy::PortProxy => {
+                // The flow carries no snapshot, so this one refusal reads the live pair: no
+                // admission produced a revision to report.
+                refusal::record(
+                    &shared,
+                    Denial {
+                        site: RefusalSite::TcpProxyFailClosed,
+                        layer: RefusalLayer::Tenant,
+                        protocol: Protocol::Tcp,
+                        dst_ip: Some(guest_dst.ip()),
+                        dst_port: Some(guest_dst.port()),
+                        name: NameEvidence::CachedFor(guest_dst.ip()),
+                        revision: policy_handle.snapshot().revision(),
+                    },
+                );
                 proxy_connect.mark_policy_denied();
                 shared.proxy_wake.wake();
                 return Ok(());
@@ -286,7 +302,7 @@ impl TcpProxy {
         // that landed while the guest's first bytes were in flight still applies to it.
         let network_policy = match admitted {
             Some(snapshot) => snapshot,
-            None => policy_handle.load(),
+            None => policy_handle.snapshot(),
         };
 
         // Evaluate egress against the *guest* dst — the address the
@@ -298,6 +314,11 @@ impl TcpProxy {
             let source = match sni.as_deref() {
                 Some(name) => HostnameSource::Sni(name),
                 None => HostnameSource::CacheOnly,
+            };
+            // The hostname this flow holds, shared by the strict and the deny reports below.
+            let name = match sni.as_deref() {
+                Some(name) => NameEvidence::Sni(name),
+                None => NameEvidence::CachedFor(guest_dst.ip()),
             };
             match network_policy.evaluate_egress_with_source(
                 guest_dst,
@@ -314,6 +335,18 @@ impl TcpProxy {
                         sni.as_deref(),
                         &initial_buf,
                     ) {
+                        refusal::record(
+                            &shared,
+                            Denial {
+                                site: RefusalSite::TcpStrict,
+                                layer: RefusalLayer::Tenant,
+                                protocol: Protocol::Tcp,
+                                dst_ip: Some(guest_dst.ip()),
+                                dst_port: Some(guest_dst.port()),
+                                name,
+                                revision: network_policy.revision(),
+                            },
+                        );
                         tracing::debug!(
                             sni = sni.as_deref(),
                             dst = %guest_dst,
@@ -325,6 +358,18 @@ impl TcpProxy {
                     }
                 }
                 EgressEvaluation::Deny => {
+                    refusal::record(
+                        &shared,
+                        Denial {
+                            site: RefusalSite::TcpHostname,
+                            layer: RefusalLayer::Tenant,
+                            protocol: Protocol::Tcp,
+                            dst_ip: Some(guest_dst.ip()),
+                            dst_port: Some(guest_dst.port()),
+                            name,
+                            revision: network_policy.revision(),
+                        },
+                    );
                     tracing::debug!(
                         dst = %guest_dst,
                         source = source.label(),
@@ -351,6 +396,18 @@ impl TcpProxy {
                 }
                 EgressEvaluation::DeferUntilHostname => {
                     debug_assert!(false, "DeferUntilHostname leaked into TCP proxy task");
+                    refusal::record(
+                        &shared,
+                        Denial {
+                            site: RefusalSite::TcpHostname,
+                            layer: RefusalLayer::Tenant,
+                            protocol: Protocol::Tcp,
+                            dst_ip: Some(guest_dst.ip()),
+                            dst_port: Some(guest_dst.port()),
+                            name,
+                            revision: network_policy.revision(),
+                        },
+                    );
                     if shared.http_deny_response_enabled() {
                         initial_buf = peek_for_http_request(
                             &mut from_smoltcp,
@@ -390,6 +447,7 @@ impl TcpProxy {
                 policy_handle,
                 tls_state,
                 strict,
+                &network_policy,
                 proxy_connect,
                 extensions.clone(),
                 outbound_proxy,
@@ -467,6 +525,7 @@ impl TcpProxy {
                 policy_handle,
                 tls_state,
                 strict,
+                &network_policy,
                 proxy_connect,
                 extensions.clone(),
                 outbound_proxy,
@@ -475,24 +534,32 @@ impl TcpProxy {
             .await;
         }
 
+        // Every plain-HTTP handler reports its refusals against this flow's admitted snapshot:
+        // the handler reads the revision off the snapshot itself, so a decision and the revision
+        // it reports can never be paired wrongly.
         let mut late_connect_state = tls_state;
         let mut secrets_handler: Option<SecretsHandler> = if is_tls {
             None
         } else if enforce_http_authority {
             let host = extract_http_host(&initial_buf).unwrap_or_default();
-            Some(SecretsHandler::new_plain_http_policy(
-                &secrets,
-                &host,
-                guest_dst,
-                network_policy.clone(),
-                shared.clone(),
-            ))
+            Some(
+                SecretsHandler::new_plain_http_policy(
+                    &secrets,
+                    &host,
+                    guest_dst,
+                    network_policy.clone(),
+                    shared.clone(),
+                )
+                .with_refusal_reporting(shared.clone(), guest_dst, &network_policy),
+            )
         } else if !secrets.secrets.is_empty() {
             Some(match extract_http_host(&initial_buf) {
                 Some(host) => {
                     SecretsHandler::new_plain_http(&secrets, &host, guest_dst.ip(), &shared)
+                        .with_refusal_reporting(shared.clone(), guest_dst, &network_policy)
                 }
-                None => SecretsHandler::new_plain_http_invalid_host(&secrets),
+                None => SecretsHandler::new_plain_http_invalid_host(&secrets)
+                    .with_refusal_reporting(shared.clone(), guest_dst, &network_policy),
             })
         } else {
             None
@@ -566,6 +633,7 @@ impl TcpProxy {
                                     policy_handle,
                                     tls_state,
                                     strict,
+                                    &network_policy,
                                     proxy_connect,
                                     extensions.clone(),
                                     outbound_proxy,
@@ -688,7 +756,7 @@ pub fn spawn_tcp_proxy(
         to_smoltcp,
         shared,
         NetworkPolicyHandle::new(NetworkPolicy::clone(&network_policy)),
-        FlowPolicy::Admitted(network_policy),
+        FlowPolicy::Admitted(PolicySnapshot::initial(network_policy)),
         secrets,
         tls_state,
         strict,
@@ -742,6 +810,7 @@ async fn handle_connect_tunnel(
     policy_handle: NetworkPolicyHandle,
     tls_state: Arc<TlsState>,
     strict: bool,
+    admitted_policy: &PolicySnapshot,
     proxy_connect: Arc<ProxyConnectState>,
     extensions: NetworkExtensions,
     outbound_proxy: Option<Arc<ResolvedOutboundProxy>>,
@@ -750,16 +819,21 @@ async fn handle_connect_tunnel(
     let connect_req =
         parse_connect_request(buffer_connect_request(initial_buf, &mut from_smoltcp).await?)?;
 
-    let connect_headers =
-        match sanitize_connect_headers(connect_req.header_bytes(), &tls_state.secrets.load()) {
-            Ok(headers) => headers,
-            Err(action) => {
-                if matches!(action, SecretViolationAction::BlockAndTerminate) {
-                    shared.trigger_termination();
-                }
-                return Ok(());
+    let connect_headers = match sanitize_connect_headers(
+        connect_req.header_bytes(),
+        &tls_state.secrets.load(),
+        &shared,
+        guest_dst,
+        admitted_policy,
+    ) {
+        Ok(headers) => headers,
+        Err(action) => {
+            if matches!(action, SecretViolationAction::BlockAndTerminate) {
+                shared.trigger_termination();
             }
-        };
+            return Ok(());
+        }
+    };
 
     // Dial the proxy and forward the CONNECT request so it opens the tunnel.
     let mut proxy_stream = match preconnected_proxy {
@@ -779,7 +853,7 @@ async fn handle_connect_tunnel(
         // replacement decides whether the restriction applies), but the inner target is
         // authorized only by the outer connection's admission, so a replacement never revokes
         // an already-open tunnel.
-        let network_policy = policy_handle.load();
+        let network_policy = policy_handle.snapshot();
         if strict
             && let Some(expected_sni) = connect_req.target.expected_sni.as_deref()
             && network_policy.allows_egress_via_hostname(
@@ -789,6 +863,21 @@ async fn handle_connect_tunnel(
                 HostnameSource::Sni(expected_sni),
             )
         {
+            refusal::record(
+                &shared,
+                Denial {
+                    site: RefusalSite::ConnectStrict,
+                    layer: RefusalLayer::Tenant,
+                    protocol: Protocol::Tcp,
+                    // The socket the guest addressed, not the rewritten tunnel target: the
+                    // strict check decides on the target, but the record must not pair a
+                    // stand-in address with a port the guest never used.
+                    dst_ip: Some(guest_dst.ip()),
+                    dst_port: Some(guest_dst.port()),
+                    name: NameEvidence::HttpHost(expected_sni),
+                    revision: network_policy.revision(),
+                },
+            );
             tracing::debug!(
                 sni = %expected_sni,
                 dst = %tunnel_dst,
@@ -881,6 +970,9 @@ async fn handle_connect_tunnel(
     )
     .with_connect_authority(expected_sni)
     .with_initial_buf(tls_seed)
+    // Policy decides on the tunnel target; refusal records name the outer socket the guest
+    // actually addressed.
+    .with_refusal_destination(guest_dst)
     .try_run()
     .await
 }
@@ -1019,12 +1111,16 @@ async fn read_connect_response_headers(stream: &mut TcpStream) -> io::Result<(Ve
 fn sanitize_connect_headers<'a>(
     header_bytes: &'a [u8],
     secrets: &SecretsConfig,
+    shared: &Arc<SharedState>,
+    guest_dst: SocketAddr,
+    admitted_policy: &PolicySnapshot,
 ) -> Result<Cow<'a, [u8]>, SecretViolationAction> {
     if secrets.secrets.is_empty() {
         return Ok(Cow::Borrowed(header_bytes));
     }
 
-    let mut handler = SecretsHandler::new_plain_http_untrusted_metadata(secrets);
+    let mut handler = SecretsHandler::new_plain_http_untrusted_metadata(secrets)
+        .with_refusal_reporting(Arc::clone(shared), guest_dst, admitted_policy);
     handler.substitute(header_bytes)
 }
 
@@ -1430,6 +1526,9 @@ pub(crate) async fn peek_for_sni(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::policy::handle::INITIAL_NETWORK_POLICY_REVISION;
+    use crate::refusal::test_support::{CollectingSink, cache_name, recording_state};
+    use microsandbox_types::{NameSource, NetworkRefusal};
 
     /// Synthetic TLS ClientHello carrying SNI `example.com`. Bytes
     /// borrowed from `tls::sni` test fixtures so the parser sees a
@@ -1577,6 +1676,7 @@ mod tests {
             NetworkPolicyHandle::new(NetworkPolicy::default()),
             tls_state,
             false,
+            &PolicySnapshot::initial(Arc::new(NetworkPolicy::default())),
             proxy_connect.clone(),
             NetworkExtensions::default(),
             Some(Arc::new(outbound_proxy)),
@@ -1765,7 +1865,7 @@ mod tests {
         ] {
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
             let dst = listener.local_addr().unwrap();
-            let shared = Arc::new(shared_with("blocked.example", "127.0.0.1"));
+            let (shared, sink) = recording_shared_with("blocked.example", "127.0.0.1");
             shared.set_http_config(microsandbox_types::HttpConfig {
                 deny_response: enabled,
                 deny_response_format: HttpDenyResponseFormat::Json,
@@ -1798,7 +1898,7 @@ mod tests {
                 to_tx,
                 shared,
                 NetworkPolicyHandle::new(NetworkPolicy::clone(&policy)),
-                FlowPolicy::Admitted(policy),
+                FlowPolicy::Admitted(PolicySnapshot::initial(policy)),
                 Arc::new(SecretsConfig::default()),
                 None,
                 false,
@@ -1828,6 +1928,21 @@ mod tests {
                 tokio::time::timeout(Duration::from_millis(20), listener.accept())
                     .await
                     .is_err()
+            );
+            // One record for the refusal, from the flow's admitted revision. The 403 responder (or
+            // the silent close) presents that same decision and adds nothing.
+            assert_eq!(
+                sink.take(),
+                vec![NetworkRefusal {
+                    site: RefusalSite::TcpHostname,
+                    layer: RefusalLayer::Tenant,
+                    protocol: microsandbox_types::Protocol::Tcp,
+                    dst_ip: Some(dst.ip()),
+                    dst_port: Some(dst.port()),
+                    name: Some("blocked.example".to_owned()),
+                    name_source: NameSource::DnsCache,
+                    revision: INITIAL_NETWORK_POLICY_REVISION,
+                }]
             );
         }
     }
@@ -1946,6 +2061,13 @@ mod tests {
             StdDuration::from_secs(60),
         );
         shared
+    }
+
+    /// `shared_with`, plus a sink that collects every refusal the proxy records.
+    fn recording_shared_with(host: &str, ip: &str) -> (Arc<SharedState>, Arc<CollectingSink>) {
+        let (shared, sink) = recording_state(4);
+        cache_name(&shared, host, ip.parse().unwrap());
+        (shared, sink)
     }
 
     fn allow_https(domain: &str) -> Rule {
@@ -2259,13 +2381,29 @@ mod tests {
         }
     }
 
+    /// Shared state, guest destination and admitted snapshot for the `sanitize_connect_headers`
+    /// fixtures.
+    fn connect_headers_fixture() -> (Arc<SharedState>, SocketAddr) {
+        (
+            Arc::new(SharedState::new(4)),
+            "203.0.113.10:443".parse().unwrap(),
+        )
+    }
+
+    /// The admitted snapshot the CONNECT-header fixtures report against.
+    fn connect_headers_policy() -> PolicySnapshot {
+        PolicySnapshot::initial(Arc::new(NetworkPolicy::allow_all()))
+    }
+
     #[test]
     fn sanitize_connect_headers_blocks_placeholder_metadata_header_by_default() {
         let secrets = make_host_bound_secret("$MSB_KEY", "real-secret-value", "example.com");
+        let (shared, guest_dst) = connect_headers_fixture();
+        let admitted = connect_headers_policy();
         let headers = b"CONNECT example.com:443 HTTP/1.1\r\nHost: example.com:443\r\nProxy-Authorization: Bearer $MSB_KEY\r\nUser-Agent: curl\r\n\r\n";
 
         assert_eq!(
-            sanitize_connect_headers(headers, &secrets),
+            sanitize_connect_headers(headers, &secrets, &shared, guest_dst, &admitted),
             Err(SecretViolationAction::BlockAndLog)
         );
     }
@@ -2274,10 +2412,12 @@ mod tests {
     fn sanitize_connect_headers_respects_block_and_terminate() {
         let mut secrets = make_host_bound_secret("$MSB_KEY", "real-secret-value", "example.com");
         secrets.violation_action = SecretViolationAction::BlockAndTerminate;
+        let (shared, guest_dst) = connect_headers_fixture();
+        let admitted = connect_headers_policy();
         let headers = b"CONNECT example.com:443 HTTP/1.1\r\nHost: example.com:443\r\nProxy-Authorization: Bearer $MSB_KEY\r\n\r\n";
 
         assert_eq!(
-            sanitize_connect_headers(headers, &secrets),
+            sanitize_connect_headers(headers, &secrets, &shared, guest_dst, &admitted),
             Err(SecretViolationAction::BlockAndTerminate)
         );
     }
@@ -2286,9 +2426,12 @@ mod tests {
     fn sanitize_connect_headers_respects_explicit_passthrough() {
         let mut secrets = make_host_bound_secret("$MSB_KEY", "real-secret-value", "example.com");
         secrets.secrets[0].passthrough_hosts = vec![HostPattern::Any];
+        let (shared, guest_dst) = connect_headers_fixture();
+        let admitted = connect_headers_policy();
         let headers = b"CONNECT example.com:443 HTTP/1.1\r\nHost: example.com:443\r\nProxy-Authorization: Bearer $MSB_KEY\r\n\r\n";
 
-        let sanitized = sanitize_connect_headers(headers, &secrets).unwrap();
+        let sanitized =
+            sanitize_connect_headers(headers, &secrets, &shared, guest_dst, &admitted).unwrap();
 
         assert_eq!(sanitized.as_ref(), headers);
         assert!(
@@ -2300,10 +2443,13 @@ mod tests {
     #[test]
     fn sanitize_connect_headers_keeps_safe_metadata_headers() {
         let secrets = make_host_bound_secret("$MSB_KEY", "real-secret-value", "example.com");
+        let (shared, guest_dst) = connect_headers_fixture();
+        let admitted = connect_headers_policy();
         let headers =
             b"CONNECT example.com:443 HTTP/1.1\r\nHost: example.com:443\r\nUser-Agent: curl\r\n\r\n";
 
-        let sanitized = sanitize_connect_headers(headers, &secrets).unwrap();
+        let sanitized =
+            sanitize_connect_headers(headers, &secrets, &shared, guest_dst, &admitted).unwrap();
 
         assert_eq!(sanitized.as_ref(), headers);
     }
@@ -2311,10 +2457,12 @@ mod tests {
     #[test]
     fn sanitize_connect_headers_blocks_placeholder_in_request_line() {
         let secrets = make_host_bound_secret("$MSB_KEY", "real-secret-value", "example.com");
+        let (shared, guest_dst) = connect_headers_fixture();
+        let admitted = connect_headers_policy();
         let headers = b"CONNECT $MSB_KEY:443 HTTP/1.1\r\nHost: example.com:443\r\n\r\n";
 
         assert_eq!(
-            sanitize_connect_headers(headers, &secrets),
+            sanitize_connect_headers(headers, &secrets, &shared, guest_dst, &admitted),
             Err(SecretViolationAction::BlockAndLog)
         );
     }
@@ -2468,7 +2616,7 @@ mod tests {
             to_tx,
             shared,
             NetworkPolicyHandle::new(NetworkPolicy::clone(&policy)),
-            FlowPolicy::Admitted(policy),
+            FlowPolicy::Admitted(PolicySnapshot::initial(policy)),
             secrets,
             None,
             false,
@@ -2486,7 +2634,7 @@ mod tests {
     #[tokio::test]
     async fn plain_http_domain_policy_allows_matching_host() {
         let (addr, sink) = spawn_sink().await;
-        let shared = Arc::new(shared_with("allowed.example", "127.0.0.1"));
+        let (shared, refusals) = recording_shared_with("allowed.example", "127.0.0.1");
         let policy = Arc::new(NetworkPolicy {
             default_egress: Action::Deny,
             default_ingress: Action::Allow,
@@ -2504,6 +2652,10 @@ mod tests {
         .await;
 
         assert_eq!(wire, b"GET / HTTP/1.1\r\nHost: allowed.example\r\n\r\n");
+        assert!(
+            refusals.take().is_empty(),
+            "an allowed request authority records nothing"
+        );
     }
 
     #[tokio::test]
@@ -2535,7 +2687,7 @@ mod tests {
     #[tokio::test]
     async fn plain_http_domain_policy_blocks_keep_alive_host_switch() {
         let (addr, sink) = spawn_sink().await;
-        let shared = Arc::new(shared_with("allowed.example", "127.0.0.1"));
+        let (shared, refusals) = recording_shared_with("allowed.example", "127.0.0.1");
         let policy = Arc::new(NetworkPolicy {
             default_egress: Action::Deny,
             default_ingress: Action::Allow,
@@ -2556,6 +2708,21 @@ mod tests {
         .await;
 
         assert_eq!(wire, b"GET /one HTTP/1.1\r\nHost: allowed.example\r\n\r\n");
+        // The second request's authority is refused on the connection admitted at revision 1,
+        // and the record names the authority the guest put on the wire.
+        assert_eq!(
+            refusals.take(),
+            vec![NetworkRefusal {
+                site: RefusalSite::HttpAuthority,
+                layer: RefusalLayer::Tenant,
+                protocol: microsandbox_types::Protocol::Tcp,
+                dst_ip: Some(addr.ip()),
+                dst_port: Some(addr.port()),
+                name: Some("denied.example".to_owned()),
+                name_source: NameSource::HttpHost,
+                revision: INITIAL_NETWORK_POLICY_REVISION,
+            }]
+        );
     }
 
     //----------------------------------------------------------------------------------------------
@@ -2627,7 +2794,7 @@ mod tests {
             to_tx,
             shared,
             policy_handle,
-            FlowPolicy::Admitted(admitted),
+            FlowPolicy::Admitted(PolicySnapshot::initial(admitted)),
             Arc::new(SecretsConfig::default()),
             None,
             false,
@@ -2653,7 +2820,7 @@ mod tests {
     async fn pending_hostname_decision_survives_a_rule_removing_replace() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
-        let shared = Arc::new(shared_with("allowed.example", "127.0.0.1"));
+        let (shared, sink) = recording_shared_with("allowed.example", "127.0.0.1");
         // The SYN deferred the decision to the hostname, then every rule disappeared.
         let policy_handle = NetworkPolicyHandle::new(
             NetworkPolicy::none()
@@ -2678,6 +2845,83 @@ mod tests {
                 .await
                 .is_err(),
             "a pending hostname decision must fail closed, not dial upstream"
+        );
+        // A pending flow takes the policy current after the peek, so its refusal reports the
+        // replacement's revision, not the one in force when the flow started.
+        assert_eq!(
+            sink.take(),
+            vec![NetworkRefusal {
+                site: RefusalSite::TcpHostname,
+                layer: RefusalLayer::Tenant,
+                protocol: microsandbox_types::Protocol::Tcp,
+                dst_ip: Some(addr.ip()),
+                dst_port: Some(addr.port()),
+                name: Some("allowed.example".to_owned()),
+                name_source: NameSource::DnsCache,
+                revision: 2,
+            }]
+        );
+    }
+
+    /// The mirror image of the pending case: a flow admitted at revision 1 that is refused later
+    /// still reports revision 1, although the handle is at 2. This is the AC9 seam half for the
+    /// proxy sites.
+    #[tokio::test]
+    async fn admitted_flow_denial_reports_the_revision_it_was_admitted_under() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (shared, sink) = recording_shared_with("allowed.example", "127.0.0.1");
+        let admitted = Arc::new(
+            NetworkPolicy::none()
+                .allow_domain("allowed.example")
+                .unwrap(),
+        );
+        // The flow was admitted at revision 1; every rule then disappeared.
+        let policy_handle = NetworkPolicyHandle::new(NetworkPolicy::clone(&admitted));
+        assert_eq!(policy_handle.replace(NetworkPolicy::none()), Ok(2));
+
+        let (from_tx, from_rx) = mpsc::channel::<Bytes>(8);
+        let (to_tx, _to_rx) = mpsc::channel::<Bytes>(8);
+        // A ClientHello for a name no rule allows, so the deferred decision refuses the flow.
+        from_tx
+            .send(Bytes::from(synthetic_client_hello("blocked.example")))
+            .await
+            .unwrap();
+        drop(from_tx);
+        TcpProxy::new(
+            None,
+            addr,
+            UpstreamTcpTarget::direct(addr),
+            from_rx,
+            to_tx,
+            Arc::clone(&shared),
+            policy_handle,
+            FlowPolicy::Admitted(PolicySnapshot::new(Arc::clone(&admitted), 1)),
+            Arc::new(SecretsConfig::default()),
+            None,
+            false,
+            Arc::new(ProxyConnectState::new()),
+            NetworkExtensions::default(),
+            None,
+        )
+        .try_run()
+        .await
+        .unwrap();
+
+        let recorded = sink.take();
+        assert_eq!(recorded.len(), 1, "one refusal, one record");
+        assert_eq!(recorded[0].site, RefusalSite::TcpHostname);
+        assert_eq!(recorded[0].name.as_deref(), Some("blocked.example"));
+        assert_eq!(recorded[0].name_source, NameSource::Sni);
+        assert_eq!(
+            recorded[0].revision, 1,
+            "an admitted flow reports the snapshot it was admitted under, not the live one"
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_millis(300), listener.accept())
+                .await
+                .is_err(),
+            "a refused flow must not dial upstream"
         );
     }
 
@@ -2742,55 +2986,178 @@ mod tests {
     /// flow itself, so this state should never arrive; if it does, the proxy must refuse the flow
     /// as a policy denial instead of falling into the pending path, where a fresh hostname
     /// decision against an allow-all live policy would dial the very upstream the SYN refused.
+    ///
+    /// Both unreachable admissions are covered, and each records exactly one
+    /// `tcp-proxy-fail-closed` refusal: the flow carries no snapshot, so its revision comes from
+    /// the live handle at that point.
     #[tokio::test]
     async fn a_denied_admission_that_reaches_the_proxy_fails_closed() {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        let shared = Arc::new(shared_with("allowed.example", "127.0.0.1"));
-        let (from_tx, from_rx) = mpsc::channel::<Bytes>(8);
-        let (to_tx, _to_rx) = mpsc::channel::<Bytes>(8);
-        from_tx
-            .send(Bytes::from_static(
-                b"GET / HTTP/1.1\r\nHost: allowed.example\r\n\r\n",
-            ))
-            .await
-            .unwrap();
-        drop(from_tx);
-        let proxy_connect = Arc::new(ProxyConnectState::new());
-        let proxy = TcpProxy::new(
-            None,
-            addr,
-            UpstreamTcpTarget::direct(addr),
-            from_rx,
-            to_tx,
-            shared,
-            // Every live decision would allow this flow; the admission still wins.
-            NetworkPolicyHandle::new(NetworkPolicy::allow_all()),
-            FlowPolicy::Denied,
-            Arc::new(SecretsConfig::default()),
-            None,
-            false,
-            Arc::clone(&proxy_connect),
-            NetworkExtensions::default(),
-            None,
-        );
-
-        tokio::time::timeout(Duration::from_secs(5), proxy.try_run())
-            .await
-            .expect("a denied admission must finish instead of peeking")
-            .expect("a denied admission is not an I/O failure");
-
-        assert_eq!(
-            proxy_connect.status(),
-            ProxyConnectStatus::PolicyDenied,
-            "the guest must see a denial, not a silent close"
-        );
-        assert!(
-            tokio::time::timeout(Duration::from_millis(300), listener.accept())
+        for (label, admission) in [
+            ("denied", FlowPolicy::Denied),
+            ("port-proxy", FlowPolicy::PortProxy),
+        ] {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let (shared, refusals) = recording_shared_with("allowed.example", "127.0.0.1");
+            let (from_tx, from_rx) = mpsc::channel::<Bytes>(8);
+            let (to_tx, _to_rx) = mpsc::channel::<Bytes>(8);
+            from_tx
+                .send(Bytes::from_static(
+                    b"GET / HTTP/1.1\r\nHost: allowed.example\r\n\r\n",
+                ))
                 .await
-                .is_err(),
-            "a denied admission must never dial upstream"
-        );
+                .unwrap();
+            drop(from_tx);
+            let proxy_connect = Arc::new(ProxyConnectState::new());
+            // Every live decision would allow this flow; the admission still wins.
+            let policy_handle = NetworkPolicyHandle::new(NetworkPolicy::allow_all());
+            let revision = policy_handle.snapshot().revision();
+            let proxy = TcpProxy::new(
+                None,
+                addr,
+                UpstreamTcpTarget::direct(addr),
+                from_rx,
+                to_tx,
+                Arc::clone(&shared),
+                policy_handle,
+                admission,
+                Arc::new(SecretsConfig::default()),
+                None,
+                false,
+                Arc::clone(&proxy_connect),
+                NetworkExtensions::default(),
+                None,
+            );
+
+            tokio::time::timeout(Duration::from_secs(5), proxy.try_run())
+                .await
+                .expect("a denied admission must finish instead of peeking")
+                .expect("a denied admission is not an I/O failure");
+
+            assert_eq!(
+                proxy_connect.status(),
+                ProxyConnectStatus::PolicyDenied,
+                "{label}: the guest must see a denial, not a silent close"
+            );
+            assert!(
+                tokio::time::timeout(Duration::from_millis(300), listener.accept())
+                    .await
+                    .is_err(),
+                "{label}: a denied admission must never dial upstream"
+            );
+            assert_eq!(
+                refusals.take(),
+                vec![NetworkRefusal {
+                    site: RefusalSite::TcpProxyFailClosed,
+                    layer: RefusalLayer::Tenant,
+                    protocol: microsandbox_types::Protocol::Tcp,
+                    dst_ip: Some(addr.ip()),
+                    dst_port: Some(addr.port()),
+                    name: Some("allowed.example".to_owned()),
+                    name_source: NameSource::DnsCache,
+                    revision,
+                }],
+                "{label}: one record for the fail-closed flow"
+            );
+        }
+    }
+
+    /// A proxy-level SNI denial through the public entry point: the admitted policy allows a
+    /// different name, the guest's ClientHello names one it does not, and the refusal must carry
+    /// the SNI rather than the cached name for the destination IP.
+    ///
+    /// The allow twin proves the same harness reaches the upstream dial, so the negative assertion
+    /// is not vacuous.
+    #[tokio::test]
+    async fn sni_denial_is_recorded_with_sni_evidence() {
+        let hello_blocked = synthetic_client_hello("blocked.example");
+        let hello_allowed = synthetic_client_hello("allowed.example");
+
+        for (hello, admitted) in [(hello_blocked, false), (hello_allowed, true)] {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let dst = listener.local_addr().unwrap();
+            let (shared, refusals) = recording_shared_with("allowed.example", "127.0.0.1");
+            let policy = NetworkPolicy {
+                default_egress: Action::Deny,
+                default_ingress: Action::Allow,
+                rules: vec![allow_tcp("allowed.example", dst.port())],
+            };
+
+            let (from_tx, from_rx) = mpsc::channel(8);
+            let (to_tx, mut to_rx) = mpsc::channel(8);
+            from_tx.send(Bytes::from(hello.clone())).await.unwrap();
+            drop(from_tx);
+            let proxy_connect = Arc::new(ProxyConnectState::new());
+            spawn_tcp_proxy(
+                &tokio::runtime::Handle::current(),
+                dst,
+                dst,
+                from_rx,
+                to_tx,
+                shared,
+                Arc::new(policy),
+                Arc::new(SecretsConfig::default()),
+                None,
+                false,
+                Arc::clone(&proxy_connect),
+                None,
+            );
+
+            if admitted {
+                let (mut server, _) =
+                    tokio::time::timeout(Duration::from_secs(5), listener.accept())
+                        .await
+                        .expect("an allowed SNI must reach the upstream")
+                        .unwrap();
+                let mut replayed = vec![0u8; hello.len()];
+                tokio::time::timeout(Duration::from_secs(5), server.read_exact(&mut replayed))
+                    .await
+                    .expect("the buffered ClientHello must be replayed")
+                    .unwrap();
+                assert_eq!(
+                    replayed, hello,
+                    "the peeked bytes must be replayed upstream"
+                );
+                assert!(
+                    refusals.take().is_empty(),
+                    "an allowed flow records no refusal"
+                );
+                continue;
+            }
+
+            // The proxy closes the flow by itself; the closed channel proves the task finished.
+            assert!(
+                tokio::time::timeout(Duration::from_secs(5), to_rx.recv())
+                    .await
+                    .expect("the denied flow must finish")
+                    .is_none(),
+                "a denied flow sends nothing to the guest"
+            );
+            assert_eq!(
+                proxy_connect.status(),
+                ProxyConnectStatus::PolicyDenied,
+                "the guest must see a denial, not a silent close"
+            );
+            assert!(
+                tokio::time::timeout(Duration::from_millis(50), listener.accept())
+                    .await
+                    .is_err(),
+                "a denied flow must never dial upstream"
+            );
+            assert_eq!(
+                refusals.take(),
+                vec![NetworkRefusal {
+                    site: RefusalSite::TcpHostname,
+                    layer: RefusalLayer::Tenant,
+                    protocol: microsandbox_types::Protocol::Tcp,
+                    dst_ip: Some(dst.ip()),
+                    dst_port: Some(dst.port()),
+                    name: Some("blocked.example".to_owned()),
+                    name_source: NameSource::Sni,
+                    revision: INITIAL_NETWORK_POLICY_REVISION,
+                }]
+            );
+        }
     }
 
     /// An admitted flow still re-walks its deferred evaluation when the proxy starts. That re-walk
@@ -2857,7 +3224,7 @@ mod tests {
                 to_tx,
                 Arc::clone(&shared),
                 NetworkPolicyHandle::new(NetworkPolicy::allow_all()),
-                FlowPolicy::Admitted(Arc::clone(&policy)),
+                FlowPolicy::Admitted(PolicySnapshot::initial(Arc::clone(&policy))),
                 Arc::new(SecretsConfig::default()),
                 None,
                 strict,
@@ -2920,7 +3287,7 @@ mod tests {
             to_tx,
             shared,
             NetworkPolicyHandle::new(NetworkPolicy::clone(&policy)),
-            FlowPolicy::Admitted(policy),
+            FlowPolicy::Admitted(PolicySnapshot::initial(policy)),
             Arc::new(SecretsConfig::default()),
             None,
             false,
@@ -3166,7 +3533,7 @@ mod tests {
     #[tokio::test]
     async fn strict_mode_blocks_hostname_allowed_opaque_tls() {
         let dst = SocketAddr::new("127.0.0.1".parse().unwrap(), 443);
-        let shared = Arc::new(shared_with("allowed.example", "127.0.0.1"));
+        let (shared, sink) = recording_shared_with("allowed.example", "127.0.0.1");
         let policy = Arc::new(NetworkPolicy {
             default_egress: Action::Deny,
             default_ingress: Action::Allow,
@@ -3190,7 +3557,7 @@ mod tests {
             to_tx,
             shared,
             NetworkPolicyHandle::new(NetworkPolicy::clone(&policy)),
-            FlowPolicy::Admitted(policy),
+            FlowPolicy::Admitted(PolicySnapshot::initial(policy)),
             Arc::new(SecretsConfig::default()),
             None,
             true,
@@ -3203,6 +3570,19 @@ mod tests {
         .unwrap();
 
         assert_eq!(proxy_connect.status(), ProxyConnectStatus::PolicyDenied);
+        assert_eq!(
+            sink.take(),
+            vec![NetworkRefusal {
+                site: RefusalSite::TcpStrict,
+                layer: RefusalLayer::Tenant,
+                protocol: microsandbox_types::Protocol::Tcp,
+                dst_ip: Some(dst.ip()),
+                dst_port: Some(dst.port()),
+                name: Some("allowed.example".to_owned()),
+                name_source: NameSource::Sni,
+                revision: INITIAL_NETWORK_POLICY_REVISION,
+            }]
+        );
     }
 
     #[tokio::test]
@@ -3234,7 +3614,7 @@ mod tests {
             to_tx,
             shared,
             NetworkPolicyHandle::new(NetworkPolicy::clone(&policy)),
-            FlowPolicy::Admitted(policy),
+            FlowPolicy::Admitted(PolicySnapshot::initial(policy)),
             Arc::new(SecretsConfig::default()),
             None,
             true,
@@ -3339,7 +3719,7 @@ mod tests {
             to_tx,
             Arc::new(SharedState::new(4)),
             NetworkPolicyHandle::new(NetworkPolicy::default()),
-            FlowPolicy::Admitted(Arc::new(NetworkPolicy::default())),
+            FlowPolicy::Admitted(PolicySnapshot::initial(Arc::new(NetworkPolicy::default()))),
             Arc::new(secrets),
             None,
             false,
@@ -3415,7 +3795,7 @@ mod tests {
             to_tx,
             Arc::new(shared),
             NetworkPolicyHandle::new(NetworkPolicy::default()),
-            FlowPolicy::Admitted(Arc::new(NetworkPolicy::default())),
+            FlowPolicy::Admitted(PolicySnapshot::initial(Arc::new(NetworkPolicy::default()))),
             Arc::new(secrets),
             None,
             false,
@@ -3522,7 +3902,7 @@ mod tests {
             to_tx,
             Arc::new(SharedState::new(4)),
             NetworkPolicyHandle::new(NetworkPolicy::default()),
-            FlowPolicy::Admitted(Arc::new(NetworkPolicy::default())),
+            FlowPolicy::Admitted(PolicySnapshot::initial(Arc::new(NetworkPolicy::default()))),
             Arc::new(secrets),
             None,
             false,
@@ -3603,6 +3983,7 @@ mod tests {
         proxy_addr: SocketAddr,
         shared: Arc<SharedState>,
         policy_handle: NetworkPolicyHandle,
+        admitted_policy: &PolicySnapshot,
     ) -> (ProxyConnectStatus, Vec<u8>) {
         let (from_tx, from_rx) = mpsc::channel::<Bytes>(8);
         let (to_tx, mut to_rx) = mpsc::channel::<Bytes>(8);
@@ -3625,6 +4006,7 @@ mod tests {
                 policy_handle,
                 non_intercepting_tls_state(),
                 true,
+                admitted_policy,
                 Arc::clone(&proxy_connect),
                 NetworkExtensions::default(),
                 None,
@@ -3654,6 +4036,7 @@ mod tests {
         // The outer flow was admitted here, at revision 1. Nothing re-reads that snapshot for the
         // inner target.
         let policy_handle = NetworkPolicyHandle::new(NetworkPolicy::allow_all());
+        let admitted = PolicySnapshot::initial(Arc::new(NetworkPolicy::allow_all()));
         assert_eq!(policy_handle.replace(NetworkPolicy::none()), Ok(2));
 
         let (status, guest_bytes) = run_connect_tunnel(
@@ -3662,6 +4045,7 @@ mod tests {
             proxy_addr,
             shared,
             policy_handle,
+            &admitted,
         )
         .await;
 
@@ -3685,7 +4069,9 @@ mod tests {
     #[tokio::test]
     async fn strict_connect_restriction_reads_the_live_policy() {
         let request = b"CONNECT example.com:80 HTTP/1.1\r\nHost: example.com:80\r\n\r\n";
-        let shared = Arc::new(shared_with("example.com", "127.0.0.1"));
+        // The guest dialed the proxy at 192.0.2.4:3128 and asked it for example.com:80.
+        let proxy_socket: SocketAddr = "192.0.2.4:3128".parse().unwrap();
+        let (shared, refusals) = recording_shared_with("example.com", "192.0.2.4");
         // Allowed only by a hostname rule, which a tunnel cannot be inspected against.
         let policy_handle = NetworkPolicyHandle::new(NetworkPolicy {
             default_egress: Action::Deny,
@@ -3694,12 +4080,14 @@ mod tests {
         });
 
         let (proxy_addr, endpoint) = spawn_connect_endpoint(true).await;
+        let admitted = PolicySnapshot::initial(Arc::new(NetworkPolicy::allow_all()));
         let (status, guest_bytes) = run_connect_tunnel(
             request,
-            proxy_addr,
+            proxy_socket,
             proxy_addr,
             Arc::clone(&shared),
             policy_handle.clone(),
+            &admitted,
         )
         .await;
 
@@ -3713,12 +4101,36 @@ mod tests {
             endpoint.await.unwrap().is_empty(),
             "a refused tunnel must not forward the CONNECT request"
         );
+        // The CONNECT target is the name evidence: it is what the guest addressed and what the
+        // strict rule refused.
+        assert_eq!(
+            refusals.take(),
+            vec![NetworkRefusal {
+                site: RefusalSite::ConnectStrict,
+                layer: RefusalLayer::Tenant,
+                protocol: microsandbox_types::Protocol::Tcp,
+                dst_ip: Some(proxy_socket.ip()),
+                dst_port: Some(proxy_socket.port()),
+                name: Some("example.com".to_owned()),
+                name_source: NameSource::HttpHost,
+                revision: INITIAL_NETWORK_POLICY_REVISION,
+            }],
+            "the record names the socket the guest addressed, not the tunnel target's stand-in \
+             address with the tunnel port"
+        );
 
         assert_eq!(policy_handle.replace(NetworkPolicy::none()), Ok(2));
 
         let (proxy_addr, endpoint) = spawn_connect_endpoint(true).await;
-        let (status, guest_bytes) =
-            run_connect_tunnel(request, proxy_addr, proxy_addr, shared, policy_handle).await;
+        let (status, guest_bytes) = run_connect_tunnel(
+            request,
+            proxy_socket,
+            proxy_addr,
+            shared,
+            policy_handle,
+            &admitted,
+        )
+        .await;
 
         assert!(
             !endpoint.await.unwrap().is_empty(),
@@ -3729,6 +4141,10 @@ mod tests {
             "the strict check read the replaced policy, which no longer allows the target by hostname"
         );
         assert_eq!(status, ProxyConnectStatus::Connected);
+        assert!(
+            refusals.take().is_empty(),
+            "the restriction no longer applies, so nothing is recorded"
+        );
     }
 
     /// An IP-literal target carries no expected SNI, so the strict opaque-hostname restriction
@@ -3739,6 +4155,7 @@ mod tests {
         let (proxy_addr, endpoint) = spawn_connect_endpoint(true).await;
         let shared = Arc::new(SharedState::new(4));
         let policy_handle = NetworkPolicyHandle::new(NetworkPolicy::none());
+        let admitted = PolicySnapshot::initial(Arc::new(NetworkPolicy::none()));
 
         let (status, guest_bytes) = run_connect_tunnel(
             b"CONNECT 127.0.0.1:80 HTTP/1.1\r\nHost: 127.0.0.1:80\r\n\r\n",
@@ -3746,6 +4163,7 @@ mod tests {
             proxy_addr,
             shared,
             policy_handle,
+            &admitted,
         )
         .await;
 

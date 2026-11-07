@@ -32,6 +32,7 @@ use crate::policy::handle::NetworkPolicyHandle;
 use crate::policy::{NetworkPolicy, NetworkProfile};
 use crate::ports::publisher::PortCommand;
 use crate::proxy::OutboundRouting;
+use crate::refusal::RefusalSink;
 use crate::secrets::credential::{ResolvedHeaderCredential, validate_resolved_header_credentials};
 use crate::secrets::handle::SecretsHandle;
 
@@ -118,6 +119,8 @@ pub struct HostIntegrations {
     /// Launch-only resolved header credentials; must match the durable
     /// definitions in `config.secrets.header_credentials` one-to-one.
     pub resolved_header_credentials: Vec<ResolvedHeaderCredential>,
+    /// Receives a record for every refused egress decision; `None` records nothing.
+    pub refusals: Option<Arc<dyn RefusalSink>>,
 }
 
 /// Errors that prevent the smoltcp network from being created safely.
@@ -408,6 +411,9 @@ impl SmoltcpNetwork {
         // a large cap must not allocate a correspondingly large packet queue.
         let shared = Arc::new(SharedState::new(DEFAULT_QUEUE_CAPACITY));
         shared.set_http_config(config.http.clone());
+        if let Some(sink) = &host.refusals {
+            shared.set_refusal_sink(Arc::clone(sink));
+        }
         if let Some(prefix) = config
             .nat64_prefixes
             .iter()
@@ -989,6 +995,8 @@ mod published_ports_tests;
 mod tests {
     use std::cell::Cell;
 
+    use microsandbox_types::{NetworkRefusal, RefusalSite};
+
     use super::*;
     use crate::config::{EnvNetworkSecretResolver, NetworkConfig, PortProtocol, PublishedPort};
     use crate::dns::Nameserver;
@@ -1037,6 +1045,49 @@ mod tests {
             assert!(!Arc::ptr_eq(&child.shared, &source.shared));
         }
         assert_eq!(source.gateway_mac, SmoltcpNetwork::default_gateway_mac(7));
+    }
+
+    /// The host installs the refusal sink through [`HostIntegrations`], so the deny sites find it
+    /// on the shared state they already hold. Without it, reporting a refusal does nothing.
+    #[test]
+    fn host_refusal_sink_reaches_the_shared_state() {
+        struct NoopSink;
+
+        impl RefusalSink for NoopSink {
+            fn admits(&self, _site: RefusalSite) -> bool {
+                true
+            }
+
+            fn record(&self, _refusal: NetworkRefusal) {}
+        }
+
+        let sink: Arc<dyn RefusalSink> = Arc::new(NoopSink);
+        let with_sink = SmoltcpNetwork::build(
+            resolved(NetworkConfig::default()),
+            8,
+            DeploymentProfile::SingleTenant,
+            HostIntegrations {
+                refusals: Some(Arc::clone(&sink)),
+                ..Default::default()
+            },
+            routes(true, true),
+        )
+        .unwrap();
+        let installed = with_sink
+            .shared
+            .refusal_sink()
+            .expect("the host sink must be installed before the network starts");
+        assert!(Arc::ptr_eq(installed, &sink));
+
+        let without_sink = SmoltcpNetwork::build(
+            resolved(NetworkConfig::default()),
+            8,
+            DeploymentProfile::SingleTenant,
+            HostIntegrations::default(),
+            routes(true, true),
+        )
+        .unwrap();
+        assert!(without_sink.shared.refusal_sink().is_none());
     }
 
     #[test]
