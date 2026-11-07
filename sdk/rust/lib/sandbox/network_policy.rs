@@ -198,7 +198,9 @@ mod tests {
     }
 
     fn bind_control(local: &LocalBackend, name: &str) -> UnixListener {
-        let agent = crate::runtime::sandbox_agent_socket_path_candidates_for(local, name).remove(0);
+        let agent = local
+            .resolve_agent_socket_path(name)
+            .expect("the test backend resolves an agent socket path");
         let path = microsandbox_runtime::control::control_socket_path_for(&agent);
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         UnixListener::bind(path).unwrap()
