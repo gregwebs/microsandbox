@@ -675,11 +675,14 @@ pub(crate) async fn validate_runtime_config(
 ) -> MicrosandboxResult<()> {
     validate_build_network_intent(config)?;
     // Every launch and every restart admission passes here. Refuse a writable caller
-    // bind of this sandbox's own directory before any runtime probe or process, so a
-    // configuration that would let the guest rewrite its logs never reaches the
-    // runtime. The paths are measured, never rewritten.
-    crate::backend::local::host_paths::check_writable_binds_do_not_expose_sandbox_dir(
-        &global.sandboxes_dir().join(&config.spec.name),
+    // bind of the sandboxes state root — any sandbox directory, this one or a
+    // sibling's — before any runtime probe or process, so a configuration that would
+    // let one guest read or rewrite another sandbox's state never reaches the runtime.
+    // The paths are measured, never rewritten.
+    let sandboxes_dir = global.sandboxes_dir();
+    crate::backend::local::host_paths::check_writable_binds_do_not_expose_sandbox_state(
+        &sandboxes_dir,
+        &sandboxes_dir.join(&config.spec.name),
         &config.spec.mounts,
     )?;
     #[cfg(feature = "net")]
