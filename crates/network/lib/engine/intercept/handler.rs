@@ -708,7 +708,10 @@ mod tests {
                 vec![
                     "/bin/sh".to_string(),
                     "-c".to_string(),
-                    "printf 'HTTP/1.1 403 Forbidden\\r\\nContent-Length: 0\\r\\n\\r\\n'"
+                    // Drain stdin first: the interceptor writes the request into the hook's
+                    // stdin, so a hook that exits before reading races that write into an
+                    // `EPIPE` and fails closed instead of answering.
+                    "cat >/dev/null; printf 'HTTP/1.1 403 Forbidden\\r\\nContent-Length: 0\\r\\n\\r\\n'"
                         .to_string(),
                 ],
             ),
