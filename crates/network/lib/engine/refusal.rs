@@ -1,10 +1,11 @@
 //! Egress refusal reporting: the seam every refused egress decision is reported through.
 //!
 //! The engine cannot depend on the runtime that owns the log file, so a refused decision is handed
-//! to a [`RefusalSink`] the host installs on the per-sandbox shared state. The one entry point,
-//! [`record`], owns the rules every deny site shares: it returns before allocating when no sink is
-//! installed, resolves `dns-cache` name evidence, normalizes names, and maps the engine's protocol
-//! onto the wire contract. Sites state facts; this module decides how the facts are recorded.
+//! to a [`RefusalSink`] the host installs on the per-sandbox shared state. The one crate-internal
+//! entry point, `record`, owns the rules every deny site shares: it returns before allocating when
+//! no sink is installed, resolves `dns-cache` name evidence, normalizes names, and maps the
+//! engine's protocol onto the wire contract. Sites state facts; this module decides how the facts
+//! are recorded.
 
 use std::net::IpAddr;
 
