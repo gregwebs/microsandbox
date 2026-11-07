@@ -359,12 +359,18 @@ fn resolved_root_is_inside_sandboxes_dir(
 ) -> MicrosandboxResult<bool> {
     use std::os::unix::fs::MetadataExt;
 
-    let sandboxes = std::fs::metadata(sandboxes_dir).map_err(|error| {
-        MicrosandboxError::InvalidConfig(format!(
-            "cannot inspect sandboxes directory {}: {error}",
-            sandboxes_dir.display()
-        ))
-    })?;
+    // Admission runs before the state root is created, and nothing inside a directory
+    // that does not exist yet can be resolved into a bind root.
+    let sandboxes = match std::fs::metadata(sandboxes_dir) {
+        Ok(metadata) => metadata,
+        Err(error) if is_absent(&error) => return Ok(false),
+        Err(error) => {
+            return Err(MicrosandboxError::InvalidConfig(format!(
+                "cannot inspect sandboxes directory {}: {error}",
+                sandboxes_dir.display()
+            )));
+        }
+    };
     // A canonical prefix exists, so every ancestor of it exists too; a candidate
     // that vanished under a concurrent deletion cannot be the shared directory.
     for candidate in resolved.ancestors() {
@@ -384,12 +390,18 @@ fn resolved_root_is_inside_sandboxes_dir(
     sandboxes_dir: &Path,
     resolved: &Path,
 ) -> MicrosandboxResult<bool> {
-    let sandboxes = std::fs::canonicalize(sandboxes_dir).map_err(|error| {
-        MicrosandboxError::InvalidConfig(format!(
-            "cannot inspect sandboxes directory {}: {error}",
-            sandboxes_dir.display()
-        ))
-    })?;
+    // Admission runs before the state root is created, and nothing inside a directory
+    // that does not exist yet can be resolved into a bind root.
+    let sandboxes = match std::fs::canonicalize(sandboxes_dir) {
+        Ok(sandboxes) => sandboxes,
+        Err(error) if is_absent(&error) => return Ok(false),
+        Err(error) => {
+            return Err(MicrosandboxError::InvalidConfig(format!(
+                "cannot inspect sandboxes directory {}: {error}",
+                sandboxes_dir.display()
+            )));
+        }
+    };
     Ok(components_start_with(resolved, &sandboxes))
 }
 

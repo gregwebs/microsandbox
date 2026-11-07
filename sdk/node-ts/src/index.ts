@@ -485,6 +485,7 @@ export {
   MetricsDisabledError,
   MetricsUnavailableError,
   MicrosandboxError,
+  ModificationNotConfirmedError,
   NixError,
   PatchFailedError,
   ProtocolError,
