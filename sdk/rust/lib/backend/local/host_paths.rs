@@ -132,22 +132,24 @@ pub(crate) fn check_bind_roots_do_not_follow_symlinks(
     Ok(())
 }
 
-/// Refuse a writable caller bind that would expose this sandbox's own directory.
+/// Refuse a writable caller bind that would expose msb's sandbox state to a guest.
 ///
-/// `<sandbox_dir>` holds `logs/`, where the runtime appends the sandbox's own
-/// refusal records, so a writable bind of that directory or of a path inside it
-/// would let the guest rewrite its own log. Only `VolumeMount::Bind` roots that
-/// are not read-only are measured; owned volumes, named volumes and tmpfs mounts
-/// are msb-managed and never resolve there, and a writable bind of an *ancestor*
-/// (`$HOME`, `MSB_HOME`, the sandboxes directory) stays allowed as a documented
-/// exposure. Call this once `sandbox_dir` exists, immediately before the runtime
-/// process is spawned, so the comparison has a file identity to compare against.
+/// `<sandboxes_dir>/<name>` holds each sandbox's disks, volumes and `logs/`, where the runtime
+/// appends that sandbox's own refusal records. A writable bind of any sandbox directory, of a path
+/// inside one, or of the sandboxes directory itself would let one guest read or rewrite another
+/// sandbox's state, including the records that describe its own refusals, so all of them are
+/// refused. Only `VolumeMount::Bind` roots that are not read-only are measured; owned volumes,
+/// named volumes and tmpfs mounts are msb-managed and never resolve there, and a writable bind of
+/// an *ancestor* above the sandboxes directory (`MSB_HOME`, `$HOME`) stays allowed as a documented
+/// exposure. Call this once `sandbox_dir` exists, immediately before the runtime process is
+/// spawned, so the comparison has a file identity to compare against.
 ///
 /// Resolution is for comparison only. The configured path and its symlink policy
 /// are never rewritten: a symlink is followed here whether or not the mount opts
 /// into `follow_root_symlinks`, because the runtime either follows it too or
 /// refuses it at open, so this can only refuse earlier.
-pub(crate) fn check_writable_binds_do_not_expose_sandbox_dir(
+pub(crate) fn check_writable_binds_do_not_expose_sandbox_state(
+    sandboxes_dir: &Path,
     sandbox_dir: &Path,
     mounts: &[VolumeMount],
 ) -> MicrosandboxResult<()> {
@@ -159,20 +161,20 @@ pub(crate) fn check_writable_binds_do_not_expose_sandbox_dir(
             continue;
         }
         let resolved = resolve_bind_root_for_comparison(host)?;
-        // A directory or a path inside it is caught by walking ancestors; a hard link resolves
-        // outside the directory, so the files the log directory holds are compared by identity
-        // too.
-        if !resolved_root_is_inside_sandbox_dir(sandbox_dir, &resolved)?
+        // A directory or a path inside it is caught by walking ancestors; a hard link to one of
+        // this sandbox's log files resolves outside the directory, so those files are compared by
+        // identity too.
+        if !resolved_root_is_inside_sandboxes_dir(sandboxes_dir, &resolved)?
             && !resolved_root_aliases_a_log_file(sandbox_dir, &resolved)?
         {
             continue;
         }
         return Err(MicrosandboxError::InvalidConfig(format!(
-            "bind mount host path {} exposes this sandbox's own directory {} to the guest (it resolves to {}); the guest could rewrite its logs. Mount it read-only or bind a path outside {}",
+            "bind mount host path {} exposes msb's sandbox state directory {} to the guest (it resolves to {}); the guest could read or rewrite a sandbox's logs. Mount it read-only or bind a path outside {}",
             host.display(),
-            sandbox_dir.display(),
+            sandboxes_dir.display(),
             resolved_path_text(&resolved),
-            sandbox_dir.display()
+            sandboxes_dir.display()
         )));
     }
     Ok(())
@@ -346,26 +348,26 @@ fn is_absent(error: &std::io::Error) -> bool {
     )
 }
 
-/// Whether a resolved bind root is the sandbox directory or lies inside it.
+/// Whether a resolved bind root is the sandboxes directory or lies inside it.
 ///
 /// File identity is compared instead of path text, so a case-insensitive volume
-/// (default APFS) or a differently spelled alias of the same directory is caught.
+/// (default APFS) or a differently spelled alias of a sandbox directory is caught.
 #[cfg(unix)]
-fn resolved_root_is_inside_sandbox_dir(
-    sandbox_dir: &Path,
+fn resolved_root_is_inside_sandboxes_dir(
+    sandboxes_dir: &Path,
     resolved: &Path,
 ) -> MicrosandboxResult<bool> {
     use std::os::unix::fs::MetadataExt;
 
-    // Admission runs before the sandbox directory is created, and nothing inside a
-    // directory that does not exist yet can be resolved into a bind root.
-    let sandbox = match std::fs::metadata(sandbox_dir) {
+    // Admission runs before the state root is created, and nothing inside a directory
+    // that does not exist yet can be resolved into a bind root.
+    let sandboxes = match std::fs::metadata(sandboxes_dir) {
         Ok(metadata) => metadata,
         Err(error) if is_absent(&error) => return Ok(false),
         Err(error) => {
             return Err(MicrosandboxError::InvalidConfig(format!(
-                "cannot inspect sandbox directory {}: {error}",
-                sandbox_dir.display()
+                "cannot inspect sandboxes directory {}: {error}",
+                sandboxes_dir.display()
             )));
         }
     };
@@ -375,32 +377,32 @@ fn resolved_root_is_inside_sandbox_dir(
         let Ok(metadata) = std::fs::metadata(candidate) else {
             break;
         };
-        if metadata.dev() == sandbox.dev() && metadata.ino() == sandbox.ino() {
+        if metadata.dev() == sandboxes.dev() && metadata.ino() == sandboxes.ino() {
             return Ok(true);
         }
     }
     Ok(false)
 }
 
-/// Whether a resolved bind root is the sandbox directory or lies inside it.
+/// Whether a resolved bind root is the sandboxes directory or lies inside it.
 #[cfg(not(unix))]
-fn resolved_root_is_inside_sandbox_dir(
-    sandbox_dir: &Path,
+fn resolved_root_is_inside_sandboxes_dir(
+    sandboxes_dir: &Path,
     resolved: &Path,
 ) -> MicrosandboxResult<bool> {
-    // Admission runs before the sandbox directory is created, and nothing inside a
-    // directory that does not exist yet can be resolved into a bind root.
-    let sandbox = match std::fs::canonicalize(sandbox_dir) {
-        Ok(sandbox) => sandbox,
+    // Admission runs before the state root is created, and nothing inside a directory
+    // that does not exist yet can be resolved into a bind root.
+    let sandboxes = match std::fs::canonicalize(sandboxes_dir) {
+        Ok(sandboxes) => sandboxes,
         Err(error) if is_absent(&error) => return Ok(false),
         Err(error) => {
             return Err(MicrosandboxError::InvalidConfig(format!(
-                "cannot inspect sandbox directory {}: {error}",
-                sandbox_dir.display()
+                "cannot inspect sandboxes directory {}: {error}",
+                sandboxes_dir.display()
             )));
         }
     };
-    Ok(components_start_with(resolved, &sandbox))
+    Ok(components_start_with(resolved, &sandboxes))
 }
 
 /// Whether a resolved bind root is one of the files the sandbox's log directory holds.
@@ -411,7 +413,8 @@ fn resolved_root_is_inside_sandbox_dir(
 ///
 /// Bounded: one `read_dir` and one stat per entry, and only when the bind root is an existing
 /// file. Residual, documented exposure: a hard link to a log file created *after* this check is
-/// not caught, and a writable bind of an ancestor directory still exposes the logs (S2).
+/// not caught, and a writable bind of an ancestor above the sandboxes directory still exposes the
+/// logs (S2, S5).
 #[cfg(unix)]
 fn resolved_root_aliases_a_log_file(
     sandbox_dir: &Path,

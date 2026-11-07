@@ -200,6 +200,21 @@ Run a specific test:
 cargo test -p microsandbox test_name
 ```
 
+### When many tests fail at once
+
+A stale `target/` tree can make dozens of unrelated tests fail, especially the
+DNS and loopback-based network tests, while the same sources pass elsewhere. A
+`cargo clean` does not always clear it, because the bad artifact can sit in a
+cached dependency. Before investigating a mass failure, reproduce it in a fresh
+target directory:
+
+```bash
+CARGO_TARGET_DIR=/tmp/msb-fresh-target cargo test -p microsandbox-network --lib
+```
+
+The Windows quality job compiles and tests the `cfg(windows)` side; the
+cross-target check below compiles it locally.
+
 ### Snapshot and branch checks
 
 Run the focused logic suite without starting VMs:
