@@ -32,6 +32,7 @@ type SandboxConfig struct {
 	MaxCPUs           uint8
 	CPUPlacement      CPUPlacement
 	PlacementProfile  string
+	NestedVirt        *bool
 	THP               THPPolicy
 	Workdir           string
 	Shell             string
@@ -158,6 +159,7 @@ type persistedResources struct {
 	MaxMemoryMiB     uint32       `json:"max_memory_mib"`
 	CPUPlacement     CPUPlacement `json:"cpu_placement"`
 	PlacementProfile string       `json:"placement_profile"`
+	NestedVirt       *bool        `json:"nested_virt"`
 	THP              THPPolicy    `json:"thp"`
 }
 
@@ -236,6 +238,7 @@ func (c *SandboxConfig) UnmarshalJSON(data []byte) error {
 		CPUPlacement:      raw.cpuPlacement(),
 		PlacementProfile:  raw.placementProfile(),
 		THP:               raw.thp(),
+		NestedVirt:        raw.nestedVirt(),
 		Workdir:           runtime.Workdir,
 		Shell:             runtime.Shell,
 		SecurityProfile:   raw.SecurityProfile,
@@ -314,6 +317,13 @@ func (c persistedSandboxConfig) placementProfile() string {
 		return c.Resources.PlacementProfile
 	}
 	return c.PlacementProfile
+}
+
+func (c persistedSandboxConfig) nestedVirt() *bool {
+	if c.Resources != nil {
+		return c.Resources.NestedVirt
+	}
+	return nil
 }
 
 func (c persistedSandboxConfig) thp() THPPolicy {
@@ -736,6 +746,11 @@ func WithCPUPlacement(policy CPUPlacement) SandboxOption {
 // WithPlacementProfile selects a host-defined placement profile by name.
 func WithPlacementProfile(profile string) SandboxOption {
 	return func(o *SandboxConfig) { o.PlacementProfile = profile }
+}
+
+// WithNestedVirt enables or disables nested virtualization for local sandboxes.
+func WithNestedVirt(enabled bool) SandboxOption {
+	return func(o *SandboxConfig) { o.NestedVirt = &enabled }
 }
 
 // WithTHP selects the guest transparent huge-page policy applied at boot.

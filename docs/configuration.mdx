@@ -248,6 +248,7 @@ For workload effects, host requirements, filesystem expectations, and verificati
 | `memory_mib` | `512` | Guest memory in MiB |
 | `cpu_placement` | `"inherit"` | Host vCPU placement: `inherit`, `auto`, `spread`, or `compact` |
 | `placement_profile` | `null` | Name of a host-defined entry in `runtime.placement_profiles` |
+| `nested_virt` | unset | Enable nested virtualization for local sandboxes. Off by default. Requires host support and guest KVM. |
 | `thp` | `"madvise"` | Guest transparent huge-page policy: `always`, `madvise`, or `never` |
 | `oci` | [reference](#sandbox_defaults-oci) | Defaults for OCI-rooted sandboxes |
 | `shell` | `"/bin/sh"` | Shell for interactive sessions and scripts |
@@ -303,6 +304,19 @@ Proxy defaults do not enable disabled networking or route host downloads. Cloud 
 A per-sandbox `proxy_from_env: false` overrides ordinary user and global defaults; managed policy is applied last and stays authoritative in both directions, so a managed `true` cannot be turned off by a per-sandbox value or a CLI flag. Only the boolean is written to user and managed files - never the discovered endpoint, credentials, or `no_proxy` rules. See [corporate networking](/enterprise/corporate-networking) for managed enforcement. Setting `outbound_proxy` to `null` clears explicit routing but does not disable ambient discovery; set `proxy_from_env: false` to force it off.
 
 </Accordion>
+
+Enable nesting by default for local sandboxes:
+
+```json
+{
+  "sandbox_defaults": {
+    "nested_virt": true
+  }
+}
+```
+
+Per-sandbox settings override this user default; managed overrides take precedence. See [nested VM snapshots](/sandboxes/snapshots#nested-vm-snapshots) for host requirements and restore limits.
+
 ### `sandbox_defaults.oci`
 
 Defaults applied only when the sandbox rootfs is an OCI image.

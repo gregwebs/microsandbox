@@ -357,12 +357,18 @@ fn resolved_root_is_inside_sandbox_dir(
 ) -> MicrosandboxResult<bool> {
     use std::os::unix::fs::MetadataExt;
 
-    let sandbox = std::fs::metadata(sandbox_dir).map_err(|error| {
-        MicrosandboxError::InvalidConfig(format!(
-            "cannot inspect sandbox directory {}: {error}",
-            sandbox_dir.display()
-        ))
-    })?;
+    // Admission runs before the sandbox directory is created, and nothing inside a
+    // directory that does not exist yet can be resolved into a bind root.
+    let sandbox = match std::fs::metadata(sandbox_dir) {
+        Ok(metadata) => metadata,
+        Err(error) if is_absent(&error) => return Ok(false),
+        Err(error) => {
+            return Err(MicrosandboxError::InvalidConfig(format!(
+                "cannot inspect sandbox directory {}: {error}",
+                sandbox_dir.display()
+            )));
+        }
+    };
     // A canonical prefix exists, so every ancestor of it exists too; a candidate
     // that vanished under a concurrent deletion cannot be the shared directory.
     for candidate in resolved.ancestors() {
@@ -382,12 +388,18 @@ fn resolved_root_is_inside_sandbox_dir(
     sandbox_dir: &Path,
     resolved: &Path,
 ) -> MicrosandboxResult<bool> {
-    let sandbox = std::fs::canonicalize(sandbox_dir).map_err(|error| {
-        MicrosandboxError::InvalidConfig(format!(
-            "cannot inspect sandbox directory {}: {error}",
-            sandbox_dir.display()
-        ))
-    })?;
+    // Admission runs before the sandbox directory is created, and nothing inside a
+    // directory that does not exist yet can be resolved into a bind root.
+    let sandbox = match std::fs::canonicalize(sandbox_dir) {
+        Ok(sandbox) => sandbox,
+        Err(error) if is_absent(&error) => return Ok(false),
+        Err(error) => {
+            return Err(MicrosandboxError::InvalidConfig(format!(
+                "cannot inspect sandbox directory {}: {error}",
+                sandbox_dir.display()
+            )));
+        }
+    };
     Ok(components_start_with(resolved, &sandbox))
 }
 
