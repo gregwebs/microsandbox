@@ -440,7 +440,7 @@ Stream resource metrics at a regular interval. Returns an async stream that yiel
 <Tooltip tip="Bounded log reads are not available on microsandbox cloud; follow live with log streaming and persist output externally."><span className="msb-badge-local">Local-only <Icon icon="circle-info" size={11} /></span></Tooltip>
 
 ```rust
-fn logs(&self, opts: &LogOptions) -> MicrosandboxResult<Vec<LogEntry>>
+async fn logs(&self, opts: &LogOptions) -> MicrosandboxResult<Vec<LogEntry>>
 ```
 
 <Accordion title="Example">
@@ -451,7 +451,7 @@ use microsandbox::sandbox::{LogOptions, LogSource, Sandbox};
 let handle = Sandbox::get("web").await?;
 
 // Default: all user-program output, regardless of pipe/pty mode
-let entries = handle.logs(&LogOptions::default())?;
+let entries = handle.logs(&LogOptions::default()).await?;
 
 for e in entries {
     let source = match e.source {
@@ -481,7 +481,7 @@ let recent = handle.logs(&LogOptions {
         LogSource::System,
     ],
     ..Default::default()
-})?;
+}).await?;
 ```
 
 </Accordion>
@@ -2621,10 +2621,10 @@ Same as `kill()` with an explicit observation timeout
 <Tooltip tip="Bounded log reads are not available on microsandbox cloud; follow live and persist output externally."><span className="msb-badge-local">Local-only <Icon icon="circle-info" size={11} /></span></Tooltip>
 
 ```rust
-logs()
+async logs(opts: &LogOptions)
 ```
 
-Read captured `exec.log` (works without starting)
+Read captured log entries (works without starting)
 
 <p className="msb-label">Returns</p>
 

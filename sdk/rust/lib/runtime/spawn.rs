@@ -537,10 +537,12 @@ pub async fn spawn_sandbox(
     )?;
 
     // Every local launch passes here: create, start, restart, restore and fork
-    // children. Refuse a writable caller bind of this sandbox's own directory
-    // before any mount reaches the runtime, now that the log directory exists to
-    // compare against. The mount paths are measured, never rewritten.
-    crate::backend::local::host_paths::check_writable_binds_do_not_expose_sandbox_dir(
+    // children. Refuse a writable caller bind of any sandbox directory — this one
+    // or a sibling's — before any mount reaches the runtime, now that the log
+    // directory exists to compare against. The mount paths are measured, never
+    // rewritten.
+    crate::backend::local::host_paths::check_writable_binds_do_not_expose_sandbox_state(
+        &global.sandboxes_dir(),
         &sandbox_dir,
         &config.spec.mounts,
     )?;
