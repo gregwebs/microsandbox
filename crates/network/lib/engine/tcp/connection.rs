@@ -17,7 +17,7 @@ use smoltcp::wire::IpListenEndpoint;
 use tokio::net::TcpStream;
 use tokio::sync::mpsc;
 
-use crate::policy::NetworkPolicy;
+use crate::policy::handle::PolicySnapshot;
 use crate::proxy::ResolvedOutboundProxy;
 use crate::tcp::deferred_close::DeferredClose;
 use crate::tcp::pending::PendingConnect;
@@ -106,8 +106,9 @@ pub enum TcpAcceptMode {
 /// Egress authorization decided once at the guest SYN and carried to the proxy task.
 #[derive(Clone)]
 pub enum FlowPolicy {
-    /// The SYN decision allowed the flow; it keeps this snapshot for its later checks.
-    Admitted(Arc<NetworkPolicy>),
+    /// The SYN decision allowed the flow; it keeps this snapshot, and its revision, for its
+    /// later checks.
+    Admitted(PolicySnapshot),
     /// The SYN deferred the decision to the hostname. It has not been made yet, and it must
     /// be made against the policy current when the guest's first bytes arrive.
     PendingHostname,

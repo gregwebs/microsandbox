@@ -459,6 +459,7 @@ for e in entries {
         LogSource::Stderr => "ERR",
         LogSource::Output => "PTY",
         LogSource::System => "SYS",
+        LogSource::Network => "NET",
     };
     println!(
         "[{}] {} {:?}: {}",
@@ -485,9 +486,9 @@ let recent = handle.logs(&LogOptions {
 
 </Accordion>
 
-Read captured output from the sandbox's `exec.log`. Backed by an on-disk JSON Lines file the runtime writes via the relay tap. Works on running and stopped sandboxes alike; there is no protocol traffic. The same method is available on [`SandboxHandle`](#sandboxhandle) for callers that don't want to start the sandbox first.
+Read captured log entries from the sandbox's on-disk log files. Backed by the JSON Lines files the runtime writes, so it works on running and stopped sandboxes alike; there is no protocol traffic. The same method is available on [`SandboxHandle`](#sandboxhandle) for callers that don't want to start the sandbox first.
 
-The default sources are `Stdout`, `Stderr`, and `Output` (PTY-merged). Pass `LogSource::System` to also include synthetic lifecycle markers and runtime/kernel diagnostic lines. `logs()` is **synchronous** because it's a pure file read.
+The default sources are `Stdout`, `Stderr`, and `Output` (PTY-merged). Pass `LogSource::System` to also include synthetic lifecycle markers and runtime/kernel diagnostic lines, or `LogSource::Network` to read egress refusal records; `Network` is never part of the default. `logs()` is `async`, but it is a pure file read: no protocol traffic is involved.
 
 <p className="msb-label">Parameters</p>
 
@@ -3074,8 +3075,8 @@ A single captured log entry returned by [`logs()`](#sb-logs).
 |-------|------|-------------|
 | timestamp | `DateTime<Utc>` | Wall-clock capture time on the host |
 | source | [`LogSource`](#logsource) | Where the chunk came from |
-| session_id | `Option<u64>` | Relay-monotonic session id; `None` for `System` entries |
-| data | `Bytes` | The chunk's bytes (UTF-8 lossy decoded by default; raw bytes if `--raw` mode was used) |
+| session_id | `Option<u64>` | Relay-monotonic session id; `None` for `System` and `Network` entries |
+| data | `Bytes` | The chunk's bytes (UTF-8 lossy decoded by default; raw bytes if `--raw` mode was used). For the opt-in `Network` source the body is the record's own JSON line followed by `\n`, which deserializes as [`NetworkLogRecord`](#networklogrecord); every other source keeps its decoded chunk. |
 
 ### LogLevel
 
@@ -3102,7 +3103,7 @@ Filters passed to [`logs()`](#sb-logs). All fields optional. `LogOptions::defaul
 | tail | `Option<usize>` | Show only the last N entries after other filters apply |
 | since | `Option<DateTime<Utc>>` | Inclusive lower bound on entry timestamp |
 | until | `Option<DateTime<Utc>>` | Exclusive upper bound on entry timestamp |
-| sources | `Vec<`[`LogSource`](#logsource)`>` | Sources to include. Empty = `[Stdout, Stderr, Output]` (the default user-program sources). Add `System` to merge runtime/kernel diagnostics. |
+| sources | `Vec<`[`LogSource`](#logsource)`>` | Sources to include. Empty = `[Stdout, Stderr, Output]` (the default user-program sources). Add `System` to merge runtime/kernel diagnostics. `Network` is never in the default set and must be requested explicitly. |
 
 ### LogSource
 
@@ -3116,6 +3117,44 @@ Tag indicating where a captured log entry came from.
 | `Stderr` | Captured from a session's stderr (pipe mode) |
 | `Output` | Captured from a session running in pty mode. PTY allocation merges stdout and stderr at the kernel level inside the guest, so they arrive as a single stream, tagged `Output` rather than mislabeled as `Stdout`. |
 | `System` | Synthetic entry: lifecycle markers in `exec.log` plus runtime/kernel diagnostic lines merged in at read time when `System` is requested. |
+| `Network` | Egress refusal record from `network.log`, one JSON line per refused decision. Never part of the default sources. See [Refusal log](/networking/overview#refusal-log). |
+
+### NetworkLogRecord
+
+One line of `network.log`, yielded as [`LogEntry::data`](#logentry) when [`LogSource::Network`](#logsource) is requested.
+
+```rust
+struct NetworkLogRecord {
+    v: u32,
+    t: DateTime<Utc>,
+    s: LogSource,
+    event: NetworkLogEvent,
+}
+```
+
+`event` is a `NetworkLogEvent`: `Refusal(NetworkRefusal)` for one refused decision, or `Suppressed(NetworkSuppressed)` for a count of refusals at one site that were decided but not written. The record's fields, site values, name sources, rate limits, and reader rules are documented under [Refusal log](/networking/overview#refusal-log).
+
+<Accordion title="Example">
+
+```rust
+use microsandbox::logs::{LogOptions, LogSource, NetworkLogRecord};
+use microsandbox::Sandbox;
+
+let sb = Sandbox::get("egress").await?;
+let refusals = sb
+    .logs(&LogOptions {
+        sources: vec![LogSource::Network],
+        ..Default::default()
+    })
+    .await?;
+
+for entry in refusals {
+    let record: NetworkLogRecord = serde_json::from_slice(&entry.data)?;
+    println!("{:?} {record:?}", entry.timestamp);
+}
+```
+
+</Accordion>
 
 ### SandboxPingResult
 

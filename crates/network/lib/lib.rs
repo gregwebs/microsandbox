@@ -22,7 +22,9 @@ pub mod proxy;
 #[cfg(feature = "engine")]
 pub(crate) use engine::addr;
 #[cfg(feature = "engine")]
-pub use engine::{extensions, http_deny, icmp, intercept, netstack, network, ports, tcp, udp};
+pub use engine::{
+    extensions, http_deny, icmp, intercept, netstack, network, ports, refusal, tcp, udp,
+};
 pub use model::{config, dns, policy, secrets, tls};
 
 //--------------------------------------------------------------------------------------------------

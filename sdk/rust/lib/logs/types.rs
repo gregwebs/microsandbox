@@ -64,12 +64,17 @@ pub struct LogEntry {
     pub source: LogSource,
 
     /// Per-session identifier. Set for entries captured from an
-    /// exec session; `None` for `system` entries which are not
-    /// tied to a specific session.
+    /// exec session; `None` for `system` entries, which are not
+    /// tied to a specific session, and for `network` entries, whose
+    /// records carry no session.
     pub session_id: Option<u64>,
 
     /// Decoded body bytes. UTF-8 lossy by default; if the underlying
     /// chunk was raw-mode base64, this is the decoded raw bytes.
+    ///
+    /// For [`LogSource::Network`] entries the body is the record's own JSON line
+    /// followed by `\n`, which deserializes as
+    /// [`NetworkLogRecord`]; every other source keeps its decoded-chunk body.
     pub data: Bytes,
 
     /// Opaque per-source resume handle. Snapshot of the positions
@@ -124,7 +129,10 @@ impl LogOptions {
 // Re-Exports
 //--------------------------------------------------------------------------------------------------
 
-pub use microsandbox_types::LogSource;
+pub use microsandbox_types::{
+    LogSource, NETWORK_LOG_FORMAT_VERSION, NameSource, NetworkLogEvent, NetworkLogRecord,
+    NetworkRefusal, NetworkSuppressed, RefusalLayer, RefusalSite,
+};
 
 //--------------------------------------------------------------------------------------------------
 // Tests

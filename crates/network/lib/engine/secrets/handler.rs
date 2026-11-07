@@ -11,7 +11,7 @@ use std::sync::Arc;
 
 use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
 use httlib_hpack::{Decoder as HpackDecoder, Encoder as HpackEncoder};
-use microsandbox_types::SecretString;
+use microsandbox_types::{RefusalLayer, RefusalSite, SecretString};
 use percent_encoding::percent_decode;
 
 use super::config::SecretsConfigExt;
@@ -19,7 +19,9 @@ use super::file_source;
 use super::hpack::check_header_block;
 use crate::engine::http_deny::{classify_http_request, secret_http_forbidden_response};
 use crate::netstack::shared::SharedState;
-use crate::policy::{EgressEvaluation, HostnameSource, NetworkPolicy, Protocol};
+use crate::policy::handle::PolicySnapshot;
+use crate::policy::{EgressEvaluation, HostnameSource, Protocol};
+use crate::refusal::{self, Denial, NameEvidence};
 use crate::secrets::config::{
     HostPattern, MAX_SECRET_PLACEHOLDER_BYTES, SecretEntry, SecretSource, SecretViolationAction,
     SecretsConfig,
@@ -135,6 +137,8 @@ pub struct SecretsHandler {
     http1_response_allowed: bool,
     /// Set only by an actual HTTP/1 placeholder violation, not parse failures.
     http1_violation: bool,
+    /// Where and how this connection's refusals are reported, when they are.
+    reporting: Option<ViolationReporting>,
 }
 
 /// HTTP request framing state for the guest→server byte stream.
@@ -235,12 +239,48 @@ enum HttpAuthorityValidator {
     /// Require every HTTP authority-bearing field to be allowed by egress policy.
     Policy {
         guest_dst: SocketAddr,
-        network_policy: Arc<NetworkPolicy>,
+        /// The snapshot this connection was admitted under: the decision and the revision a
+        /// refusal reports come from the same read.
+        network_policy: PolicySnapshot,
         shared: Arc<SharedState>,
         /// Secret eligibility and passthrough are connection-scoped. Keep their
         /// proven host identity even when network policy also permits another host.
         secret_host: Option<String>,
     },
+}
+
+/// Where a secrets handler reports the refusals it decides.
+///
+/// The revision is the one the connection was admitted under: the handler never reads the policy
+/// handle again, so a refusal reports the snapshot its own decision consulted.
+struct ViolationReporting {
+    shared: Arc<SharedState>,
+    guest_dst: SocketAddr,
+    revision: u64,
+}
+
+/// A secrets-handler refusal that is recorded with its own site (R4).
+struct RecordedBlock<'a> {
+    /// The decision rule that refused.
+    site: RefusalSite,
+    /// The authority the guest sent, exactly as the check saw it; `None` uses the connection
+    /// name.
+    ///
+    /// It is deliberately not normalized here: the reporter owns what a record may say about a
+    /// name, and normalizing on this path would allocate for every block even when no sink is
+    /// installed.
+    authority: Option<Cow<'a, str>>,
+}
+
+/// Why a guest HTTP/2 header block could not be accepted.
+///
+/// Only a configured limit is a policy decision worth recording; malformed input is refused
+/// without a record (a scope boundary, not an oversight).
+enum HeaderDecodeError {
+    /// The block is not a decodable HPACK header block.
+    Malformed,
+    /// The block exceeds the decoded header field or byte limit.
+    Limit,
 }
 
 /// How this connection's destination identity was established for the purpose
@@ -661,7 +701,7 @@ impl SecretsHandler {
         config: &SecretsConfig,
         host: &str,
         guest_dst: SocketAddr,
-        network_policy: Arc<NetworkPolicy>,
+        network_policy: PolicySnapshot,
         shared: Arc<SharedState>,
     ) -> Self {
         let identity = (!host.is_empty()).then_some(SecretHostIdentity {
@@ -857,6 +897,7 @@ impl SecretsHandler {
             http1_requests: 0,
             http1_response_allowed: false,
             http1_violation: false,
+            reporting: None,
         }
     }
 
@@ -872,6 +913,28 @@ impl SecretsHandler {
     /// Attach the original guest destination for structured violation logs.
     pub fn with_guest_dst(mut self, guest_dst: SocketAddr) -> Self {
         self.guest_dst = Some(guest_dst);
+        self
+    }
+
+    /// Report this connection's refusals as egress refusals, attributed to `guest_dst` and to the
+    /// policy revision the snapshot the connection was admitted under reports.
+    ///
+    /// The snapshot is taken rather than a bare revision, so a decision made against one policy
+    /// and a record reporting another's revision cannot be paired by a caller.
+    ///
+    /// Nothing is reported until this is called, so a handler built for a non-guest purpose (a
+    /// bare unit test, a probe) records nothing.
+    pub(crate) fn with_refusal_reporting(
+        mut self,
+        shared: Arc<SharedState>,
+        guest_dst: SocketAddr,
+        policy: &PolicySnapshot,
+    ) -> Self {
+        self.reporting = Some(ViolationReporting {
+            shared,
+            guest_dst,
+            revision: policy.revision(),
+        });
         self
     }
 
@@ -1105,7 +1168,8 @@ impl SecretsHandler {
             if let Some(validator) = self.http_authority.as_ref()
                 && let Some(metadata) = parse_http_request_metadata(header_bytes)?
             {
-                validate_http1_authority(&metadata, validator)?;
+                validate_http1_authority(&metadata, validator)
+                    .map_err(|block| self.refuse(block))?;
             }
 
             // Credential-bearing requests are the only ones allowed to set a
@@ -1959,6 +2023,50 @@ impl SecretsHandler {
         })
     }
 
+    /// Report `block` when this connection reports refusals, then fail closed.
+    ///
+    /// Every caller returns [`SecretViolationAction::Block`], so the action is not a parameter: a
+    /// recorded authority or header-limit refusal always fails closed.
+    fn refuse(&self, block: RecordedBlock<'_>) -> SecretViolationAction {
+        if let Some(reporting) = &self.reporting {
+            let name = match block.authority.as_deref() {
+                Some(authority) => NameEvidence::HttpHost(authority),
+                None => self.connection_name(),
+            };
+            refusal::record(
+                &reporting.shared,
+                Denial {
+                    site: block.site,
+                    layer: RefusalLayer::Tenant,
+                    protocol: Protocol::Tcp,
+                    dst_ip: Some(reporting.guest_dst.ip()),
+                    dst_port: Some(reporting.guest_dst.port()),
+                    name,
+                    revision: reporting.revision,
+                },
+            );
+        }
+        SecretViolationAction::Block
+    }
+
+    /// The connection's fallback name evidence: a TLS-intercepted connection's SNI when it is a
+    /// hostname, a plain-HTTP connection's `Host`, and otherwise nothing.
+    ///
+    /// The SNI field holds the destination IP text when the ClientHello carried no SNI, so an IP
+    /// literal is never reported as a name.
+    fn connection_name(&self) -> NameEvidence<'_> {
+        if self.tls_intercepted {
+            if !self.sni.is_empty() && self.sni.parse::<IpAddr>().is_err() {
+                return NameEvidence::Sni(&self.sni);
+            }
+            NameEvidence::None
+        } else if self.sni.is_empty() {
+            NameEvidence::None
+        } else {
+            NameEvidence::HttpHost(&self.sni)
+        }
+    }
+
     fn apply_blocking_action(
         &mut self,
         report: Option<SecretViolationReport>,
@@ -1971,6 +2079,26 @@ impl SecretsHandler {
         self.http1_violation = matches!(report.protocol, RequestProtocol::Http1)
             && matches!(report.method.as_deref(), Some(method) if method != "HEAD" && method != "CONNECT");
 
+        // Every blocking action is a refusal, including the silent `Block`: the record says what
+        // happened, and tracing stays the only place a secret's identity appears.
+        if let Some(reporting) = &self.reporting {
+            let name = match report.host.as_deref() {
+                Some(host) => NameEvidence::HttpHost(host),
+                None => self.connection_name(),
+            };
+            refusal::record(
+                &reporting.shared,
+                Denial {
+                    site: RefusalSite::SecretViolation,
+                    layer: RefusalLayer::Tenant,
+                    protocol: Protocol::Tcp,
+                    dst_ip: Some(reporting.guest_dst.ip()),
+                    dst_port: Some(reporting.guest_dst.port()),
+                    name,
+                    revision: reporting.revision,
+                },
+            );
+        }
         self.log_violation(&report);
         Err(action.into_violation_action())
     }
@@ -2285,7 +2413,15 @@ impl Http2State {
         block: Http2HeaderBlock,
         output: &mut Vec<u8>,
     ) -> Result<(), SecretViolationAction> {
-        let mut headers = self.decode_headers(&block.block)?;
+        let mut headers = self
+            .decode_headers(&block.block)
+            .map_err(|error| match error {
+                HeaderDecodeError::Limit => handler.refuse(RecordedBlock {
+                    site: RefusalSite::HttpHeaderLimit,
+                    authority: None,
+                }),
+                HeaderDecodeError::Malformed => SecretViolationAction::Block,
+            })?;
         let is_initial_request = !self.open_request_streams.contains(&block.stream_id);
         if is_initial_request {
             // Client-initiated HTTP/2 stream ids must strictly increase. A
@@ -2304,7 +2440,8 @@ impl Http2State {
         }
 
         if let Some(validator) = handler.http_authority.as_ref() {
-            validate_http2_authority(&headers, validator, is_initial_request)?;
+            validate_http2_authority(&headers, validator, is_initial_request)
+                .map_err(|block| handler.refuse(block))?;
         }
 
         // Credential eligibility is decided on the ORIGINAL decoded block,
@@ -2338,7 +2475,7 @@ impl Http2State {
                     });
                     headers.push((name.into_bytes(), value.expose_secret().as_bytes().to_vec()));
                 }
-                enforce_http2_header_limits(&headers)?;
+                enforce_http2_header_limits(&headers).map_err(|block| handler.refuse(block))?;
             }
         } else {
             // Trailers are never substitution targets, in either HTTP version.
@@ -2369,12 +2506,12 @@ impl Http2State {
         Ok(())
     }
 
-    fn decode_headers(&mut self, block: &[u8]) -> Result<Http2Headers, SecretViolationAction> {
+    fn decode_headers(&mut self, block: &[u8]) -> Result<Http2Headers, HeaderDecodeError> {
         // `httlib-hpack` panics on a truncated representation instead of
         // returning an error, so it only gets structurally complete blocks.
         check_header_block(block).map_err(|err| {
             tracing::debug!(error = %err, "rejecting guest HTTP/2 header block");
-            SecretViolationAction::Block
+            HeaderDecodeError::Malformed
         })?;
         let mut block = block.to_vec();
         let mut headers = Vec::new();
@@ -2385,25 +2522,25 @@ impl Http2State {
             let mut decoded = Vec::with_capacity(1);
             self.decoder
                 .decode_exact(&mut block, &mut decoded)
-                .map_err(|_| SecretViolationAction::Block)?;
+                .map_err(|_| HeaderDecodeError::Malformed)?;
             if decoded.is_empty() {
                 if block.len() == before_len {
-                    return Err(SecretViolationAction::Block);
+                    return Err(HeaderDecodeError::Malformed);
                 }
                 continue;
             }
 
             if headers.len() >= MAX_HTTP2_HEADER_FIELDS {
-                return Err(SecretViolationAction::Block);
+                return Err(HeaderDecodeError::Limit);
             }
             let (name, value, _flags) = decoded.pop().expect("decoded one header");
             decoded_bytes = decoded_bytes
                 .checked_add(name.len())
                 .and_then(|len| len.checked_add(value.len()))
                 .and_then(|len| len.checked_add(4))
-                .ok_or(SecretViolationAction::Block)?;
+                .ok_or(HeaderDecodeError::Limit)?;
             if decoded_bytes > MAX_HTTP2_DECODED_HEADER_BYTES {
-                return Err(SecretViolationAction::Block);
+                return Err(HeaderDecodeError::Limit);
             }
 
             headers.push((name, value));
@@ -2591,12 +2728,15 @@ fn append_http2_frame(
     Ok(())
 }
 
-fn validate_http1_authority(
-    metadata: &HttpRequestMetadata,
+fn validate_http1_authority<'a>(
+    metadata: &'a HttpRequestMetadata,
     validator: &HttpAuthorityValidator,
-) -> Result<(), SecretViolationAction> {
+) -> Result<(), RecordedBlock<'a>> {
     if metadata.host_headers.len() != 1 {
-        return Err(SecretViolationAction::Block);
+        return Err(RecordedBlock {
+            site: RefusalSite::HttpAuthorityCount,
+            authority: None,
+        });
     }
 
     for authority in metadata
@@ -2604,45 +2744,51 @@ fn validate_http1_authority(
         .iter()
         .chain(metadata.target_authority.iter())
     {
-        validate_authority(authority, validator)?;
+        validate_authority(Cow::Borrowed(authority.as_str()), validator)?;
     }
 
     Ok(())
 }
 
-fn validate_http2_authority(
-    headers: &[(Vec<u8>, Vec<u8>)],
+fn validate_http2_authority<'a>(
+    headers: &'a [(Vec<u8>, Vec<u8>)],
     validator: &HttpAuthorityValidator,
     require_authority: bool,
-) -> Result<(), SecretViolationAction> {
+) -> Result<(), RecordedBlock<'a>> {
     let mut authority_count = 0usize;
 
     for (name, value) in headers {
         if name.eq_ignore_ascii_case(b":authority") {
             authority_count += 1;
             let authority = String::from_utf8_lossy(value);
-            validate_authority(authority.as_ref(), validator)?;
+            validate_authority(authority, validator)?;
         } else if name.eq_ignore_ascii_case(b"host") {
             let host = String::from_utf8_lossy(value);
-            validate_authority(host.as_ref(), validator)?;
+            validate_authority(host, validator)?;
         }
     }
 
     if require_authority && authority_count != 1 {
-        return Err(SecretViolationAction::Block);
+        return Err(RecordedBlock {
+            site: RefusalSite::HttpAuthorityCount,
+            authority: None,
+        });
     }
 
     Ok(())
 }
 
-fn validate_authority(
-    authority: &str,
+fn validate_authority<'a>(
+    authority: Cow<'a, str>,
     validator: &HttpAuthorityValidator,
-) -> Result<(), SecretViolationAction> {
+) -> Result<(), RecordedBlock<'a>> {
     match validator {
-        HttpAuthorityValidator::Sni(sni) => authority_matches_sni(authority, sni)
+        HttpAuthorityValidator::Sni(sni) => authority_matches_sni(&authority, sni)
             .then_some(())
-            .ok_or(SecretViolationAction::Block),
+            .ok_or(RecordedBlock {
+                site: RefusalSite::HttpAuthorityMismatch,
+                authority: Some(authority),
+            }),
         HttpAuthorityValidator::Policy {
             guest_dst,
             network_policy,
@@ -2653,12 +2799,18 @@ fn validate_authority(
             // different host (including placeholder passthrough exemptions).
             if secret_host
                 .as_ref()
-                .is_some_and(|host| !authority_matches_sni(authority, host))
+                .is_some_and(|host| !authority_matches_sni(&authority, host))
             {
-                return Err(SecretViolationAction::Block);
+                return Err(RecordedBlock {
+                    site: RefusalSite::HttpAuthorityMismatch,
+                    authority: Some(authority),
+                });
             }
-            let Some(hostname) = authority_hostname(authority) else {
-                return Err(SecretViolationAction::Block);
+            let Some(hostname) = authority_hostname(&authority) else {
+                return Err(RecordedBlock {
+                    site: RefusalSite::HttpAuthorityInvalid,
+                    authority: None,
+                });
             };
             let hostname = hostname.to_ascii_lowercase();
             let authority_dst = SocketAddr::new(guest_dst.ip(), guest_dst.port());
@@ -2670,7 +2822,10 @@ fn validate_authority(
             ) {
                 EgressEvaluation::Allow => Ok(()),
                 EgressEvaluation::Deny | EgressEvaluation::DeferUntilHostname => {
-                    Err(SecretViolationAction::Block)
+                    Err(RecordedBlock {
+                        site: RefusalSite::HttpAuthority,
+                        authority: Some(authority),
+                    })
                 }
             }
         }
@@ -2680,9 +2835,12 @@ fn validate_authority(
 /// Re-check HTTP/2 header limits after an inserted credential field.
 fn enforce_http2_header_limits(
     headers: &[(Vec<u8>, Vec<u8>)],
-) -> Result<(), SecretViolationAction> {
+) -> Result<(), RecordedBlock<'static>> {
     if headers.len() > MAX_HTTP2_HEADER_FIELDS {
-        return Err(SecretViolationAction::Block);
+        return Err(RecordedBlock {
+            site: RefusalSite::HttpHeaderLimit,
+            authority: None,
+        });
     }
     let decoded_bytes = headers.iter().try_fold(0usize, |acc, (name, value)| {
         acc.checked_add(name.len())
@@ -2690,7 +2848,10 @@ fn enforce_http2_header_limits(
             .and_then(|len| len.checked_add(4))
     });
     if decoded_bytes.is_none_or(|bytes| bytes > MAX_HTTP2_DECODED_HEADER_BYTES) {
-        return Err(SecretViolationAction::Block);
+        return Err(RecordedBlock {
+            site: RefusalSite::HttpHeaderLimit,
+            authority: None,
+        });
     }
     Ok(())
 }
@@ -3005,7 +3166,8 @@ fn authority_matches_sni(authority: &str, sni: &str) -> bool {
     })
 }
 
-fn authority_hostname(authority: &str) -> Option<&str> {
+/// The hostname part of an HTTP authority: no port, no IPv6 brackets, no trailing dot.
+pub(crate) fn authority_hostname(authority: &str) -> Option<&str> {
     let authority = authority.trim().trim_end_matches('.');
     if authority.is_empty() {
         return None;
@@ -4227,8 +4389,10 @@ mod tests {
     use super::*;
     use crate::engine::secrets::hpack::tests::{PANICKING_BLOCKS, Rng, random_block};
     use crate::netstack::shared::{ResolvedHostnameFamily, SharedState};
+    use crate::policy::NetworkPolicy;
     use crate::secrets::config::SecretSubstitution;
     use microsandbox_types::compat;
+    use microsandbox_types::{NameSource, NetworkRefusal};
 
     use std::net::{IpAddr, Ipv4Addr};
     use std::time::Duration;
@@ -4575,6 +4739,37 @@ mod tests {
         }
     }
 
+    /// The guest destination every plain-HTTP policy handler fixture uses.
+    fn policy_guest_dst() -> SocketAddr {
+        SocketAddr::new(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 10)), 80)
+    }
+
+    /// A plain-HTTP policy handler over a recording sink, admitted at revision 3, so a test can
+    /// assert exactly what a refused request authority or header limit records.
+    fn recording_policy_handler(
+        config: &SecretsConfig,
+        host: &str,
+    ) -> (
+        SecretsHandler,
+        Arc<crate::refusal::test_support::CollectingSink>,
+    ) {
+        let ip = Ipv4Addr::new(203, 0, 113, 10);
+        let (shared, sink) = crate::refusal::test_support::recording_state(16);
+        cache_host(&shared, "a.example", ip);
+        cache_host(&shared, "b.example", ip);
+        let guest_dst = policy_guest_dst();
+        let policy = PolicySnapshot::new(Arc::new(NetworkPolicy::allow_all()), 3);
+        let handler = SecretsHandler::new_plain_http_policy(
+            config,
+            host,
+            guest_dst,
+            policy.clone(),
+            Arc::clone(&shared),
+        )
+        .with_refusal_reporting(shared, guest_dst, &policy);
+        (handler, sink)
+    }
+
     fn plain_http_policy_handler(config: &SecretsConfig) -> SecretsHandler {
         let ip = Ipv4Addr::new(203, 0, 113, 10);
         let shared = Arc::new(SharedState::new(16));
@@ -4584,9 +4779,339 @@ mod tests {
             config,
             "a.example",
             SocketAddr::new(IpAddr::V4(ip), 80),
-            Arc::new(NetworkPolicy::allow_all()),
+            PolicySnapshot::initial(Arc::new(NetworkPolicy::allow_all())),
             shared,
         )
+    }
+
+    /// `http-authority-mismatch`: the request names a host the connection's secret is not scoped
+    /// to, so the record carries that offending authority.
+    #[test]
+    fn http_authority_mismatch_is_recorded_with_the_offending_authority() {
+        let mut secret = make_secret("$KEY", "real-secret", "a.example");
+        secret.require_tls_identity = false;
+        let config = make_config(vec![secret]);
+        let (mut handler, sink) = recording_policy_handler(&config, "a.example");
+
+        let result = handler.substitute(b"GET / HTTP/1.1\r\nHost: b.example\r\n\r\n");
+
+        assert_eq!(result.unwrap_err(), SecretViolationAction::Block);
+        assert_eq!(
+            sink.take(),
+            vec![NetworkRefusal {
+                site: RefusalSite::HttpAuthorityMismatch,
+                layer: RefusalLayer::Tenant,
+                protocol: microsandbox_types::Protocol::Tcp,
+                dst_ip: Some(policy_guest_dst().ip()),
+                dst_port: Some(policy_guest_dst().port()),
+                name: Some("b.example".to_owned()),
+                name_source: NameSource::HttpHost,
+                revision: 3,
+            }]
+        );
+    }
+
+    /// `http-authority`/`http-authority-mismatch` name evidence is normalized before it is
+    /// recorded, and normalization never changes the decision.
+    ///
+    /// One case per rule in R3 and in the documented normalizer: an authority's hostname is what
+    /// is recorded (userinfo and a numeric port removed, `http-host` source, ASCII-lowercased, no
+    /// trailing dot), and an authority that is not a hostname — an IP literal, a non-numeric
+    /// port, a path, a name past 253 bytes — is recorded as no evidence at all rather than
+    /// truncated or passed through.
+    #[test]
+    fn request_authorities_are_normalized_or_reported_as_no_name_evidence() {
+        let longest = [
+            "a".repeat(63),
+            "b".repeat(63),
+            "c".repeat(63),
+            "d".repeat(61),
+        ]
+        .join(".");
+        assert_eq!(longest.len(), 253);
+        let too_long = [
+            "a".repeat(63),
+            "b".repeat(63),
+            "c".repeat(63),
+            "d".repeat(62),
+        ]
+        .join(".");
+        assert_eq!(too_long.len(), 254);
+
+        let mut secret = make_secret("$KEY", "real-secret", "a.example");
+        secret.require_tls_identity = false;
+        let config = make_config(vec![secret]);
+
+        for (authority, expected) in [
+            // The offending authority's hostname, not the userinfo or the port.
+            ("user:pw@evil.test:443", Some("evil.test")),
+            ("user@evil.test", Some("evil.test")),
+            // Normalization: lowercase, no trailing dot, exactly as R3 defines it.
+            ("Evil.Test.", Some("evil.test")),
+            ("evil.test:0", Some("evil.test")),
+            ("evil.test:65535", Some("evil.test")),
+            // The longest name a record may carry.
+            (longest.as_str(), Some(longest.as_str())),
+            // Not a hostname: dropped rather than mangled into a different domain.
+            ("evil.test:abc", None),
+            ("evil.test:65536", None),
+            ("evil.test/path", None),
+            ("https://evil.test", None),
+            ("203.0.113.10", None),
+            ("203.0.113.10:443", None),
+            ("[2001:db8::1]:443", None),
+            ("2001:db8::1", None),
+            ("evil..test", None),
+            ("evil .test", None),
+            (too_long.as_str(), None),
+        ] {
+            let (mut handler, sink) = recording_policy_handler(&config, "a.example");
+            let request = format!("GET / HTTP/1.1\r\nHost: {authority}\r\n\r\n");
+
+            let result = handler.substitute(request.as_bytes());
+
+            // Reporting never decides: the request is refused whatever the name looks like.
+            assert_eq!(
+                result.unwrap_err(),
+                SecretViolationAction::Block,
+                "{authority:?} must still be refused"
+            );
+            let recorded = sink.take();
+            assert_eq!(recorded.len(), 1, "one record for {authority:?}");
+            assert_eq!(recorded[0].site, RefusalSite::HttpAuthorityMismatch);
+            assert_eq!(recorded[0].name.as_deref(), expected, "{authority:?}");
+            assert_eq!(
+                recorded[0].name_source,
+                if expected.is_some() {
+                    NameSource::HttpHost
+                } else {
+                    NameSource::Absent
+                },
+                "{authority:?}: a name is present if and only if its source is not `none`"
+            );
+        }
+    }
+
+    /// A control character in the authority is not a name either; whether the HTTP parser
+    /// refuses the header block first, no record may carry a name built from the bytes.
+    #[test]
+    fn a_control_character_in_the_authority_is_never_a_name() {
+        let mut secret = make_secret("$KEY", "real-secret", "a.example");
+        secret.require_tls_identity = false;
+        let config = make_config(vec![secret]);
+        let (mut handler, sink) = recording_policy_handler(&config, "a.example");
+
+        let request = "GET / HTTP/1.1\r\nHost: evil\u{1}test\r\n\r\n";
+        assert_eq!(
+            handler.substitute(request.as_bytes()).unwrap_err(),
+            SecretViolationAction::Block
+        );
+        for refusal in sink.take() {
+            assert_eq!(
+                (refusal.name, refusal.name_source),
+                (None, NameSource::Absent),
+                "a control character is not name evidence"
+            );
+        }
+    }
+
+    /// `http-authority-count`: a request with more than one `Host` is refused under that site, and
+    /// the fallback name is the connection's own authority.
+    #[test]
+    fn http_authority_count_is_recorded_with_the_connection_name() {
+        let config = make_config(Vec::new());
+        let (mut handler, sink) = recording_policy_handler(&config, "a.example");
+
+        let result =
+            handler.substitute(b"GET / HTTP/1.1\r\nHost: a.example\r\nHost: b.example\r\n\r\n");
+
+        assert_eq!(result.unwrap_err(), SecretViolationAction::Block);
+        let recorded = sink.take();
+        assert_eq!(recorded.len(), 1);
+        assert_eq!(recorded[0].site, RefusalSite::HttpAuthorityCount);
+        assert_eq!(recorded[0].name.as_deref(), Some("a.example"));
+        assert_eq!(recorded[0].name_source, NameSource::HttpHost);
+    }
+
+    /// `http-authority-invalid`: an authority with no parseable hostname is refused under its own
+    /// site and falls back to the connection name.
+    #[test]
+    fn http_authority_invalid_is_recorded_with_the_connection_name() {
+        let config = make_config(Vec::new());
+        let (mut handler, sink) = recording_policy_handler(&config, "a.example");
+
+        let result = handler.substitute(b"GET / HTTP/1.1\r\nHost: \r\n\r\n");
+
+        assert_eq!(result.unwrap_err(), SecretViolationAction::Block);
+        let recorded = sink.take();
+        assert_eq!(recorded.len(), 1);
+        assert_eq!(recorded[0].site, RefusalSite::HttpAuthorityInvalid);
+        assert_eq!(recorded[0].name.as_deref(), Some("a.example"));
+    }
+
+    /// `http-authority`: a request whose authority the network policy refuses is recorded with
+    /// that authority as its name evidence.
+    #[test]
+    fn http_authority_denial_is_recorded_with_the_request_authority() {
+        let ip = Ipv4Addr::new(203, 0, 113, 10);
+        let (shared, sink) = crate::refusal::test_support::recording_state(16);
+        cache_host(&shared, "a.example", ip);
+        let guest_dst = policy_guest_dst();
+        let policy = PolicySnapshot::new(Arc::new(NetworkPolicy::none()), 2);
+        let mut handler = SecretsHandler::new_plain_http_policy(
+            &make_config(Vec::new()),
+            "a.example",
+            guest_dst,
+            policy.clone(),
+            Arc::clone(&shared),
+        )
+        .with_refusal_reporting(shared, guest_dst, &policy);
+
+        let result = handler.substitute(b"GET / HTTP/1.1\r\nHost: blocked.example\r\n\r\n");
+
+        assert_eq!(result.unwrap_err(), SecretViolationAction::Block);
+        assert_eq!(
+            sink.take(),
+            vec![NetworkRefusal {
+                site: RefusalSite::HttpAuthority,
+                layer: RefusalLayer::Tenant,
+                protocol: microsandbox_types::Protocol::Tcp,
+                dst_ip: Some(guest_dst.ip()),
+                dst_port: Some(guest_dst.port()),
+                name: Some("blocked.example".to_owned()),
+                name_source: NameSource::HttpHost,
+                revision: 2,
+            }]
+        );
+    }
+
+    /// `http-header-limit`: the decoded-header limit is a policy refusal and is recorded; a
+    /// header block that is merely malformed is refused without a record.
+    #[test]
+    fn http_header_limit_is_recorded_and_malformed_blocks_are_not() {
+        let config = make_config(Vec::new());
+        let (handler, sink) = recording_policy_handler(&config, "a.example");
+
+        // One field past the decoded-field limit, encoded as never-indexed raw literals.
+        let mut block = Vec::new();
+        for _ in 0..=MAX_HTTP2_HEADER_FIELDS {
+            block.extend_from_slice(&[0x10, 1, b'x', 0]);
+        }
+        let mut state = Http2State::default();
+        assert!(matches!(
+            state.decode_headers(&block),
+            Err(HeaderDecodeError::Limit)
+        ));
+        let recorded = handler.refuse(RecordedBlock {
+            site: RefusalSite::HttpHeaderLimit,
+            authority: None,
+        });
+        assert_eq!(recorded, SecretViolationAction::Block);
+        let recorded = sink.take();
+        assert_eq!(recorded.len(), 1);
+        assert_eq!(recorded[0].site, RefusalSite::HttpHeaderLimit);
+        assert_eq!(
+            recorded[0].name.as_deref(),
+            Some("a.example"),
+            "the connection name is the fallback"
+        );
+
+        // A truncated block is malformed input, not a policy decision: nothing is recorded.
+        assert!(matches!(
+            state.decode_headers(&[0xff]),
+            Err(HeaderDecodeError::Malformed)
+        ));
+        assert!(sink.take().is_empty());
+    }
+
+    /// `secret-violation`: every blocking action records, including the silent `Block`, and the
+    /// record carries the request's `Host` rather than the connection name.
+    #[test]
+    fn secret_violation_is_recorded_for_every_blocking_action() {
+        for action in [
+            BlockingAction::Block,
+            BlockingAction::BlockAndLog,
+            BlockingAction::BlockAndTerminate,
+        ] {
+            // The secret keeps its TLS-only identity, so the placeholder cannot be substituted
+            // over plain HTTP and is a violation even on the host it is scoped to.
+            let secret = make_secret("$KEY", "real-secret", "a.example");
+            let mut config = make_config(vec![secret]);
+            config.violation_action = match action {
+                BlockingAction::Block => SecretViolationAction::Block,
+                BlockingAction::BlockAndLog => SecretViolationAction::BlockAndLog,
+                BlockingAction::BlockAndTerminate => SecretViolationAction::BlockAndTerminate,
+            };
+            let (mut handler, sink) = recording_policy_handler(&config, "a.example");
+
+            let result = handler.substitute(
+                b"GET / HTTP/1.1\r\nHost: a.example\r\nAuthorization: Bearer $KEY\r\n\r\n",
+            );
+
+            assert_eq!(result.unwrap_err(), config.violation_action);
+            let recorded = sink.take();
+            let violations: Vec<_> = recorded
+                .iter()
+                .filter(|record| record.site == RefusalSite::SecretViolation)
+                .collect();
+            assert_eq!(violations.len(), 1, "{action:?}: one record per violation");
+            assert_eq!(violations[0].name.as_deref(), Some("a.example"));
+            assert_eq!(violations[0].name_source, NameSource::HttpHost);
+            assert!(recorded.iter().all(|record| record.revision == 3));
+        }
+    }
+
+    /// A placeholder in `Host` never becomes a record's `name`.
+    ///
+    /// The authority is checked before substitution, so the decision here is
+    /// `http-authority-mismatch`: the `Host` is not the secret's proven host. What this pins is the
+    /// name rule — the placeholder is guest-known text and a record's `name` is what an approval
+    /// UI would render, so an authority that is not a hostname is reported as no evidence.
+    #[test]
+    fn a_placeholder_in_host_is_never_recorded_as_a_name() {
+        let secret = make_secret("$KEY", "real-secret", "a.example");
+        let config = make_config(vec![secret]);
+        let (mut handler, sink) = recording_policy_handler(&config, "a.example");
+
+        let result = handler.substitute(b"GET / HTTP/1.1\r\nHost: $KEY\r\n\r\n");
+
+        assert_eq!(result.unwrap_err(), SecretViolationAction::Block);
+        let recorded = sink.take();
+        assert_eq!(recorded.len(), 1, "one refusal, one record: {recorded:?}");
+        assert_eq!(recorded[0].site, RefusalSite::HttpAuthorityMismatch);
+        assert_eq!(
+            recorded[0].name, None,
+            "a placeholder is not a hostname and must never be recorded as a name"
+        );
+        assert_eq!(recorded[0].name_source, NameSource::Absent);
+    }
+
+    /// An IP-literal `Host` is an address, not a name, so the refusal records no name evidence
+    /// even though the authority is the thing that was refused.
+    #[test]
+    fn an_ip_literal_host_is_never_recorded_as_a_name() {
+        let ip = Ipv4Addr::new(203, 0, 113, 10);
+        let (shared, sink) = crate::refusal::test_support::recording_state(16);
+        cache_host(&shared, "a.example", ip);
+        let guest_dst = policy_guest_dst();
+        let policy = PolicySnapshot::initial(Arc::new(NetworkPolicy::none()));
+        let mut handler = SecretsHandler::new_plain_http_policy(
+            &make_config(Vec::new()),
+            "a.example",
+            guest_dst,
+            policy.clone(),
+            Arc::clone(&shared),
+        )
+        .with_refusal_reporting(shared, guest_dst, &policy);
+
+        let result = handler.substitute(b"GET / HTTP/1.1\r\nHost: 203.0.113.10:8080\r\n\r\n");
+
+        assert_eq!(result.unwrap_err(), SecretViolationAction::Block);
+        let recorded = sink.take();
+        assert_eq!(recorded.len(), 1, "{recorded:?}");
+        assert_eq!(recorded[0].site, RefusalSite::HttpAuthority);
+        assert_eq!(recorded[0].name, None, "an address is not a name");
+        assert_eq!(recorded[0].name_source, NameSource::Absent);
     }
 
     #[test]

@@ -12,13 +12,16 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::os::fd::FromRawFd;
 use std::sync::Arc;
 
+use microsandbox_types::{RefusalLayer, RefusalSite};
 use smoltcp::wire::{
     EthernetAddress, EthernetFrame, EthernetProtocol, EthernetRepr, Icmpv4Packet, Icmpv4Repr,
     Icmpv6Packet, Icmpv6Repr, IpProtocol, Ipv4Packet, Ipv4Repr, Ipv6Packet, Ipv6Repr,
 };
 
 use crate::netstack::{poll::PollLoopConfig, shared::SharedState};
+use crate::policy::handle::PolicySnapshot;
 use crate::policy::{NetworkPolicy, Protocol};
+use crate::refusal::{self, Denial, NameEvidence};
 
 //--------------------------------------------------------------------------------------------------
 // Constants
@@ -117,7 +120,7 @@ impl IcmpRelay {
         &self,
         frame: &[u8],
         config: &PollLoopConfig,
-        policy: &NetworkPolicy,
+        policy: &PolicySnapshot,
         platform_policy: Option<&NetworkPolicy>,
     ) -> bool {
         let Ok(eth) = EthernetFrame::new_checked(frame) else {
@@ -137,12 +140,55 @@ impl IcmpRelay {
 }
 
 impl IcmpRelay {
+    /// Apply the tenant policy and the optional host-owned floor to one echo request, reporting a
+    /// refusal as an R4 `icmp` record.
+    ///
+    /// Returns `true` when the echo was refused (and so must be consumed). The floor is evaluated
+    /// first, so a refusal it alone would make is the platform's.
+    fn refuse_echo(
+        &self,
+        dst_ip: IpAddr,
+        protocol: Protocol,
+        policy: &PolicySnapshot,
+        platform_policy: Option<&NetworkPolicy>,
+    ) -> bool {
+        let layer = if platform_policy.is_some_and(|platform| {
+            platform
+                .evaluate_egress_ip(dst_ip, protocol, &self.shared)
+                .is_deny()
+        }) {
+            RefusalLayer::Platform
+        } else if policy
+            .evaluate_egress_ip(dst_ip, protocol, &self.shared)
+            .is_deny()
+        {
+            RefusalLayer::Tenant
+        } else {
+            return false;
+        };
+
+        refusal::record(
+            &self.shared,
+            Denial {
+                site: RefusalSite::Icmp,
+                layer,
+                protocol,
+                dst_ip: Some(dst_ip),
+                dst_port: None,
+                name: NameEvidence::CachedFor(dst_ip),
+                revision: policy.revision(),
+            },
+        );
+
+        true
+    }
+
     /// Try to relay an ICMPv4 echo request. Returns true if consumed.
     fn try_relay_icmpv4(
         &self,
         eth: &EthernetFrame<&[u8]>,
         config: &PollLoopConfig,
-        policy: &NetworkPolicy,
+        policy: &PolicySnapshot,
         platform_policy: Option<&NetworkPolicy>,
     ) -> bool {
         let Ok(ipv4) = Ipv4Packet::new_checked(eth.payload()) else {
@@ -171,14 +217,12 @@ impl IcmpRelay {
         };
 
         // Policy check.
-        if platform_policy.is_some_and(|platform| {
-            platform
-                .evaluate_egress_ip(IpAddr::V4(dst_ip), Protocol::Icmpv4, &self.shared)
-                .is_deny()
-        }) || policy
-            .evaluate_egress_ip(IpAddr::V4(dst_ip), Protocol::Icmpv4, &self.shared)
-            .is_deny()
-        {
+        if self.refuse_echo(
+            IpAddr::V4(dst_ip),
+            Protocol::Icmpv4,
+            policy,
+            platform_policy,
+        ) {
             tracing::debug!(dst = %dst_ip, "ICMP echo denied by policy");
             return true; // Consumed (silently dropped by policy).
         }
@@ -218,7 +262,7 @@ impl IcmpRelay {
         &self,
         eth: &EthernetFrame<&[u8]>,
         config: &PollLoopConfig,
-        policy: &NetworkPolicy,
+        policy: &PolicySnapshot,
         platform_policy: Option<&NetworkPolicy>,
     ) -> bool {
         let Ok(ipv6) = Ipv6Packet::new_checked(eth.payload()) else {
@@ -252,14 +296,12 @@ impl IcmpRelay {
         };
 
         // Policy check.
-        if platform_policy.is_some_and(|platform| {
-            platform
-                .evaluate_egress_ip(IpAddr::V6(dst_ip), Protocol::Icmpv6, &self.shared)
-                .is_deny()
-        }) || policy
-            .evaluate_egress_ip(IpAddr::V6(dst_ip), Protocol::Icmpv6, &self.shared)
-            .is_deny()
-        {
+        if self.refuse_echo(
+            IpAddr::V6(dst_ip),
+            Protocol::Icmpv6,
+            policy,
+            platform_policy,
+        ) {
             tracing::debug!(dst = %dst_ip, "ICMPv6 echo denied by policy");
             return true;
         }
@@ -839,7 +881,11 @@ fn construct_icmpv6_echo_reply(
 mod tests {
     use super::*;
 
+    use microsandbox_types::{NameSource, NetworkRefusal, Protocol as WireProtocol};
     use smoltcp::phy::ChecksumCapabilities;
+
+    use crate::netstack::poll::GatewayIps;
+    use crate::refusal::test_support::recording_state;
 
     #[test]
     fn construct_icmpv4_reply_roundtrips() {
@@ -1070,5 +1116,195 @@ mod tests {
         let (seq_no, data) = parse_icmpv6_echo_reply(eth.payload(), src, dst).unwrap();
         assert_eq!(seq_no, 0x0002);
         assert_eq!(data, b"v6ping");
+    }
+    // ─────────────────────────────────────────────────────────────────────
+    // Egress refusal records (R4 `icmp`).
+    //
+    // The relay's echo backends are forced available so the policy check is
+    // reached; it runs before any outbound socket, so a refused packet never
+    // touches the network.
+    // ─────────────────────────────────────────────────────────────────────
+
+    const GUEST_MAC: [u8; 6] = [0x02, 0x00, 0x00, 0x00, 0x00, 0x02];
+    const GATEWAY_MAC: [u8; 6] = [0x02, 0x00, 0x00, 0x00, 0x00, 0x01];
+    const GUEST_IPV4: Ipv4Addr = Ipv4Addr::new(100, 96, 0, 2);
+    const GATEWAY_IPV4: Ipv4Addr = Ipv4Addr::new(100, 96, 0, 1);
+    const GUEST_IPV6: Ipv6Addr = Ipv6Addr::new(0xfd42, 0x6d73, 0x0062, 0, 0, 0, 0, 2);
+    const GATEWAY_IPV6: Ipv6Addr = Ipv6Addr::new(0xfd42, 0x6d73, 0x0062, 0, 0, 0, 0, 1);
+
+    /// A relay whose echo backends are available, so a probe would be attempted if allowed.
+    fn available_relay(shared: Arc<SharedState>) -> IcmpRelay {
+        IcmpRelay {
+            shared,
+            gateway_mac: EthernetAddress(GATEWAY_MAC),
+            guest_mac: EthernetAddress(GUEST_MAC),
+            tokio_handle: tokio::runtime::Handle::current(),
+            backend_v4: EchoBackend::Available,
+            backend_v6: EchoBackend::Available,
+        }
+    }
+
+    fn relay_config() -> PollLoopConfig {
+        PollLoopConfig {
+            gateway_mac: GATEWAY_MAC,
+            guest_mac: GUEST_MAC,
+            gateway: GatewayIps {
+                ipv4: Some(GATEWAY_IPV4),
+                ipv6: Some(GATEWAY_IPV6),
+            },
+            guest_ipv4: Some(GUEST_IPV4),
+            guest_ipv6: Some(GUEST_IPV6),
+            mtu: 1500,
+        }
+    }
+
+    /// An Ethernet + IPv4 + ICMPv4 echo request from the guest.
+    fn icmpv4_echo_request(dst_ip: Ipv4Addr) -> Vec<u8> {
+        let icmp_repr = Icmpv4Repr::EchoRequest {
+            ident: 0x1234,
+            seq_no: 1,
+            data: b"ping",
+        };
+        let ipv4_repr = Ipv4Repr {
+            src_addr: GUEST_IPV4,
+            dst_addr: dst_ip,
+            next_header: IpProtocol::Icmp,
+            payload_len: icmp_repr.buffer_len(),
+            hop_limit: 64,
+        };
+        let mut frame = vec![0u8; ETH_HDR_LEN + ipv4_repr.buffer_len() + icmp_repr.buffer_len()];
+
+        EthernetRepr {
+            src_addr: EthernetAddress(GUEST_MAC),
+            dst_addr: EthernetAddress(GATEWAY_MAC),
+            ethertype: EthernetProtocol::Ipv4,
+        }
+        .emit(&mut EthernetFrame::new_unchecked(&mut frame));
+        ipv4_repr.emit(
+            &mut Ipv4Packet::new_unchecked(&mut frame[ETH_HDR_LEN..ETH_HDR_LEN + IPV4_HDR_LEN]),
+            &smoltcp::phy::ChecksumCapabilities::default(),
+        );
+        icmp_repr.emit(
+            &mut Icmpv4Packet::new_unchecked(&mut frame[ETH_HDR_LEN + IPV4_HDR_LEN..]),
+            &smoltcp::phy::ChecksumCapabilities::default(),
+        );
+
+        frame
+    }
+
+    /// An Ethernet + IPv6 + ICMPv6 echo request from the guest.
+    fn icmpv6_echo_request(dst_ip: Ipv6Addr) -> Vec<u8> {
+        let icmp_repr = Icmpv6Repr::EchoRequest {
+            ident: 0x5678,
+            seq_no: 1,
+            data: b"ping6",
+        };
+        let mut frame = vec![0u8; ETH_HDR_LEN + IPV6_HDR_LEN + icmp_repr.buffer_len()];
+
+        EthernetRepr {
+            src_addr: EthernetAddress(GUEST_MAC),
+            dst_addr: EthernetAddress(GATEWAY_MAC),
+            ethertype: EthernetProtocol::Ipv6,
+        }
+        .emit(&mut EthernetFrame::new_unchecked(&mut frame));
+        Ipv6Repr {
+            src_addr: GUEST_IPV6,
+            dst_addr: dst_ip,
+            next_header: IpProtocol::Icmpv6,
+            payload_len: icmp_repr.buffer_len(),
+            hop_limit: 64,
+        }
+        .emit(&mut Ipv6Packet::new_unchecked(
+            &mut frame[ETH_HDR_LEN..ETH_HDR_LEN + IPV6_HDR_LEN],
+        ));
+        icmp_repr.emit(
+            &GUEST_IPV6,
+            &dst_ip,
+            &mut Icmpv6Packet::new_unchecked(&mut frame[ETH_HDR_LEN + IPV6_HDR_LEN..]),
+            &smoltcp::phy::ChecksumCapabilities::default(),
+        );
+
+        frame
+    }
+
+    /// The `icmp` record a refused echo to `dst_ip` produces.
+    fn echo_refusal(dst_ip: IpAddr, protocol: WireProtocol, layer: RefusalLayer) -> NetworkRefusal {
+        NetworkRefusal {
+            site: RefusalSite::Icmp,
+            layer,
+            protocol,
+            dst_ip: Some(dst_ip),
+            dst_port: None,
+            name: None,
+            name_source: NameSource::Absent,
+            revision: 1,
+        }
+    }
+
+    #[tokio::test]
+    async fn icmp_relay_v4_denial_is_recorded() {
+        let (shared, sink) = recording_state(8);
+        let relay = available_relay(shared.clone());
+        let config = relay_config();
+        let dst = Ipv4Addr::new(203, 0, 113, 7);
+        let policy = PolicySnapshot::initial(Arc::new(NetworkPolicy::none()));
+
+        assert!(
+            relay.relay_outbound_if_echo(&icmpv4_echo_request(dst), &config, &policy, None),
+            "a denied echo is consumed"
+        );
+
+        assert_eq!(
+            sink.take(),
+            vec![echo_refusal(
+                IpAddr::V4(dst),
+                WireProtocol::Icmpv4,
+                RefusalLayer::Tenant
+            )]
+        );
+    }
+
+    /// The floor is evaluated first in the relay too, so a floor-only refusal is `platform`.
+    #[tokio::test]
+    async fn icmp_relay_v6_denial_is_recorded() {
+        let (shared, sink) = recording_state(8);
+        let relay = available_relay(shared.clone());
+        let config = relay_config();
+        // A ULA destination: the floor's public range does not cover it, the tenant allows it.
+        let dst: Ipv6Addr = "fd42:6d73:62::7".parse().unwrap();
+        // The tenant allows everything and the floor refuses the address.
+        let policy = PolicySnapshot::initial(Arc::new(NetworkPolicy::allow_all()));
+        let floor = NetworkPolicy::from_profiles([crate::policy::NetworkProfile::Public]);
+
+        assert!(
+            relay.relay_outbound_if_echo(&icmpv6_echo_request(dst), &config, &policy, Some(&floor)),
+            "a denied echo is consumed"
+        );
+
+        assert_eq!(
+            sink.take(),
+            vec![echo_refusal(
+                IpAddr::V6(dst),
+                WireProtocol::Icmpv6,
+                RefusalLayer::Platform
+            )]
+        );
+    }
+
+    /// An allowed echo is relayed and records nothing.
+    #[tokio::test]
+    async fn icmp_relay_allowed_echo_is_not_recorded() {
+        let (shared, sink) = recording_state(8);
+        let relay = available_relay(shared.clone());
+        let config = relay_config();
+        let dst = Ipv4Addr::new(203, 0, 113, 7);
+        let policy = PolicySnapshot::initial(Arc::new(NetworkPolicy::allow_all()));
+
+        assert!(
+            relay.relay_outbound_if_echo(&icmpv4_echo_request(dst), &config, &policy, None),
+            "an allowed echo is consumed by the relay"
+        );
+
+        assert!(sink.take().is_empty(), "an allowed echo is not a refusal");
     }
 }

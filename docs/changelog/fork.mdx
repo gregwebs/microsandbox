@@ -1,7 +1,7 @@
 ---
 title: "Changes in this fork"
 sidebarTitle: "This fork"
-description: "Fork-only features: rotating file secrets, header credentials, request interception, opt-in ambient proxy discovery, auto-published listeners, and live network policy replacement."
+description: "Fork-only features: rotating file secrets, header credentials, request interception, opt-in ambient proxy discovery, auto-published listeners, live network policy replacement, and the egress refusal log."
 icon: "code-fork"
 ---
 
@@ -176,3 +176,59 @@ launcher can offer a next-launch grant. This is the Rust SDK only: there is no `
 no Python, Node, Go, or Ruby method.
 
 See [Replacing a running sandbox's policy](/networking/overview#live-policy-replacement).
+
+## Egress refusal log
+
+A local sandbox with networking enabled writes one JSON line to `<sandbox-dir>/logs/network.log`
+for every egress decision it refuses, at the moment it refuses it. A refusal is recorded by a policy
+or by the `multi-tenant` platform floor, by the strict-hostname rule, by DNS rebind protection, by
+protocol-steering drops such as QUIC blocking and alternative-DNS or DNS-over-TLS ports, by the
+secrets handler's authority and header-limit checks, by a secret violation, and by the fail-closed
+proxy path. Capacity refusals, malformed-input blocks, allowed flows, and ingress denials are not
+recorded, and neither are the `403` and in-tunnel TLS denial responses: they present a decision that
+was already recorded where it was made.
+
+Each record reports facts only — the site that refused, whether the sandbox policy or the floor owns
+the decision, the destination the guest used, the guest-supplied name evidence and its source, and
+the policy revision in force. Classifying refusals and coalescing them are the launcher's job. The
+file rotates like `exec.log` (10 MiB, `.1` to `.4`), each site's own token bucket caps it at a
+256-record burst and 20 records/s with a `suppressed` record carrying the count, and it is removed
+with the sandbox.
+
+```rust
+use futures::StreamExt;
+use microsandbox::logs::{LogSource, LogStreamOptions, NetworkLogRecord};
+use microsandbox::Sandbox;
+
+let sb = Sandbox::get("egress").await?;
+let mut refusals = sb
+    .log_stream(&LogStreamOptions {
+        sources: vec![LogSource::Network],
+        follow: true,
+        ..Default::default()
+    })
+    .await?;
+
+while let Some(entry) = refusals.next().await {
+    let record: NetworkLogRecord = serde_json::from_slice(&entry?.data)?;
+    println!("{record:?}");
+}
+```
+
+One refused TCP SYN:
+
+```text
+{"v":1,"t":"2026-11-05T14:03:07.412Z","s":"network","event":"refusal","site":"tcp-syn","layer":"tenant","protocol":"tcp","dst_ip":"203.0.113.10","dst_port":443,"name":"api.example.com","name_source":"dns-cache","revision":2}
+```
+
+The `network` source is never in the default sources and never in `msb logs --source all`, and the
+Python, Node, Go, and Ruby SDKs do not accept it. A newer SDK that requests the `network` source
+from a runtime that predates it gets an empty stream rather than an error: there is no capability
+bit for it, because a stopped sandbox's logs are read directly with no runtime to query. A writable
+bind mount of a sandbox's own directory is refused at launch so the guest cannot rewrite its own
+log; a writable bind of a parent directory is still allowed and exposes that log.
+
+This is the Rust SDK only: there is no new `msb` command — `msb logs --source network` reads the
+file.
+
+See [Refusal log](/networking/overview#refusal-log).

@@ -941,6 +941,22 @@ fn run(
             }
         };
 
+    // Attach the egress refusal log the network engine reports every refused decision to. Like
+    // `exec.log`, best-effort: a sandbox without its refusal log still boots, and the file is
+    // never created for a sandbox whose networking is disabled.
+    #[cfg(feature = "net")]
+    let network_log = if config.vm.network.config().enabled {
+        match crate::runner::network_log::NetworkLog::open(&config.log_dir) {
+            Ok(log) => Some(log),
+            Err(err) => {
+                tracing::warn!(error = %err, "network_log: open failed, refusal log disabled");
+                None
+            }
+        }
+    } else {
+        None
+    };
+
     // Shared termination reason — background tasks store the reason before
     // triggering exit; the exit observer reads it for the DB update.
     let exit_reason: Arc<std::sync::atomic::AtomicU8> =
@@ -980,6 +996,8 @@ fn run(
     let exit_sandbox_name = config.sandbox_name.clone();
     let exit_sandboxes_dir = config.sandboxes_dir.clone();
     let exit_log_writer = exec_log_writer.clone();
+    #[cfg(feature = "net")]
+    let exit_network_log = network_log.clone();
     // Capture the activated writer so the exit observer can release the slot
     // without re-opening the registry (saving two mmap syscalls and a
     // potential `wait_for_ready` round-trip on the VMM's exit path).
@@ -1042,6 +1060,16 @@ fn run(
                 _ if exit_code == 0 => run_entity::TerminationReason::Completed,
                 _ => run_entity::TerminationReason::Failed,
             };
+
+            // Flush the egress refusal log *before* the sandbox is published as stopped: a
+            // launcher that reads `Network` as soon as it sees `Stopped` must find the final
+            // records and the pending suppressed counts, and an ephemeral sandbox's directory is
+            // unlinked by the cleanup below. The drain is bounded (250 ms, best effort) and blocks
+            // no producer: the sink never waits on the writer.
+            #[cfg(feature = "net")]
+            if let Some(ref log) = exit_network_log {
+                log.close(crate::runner::network_log::NETWORK_LOG_CLOSE_TIMEOUT);
+            }
 
             rt_handle.block_on(async {
                 let now = chrono::Utc::now().naive_utc();
@@ -1163,6 +1191,8 @@ fn run(
         VmBuildRuntime {
             tokio_handle: tokio_rt.handle().clone(),
             startup_progress: startup_progress.clone(),
+            #[cfg(feature = "net")]
+            network_log,
         },
         host_placement,
         writeback_limit.as_ref(),
@@ -2011,6 +2041,9 @@ struct HostPlacement<'a> {
 struct VmBuildRuntime {
     tokio_handle: tokio::runtime::Handle,
     startup_progress: crate::startup_progress::StartupProgressCallback,
+    /// Egress refusal log handed to the network engine as its refusal sink.
+    #[cfg(feature = "net")]
+    network_log: Option<Arc<crate::runner::network_log::NetworkLog>>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2027,6 +2060,8 @@ fn build_vm(
     let VmBuildRuntime {
         tokio_handle,
         startup_progress,
+        #[cfg(feature = "net")]
+        network_log,
     } = runtime;
     let AgentConsoleBackends {
         control: console_backend,
@@ -2788,6 +2823,8 @@ fn build_vm(
             vm.deployment_profile,
             microsandbox_network::network::HostIntegrations {
                 resolved_header_credentials: vm.resolved_header_credentials.clone(),
+                refusals: network_log
+                    .map(|log| log as Arc<dyn microsandbox_network::refusal::RefusalSink>),
                 ..Default::default()
             },
         )
@@ -4607,6 +4644,8 @@ mod tests {
             super::VmBuildRuntime {
                 tokio_handle: tokio_rt.handle().clone(),
                 startup_progress: Arc::new(|_| {}),
+                #[cfg(feature = "net")]
+                network_log: None,
             },
             super::HostPlacement {
                 vcpu_targets: None,
@@ -4678,6 +4717,8 @@ mod tests {
             super::VmBuildRuntime {
                 tokio_handle: tokio_rt.handle().clone(),
                 startup_progress: Arc::new(|_| {}),
+                #[cfg(feature = "net")]
+                network_log: None,
             },
             super::HostPlacement {
                 vcpu_targets: None,

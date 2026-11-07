@@ -23,6 +23,7 @@ use crate::engine::http_deny::{
     DEFAULT_HTTP_DENY_MESSAGE, http_forbidden_response, json_http_forbidden_response,
     render_http_deny_message,
 };
+use crate::refusal::RefusalSink;
 
 //--------------------------------------------------------------------------------------------------
 // Constants
@@ -97,6 +98,9 @@ pub struct SharedState {
 
     /// HTTP denial settings installed before the network starts.
     http: OnceLock<HttpConfig>,
+
+    /// Host-side egress refusal sink, installed once before the network starts.
+    refusal_sink: OnceLock<Arc<dyn RefusalSink>>,
 }
 
 /// Aggregate network byte counters shared with the runtime metrics sampler.
@@ -142,6 +146,7 @@ impl SharedState {
             nat64_prefixes: OnceLock::new(),
             metrics: NetworkMetrics::default(),
             http: OnceLock::new(),
+            refusal_sink: OnceLock::new(),
         }
     }
 
@@ -169,6 +174,19 @@ impl SharedState {
     /// Install HTTP denial settings. The first call wins.
     pub fn set_http_config(&self, config: HttpConfig) {
         let _ = self.http.set(config);
+    }
+
+    /// Install the egress refusal sink.
+    ///
+    /// Called once before the network starts; the first call wins. Without a sink, a refused
+    /// decision is reported by a call that returns before it allocates anything.
+    pub fn set_refusal_sink(&self, sink: Arc<dyn RefusalSink>) {
+        let _ = self.refusal_sink.set(sink);
+    }
+
+    /// The installed egress refusal sink, if any.
+    pub(crate) fn refusal_sink(&self) -> Option<&Arc<dyn RefusalSink>> {
+        self.refusal_sink.get()
     }
 
     /// Whether readable denial responses were explicitly enabled.
@@ -303,6 +321,31 @@ impl SharedState {
         self.resolved_hostnames
             .read()
             .member_matches(&addr, Instant::now(), |key| predicate(&key.hostname))
+    }
+
+    /// The lexicographically smallest live name the guest's own DNS answers bound to `addr`.
+    ///
+    /// Every live binding is visited and the smallest name wins, so the result is deterministic
+    /// whatever order the index iterates in. Any of the bound names would match a domain rule for
+    /// this address, so reporting one of them is enough name evidence.
+    pub(crate) fn resolved_hostname_for(&self, addr: IpAddr) -> Option<String> {
+        let addr = normalize_ip_addr(addr);
+        let mut smallest: Option<String> = None;
+
+        self.resolved_hostnames
+            .read()
+            .member_matches(&addr, Instant::now(), |key| {
+                if smallest
+                    .as_deref()
+                    .is_none_or(|current| key.hostname.as_str() < current)
+                {
+                    smallest = Some(key.hostname.clone());
+                }
+                // Visit every binding: the predicate's answer is not what decides.
+                false
+            });
+
+        smallest
     }
 
     /// Best-effort expiry maintenance for resolved hostnames.

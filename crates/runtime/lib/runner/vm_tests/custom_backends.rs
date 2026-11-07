@@ -166,6 +166,8 @@ fn build(config: &mut Config) -> RuntimeResult<VmBuildOutput> {
         VmBuildRuntime {
             tokio_handle: tokio::runtime::Handle::current(),
             startup_progress: Arc::new(|_| {}),
+            #[cfg(feature = "net")]
+            network_log: None,
         },
         HostPlacement {
             vcpu_targets: None,

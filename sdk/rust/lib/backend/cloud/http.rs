@@ -286,6 +286,8 @@ impl CloudBackend {
         name: &str,
         opts: &LogStreamOptions,
     ) -> MicrosandboxResult<LogStream> {
+        refuse_local_only_log_sources(Operation::SandboxLogStream, &opts.sources)?;
+
         if !opts.follow {
             return Err(MicrosandboxError::unsupported(
                 Operation::SandboxLogStreamNoFollow,
@@ -311,7 +313,7 @@ impl CloudBackend {
         opts: &LogStreamOptions,
     ) -> MicrosandboxResult<LogStream> {
         let mut query = Vec::new();
-        let cloud_sources = cloud_log_sources(&opts.sources);
+        let cloud_sources = cloud_log_sources(&opts.sources)?;
         if !cloud_sources.is_empty() {
             query.push(format!("sources={}", cloud_sources.join(",")));
         }
@@ -701,19 +703,48 @@ fn cloud_log_event_to_entry(
     }))
 }
 
-fn cloud_log_sources(requested: &[LogSource]) -> Vec<String> {
-    LogSource::effective(requested)
-        .into_iter()
-        .map(|source| {
-            match source {
-                LogSource::Stdout => "stdout",
-                LogSource::Stderr => "stderr",
-                LogSource::System => "system",
-                LogSource::Output => "output",
+/// Refuse a log request naming a source only local sandboxes have.
+///
+/// Called at the public entry points before sandbox-name resolution, so a refused request issues
+/// no HTTP request at all.
+pub(crate) fn refuse_local_only_log_sources(
+    operation: Operation,
+    sources: &[LogSource],
+) -> MicrosandboxResult<()> {
+    if sources.contains(&LogSource::Network) {
+        return Err(network_source_unsupported(operation));
+    }
+
+    Ok(())
+}
+
+/// The refusal for a log request naming [`LogSource::Network`].
+fn network_source_unsupported(operation: Operation) -> MicrosandboxError {
+    MicrosandboxError::unsupported(
+        operation,
+        UnsupportedReason::NotAvailable("the network log source is local-only".to_string()),
+    )
+}
+
+fn cloud_log_sources(requested: &[LogSource]) -> MicrosandboxResult<Vec<String>> {
+    let mut names = Vec::with_capacity(4);
+
+    for source in LogSource::effective(requested) {
+        let name = match source {
+            LogSource::Stdout => "stdout",
+            LogSource::Stderr => "stderr",
+            LogSource::System => "system",
+            LogSource::Output => "output",
+            // Refused by `refuse_local_only_log_sources` before this loop runs; this arm keeps
+            // the match exhaustive and reports the same error for any future caller.
+            LogSource::Network => {
+                return Err(network_source_unsupported(Operation::SandboxLogStream));
             }
-            .to_string()
-        })
-        .collect()
+        };
+        names.push(name.to_string());
+    }
+
+    Ok(names)
 }
 
 fn parse_cloud_log_source(source: &str) -> MicrosandboxResult<LogSource> {
@@ -873,16 +904,26 @@ mod tests {
 
     #[test]
     fn cloud_log_sources_include_pty_output() {
-        let sources = cloud_log_sources(&[LogSource::Output]);
+        let sources = cloud_log_sources(&[LogSource::Output]).unwrap();
 
         assert_eq!(sources, ["output"]);
     }
 
     #[test]
     fn cloud_log_sources_use_the_cross_backend_default() {
-        let sources = cloud_log_sources(&[]);
+        let sources = cloud_log_sources(&[]).unwrap();
 
         assert_eq!(sources, ["stdout", "stderr", "output"]);
+    }
+
+    #[test]
+    fn cloud_log_sources_refuse_the_network_source() {
+        let error = cloud_log_sources(&[LogSource::Network]).unwrap_err();
+
+        assert!(
+            matches!(error, MicrosandboxError::Unsupported { .. }),
+            "{error:?}"
+        );
     }
 
     #[test]

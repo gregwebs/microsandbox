@@ -455,6 +455,131 @@ The replacement is not persisted. The sandbox record keeps the launch policy, so
 
 </Accordion>
 
+<span id="refusal-log" />
+
+## Refusal log
+
+A local sandbox with networking enabled writes one JSON line to `<sandbox-dir>/logs/network.log` for every egress decision it refuses: a policy or platform-floor deny, the strict-hostname rule, rebind protection, a protocol-steering drop, an authority or header limit, a secret violation, or a fail-closed proxy path. The record is written where the decision is made, so a launcher can follow refusals as they happen instead of inferring them from client errors.
+
+The Rust SDK reads the file through the `network` log source:
+
+```rust
+use futures::StreamExt;
+use microsandbox::logs::{LogSource, LogStreamOptions, NetworkLogRecord};
+use microsandbox::Sandbox;
+
+let sb = Sandbox::get("egress").await?;
+let mut refusals = sb
+    .log_stream(&LogStreamOptions {
+        sources: vec![LogSource::Network],
+        follow: true,
+        ..Default::default()
+    })
+    .await?;
+
+while let Some(entry) = refusals.next().await {
+    let record: NetworkLogRecord = serde_json::from_slice(&entry?.data)?;
+    println!("{record:?}");
+}
+```
+
+With `follow: true` the stream yields each record as it is written; without it, the stream ends at the current end of the file. An entry's `data` is the record's own line followed by a newline, so it deserializes as [`NetworkLogRecord`](/sdk/rust/sandbox#networklogrecord). One refused TCP SYN:
+
+```text
+{"v":1,"t":"2026-11-05T14:03:07.412Z","s":"network","event":"refusal","site":"tcp-syn","layer":"tenant","protocol":"tcp","dst_ip":"203.0.113.10","dst_port":443,"name":"api.example.com","name_source":"dns-cache","revision":2}
+```
+
+Records carry facts only: which site refused, which configuration owns the decision, the destination the guest used, the name evidence, and the policy revision in force. Deciding what a refusal means, assigning it an ID, and coalescing or deduplicating records are the reader's job.
+
+<Accordion title="Record fields">
+
+Every line is one JSON object and always carries the envelope:
+
+| Field | Type | Meaning |
+|---|---|---|
+| `v` | integer | Format version. `1` for this format; additive optional fields keep it, and only an incompatible change increments it. |
+| `t` | string | RFC 3339 UTC with millisecond precision and `Z`. |
+| `s` | string | Always `network`. |
+| `event` | string | `refusal` or `suppressed`. |
+
+`event: "refusal"` adds:
+
+| Field | Type | Meaning |
+|---|---|---|
+| `site` | string | Where the decision was made; one of the site values below. |
+| `layer` | string | `platform` when the deployment profile's platform floor refused, otherwise `tenant` for the sandbox's own configuration or a built-in engine rule. When both would refuse, `platform`. |
+| `protocol` | string | `tcp`, `udp`, `icmpv4`, or `icmpv6`. |
+| `dst_ip` | string, optional | Destination address the guest used. Absent only for a DNS query whose addressed resolver the engine could not determine. |
+| `dst_port` | integer, optional | Destination port. Absent for ICMP and for `dns-rebind`. |
+| `name` | string, optional | Guest-supplied name evidence. Present if and only if `name_source` is not `none`. It is normalized and syntax-checked, but the guest still chose it: treat it as untrusted text, never as a verified hostname. A `dns-cache` name is any name the guest's own lookups bound to `dst_ip`, so it need not be the name the refused flow meant. |
+| `name_source` | string | `sni` (TLS ClientHello), `http-host` (HTTP `Host`, HTTP/2 `:authority`, or `CONNECT` target), `dns-query` (the queried name), `dns-cache` (a name the guest's own DNS answers bound to `dst_ip`), or `none`. |
+| `revision` | integer | Revision of the sandbox's policy in force for this decision; see [Replacing a running sandbox's policy](#live-policy-replacement). |
+
+`event: "suppressed"` adds:
+
+| Field | Type | Meaning |
+|---|---|---|
+| `site` | string | The site whose refusals were not written. |
+| `count` | integer | Refusals decided at that site and not written since the previous suppressed record for it in this runtime process. |
+
+A name is reported only if it is a name: after trimming a trailing dot and lowercasing it, it must be dot-separated labels of ASCII letters, digits, hyphens and underscores, no longer than 253 bytes, and not an IP literal. An `http-host` name is the hostname part of the authority, so userinfo and a numeric port are removed. Anything else — empty, over-long, a scheme or path, whitespace or a control character, an IPv6 literal — is recorded as `name_source: "none"` with no `name`, never truncated, because a truncated name could read as a different, approvable domain. That makes `name` renderable text, but it is still what the guest asked for, not a verified hostname. Read a line only if you know its `v`, `event`, `site`, `layer`, `name_source`, and `protocol` values; skip the ones you do not, and ignore fields you do not recognize.
+
+</Accordion>
+
+<Accordion title="Sites">
+
+A `site` names the rule that refused, never the reply it produced, and a value is never reused for a different rule.
+
+| `site` | Refused decision |
+|---|---|
+| `tcp-syn` | TCP SYN refused by a policy at admission |
+| `tcp-dot` | TCP connection to a DNS-over-TLS port refused because TLS interception is off |
+| `tcp-alt-dns` | TCP connection to an alternative DNS port refused |
+| `tcp-hostname` | TCP flow whose hostname a policy refused at the proxy |
+| `tcp-strict` | Opaque TLS flow refused for having no hostname evidence under strict mode |
+| `tcp-proxy-fail-closed` | Denied flow that reached the TCP proxy and was closed as a denial |
+| `connect-strict` | HTTP `CONNECT` request refused by the strict-hostname rule |
+| `tls-sni` | ClientHello SNI refused by a policy |
+| `tls-strict-bypass` | TLS flow refused by the strict-hostname rule |
+| `tls-connect-mismatch` | ClientHello SNI that is not the `CONNECT` authority |
+| `udp` | UDP datagram refused by a policy |
+| `udp-quic` | UDP to a TLS-intercepted port dropped because QUIC is blocked |
+| `udp-alt-dns` | UDP to an alternative DNS port dropped |
+| `udp-dns-port` | UDP to a DNS port dropped by the relay's defensive check |
+| `icmp` | ICMP echo refused by a policy |
+| `dns-query` | DNS query refused by a policy |
+| `dns-resolver` | DNS query to a directly addressed resolver refused |
+| `dns-rebind` | DNS answer refused by rebind protection |
+| `http-authority` | HTTP request authority refused by a policy |
+| `http-authority-mismatch` | Request authority that is not the connection's proven name |
+| `http-authority-invalid` | Request authority with no parsable hostname |
+| `http-authority-count` | Request whose authority count is not one |
+| `http-header-limit` | HTTP/2 header block over the header limits |
+| `secret-violation` | Secret violation blocked by the secrets handler |
+
+Not recorded: allowed flows, ingress denials on published ports, the 403 and in-tunnel TLS denial responses (they present a decision recorded where it was made), capacity refusals such as a full TCP connection table or UDP session cap, and fail-closed blocks of malformed bytes that are not an authority or header-limit check.
+
+</Accordion>
+
+<Accordion title="Rate limits">
+
+Each site has its own token bucket: 256 tokens when the log opens, refilled at 20 tokens per second, so a site can write a 256-record burst and then 20 records/s. A refusal that finds no token, or that finds the 1,024-record writer queue full, is counted instead of written, and the writer emits one `suppressed` record per site with the accumulated count at most once per second and once more when the runtime closes the log on a clean stop. A suppressed record can therefore follow refusals at that site admitted after it, within the same second. Sustained worst case is 20 records/s per site across all 24 sites.
+
+The file rotates like `exec.log`: 10 MiB per file, suffixes `.1` to `.4`, lines never split across files, so retention is bounded at 50 MiB. Refusals at one site never suppress records at another site.
+
+</Accordion>
+
+<Accordion title="Limits">
+
+- Local sandboxes only. Cloud has no local log directory and the SDK refuses a `Network` request with an unsupported-feature error.
+- `network` is never in the default source set and never in `--source all`. `msb logs <name> --source network` reads it; `--job` cannot, because refusals are sandbox-wide. The Python, Node, Go, and Ruby SDKs do not accept it as a requested source.
+- The file is created when a sandbox with networking enabled boots, is appended across restarts, and is removed with the sandbox. If it cannot be opened, the runtime logs a warning and runs without it.
+- Revisions are numbered per runtime process and start again at `1` after a restart, so records from different runs can repeat revision numbers. Records carry no run identity.
+- Each record's `revision` is the sandbox policy revision its decision consulted. A `platform` refusal reports the tenant revision in force, because the floor has no revision of its own.
+- The SDK refuses the launch, before the runtime starts, when a writable `--mount` or `--mount-file` bind resolves to the sandbox's own directory or into it, which would let the guest rewrite its own log. The comparison follows symlinks and compares file identity, so an alias, a case variant on a case-insensitive volume, a `..` path through a symlink, a single-file bind and a hard link to a file in the log directory are all refused; read-only binds are exempt. Two documented exposures remain: a writable bind of a *parent* directory (`$HOME`, `MSB_HOME`, the sandboxes directory) still exposes that sandbox's own log, and a writable bind of a *sibling* sandbox's directory lets the guest rewrite that sandbox's log. A hard link created after the launch check is also outside it.
+
+</Accordion>
+
 ## Port mapping
 
 Publish a guest port to your host machine. This example forwards host port `8080` to guest port `80`, listening on `127.0.0.1` by default. Port publishing is local-only.

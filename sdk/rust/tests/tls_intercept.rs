@@ -5,9 +5,13 @@ use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::Arc;
 use std::time::Duration;
 
+use microsandbox::logs::{NameSource, NetworkLogEvent, RefusalLayer, RefusalSite};
 use microsandbox::sandbox::{DeploymentProfile, SecretSource};
 use microsandbox::{MicrosandboxError, NetworkPolicy, Operation, Sandbox};
 use microsandbox_network::config::InterfaceOverrides;
+use microsandbox_network::policy::{
+    Action, Destination, Direction, PortRange, Protocol as PolicyProtocol, Rule,
+};
 use rcgen::CertificateParams;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 use test_utils::msb_test;
@@ -15,6 +19,11 @@ use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::task::JoinHandle;
 use tokio_rustls::TlsAcceptor;
+
+#[path = "support/refusal_log.rs"]
+mod refusal_log;
+
+use refusal_log::RefusalLog;
 
 //--------------------------------------------------------------------------------------------------
 // Constants
@@ -2302,6 +2311,151 @@ async fn network_policy_replace_adds_then_removes_exact_hostname() {
     // recorded. Neither refused probe nor an implicit reconnect may appear here:
     // exactly two upstream connections are allowed.
     upstream.assert_accepted_exactly(2).await;
+    dns.assert_running().await;
+
+    teardown(sb, name).await;
+}
+
+/// AC1 (end-to-end half) at the SNI decision: a ClientHello a hostname rule
+/// refuses records one `tls-sni` record carrying the SNI as name evidence, and
+/// the flow whose SNI the policy admits records nothing.
+///
+/// The policy shape decides which site sees the flow. A deny-all policy with no
+/// hostname rule refuses the flow at its SYN (`tcp-syn`) and never reaches the
+/// SNI decision, so the launch policy here denies by default and allows one
+/// *different* domain. An allow `Domain` rule only defers the SYN when the
+/// destination address already has DNS evidence for that name, so the flow is
+/// given that evidence first — a lookup through the sandbox's own forwarder,
+/// which `allow_dns` admits — and then the ClientHello for `probe.example` is
+/// admitted as a pending hostname and refused where the SNI is decided.
+#[msb_test]
+async fn network_refusal_log_records_tls_sni_denial() {
+    let mut dns = HostDns::start().await;
+    let mut upstream = HostHttps::start().await.expect("https fixture");
+    let port = upstream.port();
+    let name = "network-refusal-tls-sni";
+    let allowed = "allowed.example";
+    let policy = NetworkPolicy {
+        default_egress: Action::Deny,
+        default_ingress: Action::Allow,
+        rules: vec![
+            Rule::allow_dns(),
+            Rule {
+                direction: Direction::Egress,
+                destination: Destination::Domain(allowed.parse().expect("valid domain")),
+                protocols: vec![PolicyProtocol::Tcp],
+                ports: vec![PortRange::single(port)],
+                action: Action::Allow,
+            },
+        ],
+    };
+    let sb = Sandbox::builder(name)
+        .image(PYTHON_IMAGE)
+        .cpus(1)
+        .memory(256)
+        .replace()
+        .network(|n| {
+            n.dns(|d| d.nameservers([dns.address]).rebind_protection(false))
+                .policy(policy)
+                .strict(true)
+                .interface(probe_interface(false))
+                .tls(|t| t.intercepted_ports(vec![port]).verify_upstream(false))
+                // A refusal must be a close, not a readable denial, so a probe
+                // that was refused cannot be mistaken for a completed request.
+                .http(|h| h.deny_response(false))
+        })
+        .create()
+        .await
+        .expect("create sandbox");
+    write_policy_fixtures(&sb).await;
+    // Opened before any probe, as a launcher opens it: the record has to arrive
+    // on a stream that was already following the file.
+    let mut log = RefusalLog::open(&sb).await;
+
+    // DNS evidence for the allowed name: this is what makes its SYN defer instead
+    // of being refused at admission, and it is the flow's only name evidence when
+    // the ClientHello carries none. A policy denial answers NXDOMAIN on every
+    // attempt, so retrying only tolerates a lookup the host lost under the load of
+    // the other sandboxes running in this suite.
+    let expected = format!("ok:{HOST_GATEWAY_IPV4}");
+    let mut answer = String::new();
+    for _ in 0..5 {
+        answer = policy_probe(&sb, &format!("dns {allowed}")).await;
+        if answer == expected {
+            break;
+        }
+    }
+    assert_eq!(
+        answer, expected,
+        "the lookup the allow rule depends on must answer with the gateway"
+    );
+
+    let denied = format!("tls {HOST_GATEWAY_IPV4} {port} {PROBE_DOMAIN}");
+    assert_eq!(
+        policy_probe(&sb, &denied).await,
+        "refused",
+        "a denied SNI must not be admitted"
+    );
+    let record = log
+        .expect_refusal("the refused ClientHello", |refusal| {
+            refusal.site == RefusalSite::TlsSni
+        })
+        .await;
+    let refusal = RefusalLog::refusal(&record);
+    assert_eq!(refusal.site, RefusalSite::TlsSni);
+    assert_eq!(refusal.layer, RefusalLayer::Tenant);
+    assert_eq!(refusal.name.as_deref(), Some(PROBE_DOMAIN));
+    assert_eq!(refusal.name_source, NameSource::Sni);
+    assert_eq!(refusal.revision, 1, "the launch policy is revision 1");
+    assert_eq!(refusal.dst_port, Some(port));
+    let wire = RefusalLog::wire(&record);
+    assert_eq!(wire["site"], "tls-sni");
+    assert_eq!(wire["protocol"], "tcp");
+    assert_eq!(wire["name_source"], "sni");
+    assert_eq!(wire["name"], PROBE_DOMAIN);
+
+    // One decision, one record: nothing else may be recorded for this flow.
+    assert_eq!(
+        log.count_refusals(RefusalSite::TlsSni),
+        1,
+        "the denial was decided once"
+    );
+    let other_sites: Vec<String> = log
+        .records()
+        .iter()
+        .filter_map(|record| match &record.event {
+            NetworkLogEvent::Refusal(refusal)
+                if refusal.dst_port == Some(port) && refusal.site != RefusalSite::TlsSni =>
+            {
+                serde_json::to_string(record).ok()
+            }
+            _ => None,
+        })
+        .collect();
+    assert!(
+        other_sites.is_empty(),
+        "the same flow must not be recorded at another site: {other_sites:?}"
+    );
+
+    // The flow whose SNI the rule allows is intercepted and answered, and no
+    // site may record it either.
+    let admitted = format!("tls {HOST_GATEWAY_IPV4} {port} {allowed}");
+    assert_eq!(
+        policy_probe(&sb, &admitted).await,
+        "ok:200",
+        "the allowed SNI must be admitted"
+    );
+    log.expect_no_refusal(
+        "the admitted ClientHello",
+        Duration::from_secs(1),
+        |refusal| refusal.dst_port == Some(port),
+    )
+    .await;
+
+    upstream
+        .received_request()
+        .await
+        .expect("the admitted probe must reach the upstream");
     dns.assert_running().await;
 
     teardown(sb, name).await;

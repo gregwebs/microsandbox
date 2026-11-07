@@ -20,7 +20,7 @@ use tokio::io::{AsyncReadExt, AsyncSeekExt};
 use crate::{MicrosandboxError, MicrosandboxResult};
 
 use super::cursor::{FilePosition, LogCursor};
-use super::types::{LogEntry, LogSource};
+use super::types::{LogEntry, LogSource, NETWORK_LOG_FORMAT_VERSION, NetworkLogRecord};
 
 //--------------------------------------------------------------------------------------------------
 // Constants
@@ -118,10 +118,13 @@ impl FileHandle {
 // RawEntry — the JSONL wire format
 //--------------------------------------------------------------------------------------------------
 
+/// The `exec.log` body envelope.
+///
+/// `s` is not a field here: the source is read first, from the line's own `s`, by
+/// [`jsonl_source`], so identifying which reader a line belongs to never depends on this decode.
 #[derive(Debug, Deserialize)]
 pub(super) struct RawEntry {
     pub(super) t: String,
-    pub(super) s: String,
     #[serde(default)]
     pub(super) d: String,
     #[serde(default)]
@@ -223,6 +226,9 @@ impl ParserKind {
     /// Parse JSON Lines bytes. Emits `(entry, position)` pairs;
     /// each `position` carries the file's `generation` and the
     /// byte offset just after the entry's terminating newline.
+    ///
+    /// A `network` line is decoded as its own record type and yielded with the whole line as its
+    /// body; any other `network` line is skipped.
     pub(super) fn parse_jsonl(
         bytes: &[u8],
         base_offset: u64,
@@ -232,20 +238,38 @@ impl ParserKind {
         out: &mut Vec<(LogEntry, FilePosition)>,
     ) -> usize {
         Self::walk_lines(bytes, base_offset, out, |line, entry_end_offset| {
-            let raw: RawEntry = serde_json::from_slice(line).ok()?;
-            let source = match raw.s.as_str() {
-                "stdout" => LogSource::Stdout,
-                "stderr" => LogSource::Stderr,
-                "output" => LogSource::Output,
-                "system" => LogSource::System,
-                _ => return None,
-            };
+            // Identify the source without decoding the `exec.log` envelope: a `network` record is
+            // a different shape, so an envelope decode would reject a valid line.
+            let source = jsonl_source(line)?;
             if !sources.contains(&source) {
                 return None;
             }
-            let timestamp = DateTime::parse_from_rfc3339(&raw.t)
-                .ok()?
-                .with_timezone(&Utc);
+
+            // A network record is its own payload: hand the consumer the exact line so it
+            // deserializes as `NetworkLogRecord`, with the newline every other line-oriented
+            // entry carries. Only records this SDK understands are yielded; a newer format, an
+            // unknown site, event or field value, or a malformed line is skipped exactly like an
+            // unknown source, and the cursor still advances past it.
+            //
+            // Everything else is the `exec.log` envelope: its body, its session id and its own
+            // timestamp, exactly as before.
+            let (timestamp, session_id, data) = if source == LogSource::Network {
+                let record: NetworkLogRecord = serde_json::from_slice(line).ok()?;
+                if record.v > NETWORK_LOG_FORMAT_VERSION {
+                    return None;
+                }
+                let mut payload = line.to_vec();
+                payload.push(b'\n');
+                // A network entry never belongs to a session, whatever the line carries.
+                (record.t, None, Bytes::from(payload))
+            } else {
+                let raw: RawEntry = serde_json::from_slice(line).ok()?;
+                let timestamp = DateTime::parse_from_rfc3339(&raw.t)
+                    .ok()?
+                    .with_timezone(&Utc);
+                (timestamp, raw.id, raw.decode_body())
+            };
+
             if since.is_some_and(|s| timestamp < s) {
                 return None;
             }
@@ -253,8 +277,8 @@ impl ParserKind {
                 LogEntry {
                     timestamp,
                     source,
-                    session_id: raw.id,
-                    data: raw.decode_body(),
+                    session_id,
+                    data,
                     cursor: LogCursor::empty(),
                 },
                 FilePosition {
@@ -341,11 +365,42 @@ impl ParserKind {
 }
 
 //--------------------------------------------------------------------------------------------------
+// Functions: Helpers
+//--------------------------------------------------------------------------------------------------
+
+/// The [`LogSource`] one JSON Lines entry names, read without decoding the rest of the line.
+///
+/// Source detection must not depend on [`RawEntry`]: a `network.log` record carries its own
+/// fields, so an additive or differently typed one there would make the `exec.log` envelope
+/// decode fail and hide a line this reader understands. `None` means the line names no source
+/// this reader knows, which is skipped like any other unknown value.
+fn jsonl_source(line: &[u8]) -> Option<LogSource> {
+    #[derive(Deserialize)]
+    struct SourceTag<'a> {
+        #[serde(borrow)]
+        s: &'a str,
+    }
+
+    let tag: SourceTag<'_> = serde_json::from_slice(line).ok()?;
+    match tag.s {
+        "stdout" => Some(LogSource::Stdout),
+        "stderr" => Some(LogSource::Stderr),
+        "output" => Some(LogSource::Output),
+        "system" => Some(LogSource::System),
+        "network" => Some(LogSource::Network),
+        _ => None,
+    }
+}
+
+//--------------------------------------------------------------------------------------------------
 // Tests
 //--------------------------------------------------------------------------------------------------
 
 #[cfg(test)]
 mod tests {
+    use super::super::types::{
+        NameSource, NetworkLogEvent, NetworkRefusal, RefusalLayer, RefusalSite,
+    };
     use super::*;
     use chrono::TimeZone;
 
@@ -566,7 +621,6 @@ mod tests {
     fn decode_body_returns_plain_bytes_without_base64_tag() {
         let raw = RawEntry {
             t: "x".into(),
-            s: "stdout".into(),
             d: "hello".into(),
             id: None,
             e: None,
@@ -578,7 +632,6 @@ mod tests {
     fn decode_body_base64_decodes_when_tagged_b64() {
         let raw = RawEntry {
             t: "x".into(),
-            s: "stdout".into(),
             d: "aGVsbG8=".into(),
             id: None,
             e: Some("b64".into()),
@@ -590,11 +643,390 @@ mod tests {
     fn decode_body_falls_back_to_raw_on_invalid_base64() {
         let raw = RawEntry {
             t: "x".into(),
-            s: "stdout".into(),
             d: "not valid b64!".into(),
             id: None,
             e: Some("b64".into()),
         };
         assert_eq!(raw.decode_body(), Bytes::from("not valid b64!".as_bytes()));
+    }
+
+    // -- network records -----------------------------------------------
+
+    const NETWORK_REFUSAL_LINE: &str = r#"{"v":1,"t":"2026-11-05T14:03:07.412Z","s":"network","event":"refusal","site":"tcp-syn","layer":"tenant","protocol":"tcp","dst_ip":"203.0.113.10","dst_port":443,"name":"api.example.com","name_source":"dns-cache","revision":2}"#;
+
+    fn network_lines() -> Vec<NetworkLogRecord> {
+        let refusal: NetworkLogRecord = serde_json::from_str(NETWORK_REFUSAL_LINE).unwrap();
+        let suppressed: NetworkLogRecord = serde_json::from_str(
+            r#"{"v":1,"t":"2026-11-05T14:03:09.000Z","s":"network","event":"suppressed","site":"udp","count":4744}"#,
+        )
+        .unwrap();
+        vec![refusal, suppressed]
+    }
+
+    #[test]
+    fn jsonl_parses_network_record_as_whole_line() {
+        let bytes = format!("{NETWORK_REFUSAL_LINE}\n");
+        let mut out = Vec::new();
+        ParserKind::parse_jsonl(
+            bytes.as_bytes(),
+            0,
+            7,
+            &[LogSource::Network],
+            None,
+            &mut out,
+        );
+
+        assert_eq!(out.len(), 1);
+        let (entry, position) = &out[0];
+        assert_eq!(entry.source, LogSource::Network);
+        assert_eq!(entry.session_id, None);
+        assert_eq!(entry.data, Bytes::from(bytes.clone().into_bytes()));
+        assert_eq!(entry.timestamp, ts("2026-11-05T14:03:07.412Z"));
+        let record: NetworkLogRecord = serde_json::from_slice(&entry.data).unwrap();
+        assert_eq!(
+            record,
+            serde_json::from_str::<NetworkLogRecord>(NETWORK_REFUSAL_LINE).unwrap()
+        );
+        assert_eq!(position.offset, bytes.len() as u64);
+    }
+
+    #[test]
+    fn jsonl_filters_network_unless_requested() {
+        let mut bytes = String::new();
+        bytes.push_str(NETWORK_REFUSAL_LINE);
+        bytes.push('\n');
+        bytes.push_str("{\"t\":\"2026-11-05T14:03:08.000Z\",\"s\":\"stdout\",\"d\":\"hi\"}\n");
+
+        let mut out = Vec::new();
+        let consumed =
+            ParserKind::parse_jsonl(bytes.as_bytes(), 0, 0, &[LogSource::Stdout], None, &mut out);
+
+        assert_eq!(consumed, bytes.len(), "the skipped line is consumed");
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].0.source, LogSource::Stdout);
+    }
+
+    #[test]
+    fn jsonl_skips_network_lines_a_newer_or_unknown_reader_cannot_decode() {
+        let future_version = NETWORK_REFUSAL_LINE.replace(r#""v":1"#, r#""v":2"#);
+        let unknown_site = NETWORK_REFUSAL_LINE.replace("tcp-syn", "tcp-future");
+        let unknown_event =
+            NETWORK_REFUSAL_LINE.replace(r#""event":"refusal""#, r#""event":"invented""#);
+        let unknown_layer =
+            NETWORK_REFUSAL_LINE.replace(r#""layer":"tenant""#, r#""layer":"host""#);
+        let unknown_name_source =
+            NETWORK_REFUSAL_LINE.replace(r#""name_source":"dns-cache""#, r#""name_source":"rdns""#);
+        let unknown_protocol =
+            NETWORK_REFUSAL_LINE.replace(r#""protocol":"tcp""#, r#""protocol":"sctp""#);
+        let malformed = r#"{"v":1,"t":"2026-11-05T14:03:07.412Z","s":"network","event":"#;
+
+        let mut bytes = String::new();
+        for line in [
+            &future_version,
+            &unknown_site,
+            &unknown_event,
+            &unknown_layer,
+            &unknown_name_source,
+            &unknown_protocol,
+            malformed,
+        ] {
+            bytes.push_str(line);
+            bytes.push('\n');
+        }
+        bytes.push_str(NETWORK_REFUSAL_LINE);
+        bytes.push('\n');
+
+        let mut out = Vec::new();
+        let consumed = ParserKind::parse_jsonl(
+            bytes.as_bytes(),
+            0,
+            0,
+            &[LogSource::Network],
+            None,
+            &mut out,
+        );
+
+        assert_eq!(consumed, bytes.len(), "every line is consumed");
+        assert_eq!(out.len(), 1, "only the valid line is yielded");
+        assert_eq!(
+            out[0].0.data,
+            Bytes::from(format!("{NETWORK_REFUSAL_LINE}\n"))
+        );
+    }
+
+    #[test]
+    fn jsonl_ignores_unknown_fields_on_a_network_record() {
+        let line = NETWORK_REFUSAL_LINE.replace(r#""revision":2"#, r#""revision":2,"future":1"#);
+        let mut bytes = line.clone();
+        bytes.push('\n');
+
+        let mut out = Vec::new();
+        ParserKind::parse_jsonl(
+            bytes.as_bytes(),
+            0,
+            0,
+            &[LogSource::Network],
+            None,
+            &mut out,
+        );
+
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].0.data, Bytes::from(bytes.into_bytes()));
+    }
+
+    /// Network detection does not go through the `exec.log` envelope: a record whose fields do
+    /// not decode as one is still yielded, and it never borrows an `id` as its session id.
+    #[test]
+    fn jsonl_decodes_network_records_without_the_exec_envelope() {
+        // `d` is a string in the exec envelope, so the envelope decode rejects this line.
+        let non_string_body =
+            NETWORK_REFUSAL_LINE.replace(r#""revision":2"#, r#""revision":2,"d":17"#);
+        // `id` is the exec envelope's session id; a network entry never has one.
+        let with_session_id =
+            NETWORK_REFUSAL_LINE.replace(r#""revision":2"#, r#""revision":2,"id":42"#);
+        let with_both = NETWORK_REFUSAL_LINE.replace(
+            r#""revision":2"#,
+            r#""revision":2,"d":{"nested":true},"id":42,"e":"b64""#,
+        );
+
+        let mut bytes = String::new();
+        for line in [&non_string_body, &with_session_id, &with_both] {
+            bytes.push_str(line);
+            bytes.push('\n');
+        }
+
+        let mut out = Vec::new();
+        let consumed = ParserKind::parse_jsonl(
+            bytes.as_bytes(),
+            0,
+            0,
+            &[LogSource::Network],
+            None,
+            &mut out,
+        );
+
+        assert_eq!(consumed, bytes.len());
+        assert_eq!(
+            out.len(),
+            3,
+            "every line is a record this reader understands"
+        );
+        for (entry, _) in &out {
+            assert_eq!(entry.source, LogSource::Network);
+            assert_eq!(
+                entry.session_id, None,
+                "a network entry never carries a session id"
+            );
+            assert_eq!(
+                entry.timestamp,
+                ts("2026-11-05T14:03:07.412Z"),
+                "the timestamp comes from the record itself"
+            );
+            assert!(serde_json::from_slice::<NetworkLogRecord>(&entry.data).is_ok());
+        }
+    }
+
+    /// A record the runtime wrote with a hostile name is still one line, and the SDK yields it
+    /// with the name intact: the escaping is the serializer's, so no name can split a line.
+    #[test]
+    fn jsonl_yields_a_network_record_whose_name_is_hostile() {
+        let names = [
+            "quote\"and\\slash.example",
+            "new\nline.example",
+            "carriage\rreturn.example",
+            "line\u{2028}separator.example",
+            "nul\u{0}byte.example",
+            "snowman-\u{2603}.example",
+        ];
+        let mut bytes = String::new();
+        for name in names {
+            // Exactly how the runtime's writer encodes it: the serializer escapes the name.
+            let record = NetworkLogRecord {
+                v: NETWORK_LOG_FORMAT_VERSION,
+                t: "2026-11-05T14:03:07.412Z".parse().unwrap(),
+                s: LogSource::Network,
+                event: NetworkLogEvent::Refusal(NetworkRefusal {
+                    site: RefusalSite::TcpHostname,
+                    layer: RefusalLayer::Tenant,
+                    protocol: microsandbox_types::Protocol::Tcp,
+                    dst_ip: Some("203.0.113.10".parse().unwrap()),
+                    dst_port: Some(443),
+                    name: Some(name.to_owned()),
+                    name_source: NameSource::Sni,
+                    revision: 1,
+                }),
+            };
+            bytes.push_str(&serde_json::to_string(&record).unwrap());
+            bytes.push('\n');
+        }
+
+        let mut out = Vec::new();
+        let consumed = ParserKind::parse_jsonl(
+            bytes.as_bytes(),
+            0,
+            0,
+            &[LogSource::Network],
+            None,
+            &mut out,
+        );
+
+        assert_eq!(consumed, bytes.len());
+        assert_eq!(
+            out.len(),
+            names.len(),
+            "one line per record, so no name split a line"
+        );
+        for ((entry, _), name) in out.iter().zip(names) {
+            let record: NetworkLogRecord = serde_json::from_slice(&entry.data).unwrap();
+            let NetworkLogEvent::Refusal(refusal) = record.event else {
+                panic!("expected a refusal");
+            };
+            assert_eq!(refusal.name.as_deref(), Some(name));
+            assert_eq!(entry.data.iter().filter(|byte| **byte == b'\n').count(), 1);
+        }
+    }
+
+    /// `since` filters a network line by the record's own `t`, and a filtered line still advances
+    /// the cursor.
+    #[test]
+    fn jsonl_applies_since_to_network_records_by_their_own_timestamp() {
+        let earlier = NETWORK_REFUSAL_LINE.replace("14:03:07.412Z", "14:03:00.000Z");
+        let mut bytes = format!("{earlier}\n{NETWORK_REFUSAL_LINE}\n");
+        let since = Some(ts("2026-11-05T14:03:05Z"));
+
+        let mut out = Vec::new();
+        let consumed = ParserKind::parse_jsonl(
+            bytes.as_bytes(),
+            0,
+            9,
+            &[LogSource::Network],
+            since,
+            &mut out,
+        );
+
+        assert_eq!(consumed, bytes.len(), "the filtered line is consumed too");
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].0.timestamp, ts("2026-11-05T14:03:07.412Z"));
+        assert_eq!(out[0].1.offset, bytes.len() as u64);
+
+        // A cut-off past every record yields nothing, and still consumes the bytes.
+        bytes.clear();
+        bytes.push_str(NETWORK_REFUSAL_LINE);
+        bytes.push('\n');
+        let mut out = Vec::new();
+        let consumed = ParserKind::parse_jsonl(
+            bytes.as_bytes(),
+            0,
+            9,
+            &[LogSource::Network],
+            Some(ts("2027-01-01T00:00:00Z")),
+            &mut out,
+        );
+        assert_eq!(consumed, bytes.len());
+        assert!(out.is_empty());
+    }
+
+    /// Shapes the reader must survive without depending on field order, on the `exec.log`
+    /// envelope, or on any line being well-formed.
+    ///
+    /// The rule under test is R2's reader rule: a `network` line is yielded exactly when it
+    /// deserializes as `NetworkLogRecord` with `v <= NETWORK_LOG_FORMAT_VERSION`, whatever else
+    /// the line holds; everything else is skipped, and the cursor advances past every line.
+    #[test]
+    fn jsonl_network_lines_follow_the_documented_reader_rule_for_odd_shapes() {
+        // The source tag is read wherever it appears in the object: a record is not required to
+        // put `s` before its payload.
+        let source_last = r#"{"v":1,"t":"2026-11-05T14:03:07.412Z","event":"refusal","site":"tcp-syn","layer":"tenant","protocol":"tcp","dst_ip":"203.0.113.10","dst_port":443,"name_source":"none","revision":1,"d":17,"s":"network"}"#.to_string();
+        // `v: 0` is not a future version, so the documented rule still yields it.
+        let zero_version = NETWORK_REFUSAL_LINE.replace(r#""v":1"#, r#""v":0"#);
+
+        // Skipped: values the record's own decoder rejects, and lines that are not an object
+        // with a known source at all.
+        let negative_count = r#"{"v":1,"t":"2026-11-05T14:03:09.000Z","s":"network","event":"suppressed","site":"udp","count":-1}"#;
+        let fractional_count = r#"{"v":1,"t":"2026-11-05T14:03:09.000Z","s":"network","event":"suppressed","site":"udp","count":1.5}"#;
+        let unparsable_timestamp = NETWORK_REFUSAL_LINE.replace("14:03:07.412Z", "yesterday");
+        let array_line = r#"["network",1]"#;
+        let bare_string = r#""network""#;
+        let no_source = r#"{"v":1,"t":"2026-11-05T14:03:07.412Z","event":"refusal"}"#;
+
+        let mut bytes = String::new();
+        for line in [
+            negative_count,
+            fractional_count,
+            unparsable_timestamp.as_str(),
+            array_line,
+            bare_string,
+            no_source,
+            "",
+        ] {
+            bytes.push_str(line);
+            bytes.push('\n');
+        }
+        bytes.push_str(&source_last);
+        bytes.push('\n');
+        bytes.push_str(&zero_version);
+        bytes.push('\n');
+
+        let mut out = Vec::new();
+        let consumed = ParserKind::parse_jsonl(
+            bytes.as_bytes(),
+            0,
+            0,
+            &[LogSource::Network],
+            None,
+            &mut out,
+        );
+
+        assert_eq!(consumed, bytes.len(), "every line is consumed");
+        assert_eq!(
+            out.len(),
+            2,
+            "only the two decodable records are yielded: {:?}",
+            out.iter().map(|(entry, _)| &entry.data).collect::<Vec<_>>()
+        );
+        assert_eq!(out[0].0.data, Bytes::from(format!("{source_last}\n")));
+        assert_eq!(out[0].0.session_id, None);
+        assert_eq!(out[1].0.data, Bytes::from(format!("{zero_version}\n")));
+
+        // A non-network line keeps the `exec.log` interpretation: a body that is not a string is
+        // skipped, exactly as before this source existed.
+        let object_body =
+            r#"{"t":"2026-11-05T14:03:07.412Z","s":"stdout","d":{"nested":true},"id":1}"#;
+        let plain_body = jsonl_stdout_line();
+        let bytes = format!("{object_body}\n{plain_body}\n");
+        let mut out = Vec::new();
+        let consumed =
+            ParserKind::parse_jsonl(bytes.as_bytes(), 0, 0, &[LogSource::Stdout], None, &mut out);
+        assert_eq!(consumed, bytes.len());
+        assert_eq!(out.len(), 1, "the unparsable envelope is skipped");
+        assert_eq!(out[0].0.source, LogSource::Stdout);
+    }
+
+    /// One ordinary `stdout` line, in the `exec.log` envelope.
+    fn jsonl_stdout_line() -> String {
+        r#"{"t":"2026-11-05T14:03:07.412Z","s":"stdout","d":"hi\n","id":7}"#.to_owned()
+    }
+
+    #[test]
+    fn jsonl_yields_every_network_event_kind() {
+        let mut bytes = String::new();
+        for record in network_lines() {
+            bytes.push_str(&serde_json::to_string(&record).unwrap());
+            bytes.push('\n');
+        }
+
+        let mut out = Vec::new();
+        ParserKind::parse_jsonl(
+            bytes.as_bytes(),
+            0,
+            0,
+            &[LogSource::Network],
+            None,
+            &mut out,
+        );
+
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[0].0.timestamp, ts("2026-11-05T14:03:07.412Z"));
+        assert_eq!(out[1].0.timestamp, ts("2026-11-05T14:03:09Z"));
     }
 }

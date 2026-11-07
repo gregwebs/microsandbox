@@ -17,6 +17,8 @@ pub mod heartbeat;
 pub(crate) mod jobs;
 pub(crate) mod logging;
 pub mod metrics;
+#[cfg(feature = "net")]
+pub(crate) mod network_log;
 pub mod policy;
 pub(crate) mod progress;
 pub mod relay;

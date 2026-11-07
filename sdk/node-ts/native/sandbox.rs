@@ -1050,6 +1050,7 @@ pub fn log_entry_to_js(entry: microsandbox::logs::LogEntry) -> LogEntry {
         microsandbox::logs::LogSource::Stderr => "stderr",
         microsandbox::logs::LogSource::Output => "output",
         microsandbox::logs::LogSource::System => "system",
+        microsandbox::logs::LogSource::Network => "network",
     };
     LogEntry {
         timestamp_ms: entry.timestamp.timestamp_millis() as f64,
