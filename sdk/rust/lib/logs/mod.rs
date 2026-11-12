@@ -80,7 +80,8 @@ pub use stream::{LogStreamOptions, LogStreamStart};
 pub use types::{BootError, BootErrorStage};
 pub use types::{
     LogEntry, LogOptions, LogSource, NETWORK_LOG_FORMAT_VERSION, NameSource, NetworkLogEvent,
-    NetworkLogRecord, NetworkRefusal, NetworkSuppressed, RefusalLayer, RefusalSite,
+    NetworkLogRecord, NetworkRefusal, NetworkSuppressed, PlaceholderLocation, RefusalLayer,
+    RefusalSite, SecretRefusalReason,
 };
 pub use watch::{LogRegistration, LogRegistry, RegistryStatsSnapshot};
 

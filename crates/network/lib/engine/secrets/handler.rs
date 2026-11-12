@@ -4907,6 +4907,9 @@ mod tests {
                 name: Some("b.example".to_owned()),
                 name_source: NameSource::HttpHost,
                 revision: 3,
+                credential: None,
+                location: None,
+                reason: None,
             }]
         );
     }
@@ -5081,6 +5084,9 @@ mod tests {
                 name: Some("blocked.example".to_owned()),
                 name_source: NameSource::HttpHost,
                 revision: 2,
+                credential: None,
+                location: None,
+                reason: None,
             }]
         );
     }

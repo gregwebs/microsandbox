@@ -114,6 +114,9 @@ pub(crate) fn record(shared: &SharedState, denial: Denial<'_>) {
         name,
         name_source,
         revision: denial.revision,
+        credential: None,
+        location: None,
+        reason: None,
     });
 }
 
@@ -305,6 +308,9 @@ mod tests {
                 name: Some("blocked.example".to_owned()),
                 name_source: NameSource::DnsQuery,
                 revision: 7,
+                credential: None,
+                location: None,
+                reason: None,
             }]
         );
     }

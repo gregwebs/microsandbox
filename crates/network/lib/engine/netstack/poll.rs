@@ -1891,6 +1891,9 @@ mod tests {
                 name: None,
                 name_source: NameSource::Absent,
                 revision: 1,
+                credential: None,
+                location: None,
+                reason: None,
             }],
             "a refused gateway echo is recorded once, with no port and no name"
         );
@@ -3964,6 +3967,9 @@ mod tests {
                 NameSource::Absent
             },
             revision: 1,
+            credential: None,
+            location: None,
+            reason: None,
         }
     }
 
@@ -4249,6 +4255,9 @@ mod tests {
                 name: None,
                 name_source: NameSource::Absent,
                 revision: 1,
+                credential: None,
+                location: None,
+                reason: None,
             }],
             "a steering drop is its own site, and only one record"
         );
@@ -4343,6 +4352,9 @@ mod tests {
                 NameSource::Absent
             },
             revision: 1,
+            credential: None,
+            location: None,
+            reason: None,
         }
     }
 

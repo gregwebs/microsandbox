@@ -854,6 +854,9 @@ mod tests {
                     name: Some(name.to_owned()),
                     name_source: NameSource::Sni,
                     revision: 1,
+                    credential: None,
+                    location: None,
+                    reason: None,
                 }),
             };
             bytes.push_str(&serde_json::to_string(&record).unwrap());

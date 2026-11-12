@@ -635,7 +635,9 @@ mod tests {
         time::Duration,
     };
 
-    use microsandbox_types::{NameSource, Protocol, RefusalLayer};
+    use microsandbox_types::{
+        NameSource, PlaceholderLocation, Protocol, RefusalLayer, SecretRefusalReason,
+    };
 
     use super::*;
 
@@ -650,6 +652,9 @@ mod tests {
             name: Some("api.example.com".to_string()),
             name_source: NameSource::DnsCache,
             revision,
+            credential: None,
+            location: None,
+            reason: None,
         }
     }
 
@@ -930,6 +935,54 @@ mod tests {
                 r#"{{"v":1,"t":"{t}","s":"network","event":"refusal","site":"tcp-syn","layer":"tenant","protocol":"tcp","dst_ip":"203.0.113.10","dst_port":443,"name":"api.example.com","name_source":"dns-cache","revision":1}}"#
             )
         );
+    }
+
+    /// The writer puts a `secret-violation` record on disk with its three fields in the
+    /// documented order; a reader of the same line gets them back.
+    #[test]
+    fn writes_the_documented_secret_violation_line() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = NetworkLog::open_with(dir.path(), burst_settings(8)).unwrap();
+
+        report(
+            &log,
+            NetworkRefusal {
+                site: RefusalSite::SecretViolation,
+                layer: RefusalLayer::Tenant,
+                protocol: Protocol::Tcp,
+                dst_ip: Some(Ipv4Addr::new(203, 0, 113, 10).into()),
+                dst_port: Some(443),
+                name: Some("api.deepseek.com".to_owned()),
+                name_source: NameSource::Sni,
+                revision: 2,
+                credential: Some("MSB_AGENT_VM_ANTHROPIC_UNUSED".to_owned()),
+                location: Some(PlaceholderLocation::Header),
+                reason: Some(SecretRefusalReason::HostNotCovered),
+            },
+        );
+        log.close(Duration::from_secs(5));
+
+        // Byte for byte the documented line, with the writer's own timestamp in place.
+        let records = read_records(dir.path());
+        assert_eq!(records.len(), 1);
+        let t = records[0]
+            .t
+            .to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+        let text = std::fs::read_to_string(dir.path().join("network.log")).unwrap();
+        assert_eq!(
+            text,
+            format!(
+                r#"{{"v":1,"t":"{t}","s":"network","event":"refusal","site":"secret-violation","layer":"tenant","protocol":"tcp","dst_ip":"203.0.113.10","dst_port":443,"name":"api.deepseek.com","name_source":"sni","revision":2,"credential":"MSB_AGENT_VM_ANTHROPIC_UNUSED","location":"header","reason":"host-not-covered"}}"#
+            ) + "\n"
+        );
+
+        let refusal = refusals(&records)[0];
+        assert_eq!(
+            refusal.credential.as_deref(),
+            Some("MSB_AGENT_VM_ANTHROPIC_UNUSED")
+        );
+        assert_eq!(refusal.location, Some(PlaceholderLocation::Header));
+        assert_eq!(refusal.reason, Some(SecretRefusalReason::HostNotCovered));
     }
 
     #[test]

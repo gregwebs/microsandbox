@@ -1942,6 +1942,9 @@ mod tests {
                     name: Some("blocked.example".to_owned()),
                     name_source: NameSource::DnsCache,
                     revision: INITIAL_NETWORK_POLICY_REVISION,
+                    credential: None,
+                    location: None,
+                    reason: None,
                 }]
             );
         }
@@ -2721,6 +2724,9 @@ mod tests {
                 name: Some("denied.example".to_owned()),
                 name_source: NameSource::HttpHost,
                 revision: INITIAL_NETWORK_POLICY_REVISION,
+                credential: None,
+                location: None,
+                reason: None,
             }]
         );
     }
@@ -2859,6 +2865,9 @@ mod tests {
                 name: Some("allowed.example".to_owned()),
                 name_source: NameSource::DnsCache,
                 revision: 2,
+                credential: None,
+                location: None,
+                reason: None,
             }]
         );
     }
@@ -3056,6 +3065,9 @@ mod tests {
                     name: Some("allowed.example".to_owned()),
                     name_source: NameSource::DnsCache,
                     revision,
+                    credential: None,
+                    location: None,
+                    reason: None,
                 }],
                 "{label}: one record for the fail-closed flow"
             );
@@ -3155,6 +3167,9 @@ mod tests {
                     name: Some("blocked.example".to_owned()),
                     name_source: NameSource::Sni,
                     revision: INITIAL_NETWORK_POLICY_REVISION,
+                    credential: None,
+                    location: None,
+                    reason: None,
                 }]
             );
         }
@@ -3581,6 +3596,9 @@ mod tests {
                 name: Some("allowed.example".to_owned()),
                 name_source: NameSource::Sni,
                 revision: INITIAL_NETWORK_POLICY_REVISION,
+                credential: None,
+                location: None,
+                reason: None,
             }]
         );
     }
@@ -4114,6 +4132,9 @@ mod tests {
                 name: Some("example.com".to_owned()),
                 name_source: NameSource::HttpHost,
                 revision: INITIAL_NETWORK_POLICY_REVISION,
+                credential: None,
+                location: None,
+                reason: None,
             }],
             "the record names the socket the guest addressed, not the tunnel target's stand-in \
              address with the tunnel port"

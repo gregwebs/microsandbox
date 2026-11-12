@@ -60,7 +60,9 @@ pub enum NetworkLogEvent {
 /// Facts about one refused egress decision.
 ///
 /// Every name is guest-supplied; the record reports the name and where it came from, never
-/// whether the name is approvable.
+/// whether the name is approvable. [`NetworkRefusal::credential`] is the exception: it is the
+/// refused secret's environment variable name, which the sandbox's configuration supplied, and it
+/// is absent for a name that carries a placeholder.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NetworkRefusal {
     /// Where in the network engine the refusal was decided.
@@ -91,6 +93,20 @@ pub struct NetworkRefusal {
 
     /// Tenant policy revision in force for this decision.
     pub revision: u64,
+
+    /// Environment variable name of the secret whose placeholder was refused. Present only for
+    /// [`RefusalSite::SecretViolation`]; never the secret's value, its length, a prefix or a hash.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub credential: Option<String>,
+
+    /// Where the refused placeholder was found. Present only for [`RefusalSite::SecretViolation`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub location: Option<PlaceholderLocation>,
+
+    /// Why the secret could not serve the request. Present only for
+    /// [`RefusalSite::SecretViolation`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<SecretRefusalReason>,
 }
 
 /// A count of refusals at one site that were decided but not written.
@@ -225,9 +241,94 @@ pub enum NameSource {
     Absent,
 }
 
+/// Where in a request a refused secret placeholder was found.
+///
+/// The string form is part of the wire contract: the `secret_policy_denied` 403 body and the
+/// `network.log` record share it, and a value is never reused or renamed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+#[non_exhaustive]
+pub enum PlaceholderLocation {
+    /// A request header field.
+    Header,
+
+    /// The decoded credentials of a Basic `Authorization` header.
+    BasicAuth,
+
+    /// A trailer field after a chunked body.
+    Trailer,
+
+    /// The query string of the request target.
+    Query,
+
+    /// The rest of the request line (method, path, version), an HTTP/2 pseudo-header, or a stream
+    /// that is not HTTP.
+    Unknown,
+
+    /// The request body.
+    Body,
+
+    /// A chunk-size line or chunk extension.
+    ChunkMetadata,
+}
+
+/// Why a secret could not serve the request its placeholder was refused in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+#[non_exhaustive]
+pub enum SecretRefusalReason {
+    /// The destination is not among the hosts the secret is substituted for.
+    HostNotCovered,
+
+    /// The secret's file-backed value could not be read.
+    CredentialUnavailable,
+
+    /// The destination's identity could not be bound to a host the secret serves.
+    DestinationUnverified,
+}
+
 //--------------------------------------------------------------------------------------------------
 // Methods
 //--------------------------------------------------------------------------------------------------
+
+impl PlaceholderLocation {
+    /// The wire value, as serde writes it.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Header => "header",
+            Self::BasicAuth => "basic-auth",
+            Self::Trailer => "trailer",
+            Self::Query => "query",
+            Self::Unknown => "unknown",
+            Self::Body => "body",
+            Self::ChunkMetadata => "chunk-metadata",
+        }
+    }
+
+    /// The location as it reads in a sentence: "sent in {phrase} to …".
+    pub const fn phrase(self) -> &'static str {
+        match self {
+            Self::Header => "a request header",
+            Self::BasicAuth => "a Basic auth header",
+            Self::Trailer => "a request trailer",
+            Self::Query => "the query string",
+            Self::Unknown => "the request line",
+            Self::Body => "the request body",
+            Self::ChunkMetadata => "chunk metadata",
+        }
+    }
+}
+
+impl SecretRefusalReason {
+    /// The wire value, as serde writes it.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::HostNotCovered => "host-not-covered",
+            Self::CredentialUnavailable => "credential-unavailable",
+            Self::DestinationUnverified => "destination-unverified",
+        }
+    }
+}
 
 impl RefusalSite {
     /// Number of sites; the length of [`RefusalSite::ALL`].
@@ -329,6 +430,7 @@ mod tests {
     const DNS_QUERY_LINE: &str = r#"{"v":1,"t":"2026-11-05T14:03:07.398Z","s":"network","event":"refusal","site":"dns-query","layer":"tenant","protocol":"udp","dst_ip":"100.96.0.1","dst_port":53,"name":"blocked.example","name_source":"dns-query","revision":2}"#;
     const ICMP_LINE: &str = r#"{"v":1,"t":"2026-11-05T14:03:08.051Z","s":"network","event":"refusal","site":"icmp","layer":"platform","protocol":"icmpv4","dst_ip":"10.0.0.7","name_source":"none","revision":1}"#;
     const SUPPRESSED_LINE: &str = r#"{"v":1,"t":"2026-11-05T14:03:09.000Z","s":"network","event":"suppressed","site":"udp","count":4744}"#;
+    const SECRET_VIOLATION_LINE: &str = r#"{"v":1,"t":"2026-11-05T14:03:10.000Z","s":"network","event":"refusal","site":"secret-violation","layer":"tenant","protocol":"tcp","dst_ip":"203.0.113.10","dst_port":443,"name":"api.deepseek.com","name_source":"sni","revision":2,"credential":"MSB_AGENT_VM_ANTHROPIC_UNUSED","location":"header","reason":"host-not-covered"}"#;
 
     fn tcp_syn() -> NetworkLogRecord {
         NetworkLogRecord {
@@ -344,6 +446,30 @@ mod tests {
                 name: Some("api.example.com".to_string()),
                 name_source: NameSource::DnsCache,
                 revision: 2,
+                credential: None,
+                location: None,
+                reason: None,
+            }),
+        }
+    }
+
+    fn secret_violation() -> NetworkLogRecord {
+        NetworkLogRecord {
+            v: NETWORK_LOG_FORMAT_VERSION,
+            t: "2026-11-05T14:03:10.000Z".parse().unwrap(),
+            s: LogSource::Network,
+            event: NetworkLogEvent::Refusal(NetworkRefusal {
+                site: RefusalSite::SecretViolation,
+                layer: RefusalLayer::Tenant,
+                protocol: Protocol::Tcp,
+                dst_ip: Some("203.0.113.10".parse().unwrap()),
+                dst_port: Some(443),
+                name: Some("api.deepseek.com".to_string()),
+                name_source: NameSource::Sni,
+                revision: 2,
+                credential: Some("MSB_AGENT_VM_ANTHROPIC_UNUSED".to_string()),
+                location: Some(PlaceholderLocation::Header),
+                reason: Some(SecretRefusalReason::HostNotCovered),
             }),
         }
     }
@@ -362,6 +488,9 @@ mod tests {
                 name: Some("blocked.example".to_string()),
                 name_source: NameSource::DnsQuery,
                 revision: 2,
+                credential: None,
+                location: None,
+                reason: None,
             }),
         }
     }
@@ -414,6 +543,9 @@ mod tests {
                 name: None,
                 name_source: NameSource::Absent,
                 revision: 1,
+                credential: None,
+                location: None,
+                reason: None,
             }),
         };
 
@@ -559,5 +691,152 @@ mod tests {
         let record: NetworkLogRecord = serde_json::from_str(TCP_SYN_LINE).unwrap();
 
         assert_eq!(record.s, LogSource::Network);
+    }
+
+    #[test]
+    fn secret_violation_record_serializes_to_the_documented_bytes() {
+        assert_eq!(
+            serde_json::to_string(&secret_violation()).unwrap(),
+            SECRET_VIOLATION_LINE
+        );
+        assert_eq!(
+            serde_json::from_str::<NetworkLogRecord>(SECRET_VIOLATION_LINE).unwrap(),
+            secret_violation()
+        );
+    }
+
+    #[test]
+    fn every_other_site_omits_the_secret_fields() {
+        // Every site but `secret-violation`: the three fields are that site's alone, so a record
+        // of any other site is byte-identical to the format that predates them.
+        let sites = RefusalSite::ALL
+            .into_iter()
+            .filter(|site| *site != RefusalSite::SecretViolation);
+
+        for site in sites {
+            let record = NetworkLogRecord {
+                v: NETWORK_LOG_FORMAT_VERSION,
+                t: "2026-11-05T14:03:10.000Z".parse().unwrap(),
+                s: LogSource::Network,
+                event: NetworkLogEvent::Refusal(NetworkRefusal {
+                    site,
+                    layer: RefusalLayer::Tenant,
+                    protocol: Protocol::Tcp,
+                    dst_ip: None,
+                    dst_port: None,
+                    name: None,
+                    name_source: NameSource::Absent,
+                    revision: 1,
+                    credential: None,
+                    location: None,
+                    reason: None,
+                }),
+            };
+            let line = serde_json::to_string(&record).unwrap();
+
+            assert!(!line.contains("credential"), "{site:?}: {line}");
+            assert!(!line.contains("location"), "{site:?}: {line}");
+            assert!(!line.contains("reason"), "{site:?}: {line}");
+        }
+    }
+
+    #[test]
+    fn a_suppressed_secret_violation_record_carries_no_secret_fields() {
+        let record = NetworkLogRecord {
+            v: NETWORK_LOG_FORMAT_VERSION,
+            t: "2026-11-05T14:03:10.000Z".parse().unwrap(),
+            s: LogSource::Network,
+            event: NetworkLogEvent::Suppressed(NetworkSuppressed {
+                site: RefusalSite::SecretViolation,
+                count: 3,
+            }),
+        };
+
+        assert_eq!(
+            serde_json::to_string(&record).unwrap(),
+            r#"{"v":1,"t":"2026-11-05T14:03:10.000Z","s":"network","event":"suppressed","site":"secret-violation","count":3}"#
+        );
+    }
+
+    #[test]
+    fn every_placeholder_location_renders_its_documented_value_and_phrase() {
+        let expected = [
+            (PlaceholderLocation::Header, "header", "a request header"),
+            (
+                PlaceholderLocation::BasicAuth,
+                "basic-auth",
+                "a Basic auth header",
+            ),
+            (PlaceholderLocation::Trailer, "trailer", "a request trailer"),
+            (PlaceholderLocation::Query, "query", "the query string"),
+            (PlaceholderLocation::Unknown, "unknown", "the request line"),
+            (PlaceholderLocation::Body, "body", "the request body"),
+            (
+                PlaceholderLocation::ChunkMetadata,
+                "chunk-metadata",
+                "chunk metadata",
+            ),
+        ];
+
+        for (location, value, phrase) in expected {
+            assert_eq!(location.as_str(), value);
+            assert_eq!(location.phrase(), phrase);
+            let rendered = serde_json::to_value(location).unwrap();
+            assert_eq!(rendered, serde_json::json!(value));
+            assert_eq!(
+                serde_json::from_value::<PlaceholderLocation>(rendered).unwrap(),
+                location
+            );
+        }
+    }
+
+    #[test]
+    fn every_secret_refusal_reason_renders_its_documented_value() {
+        let expected = [
+            (SecretRefusalReason::HostNotCovered, "host-not-covered"),
+            (
+                SecretRefusalReason::CredentialUnavailable,
+                "credential-unavailable",
+            ),
+            (
+                SecretRefusalReason::DestinationUnverified,
+                "destination-unverified",
+            ),
+        ];
+
+        for (reason, value) in expected {
+            assert_eq!(reason.as_str(), value);
+            let rendered = serde_json::to_value(reason).unwrap();
+            assert_eq!(rendered, serde_json::json!(value));
+            assert_eq!(
+                serde_json::from_value::<SecretRefusalReason>(rendered).unwrap(),
+                reason
+            );
+        }
+    }
+
+    #[test]
+    fn unknown_reason_fails_to_deserialize() {
+        let line =
+            SECRET_VIOLATION_LINE.replace(r#""reason":"host-not-covered""#, r#""reason":"future""#);
+
+        assert!(serde_json::from_str::<NetworkLogRecord>(&line).is_err());
+    }
+
+    #[test]
+    fn old_line_without_the_secret_fields_reads_back_as_none() {
+        let line = SECRET_VIOLATION_LINE
+            .replace(r#","credential":"MSB_AGENT_VM_ANTHROPIC_UNUSED""#, "")
+            .replace(r#","location":"header""#, "")
+            .replace(r#","reason":"host-not-covered""#, "");
+
+        let record: NetworkLogRecord = serde_json::from_str(&line).unwrap();
+        let NetworkLogEvent::Refusal(refusal) = &record.event else {
+            unreachable!("the fixture is a refusal");
+        };
+
+        assert_eq!(refusal.credential, None);
+        assert_eq!(refusal.location, None);
+        assert_eq!(refusal.reason, None);
     }
 }
