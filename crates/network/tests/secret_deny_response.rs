@@ -224,6 +224,9 @@ async fn secret_denials_answer_only_when_an_http_response_is_safe() {
                             .value("real-secret")
                             .placeholder("$KEY")
                             .allow("github.com")
+                            // The secrets the rows below put in a body must refuse
+                            // there to prove when a denial is safe to answer.
+                            .substitute_in_body(true)
                             .build(),
                     ],
                     ..Default::default()

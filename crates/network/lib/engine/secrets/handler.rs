@@ -372,10 +372,17 @@ struct EligibleSecret {
 }
 
 /// A secret whose placeholder is not permitted on this connection.
+///
+/// Its header and body substitution scope is kept so a refusal fires only
+/// where this secret could have been substituted (#562): a placeholder
+/// elsewhere is a marker, not a credential, and forwarding it discloses
+/// nothing. The query scope is not kept: a query placeholder always refuses.
 struct IneligibleSecret {
     env_var: String,
     placeholder: String,
     action: BlockingAction,
+    substitute_headers: bool,
+    substitute_body: bool,
 }
 
 /// Details about a blocked secret placeholder.
@@ -533,6 +540,26 @@ impl EligibleSecret {
             "{name}: Basic {}",
             BASE64.encode(replaced.as_bytes())
         ))
+    }
+}
+
+impl IneligibleSecret {
+    /// Returns true when this secret's placeholder at `location` is refused.
+    ///
+    /// Header and body locations refuse only when the secret substitutes there.
+    /// Trailers and chunk extensions are never substituted, but they extend the
+    /// header and body sections, so they follow those scopes. A query, and
+    /// `Unknown` bytes (method, URL path, version, HTTP/2 pseudo-headers, a
+    /// stream that is not HTTP), read as a credential whatever the scope, so
+    /// they always refuse.
+    fn refuses_at(&self, location: RequestLocation) -> bool {
+        match location {
+            RequestLocation::Header | RequestLocation::BasicAuth | RequestLocation::Trailer => {
+                self.substitute_headers
+            }
+            RequestLocation::Body | RequestLocation::ChunkMetadata => self.substitute_body,
+            RequestLocation::Query | RequestLocation::Unknown => true,
+        }
     }
 }
 
@@ -795,7 +822,7 @@ impl SecretsHandler {
                         tracing::warn!(
                             env_var = %secret.env_var,
                             error = error.kind_str(),
-                            "file-backed secret unresolved; blocking placeholder on this connection"
+                            "file-backed secret unresolved; refusing its placeholder where it substitutes on this connection"
                         );
                         resolution_failed = true;
                         None
@@ -809,8 +836,9 @@ impl SecretsHandler {
                 && secret_host_allowed(secret, sni, identity.as_ref());
 
             // Substitution and placeholder passthrough are independent policies. A verified
-            // destination trusted with the credential may also receive its
-            // placeholder unchanged outside enabled substitution locations.
+            // destination trusted with the credential receives its placeholder unchanged wherever
+            // substitution is off; any other destination does so only in a header or body location
+            // the secret does not substitute in (`IneligibleSecret::refuses_at`).
             if host_allowed && let Some(value) = resolved_value {
                 if secret.substitution.body {
                     max_body_placeholder_len = max_body_placeholder_len
@@ -863,6 +891,8 @@ impl SecretsHandler {
                 env_var: secret.env_var.clone(),
                 placeholder: secret.placeholder.clone(),
                 action: BlockingAction::from_violation_action(action).unwrap_or_default(),
+                substitute_headers: secret.substitution.headers,
+                substitute_body: secret.substitution.body,
             });
         }
 
@@ -947,7 +977,8 @@ impl SecretsHandler {
     /// - `body`: substitutes in the body portion (after boundary)
     ///
     /// Returns the violation action if a placeholder is detected going to a
-    /// disallowed host.
+    /// disallowed host in a header or body location its secret substitutes in,
+    /// the URL, or a stream that is not HTTP.
     pub fn substitute<'a>(
         &mut self,
         data: &'a [u8],
@@ -2156,7 +2187,8 @@ impl SecretsHandler {
     }
 
     /// Returns the strongest blocking action for any placeholder appearing in data
-    /// for a host that isn't allowed to receive either the real secret or the placeholder.
+    /// for a host that isn't allowed to receive either the real secret or the placeholder
+    /// in a location where its secret refuses it (see `IneligibleSecret::refuses_at`).
     ///
     /// Scans the raw bytes (stitched with the previous call's tail for
     /// cross-write detection), plus URL- and JSON-decoded variants for
@@ -2483,10 +2515,15 @@ impl Http2State {
                 .request_summaries
                 .get(&block.stream_id)
                 .unwrap_or(&request_summary);
+            let trailer_fragments = http2_trailer_fragments(&headers);
+            let fragments: Vec<(&[u8], RequestLocation)> = trailer_fragments
+                .iter()
+                .map(|(bytes, location)| (bytes.as_slice(), *location))
+                .collect();
 
             handler.apply_blocking_action(detect_blocking_action_in_fragments(
                 &handler.ineligible_for_substitution,
-                &[(&detection_bytes, RequestLocation::Trailer)],
+                &fragments,
                 RequestProtocol::Http2,
                 summary,
                 Some(block.stream_id),
@@ -2856,6 +2893,26 @@ fn enforce_http2_header_limits(
     Ok(())
 }
 
+/// A trailer block's fields are `Trailer` locations, except a pseudo-header:
+/// RFC 9113 §8.1 forbids one there, so it has no proven location and is
+/// `Unknown`, which refuses for every scope (#562).
+fn http2_trailer_fragments(headers: &[(Vec<u8>, Vec<u8>)]) -> Vec<(Vec<u8>, RequestLocation)> {
+    headers
+        .iter()
+        .map(|(name, value)| {
+            let location = if name.starts_with(b":") {
+                RequestLocation::Unknown
+            } else {
+                RequestLocation::Trailer
+            };
+            (
+                [name.as_slice(), b": ", value.as_slice()].concat(),
+                location,
+            )
+        })
+        .collect()
+}
+
 fn http2_header_detection_bytes(headers: &[(Vec<u8>, Vec<u8>)]) -> Vec<u8> {
     let len = headers
         .iter()
@@ -3120,11 +3177,16 @@ fn opaque_prefix_might_be_http(data: &[u8]) -> bool {
 
 pub(crate) fn first_line_is_not_http_request(data: &[u8]) -> bool {
     let data = skip_leading_empty_http_lines(data);
+    // No complete first line yet: still a candidate request, so keep buffering.
     let Some(line_end) = data.windows(2).position(|window| window == b"\r\n") else {
         return false;
     };
     let line = String::from_utf8_lossy(&data[..line_end]);
-    http_request_version(line.as_ref()).is_none()
+    // `split_http_request_line` accepts any third token as a version, so
+    // `MAIL FROM:<a> x` would read as a request and be buffered forever waiting
+    // for a header block. Only an `HTTP/` version proves the stream is HTTP
+    // (#562, D8); anything else is scanned as text instead.
+    !http_request_version(line.as_ref()).is_some_and(|version| version.starts_with("HTTP/"))
 }
 
 pub(crate) fn skip_leading_empty_http_lines(mut data: &[u8]) -> &[u8] {
@@ -4015,7 +4077,8 @@ fn append_chunk(output: &mut Vec<u8>, payload: &[u8]) {
 
 /// Split HTTP/1 metadata before decoding so matches cannot move between
 /// permitted headers and forbidden query/body locations. Continuation reads
-/// carry bytes only from the same body (or opaque stream).
+/// carry bytes only from the same body (or opaque stream). A stream whose
+/// first line is not an `HTTP/` request line keeps every fragment `Unknown`.
 fn detect_blocking_action_with_tail(
     ineligible_for_substitution: &[IneligibleSecret],
     prev_tail: &[u8],
@@ -4035,8 +4098,18 @@ fn detect_blocking_action_with_tail(
         && !headers.is_empty()
         && !is_scoped_fragment_location(location_hint)
     {
-        let (request_line, metadata) = headers.split_once("\r\n").unwrap_or((headers, ""));
-        if let Some((method, target, version)) = split_http_request_line(request_line) {
+        // Skip leading empty lines as `parse_http_request_metadata` and
+        // `http1_request_summary` do, so a stray CRLF does not demote a request.
+        let head = headers.trim_start_matches("\r\n");
+        let (request_line, metadata) = head.split_once("\r\n").unwrap_or((head, ""));
+        let request_line_fields = split_http_request_line(request_line);
+        // Only an `HTTP/` request line proves the lines after it are header fields
+        // and the bytes after the blank line a body. Text protocols such as SMTP or
+        // RESP arrive here too, because only binary control bytes divert a stream to
+        // `scan_opaque`; for them no byte is a substitution location.
+        let is_http_request =
+            request_line_fields.is_some_and(|(_, _, version)| version.starts_with("HTTP/"));
+        if let Some((method, target, version)) = request_line_fields {
             fragments.push((method.as_bytes(), RequestLocation::Unknown));
             push_request_target_fragments(&mut fragments, target.as_bytes());
             fragments.push((version.as_bytes(), RequestLocation::Unknown));
@@ -4044,10 +4117,15 @@ fn detect_blocking_action_with_tail(
             fragments.push((request_line.as_bytes(), RequestLocation::Unknown));
         }
 
-        fragments.push((metadata.as_bytes(), RequestLocation::Header));
+        let (metadata_location, body_location) = if is_http_request {
+            (RequestLocation::Header, RequestLocation::Body)
+        } else {
+            (RequestLocation::Unknown, RequestLocation::Unknown)
+        };
+        fragments.push((metadata.as_bytes(), metadata_location));
         // Lossy UTF-8 decoding can expand header bytes; locate the body in the raw request.
         let body_start = find_header_boundary(data).unwrap_or(data.len());
-        fragments.push((&data[body_start..], RequestLocation::Body));
+        fragments.push((&data[body_start..], body_location));
 
         request_summary(headers, protocol)
     } else {
@@ -4102,7 +4180,12 @@ fn detect_http2_header_blocking_action(
         .map(|(name, value)| [name.as_slice(), b": ", value.as_slice()].concat())
         .collect();
     for (name, value) in headers {
-        fragments.push((name.as_slice(), RequestLocation::Unknown));
+        // A pseudo-header is structured metadata with no substitution location;
+        // a regular field name is part of its `metadata` line below, which is a
+        // header location, so it follows the header scope (R10).
+        if name.starts_with(b":") {
+            fragments.push((name.as_slice(), RequestLocation::Unknown));
+        }
         if name.eq_ignore_ascii_case(b":path") {
             push_request_target_fragments(&mut fragments, value);
         } else if name.starts_with(b":") {
@@ -4123,6 +4206,11 @@ fn detect_http2_header_blocking_action(
 
 /// Check each location for placeholders not permitted on this connection.
 /// A permitted secret must not mask another secret's encoded placeholder.
+///
+/// A match refuses only where [`IneligibleSecret::refuses_at`] says so.
+/// Elsewhere the placeholder is forwarded unchanged, unlogged and unrecorded,
+/// like a disabled location on a credential-allowed host: a poisoned
+/// transcript resends it on every request. Opaque streams always refuse.
 fn detect_blocking_action_in_fragments(
     secrets: &[IneligibleSecret],
     fragments: &[(&[u8], RequestLocation)],
@@ -4144,12 +4232,18 @@ fn detect_blocking_action_in_fragments(
             .windows(2)
             .any(|window| window == b"\\u")
             .then(|| json_unescape(data));
-        let basic_auth_credentials =
-            if opaque || matches!(location, RequestLocation::Header | RequestLocation::Trailer) {
-                decoded_basic_auth_credentials(&String::from_utf8_lossy(data))
-            } else {
-                Vec::new()
-            };
+        // `Unknown` bytes have no proven header location, but a text stream that
+        // is not HTTP still carries `Authorization` lines (#562): decode them, so
+        // an encoded match is refused at the fragment's own `Unknown` label.
+        let basic_auth_credentials = if opaque
+            || matches!(
+                location,
+                RequestLocation::Header | RequestLocation::Trailer | RequestLocation::Unknown
+            ) {
+            decoded_basic_auth_credentials(&String::from_utf8_lossy(data))
+        } else {
+            Vec::new()
+        };
 
         for secret in secrets {
             let needle = secret.placeholder.as_bytes();
@@ -4157,14 +4251,16 @@ fn detect_blocking_action_in_fragments(
                 .iter()
                 .any(|decoded| decoded.contains(&secret.placeholder))
             {
-                Some((
-                    if location == RequestLocation::Trailer {
-                        location
-                    } else {
-                        RequestLocation::BasicAuth
-                    },
-                    PlaceholderMatchForm::BasicAuthDecoded,
-                ))
+                // A text stream that is not HTTP reports the fragment's own
+                // `Unknown` label, which refuses for every scope. An opaque
+                // stream keeps `BasicAuth`: it has no request locations, and it
+                // refuses regardless.
+                let reported_location = match location {
+                    RequestLocation::Unknown if !opaque => RequestLocation::Unknown,
+                    RequestLocation::Trailer => RequestLocation::Trailer,
+                    _ => RequestLocation::BasicAuth,
+                };
+                Some((reported_location, PlaceholderMatchForm::BasicAuthDecoded))
             } else if contains_bytes(data, needle) {
                 Some((location, PlaceholderMatchForm::Raw))
             } else if url_decoded
@@ -4182,6 +4278,11 @@ fn detect_blocking_action_in_fragments(
             };
 
             if let Some((location, match_form)) = matched {
+                // An opaque stream has no request locations; its Basic-auth match
+                // is labelled `BasicAuth` only for the report.
+                if !opaque && !secret.refuses_at(location) {
+                    continue;
+                }
                 let report = SecretViolationReport {
                     action: secret.action,
                     env_var: secret.env_var.clone(),
@@ -4462,8 +4563,10 @@ mod tests {
         }
     }
 
+    /// The decoded v0.5.0 policy has no body scope, so the placeholder in a body
+    /// is preserved on the secret's own host and on a host it does not allow.
     #[test]
-    fn decoded_v06_policy_uses_current_disabled_body_enforcement() {
+    fn decoded_v06_policy_preserves_the_disabled_body_placeholder_on_every_host() {
         let mut wire = serde_json::json!({"on_violation":"block", "secrets":[{
             "env_var":"KEY", "value":"real-secret", "placeholder":"$KEY",
             "allowed_hosts":[{"exact":"api.example.com"}],
@@ -4476,10 +4579,7 @@ mod tests {
         let mut handler = SecretsHandler::new(&config, "api.example.com", true);
         assert_eq!(handler.substitute(request).unwrap().as_ref(), request);
         let mut denied = SecretsHandler::new(&config, "denied.example", true);
-        assert_eq!(
-            denied.substitute(request).unwrap_err(),
-            SecretViolationAction::Block
-        );
+        assert_eq!(denied.substitute(request).unwrap().as_ref(), request);
     }
 
     #[test]
@@ -4631,9 +4731,9 @@ mod tests {
     /// Even a passthrough policy for the host does not forward a File
     /// secret's placeholder when the file failed to resolve: the operator
     /// wanted a live credential, not a dead placeholder leaked upstream. The
-    /// failed resolution skips both passthrough `continue`s and forces an
-    /// all-false substitution scope, so the configured violation action still
-    /// applies.
+    /// failed resolution skips both passthrough `continue`s, so the configured
+    /// violation action still applies where the secret substitutes: here, the
+    /// `Authorization` header.
     #[test]
     fn file_backed_secret_missing_file_blocks_even_under_passthrough() {
         let dir = tempfile::tempdir().unwrap();
@@ -6224,6 +6324,8 @@ mod tests {
             env_var: "OPENAI_API_KEY".into(),
             placeholder: "$KEY".into(),
             action: BlockingAction::BlockAndLog,
+            substitute_headers: true,
+            substitute_body: false,
         };
         let encoded = BASE64.encode(b"user:$KEY");
         let headers = format!(
@@ -6260,6 +6362,8 @@ mod tests {
             env_var: "SERVICE_TOKEN".into(),
             placeholder: "abc/key".into(),
             action: BlockingAction::BlockAndLog,
+            substitute_headers: true,
+            substitute_body: false,
         };
         let headers =
             "GET /leak?token=abc%2Fkey&other=redacted HTTP/1.1\r\nHost: evil.example.com\r\n\r\n";
@@ -6406,12 +6510,16 @@ mod tests {
         notes.extend(
             (0x80..=u8::MAX).map(|byte| [b"X-Note: ".as_slice(), &[byte], b"\r\n"].concat()),
         );
+        // The masking secret substitutes in bodies, so the body placeholder it must
+        // still catch stays a refused location (#562).
+        let mut blocked_secret = make_secret("$BLOCKED", "other-secret", "other.example");
+        blocked_secret.substitution.body = true;
         for auth in ["Authorization: Bearer $KEY\r\n", basic.as_str()] {
             for body in ["$BLOCKED", "%24BLOCKED", r"\u0024BLOCKED"] {
                 for note in &notes {
                     let config = make_config(vec![
                         make_secret("$KEY", "real-secret", "api.example.com"),
-                        make_secret("$BLOCKED", "other-secret", "other.example"),
+                        blocked_secret.clone(),
                     ]);
                     let mut request =
                         format!("POST / HTTP/1.1\r\nHost: api.example.com\r\n{auth}").into_bytes();
@@ -6835,8 +6943,10 @@ mod tests {
         );
     }
 
+    /// A body placeholder is a marker, not a credential: it is forwarded on every
+    /// host, under every pin and violation action, in every framing (#562).
     #[test]
-    fn disabled_body_substitution_preserves_placeholder_only_for_verified_allowed_host() {
+    fn disabled_body_substitution_preserves_placeholder_on_every_host() {
         let body = b"{\"key\":\"$KEY\"}";
         for action in [
             SecretViolationAction::Block,
@@ -6893,20 +7003,372 @@ mod tests {
                             .concat()
                         };
                         let result = handler.substitute(&request);
-                        if pinned && host == "api.example.com" {
-                            let output = result.unwrap();
-                            if framing == "http2" {
-                                assert!(output.ends_with(body));
-                                assert!(!contains_bytes(&output, b"real-secret"));
-                            } else {
-                                assert_eq!(output.as_ref(), request);
-                            }
-                        } else {
-                            assert_eq!(result.unwrap_err(), action);
-                        }
+                        let output = result.unwrap();
+                        assert_eq!(output.as_ref(), request);
+                        assert!(!contains_bytes(&output, b"real-secret"));
                     }
                 }
             }
+        }
+    }
+
+    /// #562: a refusal fires only where the placeholder's own secret could
+    /// have substituted it, plus the URL and streams that are not HTTP, which
+    /// refuse for every scope. Each row puts `$KEY` in one place on a host the
+    /// secret does not allow.
+    #[test]
+    fn placeholder_refusal_follows_the_secret_substitution_scope() {
+        let basic = BASE64.encode(b"user:$KEY");
+        let body = "{\"k\":\"$KEY\"}";
+        let rows: [(&str, String); 12] = [
+            (
+                "header",
+                "GET / HTTP/1.1\r\nHost: evil.com\r\nX-Key: $KEY\r\n\r\n".into(),
+            ),
+            (
+                "basic auth",
+                format!(
+                    "GET / HTTP/1.1\r\nHost: evil.com\r\nAuthorization: Basic {basic}\r\n\r\n"
+                ),
+            ),
+            (
+                "trailer",
+                "POST / HTTP/1.1\r\nHost: evil.com\r\nTransfer-Encoding: chunked\r\n\r\n1\r\nx\r\n0\r\nX-Key: $KEY\r\n\r\n".into(),
+            ),
+            (
+                "body",
+                format!(
+                    "POST / HTTP/1.1\r\nHost: evil.com\r\nContent-Length: {}\r\n\r\n{body}",
+                    body.len()
+                ),
+            ),
+            (
+                "leading blank line body",
+                format!(
+                    "\r\nPOST / HTTP/1.1\r\nHost: evil.com\r\nContent-Length: {}\r\n\r\n{body}",
+                    body.len()
+                ),
+            ),
+            (
+                "chunk metadata",
+                "POST / HTTP/1.1\r\nHost: evil.com\r\nTransfer-Encoding: chunked\r\n\r\n1;k=$KEY\r\nx\r\n0\r\n\r\n".into(),
+            ),
+            ("query", "GET /?k=$KEY HTTP/1.1\r\nHost: evil.com\r\n\r\n".into()),
+            ("path", "GET /$KEY HTTP/1.1\r\nHost: evil.com\r\n\r\n".into()),
+            // Text protocols that are not HTTP: a first line that does not split,
+            // one that splits but has no `HTTP/` version, a RESP frame, and an
+            // SMTP stream whose only marker is a Base64 Basic value.
+            ("smtp", "EHLO client\r\nAUTH PLAIN $KEY\r\n".into()),
+            (
+                "smtp mail",
+                "MAIL FROM:<a> x\r\nAUTH PLAIN $KEY\r\n\r\n".into(),
+            ),
+            ("resp", "*2\r\n$3\r\nGET\r\nfoo $KEY\r\n".into()),
+            // No raw placeholder bytes appear here, so this row fails if the
+            // Basic-auth decode does not cover a stream that is not HTTP.
+            (
+                "smtp basic auth",
+                format!("EHLO client\r\nAuthorization: Basic {basic}\r\n"),
+            ),
+        ];
+        // A placeholder in a regular field name is a header location in both
+        // versions, so a body-only secret forwards it (R10).
+        let header_field_name = "GET / HTTP/1.1\r\nHost: evil.com\r\nX-$KEY: v\r\n\r\n";
+        for (headers, query, body) in [
+            (true, false, false),
+            (false, true, false),
+            (false, false, true),
+        ] {
+            let scope = (headers, query, body);
+            let mut secret = make_secret("$KEY", "real-secret", "api.openai.com");
+            secret.substitution.headers = headers;
+            secret.substitution.query = query;
+            secret.substitution.body = body;
+            let config = make_config(vec![secret]);
+            for (location, request) in &rows {
+                let refuses = match *location {
+                    "header" | "basic auth" | "trailer" => headers,
+                    "body" | "leading blank line body" | "chunk metadata" => body,
+                    // Query (D7), the URL path (D2), and text that is not HTTP
+                    // (D8), plain or Basic-encoded.
+                    _ => true,
+                };
+                let mut handler = SecretsHandler::new(&config, "evil.com", true);
+
+                let result = handler.substitute(request.as_bytes());
+
+                if refuses {
+                    assert_eq!(
+                        result.unwrap_err(),
+                        SecretViolationAction::Block,
+                        "{location} {scope:?}"
+                    );
+                } else {
+                    assert_eq!(
+                        result.unwrap().as_ref(),
+                        request.as_bytes(),
+                        "{location} {scope:?}"
+                    );
+                }
+            }
+
+            let mut handler = SecretsHandler::new(&config, "evil.com", true);
+            let field_name_result = handler.substitute(header_field_name.as_bytes());
+            if headers {
+                assert_eq!(
+                    field_name_result.unwrap_err(),
+                    SecretViolationAction::Block,
+                    "header field name {scope:?}"
+                );
+            } else {
+                assert_eq!(
+                    field_name_result.unwrap().as_ref(),
+                    header_field_name.as_bytes(),
+                    "header field name {scope:?}"
+                );
+            }
+
+            // HTTP/2 has no request line: a regular field follows the header
+            // scope, and `:path` is `Unknown`, which refuses for every scope.
+            let h2_header = h2_request(
+                &[
+                    (b":method", b"GET"),
+                    (b":scheme", b"https"),
+                    (b":authority", b"evil.com"),
+                    (b":path", b"/"),
+                    (b"x-key", b"$KEY"),
+                ],
+                true,
+            );
+            let h2_path = h2_request(
+                &[
+                    (b":method", b"GET"),
+                    (b":scheme", b"https"),
+                    (b":authority", b"evil.com"),
+                    (b":path", b"/$KEY"),
+                ],
+                true,
+            );
+
+            let header_result =
+                SecretsHandler::new(&config, "evil.com", true).substitute(&h2_header);
+            let path_result = SecretsHandler::new(&config, "evil.com", true).substitute(&h2_path);
+
+            if headers {
+                assert_eq!(
+                    header_result.unwrap_err(),
+                    SecretViolationAction::Block,
+                    "h2 header {scope:?}"
+                );
+            } else {
+                let fields = decode_first_h2_headers(&header_result.unwrap());
+                assert_eq!(
+                    h2_header_value(&fields, b"x-key"),
+                    "$KEY",
+                    "h2 header {scope:?}"
+                );
+            }
+            assert_eq!(
+                path_result.unwrap_err(),
+                SecretViolationAction::Block,
+                "h2 path {scope:?}"
+            );
+
+            // A regular field name is a header location, not `Unknown`.
+            let h2_field_name = h2_request(
+                &[
+                    (b":method", b"GET"),
+                    (b":scheme", b"https"),
+                    (b":authority", b"evil.com"),
+                    (b":path", b"/"),
+                    (b"x-$KEY", b"v"),
+                ],
+                true,
+            );
+            let field_name_result =
+                SecretsHandler::new(&config, "evil.com", true).substitute(&h2_field_name);
+            if headers {
+                assert_eq!(
+                    field_name_result.unwrap_err(),
+                    SecretViolationAction::Block,
+                    "h2 field name {scope:?}"
+                );
+            } else {
+                let fields = decode_first_h2_headers(&field_name_result.unwrap());
+                assert_eq!(
+                    h2_header_value(&fields, b"x-$KEY"),
+                    "v",
+                    "h2 field name {scope:?}"
+                );
+            }
+
+            // A pseudo-header is illegal in a trailer block (RFC 9113 §8.1), so
+            // it has no proven location and refuses for every scope.
+            let mut trailer_handler = SecretsHandler::new(&config, "evil.com", true);
+            let initial = h2_request(
+                &[
+                    (b":method", b"POST"),
+                    (b":scheme", b"https"),
+                    (b":authority", b"evil.com"),
+                    (b":path", b"/"),
+                ],
+                false,
+            );
+            trailer_handler.substitute(&initial).unwrap();
+            let mut trailers = Vec::new();
+            append_h2_headers(&mut trailers, 1, &[(b":authority", b"$KEY")], true);
+            assert_eq!(
+                trailer_handler.substitute(&trailers).unwrap_err(),
+                SecretViolationAction::Block,
+                "h2 trailer pseudo-header {scope:?}"
+            );
+        }
+    }
+
+    /// A first line that splits into three tokens is an HTTP request only when
+    /// its version starts with `HTTP/` (#562, D8). `MAIL FROM:<a> x` is not, so
+    /// the stream is scanned as text and refused instead of being buffered for a
+    /// header block that never arrives.
+    #[test]
+    fn three_token_first_line_that_is_not_http_refuses_instead_of_buffering() {
+        let config = make_config(vec![make_secret("$KEY", "real-secret", "api.openai.com")]);
+        let mut handler = SecretsHandler::new(&config, "evil.com", true);
+
+        let result = handler.substitute(b"MAIL FROM:<a> x\r\nAUTH PLAIN $KEY\r\n");
+
+        assert_eq!(result.unwrap_err(), SecretViolationAction::Block);
+    }
+
+    /// #562 replay: a transcript that quoted another provider's placeholder is
+    /// resent in every completion body. The marker reaches the foreign host in
+    /// every framing and encoding the detector decodes, at every split point,
+    /// and the real value never appears.
+    #[test]
+    fn headers_only_placeholder_in_body_is_forwarded_to_a_foreign_host() {
+        let placeholder = "msb-anthropic-placeholder-a-v2";
+        let mut secret = make_secret(placeholder, "real-anthropic-token", "api.anthropic.com");
+        secret.violation_action = Some(SecretViolationAction::BlockAndTerminate);
+        let config = make_config(vec![secret]);
+        for body in [
+            format!("{{\"content\":\"ANTHROPIC={placeholder}\"}}"),
+            format!("{{\"content\":\"\\u006d{}\"}}", &placeholder[1..]),
+            format!("content=msb%2D{}", &placeholder[4..]),
+        ] {
+            let fixed = format!(
+                "POST /v1/chat/completions HTTP/1.1\r\nHost: api.deepseek.com\r\nContent-Length: {}\r\n\r\n{body}",
+                body.len()
+            )
+            .into_bytes();
+            let chunked = format!(
+                "POST /v1/chat/completions HTTP/1.1\r\nHost: api.deepseek.com\r\nTransfer-Encoding: chunked\r\n\r\n{:x}\r\n{body}\r\n0\r\n\r\n",
+                body.len()
+            )
+            .into_bytes();
+            let http2 = h2_request_with_data(
+                &[
+                    (b":method", b"POST"),
+                    (b":scheme", b"https"),
+                    (b":authority", b"api.deepseek.com"),
+                    (b":path", b"/v1/chat/completions"),
+                ],
+                body.as_bytes(),
+            );
+            for (framing, request) in [("fixed", fixed), ("chunked", chunked), ("http2", http2)] {
+                for split in 1..=request.len() {
+                    let mut handler = SecretsHandler::new(&config, "api.deepseek.com", true);
+                    let (first, second) = request.split_at(split);
+
+                    let mut output = handler.substitute(first).unwrap().into_owned();
+                    if !second.is_empty() {
+                        output.extend_from_slice(&handler.substitute(second).unwrap());
+                    }
+
+                    assert_eq!(output, request, "{framing} split={split}");
+                    assert!(!contains_bytes(&output, b"real-anthropic-token"));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn header_placeholder_is_reported_beside_a_forwarded_body_placeholder() {
+        let secret = IneligibleSecret {
+            env_var: "API_KEY".into(),
+            placeholder: "$KEY".into(),
+            action: BlockingAction::BlockAndLog,
+            substitute_headers: true,
+            substitute_body: false,
+        };
+        let body_only = "POST / HTTP/1.1\r\nHost: evil.com\r\nContent-Length: 4\r\n\r\n$KEY";
+        let header_and_body =
+            "POST / HTTP/1.1\r\nHost: evil.com\r\nX-Key: $KEY\r\nContent-Length: 4\r\n\r\n$KEY";
+        let detect = |request: &str| {
+            let headers = &request[..request.find("\r\n\r\n").unwrap() + 4];
+            detect_blocking_action_with_tail(
+                std::slice::from_ref(&secret),
+                &[],
+                request.as_bytes(),
+                headers,
+                RequestProtocol::Http1,
+                RequestLocation::Unknown,
+                None,
+            )
+        };
+
+        assert!(detect(body_only).is_none());
+        let report = detect(header_and_body).expect("header placeholder refuses");
+        assert_eq!(report.location, RequestLocation::Header);
+    }
+
+    #[test]
+    fn new_plain_http_forwards_body_placeholder_of_require_tls_identity_secret() {
+        let config = make_config(vec![make_secret("$KEY", "real-secret", "api.openai.com")]);
+        let shared = SharedState::new(4);
+        let ip = Ipv4Addr::new(1, 2, 3, 4);
+        cache_host(&shared, "api.openai.com", ip);
+        let mut handler =
+            SecretsHandler::new_plain_http(&config, "api.openai.com", IpAddr::V4(ip), &shared);
+
+        let input = b"POST / HTTP/1.1\r\nHost: api.openai.com\r\nContent-Length: 4\r\n\r\n$KEY";
+        assert_eq!(handler.substitute(input).unwrap().as_ref(), input);
+    }
+
+    /// A failed read still refuses the placeholder where the credential would
+    /// have gone; a body the secret never substitutes in is not such a place.
+    #[test]
+    fn file_backed_secret_missing_file_refuses_only_substitution_locations() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("does-not-exist");
+        let config = make_config(vec![make_file_secret("$KEY", &path, "api.openai.com")]);
+        let header = b"GET / HTTP/1.1\r\nAuthorization: Bearer $KEY\r\n\r\n";
+        let body = b"POST / HTTP/1.1\r\nContent-Length: 4\r\n\r\n$KEY";
+
+        let mut header_handler = SecretsHandler::new(&config, "api.openai.com", true);
+        let mut body_handler = SecretsHandler::new(&config, "api.openai.com", true);
+
+        assert_eq!(
+            header_handler.substitute(header).unwrap_err(),
+            SecretViolationAction::Block
+        );
+        assert_eq!(body_handler.substitute(body).unwrap().as_ref(), body);
+    }
+
+    /// An opaque stream has no request locations, so even a Basic-auth-shaped
+    /// match for a secret that never substitutes in headers refuses.
+    #[test]
+    fn opaque_stream_refuses_placeholder_of_a_body_only_secret() {
+        let mut secret = make_secret("$KEY", "real-secret", "api.openai.com");
+        secret.require_tls_identity = false;
+        secret.substitution.headers = false;
+        secret.substitution.body = true;
+        let config = make_config(vec![secret]);
+        for input in [
+            b"BINARY3 v1\0\r\nAuthorization: Basic dXNlcjokS0VZ\r\n\r\n".as_slice(),
+            b"BINARY3 v1\0opaque $KEY\0".as_slice(),
+        ] {
+            let mut handler = SecretsHandler::new_plain_http_invalid_host(&config);
+
+            assert_eq!(handler.substitute(input), Err(SecretViolationAction::Block));
         }
     }
 
@@ -7181,7 +7643,9 @@ mod tests {
 
     #[test]
     fn split_chunked_body_payload_blocks_for_wrong_host() {
-        let config = make_config(vec![make_secret("$KEY", "real-secret", "api.openai.com")]);
+        let mut secret = make_secret("$KEY", "real-secret", "api.openai.com");
+        secret.substitution.body = true;
+        let config = make_config(vec![secret]);
         let mut handler = SecretsHandler::new(&config, "evil.com", true);
 
         let input = b"POST / HTTP/1.1\r\nHost: evil.com\r\nTransfer-Encoding: chunked\r\n\r\n2\r\n$K\r\n2\r\nEY\r\n0\r\n\r\n";
@@ -7226,7 +7690,9 @@ mod tests {
 
     #[test]
     fn split_chunk_extension_blocks_for_wrong_host() {
-        let config = make_config(vec![make_secret("$KEY", "real-secret", "api.openai.com")]);
+        let mut secret = make_secret("$KEY", "real-secret", "api.openai.com");
+        secret.substitution.body = true;
+        let config = make_config(vec![secret]);
         let mut handler = SecretsHandler::new(&config, "evil.com", true);
 
         let first =
@@ -7242,10 +7708,11 @@ mod tests {
     fn split_chunk_extension_blocks_during_body_rewrite() {
         let mut secret = make_secret("$KEY", "real-secret", "api.openai.com");
         secret.substitution.body = true;
-        let config = make_config(vec![
-            secret,
-            make_secret("$BLOCKED", "other-secret", "other.example"),
-        ]);
+        // Chunk extensions extend the body section, so the masking secret must
+        // substitute in bodies for the extension to stay a refused location.
+        let mut blocked_secret = make_secret("$BLOCKED", "other-secret", "other.example");
+        blocked_secret.substitution.body = true;
+        let config = make_config(vec![secret, blocked_secret]);
         let mut handler = SecretsHandler::new(&config, "api.openai.com", true);
 
         let first = b"POST / HTTP/1.1\r\nHost: api.openai.com\r\nTransfer-Encoding: chunked\r\n\r\n1;token=$B";
@@ -7501,7 +7968,7 @@ mod tests {
         let mut handler =
             SecretsHandler::new_plain_http(&config, "api.openai.com", IpAddr::V4(ip), &shared);
 
-        let input = b"POST / HTTP/1.1\r\nHost: api.openai.com\r\nContent-Length: 4\r\n\r\n$KEY";
+        let input = b"GET / HTTP/1.1\r\nHost: api.openai.com\r\nAuthorization: Bearer $KEY\r\n\r\n";
         assert_eq!(
             handler.substitute(input).unwrap_err(),
             SecretViolationAction::Block
@@ -7842,7 +8309,12 @@ mod tests {
 
     #[test]
     fn url_encoded_placeholder_in_query_blocks_for_wrong_host() {
-        let config = make_config(vec![make_secret("$KEY", "real-secret", "api.openai.com")]);
+        // Header substitution is off so the row distinguishes the always-refused
+        // query (D7) from a mapping that follows the header scope.
+        let mut secret = make_secret("$KEY", "real-secret", "api.openai.com");
+        secret.substitution.headers = false;
+        secret.substitution.query = true;
+        let config = make_config(vec![secret]);
         let mut handler = SecretsHandler::new(&config, "evil.com", true);
 
         // `%24KEY` is the URL-encoded form of `$KEY`.
@@ -7855,7 +8327,9 @@ mod tests {
 
     #[test]
     fn url_encoded_placeholder_in_body_blocks_for_wrong_host() {
-        let config = make_config(vec![make_secret("$KEY", "real-secret", "api.openai.com")]);
+        let mut secret = make_secret("$KEY", "real-secret", "api.openai.com");
+        secret.substitution.body = true;
+        let config = make_config(vec![secret]);
         let mut handler = SecretsHandler::new(&config, "evil.com", true);
 
         let input = b"POST / HTTP/1.1\r\nContent-Length: 13\r\n\r\nkey=%24KEY&x=1";
@@ -7865,8 +8339,11 @@ mod tests {
         );
     }
 
+    /// A POST with neither Content-Length nor Transfer-Encoding has no body, so
+    /// the trailing bytes are parsed as the next request line, which always
+    /// refuses.
     #[test]
-    fn json_escaped_placeholder_in_body_blocks_for_wrong_host() {
+    fn json_escaped_placeholder_after_unframed_post_refuses_as_a_request_line() {
         let config = make_config(vec![make_secret("$KEY", "real-secret", "api.openai.com")]);
         let mut handler = SecretsHandler::new(&config, "evil.com", true);
 
@@ -7881,7 +8358,9 @@ mod tests {
 
     #[test]
     fn split_url_encoded_placeholder_blocks_for_wrong_host() {
-        let config = make_config(vec![make_secret("$KEY", "real-secret", "api.openai.com")]);
+        let mut secret = make_secret("$KEY", "real-secret", "api.openai.com");
+        secret.substitution.body = true;
+        let config = make_config(vec![secret]);
         let mut handler = SecretsHandler::new(&config, "evil.com", true);
 
         let chunk1 = b"POST / HTTP/1.1\r\nHost: evil.com\r\nContent-Length: 14\r\n\r\nkey=%24K";
@@ -7896,7 +8375,9 @@ mod tests {
 
     #[test]
     fn split_json_escaped_placeholder_blocks_for_wrong_host() {
-        let config = make_config(vec![make_secret("$KEY", "real-secret", "api.openai.com")]);
+        let mut secret = make_secret("$KEY", "real-secret", "api.openai.com");
+        secret.substitution.body = true;
+        let config = make_config(vec![secret]);
         let mut handler = SecretsHandler::new(&config, "evil.com", true);
 
         let chunk1 =
@@ -8066,7 +8547,9 @@ mod tests {
         // Placeholder bytes for a host that is not allowed to receive the
         // real secret arrive in a body-continuation chunk. The body-only
         // path must still run violation detection.
-        let config = make_config(vec![make_secret("$KEY", "real-secret", "api.openai.com")]);
+        let mut secret = make_secret("$KEY", "real-secret", "api.openai.com");
+        secret.substitution.body = true;
+        let config = make_config(vec![secret]);
         let mut handler = SecretsHandler::new(&config, "evil.com", true);
 
         let chunk1 = b"POST /a HTTP/1.1\r\nHost: evil.com\r\nContent-Length: 16\r\n\r\n";

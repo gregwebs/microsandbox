@@ -1,7 +1,7 @@
 ---
 title: "Changes in this fork"
 sidebarTitle: "This fork"
-description: "Fork-only features: rotating file secrets, header credentials, request interception, opt-in ambient proxy discovery, auto-published listeners, live network policy replacement, and the egress refusal log."
+description: "Fork-only features: rotating file secrets, header credentials, request interception, location-scoped placeholder refusals, opt-in ambient proxy discovery, auto-published listeners, live network policy replacement, and the egress refusal log."
 icon: "code-fork"
 ---
 
@@ -16,8 +16,9 @@ re-reads the file for every eligible connection, so rotating the credential on d
 (`echo -n new-token > /run/creds/token`) takes effect on the next connection with no `msb modify`
 call and no sandbox restart. Only the file path is stored in the durable sandbox config; the bytes
 are never persisted, logged, or sent to the guest. A missing, unreadable, symlinked, oversized
-(over 64 KiB), empty, or non-UTF-8 file fails closed: the placeholder is blocked for that
-connection, even under a `Passthrough` violation policy for the host.
+(over 64 KiB), empty, or non-UTF-8 file fails closed: the placeholder is blocked in the secret's
+substitution locations for that connection, even under a `Passthrough` violation policy for the
+host.
 
 ```yaml
 TOKEN:
@@ -232,3 +233,19 @@ This is the Rust SDK only: there is no new `msb` command — `msb logs --source 
 file.
 
 See [Refusal log](/networking/overview#refusal-log).
+
+## Placeholder refusals follow the substitution scope
+
+A secret placeholder is now refused only in a location where that secret could have been
+substituted. A placeholder in a header or body location its secret does not substitute in — for
+example a headers-only credential's placeholder quoted in a request body — reaches any host
+unchanged, and the forward is neither logged nor recorded as a refusal. A placeholder in an enabled
+location, in the URL path or query string, or in a stream that is not HTTP still follows the
+violation action. Nothing is substituted anywhere new: the forwarded bytes are the marker, never
+the credential.
+
+This fixes sessions that quote a placeholder into every request body, such as an agent transcript
+that once ran `env`, which a foreign host used to answer with `403 Request blocked by secret
+policy.`
+
+See [Violation actions](/sandboxes/secrets#violation-actions).
