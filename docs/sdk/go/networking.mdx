@@ -452,8 +452,8 @@ HTTP *HTTPConfig
 
 Omitting `HTTP` enables JSON denial responses locally. When supplying `HTTPConfig`,
 set `DenyResponse: true` to keep them enabled; `false` disables them. An empty format
-defaults to JSON. `NetworkDenyMessage` and `SecretDenyMessage` customize the respective
-messages. See [HTTP denial responses](/networking/overview#http-denial-responses).
+defaults to JSON. `NetworkDenyMessage` replaces the network message; `SecretDenyMessage` is
+appended after the engine's facts sentence in a secret denial. See [HTTP denial responses](/networking/overview#http-denial-responses).
 
 ### PolicyRule
 

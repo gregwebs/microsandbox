@@ -489,7 +489,7 @@ With `follow: true` the stream yields each record as it is written; without it, 
 {"v":1,"t":"2026-11-05T14:03:07.412Z","s":"network","event":"refusal","site":"tcp-syn","layer":"tenant","protocol":"tcp","dst_ip":"203.0.113.10","dst_port":443,"name":"api.example.com","name_source":"dns-cache","revision":2}
 ```
 
-Records carry facts only: which site refused, which configuration owns the decision, the destination the guest used, the name evidence, and the policy revision in force. Deciding what a refusal means, assigning it an ID, and coalescing or deduplicating records are the reader's job.
+Records carry facts only: which site refused, which configuration owns the decision, the destination the guest used, the name evidence, and the policy revision in force. A `secret-violation` record also names the refused credential, where its placeholder was, and why it was refused. Deciding what a refusal means, assigning it an ID, and coalescing or deduplicating records are the reader's job.
 
 <Accordion title="Record fields">
 
@@ -514,6 +514,9 @@ Every line is one JSON object and always carries the envelope:
 | `name` | string, optional | Guest-supplied name evidence. Present if and only if `name_source` is not `none`. It is normalized and syntax-checked, but the guest still chose it: treat it as untrusted text, never as a verified hostname. A `dns-cache` name is any name the guest's own lookups bound to `dst_ip`, so it need not be the name the refused flow meant. |
 | `name_source` | string | `sni` (TLS ClientHello), `http-host` (HTTP `Host`, HTTP/2 `:authority`, or `CONNECT` target), `dns-query` (the queried name), `dns-cache` (a name the guest's own DNS answers bound to `dst_ip`), or `none`. |
 | `revision` | integer | Revision of the sandbox's policy in force for this decision; see [Replacing a running sandbox's policy](#live-policy-replacement). |
+| `credential` | string, optional | Environment variable name of the refused secret. Present only for a `site: "secret-violation"` refusal, and absent when that name itself contains a configured placeholder; never the secret's value, its length, a prefix or a hash. |
+| `location` | string, optional | Where the refused placeholder was found. Present only for `site: "secret-violation"`; one of `header`, `basic-auth`, `trailer`, `query`, `unknown`, `body`, `chunk-metadata`. |
+| `reason` | string, optional | Why the secret could not serve the request. Present only for `site: "secret-violation"`; one of `host-not-covered`, `credential-unavailable`, `destination-unverified`. |
 
 `event: "suppressed"` adds:
 
@@ -522,7 +525,7 @@ Every line is one JSON object and always carries the envelope:
 | `site` | string | The site whose refusals were not written. |
 | `count` | integer | Refusals decided at that site and not written since the previous suppressed record for it in this runtime process. |
 
-A name is reported only if it is a name: after trimming a trailing dot and lowercasing it, it must be dot-separated labels of ASCII letters, digits, hyphens and underscores, no longer than 253 bytes, and not an IP literal. An `http-host` name is the hostname part of the authority, so userinfo and a numeric port are removed. Anything else — empty, over-long, a scheme or path, whitespace or a control character, an IPv6 literal — is recorded as `name_source: "none"` with no `name`, never truncated, because a truncated name could read as a different, approvable domain. That makes `name` renderable text, but it is still what the guest asked for, not a verified hostname. Read a line only if you know its `v`, `event`, `site`, `layer`, `name_source`, and `protocol` values; skip the ones you do not, and ignore fields you do not recognize.
+A name is reported only if it is a name: after trimming a trailing dot and lowercasing it, it must be dot-separated labels of ASCII letters, digits, hyphens and underscores, no longer than 253 bytes, and not an IP literal. An `http-host` name is the hostname part of the authority, so userinfo and a numeric port are removed. Anything else — empty, over-long, a scheme or path, whitespace or a control character, an IPv6 literal — is recorded as `name_source: "none"` with no `name`, never truncated, because a truncated name could read as a different, approvable domain. That makes `name` renderable text, but it is still what the guest asked for, not a verified hostname. Read a line only if you know its `v`, `event`, `site`, `layer`, `name_source`, `protocol`, and, for a `secret-violation`, its `location` and `reason` values; skip the ones you do not, and ignore fields you do not recognize.
 
 </Accordion>
 
@@ -722,9 +725,9 @@ The `--net-ingress-*` flags mirror the egress flags for inbound traffic (`--net-
 
 ## HTTP denial responses
 
-New local sandboxes return JSON `403 Forbidden` responses for supported denied requests by default, with `code`, `message`, and `domain` fields. Set `deny_response: false` to close denied connections without a response. This requires a supporting runtime; cloud behavior is unchanged.
+New local sandboxes return JSON `403 Forbidden` responses for supported denied requests by default, with `code`, `message`, and `domain` fields. A secret-policy denial also carries `credential`, `location`, and `reason`. Set `deny_response: false` to close denied connections without a response. This requires a supporting runtime; cloud behavior is unchanged.
 
-In JSON mode, `network_deny_message` and `secret_deny_message` customize the respective messages. Messages are used as-is; the destination is in `domain`. Changing a message or format does not override an explicit `deny_response: false`.
+In JSON mode, `network_deny_message` and `secret_deny_message` customize the respective messages. A network message is used as-is. A secret denial's `message` is the engine's facts sentence, naming the refused credential, where it was sent, and to which host, followed by `secret_deny_message` verbatim when one is configured. The destination is in `domain`. Changing a message or format does not override an explicit `deny_response: false`.
 
 Select `deny_response_format: text` for legacy behavior: network denials return plain text, `deny_message` substitutes `{host}`, and secret violations close without a response. The old message setting remains supported but is deprecated for new integrations. Each mode uses only its own message settings. Omitted settings use the runtime defaults: responses enabled with JSON format. Explicit settings take precedence. Cloud accepts the default settings without applying them; enabled custom settings are local-only.
 
@@ -854,12 +857,39 @@ Secret-policy denial:
 ```json
 {
   "code": "secret_policy_denied",
-  "message": "Request blocked by secret policy.",
-  "domain": "example.com"
+  "message": "Blocked: MSB_ANTHROPIC_KEY was sent in a request header to api.deepseek.com; it is substituted only for api.anthropic.com. Ask the user to review secret access.",
+  "domain": "api.deepseek.com",
+  "credential": "MSB_ANTHROPIC_KEY",
+  "location": "header",
+  "reason": "host-not-covered"
 }
 ```
 
-Both custom messages are JSON-escaped. An omitted message uses the default; an empty string leaves `message` empty (Go treats an empty string as omitted). Text mode works with older runtimes that support denial responses. JSON mode requires the new runtime capability; the SDK returns an upgrade-required error if it is missing.
+A secret denial's `message` is one facts sentence, then the configured `secret_deny_message` after a space, verbatim. The facts sentence depends on `reason`:
+
+| `reason` | Facts sentence |
+|---|---|
+| `host-not-covered` | `Blocked: {credential} was sent in {location} to {host}; it is substituted only for {hosts}.` |
+| `credential-unavailable` | `Blocked: {credential} was sent in {location} to {host}, but the sandbox could not read its real value.` |
+| `destination-unverified` | `Blocked: {credential} was sent in {location} to {host}, whose identity could not be verified.` |
+
+`{host}` is the value of `domain`, or `this host` when it is `null`. `{location}` is the `location` value in prose:
+
+| `location` | `{location}` |
+|---|---|
+| `header` | `a request header` |
+| `basic-auth` | `a Basic auth header` |
+| `trailer` | `a request trailer` |
+| `query` | `the query string` |
+| `unknown` | `the request line` |
+| `body` | `the request body` |
+| `chunk-metadata` | `chunk metadata` |
+
+`{credential}` is the refused secret's environment variable name. When that name itself contains a configured placeholder, naming it would put the placeholder back into the response the guest reads, so the field is omitted from the response and the record and the sentence says `a credential` instead.
+
+`{hosts}` is the union of the allowed hosts of every declaration of that placeholder, in configured order, spelled as configured (`api.anthropic.com`, `*.example.com`); a host listed more than once — in any letter case — appears once, as it was first written. More than three hosts are counted as `and N more`.
+
+Both custom messages are JSON-escaped. An omitted network message uses the runtime default and an empty one leaves `message` empty (Go treats an empty string as omitted). A secret denial's message is appended, so an omitted or empty `secret_deny_message` leaves the facts sentence alone. Text mode works with older runtimes that support denial responses. JSON mode requires the new runtime capability; the SDK returns an upgrade-required error if it is missing. An older runtime answers a secret denial with the configured message alone and without the three new fields.
 
 </Accordion>
 

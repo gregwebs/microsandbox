@@ -238,7 +238,7 @@ export declare class HttpBuilder {
   denyMessage(message: string): this
   /** Set the network-denial JSON message in JSON mode without interpolation. Requires denyResponse. */
   networkDenyMessage(message: string): this
-  /** Set the literal secret-denial JSON message. Requires denyResponse and JSON mode. */
+  /** Set the remedy text appended after the engine's facts sentence in JSON secret denials. Requires denyResponse and JSON mode; an empty message adds nothing. */
   secretDenyMessage(message: string): this
 }
 export type JsHttpBuilder = HttpBuilder

@@ -1,7 +1,7 @@
 ---
 title: "Changes in this fork"
 sidebarTitle: "This fork"
-description: "Fork-only features: rotating file secrets, header credentials, request interception, location-scoped placeholder refusals, opt-in ambient proxy discovery, auto-published listeners, live network policy replacement, and the egress refusal log."
+description: "Fork-only features: rotating file secrets, header credentials, request interception, location-scoped placeholder refusals, attributed credential refusals, opt-in ambient proxy discovery, auto-published listeners, live network policy replacement, and the egress refusal log."
 icon: "code-fork"
 ---
 
@@ -249,3 +249,34 @@ that once ran `env`, which a foreign host used to answer with `403 Request block
 policy.`
 
 See [Violation actions](/sandboxes/secrets#violation-actions).
+
+## Attributed credential refusals
+
+A secret-policy `403` now says which credential was refused, where its placeholder was, to which
+host, and why, in `message` — the one field a client such as Claude Code shows — and in three
+value-free envelope fields: `credential` (the secret's environment variable name), `location`
+(`header`, `basic-auth`, `trailer`, `query`, `unknown`, `body`, `chunk-metadata`) and `reason`
+(`host-not-covered`, `credential-unavailable`, `destination-unverified`). A configured
+`secret_deny_message` is now appended verbatim after that facts sentence instead of replacing the
+message, and an unset or empty one leaves the facts sentence alone.
+
+The reason is the one that, fixed, would let the request through: restoring an unreadable
+file-backed secret is reported as `credential-unavailable` only when a readable file would have
+been substituted or passed through, and every other mismatch reports the destination. The same
+three fields reach each `secret-violation` refusal record in `network.log`, so a launcher can show
+them later. A name that itself contains a placeholder is never stated: the field is omitted and
+the sentence says "a credential".
+
+```json
+{
+  "code": "secret_policy_denied",
+  "message": "Blocked: MSB_ANTHROPIC_KEY was sent in a request header to api.deepseek.com; it is substituted only for api.anthropic.com.",
+  "domain": "api.deepseek.com",
+  "credential": "MSB_ANTHROPIC_KEY",
+  "location": "header",
+  "reason": "host-not-covered"
+}
+```
+
+See [HTTP denial responses](/networking/overview#http-denial-responses) and
+[Refusal log](/networking/overview#refusal-log).
