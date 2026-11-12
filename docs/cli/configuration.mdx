@@ -357,7 +357,7 @@ secrets:
 ```
 </CodeGroup>
 
-`substitution` controls headers, query parameters, and request bodies independently; it defaults to headers only, and Basic authentication follows the header setting. On credential-allowed hosts that pass the secret's identity checks, disabled locations forward the placeholder unchanged. Other destinations must appear in `passthrough` or follow the violation action. `secret_violation_action` sets the sandbox-wide blocking action, while a per-secret `violation_action` overrides it. Declaring a secret enables TLS interception and DNS-rebind protection.
+`substitution` controls headers, query parameters, and request bodies independently; it defaults to headers only, and Basic authentication follows the header setting. On credential-allowed hosts that pass the secret's identity checks, disabled locations forward the placeholder unchanged. Other destinations also receive it unchanged in a disabled header or body location; elsewhere — an enabled location, the URL path or query string, or a stream that is not HTTP — it must appear in `passthrough` or follow the violation action. `secret_violation_action` sets the sandbox-wide blocking action, while a per-secret `violation_action` overrides it. Declaring a secret enables TLS interception and DNS-rebind protection.
 
 ### Scripts
 

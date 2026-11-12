@@ -2350,6 +2350,9 @@ mod tests {
                 let _ = rustls::crypto::ring::default_provider().install_default();
                 let mut secrets = host_bound_secret_config();
                 secrets.secrets[0].allowed_hosts = vec![HostPattern::Exact("github.com".into())];
+                // The placeholder is sent as a body, so the secret must substitute in
+                // bodies for the body to stay a refused location (#562).
+                secrets.secrets[0].substitution.body = true;
                 let tls_state = test_tls_state(secrets);
                 let (shared, refusals) = recording_state(8);
                 shared.set_http_config(microsandbox_types::HttpConfig {

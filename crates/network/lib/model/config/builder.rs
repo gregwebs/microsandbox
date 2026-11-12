@@ -837,8 +837,8 @@ impl SecretBuilder {
 
     /// Add a host allowed to receive the substituted secret value.
     ///
-    /// Once the secret's host and TLS identity checks pass, this host may also
-    /// receive unchanged placeholders outside enabled substitution locations.
+    /// On this host the placeholder is replaced in the enabled substitution
+    /// scopes; the same placeholder in a disabled scope is forwarded unchanged.
     ///
     /// `*.example.com` matches the domain and its subdomains. Use
     /// [`allow_any_host_dangerous`](Self::allow_any_host_dangerous) for `*`.

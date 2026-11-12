@@ -113,6 +113,9 @@ async fn proxy_violation(
                 .value("real-secret")
                 .placeholder("$KEY")
                 .allow("api.example.com")
+                // The relay sends the placeholder as a body, so the secret must
+                // substitute in bodies for the body to stay a refused location.
+                .substitute_in_body(true)
                 .build(),
         ],
         violation_action: action.clone(),
@@ -307,6 +310,17 @@ fn secret_violation_logs_distinguish_blocking_from_allowed_placeholders() {
                     assert!(
                         events.is_empty(),
                         "permitted requests must not log violations"
+                    );
+                    continue;
+                }
+
+                // A body placeholder on a destination that cannot receive the
+                // credential is forwarded unchanged and is not a violation.
+                if location == "body" {
+                    assert_eq!(result.unwrap().as_ref(), request.as_bytes());
+                    assert!(
+                        events.is_empty(),
+                        "a forwarded body placeholder is not a violation"
                     );
                     continue;
                 }
