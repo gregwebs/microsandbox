@@ -458,8 +458,11 @@ async fn https_connect_proxy_blocks_secret_for_wrong_host() {
         error,
         serde_json::json!({
             "code": "secret_policy_denied",
-            "message": "Request blocked by secret policy.",
-            "domain": "host.microsandbox.internal"
+            "message": "Blocked: API_KEY was sent in a request header to host.microsandbox.internal; it is substituted only for api.allowed.test.",
+            "domain": "host.microsandbox.internal",
+            "credential": "API_KEY",
+            "location": "header",
+            "reason": "host-not-covered"
         })
     );
 

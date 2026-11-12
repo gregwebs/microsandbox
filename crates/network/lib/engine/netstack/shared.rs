@@ -226,12 +226,12 @@ impl SharedState {
             .unwrap_or(crate::engine::http_deny::NETWORK_JSON_DENY_MESSAGE)
     }
 
-    /// Return the configured secret-denial message without interpolation.
-    pub fn secret_deny_message(&self) -> &str {
+    /// Return the configured secret-denial remedy, appended verbatim after the engine's facts
+    /// sentence; `None` when unset.
+    pub fn secret_deny_message(&self) -> Option<&str> {
         self.http
             .get()
             .and_then(|http| http.secret_deny_message.as_deref())
-            .unwrap_or(crate::engine::http_deny::SECRET_HTTP_DENY_MESSAGE)
     }
 
     /// Set NAT64 prefixes. Called once before policy evaluation starts.

@@ -1,15 +1,17 @@
 //! Egress refusal reporting: the seam every refused egress decision is reported through.
 //!
 //! The engine cannot depend on the runtime that owns the log file, so a refused decision is handed
-//! to a [`RefusalSink`] the host installs on the per-sandbox shared state. The one crate-internal
-//! entry point, `record`, owns the rules every deny site shares: it returns before allocating when
-//! no sink is installed, resolves `dns-cache` name evidence, normalizes names, and maps the
-//! engine's protocol onto the wire contract. Sites state facts; this module decides how the facts
-//! are recorded.
+//! to a [`RefusalSink`] the host installs on the per-sandbox shared state. The two crate-internal
+//! entry points, `record` and `record_secret_violation`, own the rules every deny site shares: they
+//! return before allocating when no sink is installed, resolve `dns-cache` name evidence, normalize
+//! names, and map the engine's protocol onto the wire contract. Sites state facts; this module
+//! decides how the facts are recorded.
 
 use std::net::IpAddr;
 
-use microsandbox_types::{NameSource, NetworkRefusal, RefusalLayer, RefusalSite};
+use microsandbox_types::{
+    NameSource, NetworkRefusal, PlaceholderLocation, RefusalLayer, RefusalSite, SecretRefusalReason,
+};
 
 use crate::netstack::shared::SharedState;
 use crate::policy::Protocol;
@@ -86,6 +88,17 @@ pub(crate) struct Denial<'a> {
     pub(crate) revision: u64,
 }
 
+/// The secret a `secret-violation` refusal concerns. Holds no secret value.
+pub(crate) struct SecretRefusal<'a> {
+    /// Environment variable name of the refused secret, or `None` when the name itself carries a
+    /// placeholder and so cannot be recorded (R4).
+    pub(crate) credential: Option<&'a str>,
+    /// Where the placeholder was found.
+    pub(crate) location: PlaceholderLocation,
+    /// Why the secret could not serve the request.
+    pub(crate) reason: SecretRefusalReason,
+}
+
 //--------------------------------------------------------------------------------------------------
 // Functions
 //--------------------------------------------------------------------------------------------------
@@ -95,6 +108,30 @@ pub(crate) struct Denial<'a> {
 /// Returns before any allocation, lock or lookup when no sink is installed, and returns before
 /// resolving name evidence when the sink refuses the site's token.
 pub(crate) fn record(shared: &SharedState, denial: Denial<'_>) {
+    record_with(shared, denial, None);
+}
+
+/// Report one refused secret placeholder: a `secret-violation` record that also names the secret,
+/// where its placeholder was, and why it was refused.
+///
+/// The site is this entry point's, not the caller's, so the three fields cannot land on another
+/// site's record. The same rules as [`record`] apply: nothing is allocated for a record that is
+/// not written.
+pub(crate) fn record_secret_violation(
+    shared: &SharedState,
+    denial: Denial<'_>,
+    secret: SecretRefusal<'_>,
+) {
+    let denial = Denial {
+        site: RefusalSite::SecretViolation,
+        ..denial
+    };
+
+    record_with(shared, denial, Some(secret));
+}
+
+/// The body of both entry points, with the secret's facts copied only after admission.
+fn record_with(shared: &SharedState, denial: Denial<'_>, secret: Option<SecretRefusal<'_>>) {
     let Some(sink) = shared.refusal_sink() else {
         return;
     };
@@ -114,9 +151,12 @@ pub(crate) fn record(shared: &SharedState, denial: Denial<'_>) {
         name,
         name_source,
         revision: denial.revision,
-        credential: None,
-        location: None,
-        reason: None,
+        credential: secret
+            .as_ref()
+            .and_then(|secret| secret.credential)
+            .map(str::to_owned),
+        location: secret.as_ref().map(|secret| secret.location),
+        reason: secret.as_ref().map(|secret| secret.reason),
     });
 }
 
@@ -233,6 +273,7 @@ pub(crate) mod test_support;
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
     use std::time::Duration;
 
     use super::test_support::{cache_name, recording_state};
@@ -254,6 +295,26 @@ mod tests {
         }
     }
 
+    /// The record [`denial`] states, with no secret fields.
+    fn denial_facts(name: NameEvidence<'_>) -> NetworkRefusal {
+        let denial = denial(name);
+        let (name, name_source) = evidence(&SharedState::new(4), denial.name);
+
+        NetworkRefusal {
+            site: denial.site,
+            layer: denial.layer,
+            protocol: wire_protocol(denial.protocol),
+            dst_ip: denial.dst_ip,
+            dst_port: denial.dst_port,
+            name,
+            name_source,
+            revision: denial.revision,
+            credential: None,
+            location: None,
+            reason: None,
+        }
+    }
+
     #[test]
     fn record_without_a_sink_is_a_no_op() {
         let shared = SharedState::new(4);
@@ -272,10 +333,88 @@ mod tests {
             record(&shared, denial(name));
         }
 
+        // A secret violation costs nothing either, and copies no credential.
+        record_secret_violation(
+            &shared,
+            Denial {
+                site: RefusalSite::SecretViolation,
+                ..denial(NameEvidence::CachedFor(cached))
+            },
+            SecretRefusal {
+                credential: Some("API_KEY"),
+                location: PlaceholderLocation::Header,
+                reason: SecretRefusalReason::HostNotCovered,
+            },
+        );
+
         // Nothing was buffered for a sink that arrives later: reporting without a sink drops.
         let sink = super::test_support::CollectingSink::new();
         shared.set_refusal_sink(sink.clone());
         assert!(sink.take().is_empty());
+    }
+
+    #[test]
+    fn record_secret_violation_names_the_secret() {
+        let (shared, sink) = recording_state(4);
+        let secret = SecretRefusal {
+            credential: Some("API_KEY"),
+            location: PlaceholderLocation::Query,
+            reason: SecretRefusalReason::DestinationUnverified,
+        };
+
+        record_secret_violation(
+            &shared,
+            Denial {
+                site: RefusalSite::SecretViolation,
+                ..denial(NameEvidence::None)
+            },
+            secret,
+        );
+
+        let recorded = sink.take();
+        assert_eq!(
+            recorded,
+            vec![NetworkRefusal {
+                site: RefusalSite::SecretViolation,
+                credential: Some("API_KEY".to_owned()),
+                location: Some(PlaceholderLocation::Query),
+                reason: Some(SecretRefusalReason::DestinationUnverified),
+                // Everything else is exactly what `record` would have reported.
+                ..denial_facts(NameEvidence::None)
+            }]
+        );
+    }
+
+    #[test]
+    fn record_secret_violation_is_a_no_op_when_the_sink_suppresses() {
+        /// Admits nothing, and fails the test if a suppressed record is delivered anyway.
+        struct SuppressingSink;
+
+        impl RefusalSink for SuppressingSink {
+            fn admits(&self, _site: RefusalSite) -> bool {
+                false
+            }
+
+            fn record(&self, _refusal: NetworkRefusal) {
+                panic!("a suppressed refusal must not be delivered");
+            }
+        }
+
+        let shared = SharedState::new(4);
+        shared.set_refusal_sink(Arc::new(SuppressingSink));
+
+        record_secret_violation(
+            &shared,
+            Denial {
+                site: RefusalSite::SecretViolation,
+                ..denial(NameEvidence::None)
+            },
+            SecretRefusal {
+                credential: Some("API_KEY"),
+                location: PlaceholderLocation::Header,
+                reason: SecretRefusalReason::HostNotCovered,
+            },
+        );
     }
 
     #[test]
