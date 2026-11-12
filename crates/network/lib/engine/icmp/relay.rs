@@ -1238,6 +1238,9 @@ mod tests {
             name: None,
             name_source: NameSource::Absent,
             revision: 1,
+            credential: None,
+            location: None,
+            reason: None,
         }
     }
 

@@ -1308,8 +1308,8 @@ type HTTPConfig struct {
 	// NetworkDenyMessage sets the network-denial JSON message in JSON mode. Requires DenyResponse.
 	// Used as-is. Empty uses the default message.
 	NetworkDenyMessage string
-	// SecretDenyMessage sets the literal secret-denial JSON message.
-	// Empty uses the default message. Requires DenyResponse and JSON mode.
+	// SecretDenyMessage sets the remedy text appended after the engine's facts sentence in JSON
+	// secret denials. Empty adds nothing. Requires DenyResponse and JSON mode.
 	SecretDenyMessage string
 }
 

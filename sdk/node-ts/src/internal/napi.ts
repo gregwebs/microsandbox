@@ -1060,7 +1060,7 @@ export interface NapiHttpBuilder {
   /** @deprecated Legacy text message with {host} substitution. */
   denyMessage(message: string): this;
   networkDenyMessage(message: string): this;
-  /** Set the literal secret-denial JSON message. */
+  /** Set the remedy text appended after the engine's facts sentence in JSON secret denials. */
   secretDenyMessage(message: string): this;
 }
 

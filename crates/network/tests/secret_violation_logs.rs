@@ -19,7 +19,9 @@ use microsandbox_network::secrets::handler::SecretsHandler;
 use microsandbox_network::shared::{ResolvedHostnameFamily, SharedState};
 use microsandbox_network::tcp::proxy::spawn_tcp_proxy;
 use microsandbox_network::tls::state::TlsState;
-use microsandbox_types::{NameSource, NetworkRefusal, RefusalSite};
+use microsandbox_types::{
+    NameSource, NetworkRefusal, PlaceholderLocation, RefusalSite, SecretRefusalReason,
+};
 use tokio::io::AsyncReadExt;
 use tokio::net::TcpListener;
 use tokio::sync::mpsc;
@@ -226,6 +228,22 @@ async fn assert_proxy_violation_logs(logs: &CapturedLogs) {
             );
             assert_eq!(records[0].name.as_deref(), Some("api.example.com"));
             assert_eq!(records[0].name_source, NameSource::HttpHost);
+            // The record names the credential, the location and the reason: a TLS-only secret on
+            // its own host over plain HTTP, with CONNECT metadata forced ineligible.
+            assert_eq!(records[0].credential.as_deref(), Some("API_KEY"));
+            assert_eq!(
+                records[0].location,
+                Some(match path {
+                    "body relay" => PlaceholderLocation::Body,
+                    _ => PlaceholderLocation::Header,
+                }),
+                "{path}/{action:?}"
+            );
+            assert_eq!(
+                records[0].reason,
+                Some(SecretRefusalReason::DestinationUnverified),
+                "{path}/{action:?}"
+            );
 
             let violations: Vec<_> = events
                 .iter()
@@ -434,4 +452,185 @@ fn block_and_log_violation_is_recorded_once() {
                 assert_eq!(violations[0].level, Level::WARN);
             }
         });
+}
+
+/// M2/SN-2: a stream with no destination name reports `destination-unverified`, whether or not
+/// the policy has a domain rule.
+///
+/// With a domain rule the proxy peeks the first flight for a `Host` and builds the policy handler
+/// with an empty name; without one it builds the invalid-host handler. The reason must not depend
+/// on which constructor ran, because this record is what a launcher renders.
+#[test]
+fn hostless_stream_denial_reports_the_destination_whatever_the_policy() {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+
+    for (label, policy) in [
+        ("no domain rules", NetworkPolicy::allow_all()),
+        (
+            "domain rules",
+            NetworkPolicy::builder()
+                .default_allow()
+                .egress(|egress| egress.tcp().allow().domain("api.example.com"))
+                .build()
+                .expect("domain policy"),
+        ),
+    ] {
+        runtime.block_on(async {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let config = SecretsConfig {
+                secrets: vec![
+                    SecretBuilder::new()
+                        .env("API_KEY")
+                        .value("real-secret")
+                        .placeholder("$KEY")
+                        .allow("a.example")
+                        .build(),
+                ],
+                violation_action: SecretViolationAction::BlockAndLog,
+                ..Default::default()
+            };
+            let shared = Arc::new(SharedState::new(4));
+            shared.cache_resolved_hostname(
+                "a.example",
+                ResolvedHostnameFamily::Ipv4,
+                [addr.ip()],
+                Duration::from_secs(60),
+            );
+            let refusals = Arc::new(CollectingRefusals::default());
+            shared.set_refusal_sink(refusals.clone());
+
+            let (from_tx, from_rx) = mpsc::channel(8);
+            let (to_tx, mut to_rx) = mpsc::channel(8);
+            spawn_tcp_proxy(
+                &tokio::runtime::Handle::current(),
+                addr,
+                addr,
+                from_rx,
+                to_tx,
+                shared,
+                Arc::new(policy.clone()),
+                Arc::new(config),
+                None,
+                false,
+                Arc::new(ProxyConnectState::new()),
+                None,
+            );
+            let (mut server, _) = listener.accept().await.unwrap();
+
+            from_tx
+                .send(Bytes::from_static(b"EHLO $KEY\r\n"))
+                .await
+                .unwrap();
+            drop(from_tx);
+            let mut blocked = Vec::new();
+            server.read_to_end(&mut blocked).await.unwrap();
+
+            assert!(
+                blocked.is_empty(),
+                "{label}: blocked bytes reached upstream"
+            );
+            assert!(
+                to_rx.recv().await.is_none(),
+                "{label}: an opaque stream gets no HTTP response"
+            );
+
+            let records = refusals.0.lock().unwrap().clone();
+            let violations: Vec<_> = records
+                .iter()
+                .filter(|record| record.site == RefusalSite::SecretViolation)
+                .collect();
+            assert_eq!(violations.len(), 1, "{label}: {records:?}");
+            assert_eq!(violations[0].credential.as_deref(), Some("API_KEY"));
+            assert_eq!(violations[0].location, Some(PlaceholderLocation::Unknown));
+            assert_eq!(
+                violations[0].reason,
+                Some(SecretRefusalReason::DestinationUnverified),
+                "{label}"
+            );
+        });
+    }
+}
+
+/// A hostless HTTP request in a sandbox whose policy has a domain rule is closed while its
+/// authority is parsed, before the secret handler sees the placeholder: it answers no 403 and
+/// records nothing, unlike the same request in a sandbox without domain rules, which is recorded
+/// as a `secret-violation` at `unknown`.
+///
+/// This pins today's behaviour as a known gap, tracked as a follow-up rather than fixed here: the
+/// refusal set is unchanged by this change, so the hostless case is end to end reachable only
+/// without domain rules. Fixing it means deciding the hostless case once, in the proxy, and
+/// handing it to the secrets handler the way the invalid-host handler does.
+#[test]
+fn hostless_http_request_in_a_domain_rules_sandbox_is_closed_without_a_record() {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+
+    runtime.block_on(async {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let config = SecretsConfig {
+            secrets: vec![
+                SecretBuilder::new()
+                    .env("API_KEY")
+                    .value("real-secret")
+                    .placeholder("$KEY")
+                    .allow("a.example")
+                    .build(),
+            ],
+            violation_action: SecretViolationAction::BlockAndLog,
+            ..Default::default()
+        };
+        let policy = NetworkPolicy::builder()
+            .default_allow()
+            .egress(|egress| egress.tcp().allow().domain("api.example.com"))
+            .build()
+            .expect("domain policy");
+        let shared = Arc::new(SharedState::new(4));
+        let refusals = Arc::new(CollectingRefusals::default());
+        shared.set_refusal_sink(refusals.clone());
+
+        let (from_tx, from_rx) = mpsc::channel(8);
+        let (to_tx, mut to_rx) = mpsc::channel(8);
+        spawn_tcp_proxy(
+            &tokio::runtime::Handle::current(),
+            addr,
+            addr,
+            from_rx,
+            to_tx,
+            shared,
+            Arc::new(policy),
+            Arc::new(config),
+            None,
+            false,
+            Arc::new(ProxyConnectState::new()),
+            None,
+        );
+        let (mut server, _) = listener.accept().await.unwrap();
+
+        from_tx
+            .send(Bytes::from_static(
+                b"GET / HTTP/1.1\r\nAuthorization: Bearer $KEY\r\n\r\n",
+            ))
+            .await
+            .unwrap();
+        drop(from_tx);
+        let mut blocked = Vec::new();
+        server.read_to_end(&mut blocked).await.unwrap();
+
+        assert!(blocked.is_empty(), "blocked bytes reached upstream");
+        assert!(
+            to_rx.recv().await.is_none(),
+            "a hostless first flight gets no HTTP response"
+        );
+        assert!(
+            refusals.0.lock().unwrap().is_empty(),
+            "O1: the refusal is decided before the secret handler and never recorded"
+        );
+    });
 }

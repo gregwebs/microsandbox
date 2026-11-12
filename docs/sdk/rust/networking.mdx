@@ -1228,7 +1228,7 @@ Set the network-denial JSON `message`. Custom messages are used as-is. Omission 
 fn secret_deny_message(self, message: impl Into<String>) -> Self
 ```
 
-Set the secret-denial JSON `message`. Custom messages are used as-is. Omission uses the default message; an empty string leaves `message` empty. Requires `deny_response(true)` and JSON mode.
+Set the remedy text appended after the engine's facts sentence in JSON secret denials. The sentence names the refused credential, where its placeholder was sent, and to which host. An omitted or empty message adds nothing. Requires `deny_response(true)` and JSON mode.
 
 #### <span className="msb-recv">http.</span><span className="msb-hn">build()</span>
 

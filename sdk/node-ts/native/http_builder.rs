@@ -66,7 +66,8 @@ impl JsHttpBuilder {
         self
     }
 
-    /// Set the literal secret-denial JSON message. Requires denyResponse and JSON mode.
+    /// Set the remedy text appended after the engine's facts sentence in JSON secret denials.
+    /// Requires denyResponse and JSON mode; an empty message adds nothing.
     #[napi(js_name = "secretDenyMessage")]
     pub fn secret_deny_message(&mut self, message: String) -> &Self {
         self.secret_message = Some(message);

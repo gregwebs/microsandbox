@@ -11,17 +11,19 @@ use std::sync::Arc;
 
 use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
 use httlib_hpack::{Decoder as HpackDecoder, Encoder as HpackEncoder};
-use microsandbox_types::{RefusalLayer, RefusalSite, SecretString};
+use microsandbox_types::{PlaceholderLocation, RefusalLayer, RefusalSite, SecretString};
 use percent_encoding::percent_decode;
 
 use super::config::SecretsConfigExt;
 use super::file_source;
 use super::hpack::check_header_block;
-use crate::engine::http_deny::{classify_http_request, secret_http_forbidden_response};
+use crate::engine::http_deny::{
+    SecretDenial, SecretDenialCause, classify_http_request, secret_http_forbidden_response,
+};
 use crate::netstack::shared::SharedState;
 use crate::policy::handle::PolicySnapshot;
 use crate::policy::{EgressEvaluation, HostnameSource, Protocol};
-use crate::refusal::{self, Denial, NameEvidence};
+use crate::refusal::{self, Denial, NameEvidence, SecretRefusal};
 use crate::secrets::config::{
     HostPattern, MAX_SECRET_PLACEHOLDER_BYTES, SecretEntry, SecretSource, SecretViolationAction,
     SecretsConfig,
@@ -135,8 +137,9 @@ pub struct SecretsHandler {
     http1_requests: u8,
     /// Whether the first request can receive a normal HTTP/1 response body.
     http1_response_allowed: bool,
-    /// Set only by an actual HTTP/1 placeholder violation, not parse failures.
-    http1_violation: bool,
+    /// The HTTP/1 placeholder violation a 403 may answer; set only by an actual violation, not parse
+    /// failures.
+    http1_violation: Option<SecretViolationReport>,
     /// Where and how this connection's refusals are reported, when they are.
     reporting: Option<ViolationReporting>,
 }
@@ -383,6 +386,15 @@ struct IneligibleSecret {
     action: BlockingAction,
     substitute_headers: bool,
     substitute_body: bool,
+    /// Why this secret cannot serve the connection; stated in the refusal it causes.
+    cause: SecretDenialCause,
+    /// Whether an `allowed_hosts` pattern matches the connection name; lets a duplicate
+    /// declaration defer to the one that would serve this host.
+    covers_name: bool,
+    /// Whether a refusal may name this secret by its environment variable. False when that name
+    /// itself carries a configured placeholder (R4): the guest would otherwise read the
+    /// placeholder out of the denial.
+    names_credential: bool,
 }
 
 /// Details about a blocked secret placeholder.
@@ -397,6 +409,10 @@ struct SecretViolationReport {
     path: Option<String>,
     host: Option<String>,
     http2_stream_id: Option<u32>,
+    /// Why the refused secret could not serve this connection.
+    cause: SecretDenialCause,
+    /// Whether the refusal may name the secret by its environment variable.
+    names_credential: bool,
 }
 
 /// Minimal request metadata safe to include in violation logs.
@@ -618,6 +634,21 @@ impl fmt::Display for RequestLocation {
     }
 }
 
+impl RequestLocation {
+    /// The wire location a refusal reports for a placeholder found here.
+    fn placeholder_location(self) -> PlaceholderLocation {
+        match self {
+            Self::Header => PlaceholderLocation::Header,
+            Self::Query => PlaceholderLocation::Query,
+            Self::BasicAuth => PlaceholderLocation::BasicAuth,
+            Self::Body => PlaceholderLocation::Body,
+            Self::ChunkMetadata => PlaceholderLocation::ChunkMetadata,
+            Self::Trailer => PlaceholderLocation::Trailer,
+            Self::Unknown => PlaceholderLocation::Unknown,
+        }
+    }
+}
+
 impl fmt::Display for PlaceholderMatchForm {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let value = match self {
@@ -802,6 +833,12 @@ impl SecretsHandler {
     ) -> Self {
         let mut eligible_for_substitution = Vec::new();
         let mut ineligible_for_substitution = Vec::new();
+        let mut hosts_by_placeholder: Vec<(&str, Arc<[HostPattern]>)> = Vec::new();
+        let placeholders: Vec<&str> = config
+            .secrets
+            .iter()
+            .map(|secret| secret.placeholder.as_str())
+            .collect();
         let mut max_detection_window_len = 0;
         let mut max_body_placeholder_len = 0;
         let mut placeholder_limit_exceeded = false;
@@ -831,10 +868,11 @@ impl SecretsHandler {
                 _ => Some(secret.value.clone()),
             };
 
-            let host_allowed = !force_ineligible
-                && !resolution_failed
-                && secret_host_allowed(secret, sni, identity.as_ref());
-
+            // The identity check runs even when the file read failed, so a refusal can say
+            // whether the destination or the credential was the problem.
+            let host_verified =
+                !force_ineligible && secret_host_allowed(secret, sni, identity.as_ref());
+            let host_allowed = host_verified && !resolution_failed;
             // Substitution and placeholder passthrough are independent policies. A verified
             // destination trusted with the credential receives its placeholder unchanged wherever
             // substitution is off; any other destination does so only in a header or body location
@@ -861,27 +899,59 @@ impl SecretsHandler {
             // A failed file resolution is never rescued by passthrough: an
             // operator who configured a live credential source wants the
             // request refused, not a dead placeholder forwarded upstream.
-            if !resolution_failed {
-                if secret
-                    .passthrough_hosts
-                    .iter()
-                    .any(|pattern| host_pattern_allowed(pattern, sni, identity.as_ref()))
-                {
-                    continue;
-                }
-
-                // A per-secret blocking action overrides the global passthrough default.
-                // Per-secret passthrough falls back to the global policy off its hosts.
-                if secret.violation_action.is_none()
+            //
+            // A per-secret blocking action overrides the global passthrough default.
+            // Per-secret passthrough falls back to the global policy off its hosts.
+            let passthrough_allowed = secret
+                .passthrough_hosts
+                .iter()
+                .any(|pattern| host_pattern_allowed(pattern, sni, identity.as_ref()))
+                || (secret.violation_action.is_none()
                     && config.passthrough_hosts.as_ref().is_some_and(|hosts| {
                         hosts
                             .iter()
                             .any(|pattern| host_pattern_allowed(pattern, sni, identity.as_ref()))
-                    })
-                {
-                    continue;
-                }
+                    }));
+
+            if !resolution_failed && passthrough_allowed {
+                continue;
             }
+
+            // Report the reason that, fixed, lets the request through (R1). With the file and the
+            // destination both wrong no single fix does; the destination is reported, because
+            // restoring the file alone changes nothing.
+            let tls_identity_met = !secret.require_tls_identity || tls_intercepted;
+            let covers_name = secret
+                .allowed_hosts
+                .iter()
+                .any(|pattern| pattern.matches(sni));
+            let cause = if resolution_failed
+                && ((host_verified && tls_identity_met) || passthrough_allowed)
+            {
+                SecretDenialCause::CredentialUnavailable
+            } else if force_ineligible || sni.is_empty() {
+                // No usable destination name, whichever handler was built: a plain-HTTP request
+                // or stream with no `Host`, or proxy-owned CONNECT metadata.
+                SecretDenialCause::DestinationUnverified
+            } else if !covers_name {
+                SecretDenialCause::HostNotCovered {
+                    substituted_for: substituted_for(
+                        &mut hosts_by_placeholder,
+                        config,
+                        &secret.placeholder,
+                    ),
+                }
+            } else {
+                // Covered by name: the DNS pin failed, or the TLS identity the secret requires
+                // is missing on this plain-HTTP connection.
+                SecretDenialCause::DestinationUnverified
+            };
+
+            // A name that carries a configured placeholder would put that placeholder into the
+            // 403 and the record, which R4 forbids. Such a refusal does not name the credential.
+            let names_credential = !placeholders.iter().any(|placeholder| {
+                !placeholder.is_empty() && secret.env_var.contains(*placeholder)
+            });
 
             let action = secret
                 .violation_action
@@ -893,6 +963,9 @@ impl SecretsHandler {
                 action: BlockingAction::from_violation_action(action).unwrap_or_default(),
                 substitute_headers: secret.substitution.headers,
                 substitute_body: secret.substitution.body,
+                cause,
+                covers_name,
+                names_credential,
             });
         }
 
@@ -904,6 +977,40 @@ impl SecretsHandler {
                     && (!eligible.require_tls_identity || tls_intercepted)
             })
         });
+
+        // Duplicate declarations are one credential to the reader: a declaration that does not
+        // cover this name takes the reason and the name of one of the same placeholder that does,
+        // which is the declaration that would serve this host. Its own reason can be anything,
+        // including `credential-unavailable` through a passthrough rule, because the covering
+        // declaration still refuses once that file is restored.
+        //
+        // Known corner, accepted rather than fixed: when the covering declaration is
+        // `credential-unavailable` only through that passthrough rule, restoring its file makes it
+        // forward the placeholder rather than serve it, so the reported fix is incomplete. Getting
+        // it right needs a second, cross-declaration pass for a configuration that declares one
+        // placeholder twice, covers the name with one, and adds passthrough on top.
+        for index in 0..ineligible_for_substitution.len() {
+            if ineligible_for_substitution[index].covers_name {
+                continue;
+            }
+            let placeholder = &ineligible_for_substitution[index].placeholder;
+            let covering = ineligible_for_substitution
+                .iter()
+                .find(|other| other.covers_name && other.placeholder == *placeholder)
+                .map(|other| {
+                    (
+                        other.cause.clone(),
+                        other.env_var.clone(),
+                        other.names_credential,
+                    )
+                });
+            if let Some((cause, env_var, names_credential)) = covering {
+                let ineligible = &mut ineligible_for_substitution[index];
+                ineligible.cause = cause;
+                ineligible.env_var = env_var;
+                ineligible.names_credential = names_credential;
+            }
+        }
 
         Self {
             eligible_for_substitution,
@@ -926,7 +1033,7 @@ impl SecretsHandler {
             credential_identity,
             http1_requests: 0,
             http1_response_allowed: false,
-            http1_violation: false,
+            http1_violation: None,
             reporting: None,
         }
     }
@@ -1086,11 +1193,22 @@ impl SecretsHandler {
         self.substitute_headers(data)
     }
 
-    /// Build a secret-policy denial only for the first recognized HTTP/1 request.
+    /// Build a secret-policy denial only for the first recognized HTTP/1 request: the refused
+    /// placeholder's facts, then `remedy` when one is configured.
     /// The relay must also ensure no upstream response has reached the guest.
-    pub(crate) fn http1_violation_response(&self, message: &str) -> Option<Vec<u8>> {
-        (self.http1_response_allowed && self.http1_violation)
-            .then(|| secret_http_forbidden_response(message, &self.sni))
+    pub(crate) fn http1_violation_response(&self, remedy: Option<&str>) -> Option<Vec<u8>> {
+        if !self.http1_response_allowed {
+            return None;
+        }
+        let report = self.http1_violation.as_ref()?;
+
+        let denial = SecretDenial {
+            credential: report.names_credential.then_some(report.env_var.as_str()),
+            location: report.location.placeholder_location(),
+            cause: &report.cause,
+        };
+
+        Some(secret_http_forbidden_response(&denial, &self.sni, remedy))
     }
 
     fn scan_opaque<'a>(&mut self, data: &'a [u8]) -> Result<Cow<'a, [u8]>, SecretViolationAction> {
@@ -2107,17 +2225,17 @@ impl SecretsHandler {
         };
 
         let action = report.action;
-        self.http1_violation = matches!(report.protocol, RequestProtocol::Http1)
+        let answerable = matches!(report.protocol, RequestProtocol::Http1)
             && matches!(report.method.as_deref(), Some(method) if method != "HEAD" && method != "CONNECT");
 
-        // Every blocking action is a refusal, including the silent `Block`: the record says what
-        // happened, and tracing stays the only place a secret's identity appears.
+        // Every blocking action is a refusal, including the silent `Block`. The record names the
+        // secret by its environment variable only; its placeholder stays in tracing.
         if let Some(reporting) = &self.reporting {
             let name = match report.host.as_deref() {
                 Some(host) => NameEvidence::HttpHost(host),
                 None => self.connection_name(),
             };
-            refusal::record(
+            refusal::record_secret_violation(
                 &reporting.shared,
                 Denial {
                     site: RefusalSite::SecretViolation,
@@ -2128,9 +2246,15 @@ impl SecretsHandler {
                     name,
                     revision: reporting.revision,
                 },
+                SecretRefusal {
+                    credential: report.names_credential.then_some(report.env_var.as_str()),
+                    location: report.location.placeholder_location(),
+                    reason: report.cause.reason(),
+                },
             );
         }
         self.log_violation(&report);
+        self.http1_violation = answerable.then_some(report);
         Err(action.into_violation_action())
     }
 
@@ -2163,6 +2287,7 @@ impl SecretsHandler {
                 method = %method,
                 path = %path,
                 location = %report.location,
+                reason = %report.cause.reason().as_str(),
                 match_form = %report.match_form,
                 guest_dst = %guest_dst,
                 http2_stream_id = %http2_stream_id,
@@ -2178,6 +2303,7 @@ impl SecretsHandler {
                 method = %method,
                 path = %path,
                 location = %report.location,
+                reason = %report.cause.reason().as_str(),
                 match_form = %report.match_form,
                 guest_dst = %guest_dst,
                 http2_stream_id = %http2_stream_id,
@@ -3663,6 +3789,54 @@ fn secret_host_allowed(
         .any(|pattern| host_pattern_allowed(pattern, sni, identity))
 }
 
+/// Every host `placeholder` is substituted for, over all its declarations in `config`, in
+/// configured order without repeats. Built once per placeholder per handler.
+///
+/// Repeats are removed ASCII case-insensitively — host matching is — and the first spelling is
+/// kept, so one host is named once however its declarations spell it.
+fn substituted_for<'c>(
+    built: &mut Vec<(&'c str, Arc<[HostPattern]>)>,
+    config: &'c SecretsConfig,
+    placeholder: &'c str,
+) -> Arc<[HostPattern]> {
+    if let Some((_, hosts)) = built
+        .iter()
+        .find(|(built_for, _)| *built_for == placeholder)
+    {
+        return Arc::clone(hosts);
+    }
+
+    let mut hosts: Vec<HostPattern> = Vec::new();
+    for declaration in config
+        .secrets
+        .iter()
+        .filter(|entry| entry.placeholder == placeholder)
+    {
+        for pattern in &declaration.allowed_hosts {
+            if !hosts.iter().any(|existing| same_host(existing, pattern)) {
+                hosts.push(pattern.clone());
+            }
+        }
+    }
+
+    let hosts: Arc<[HostPattern]> = hosts.into();
+    built.push((placeholder, Arc::clone(&hosts)));
+    hosts
+}
+
+/// Whether two host patterns name the same host. Matching is ASCII case-insensitive, so a repeat
+/// that differs only in case is one host.
+fn same_host(left: &HostPattern, right: &HostPattern) -> bool {
+    match (left, right) {
+        (HostPattern::Exact(left), HostPattern::Exact(right))
+        | (HostPattern::Wildcard(left), HostPattern::Wildcard(right)) => {
+            left.eq_ignore_ascii_case(right)
+        }
+        (HostPattern::Any, HostPattern::Any) => true,
+        _ => false,
+    }
+}
+
 fn host_pattern_allowed(
     pattern: &HostPattern,
     sni: &str,
@@ -4294,6 +4468,8 @@ fn detect_blocking_action_in_fragments(
                     path: summary.path.clone(),
                     host: summary.host.clone(),
                     http2_stream_id,
+                    cause: secret.cause.clone(),
+                    names_credential: secret.names_credential,
                 };
 
                 detected = Some(strictest_violation_report(detected, report));
@@ -4493,7 +4669,7 @@ mod tests {
     use crate::policy::NetworkPolicy;
     use crate::secrets::config::SecretSubstitution;
     use microsandbox_types::compat;
-    use microsandbox_types::{NameSource, NetworkRefusal};
+    use microsandbox_types::{NameSource, NetworkRefusal, SecretRefusalReason};
 
     use std::net::{IpAddr, Ipv4Addr};
     use std::time::Duration;
@@ -4907,6 +5083,9 @@ mod tests {
                 name: Some("b.example".to_owned()),
                 name_source: NameSource::HttpHost,
                 revision: 3,
+                credential: None,
+                location: None,
+                reason: None,
             }]
         );
     }
@@ -5081,6 +5260,9 @@ mod tests {
                 name: Some("blocked.example".to_owned()),
                 name_source: NameSource::HttpHost,
                 revision: 2,
+                credential: None,
+                location: None,
+                reason: None,
             }]
         );
     }
@@ -5157,8 +5339,1085 @@ mod tests {
             assert_eq!(violations.len(), 1, "{action:?}: one record per violation");
             assert_eq!(violations[0].name.as_deref(), Some("a.example"));
             assert_eq!(violations[0].name_source, NameSource::HttpHost);
+            // A TLS-only secret on its own host over plain HTTP: its identity is unverified here.
+            assert_eq!(violations[0].credential.as_deref(), Some("TEST_KEY"));
+            assert_eq!(violations[0].location, Some(PlaceholderLocation::Header));
+            assert_eq!(
+                violations[0].reason,
+                Some(SecretRefusalReason::DestinationUnverified)
+            );
             assert!(recorded.iter().all(|record| record.revision == 3));
         }
+    }
+
+    /// A `host-not-covered` cause, as the classification states it.
+    fn host_not_covered(hosts: &[&str]) -> SecretDenialCause {
+        let hosts: Vec<HostPattern> = hosts
+            .iter()
+            .map(|host| HostPattern::Exact((*host).to_owned()))
+            .collect();
+
+        SecretDenialCause::HostNotCovered {
+            substituted_for: hosts.into(),
+        }
+    }
+
+    /// The request every precedence row sends to the connection named `sni`.
+    fn precedence_request(sni: &str) -> String {
+        if sni.is_empty() {
+            "GET / HTTP/1.1\r\nAuthorization: Bearer $KEY\r\n\r\n".to_owned()
+        } else {
+            format!("GET / HTTP/1.1\r\nHost: {sni}\r\nAuthorization: Bearer $KEY\r\n\r\n")
+        }
+    }
+
+    /// Assert what a handler decided and why, as literals: eligibility, cause, and the refusal.
+    fn assert_classified(
+        mut handler: SecretsHandler,
+        request: &str,
+        (eligible, ineligible): (usize, usize),
+        cause: SecretDenialCause,
+    ) {
+        assert_eq!(
+            handler.eligible_for_substitution.len(),
+            eligible,
+            "eligible secrets"
+        );
+        assert_eq!(
+            handler.ineligible_for_substitution.len(),
+            ineligible,
+            "ineligible secrets"
+        );
+        assert_eq!(handler.ineligible_for_substitution[0].cause, cause);
+        assert_eq!(
+            handler.substitute(request.as_bytes()).unwrap_err(),
+            SecretViolationAction::Block
+        );
+    }
+
+    /// Assert that the reported fix works: the handler substitutes instead of refusing.
+    fn assert_substituted(handler: &mut SecretsHandler, request: &str, expected: &str) {
+        let output = handler.substitute(request.as_bytes()).unwrap().into_owned();
+
+        assert_eq!(String::from_utf8(output).unwrap(), expected);
+    }
+
+    /// The body of a 403 this module built, parsed.
+    fn forbidden_body(response: &[u8]) -> serde_json::Value {
+        let text = std::str::from_utf8(response).unwrap();
+        let (_, body) = text.split_once("\r\n\r\n").unwrap();
+
+        serde_json::from_str(body).unwrap()
+    }
+
+    /// Every reason a placeholder is refused for, with the eligibility it implies.
+    ///
+    /// Each `credential-unavailable` row also proves the R1 principle: restoring the file lets
+    /// the request through. The rows run with the file still missing, then again once it is
+    /// written, so a row's cause and its fix are asserted against the same configuration.
+    #[test]
+    fn ineligible_cause_follows_the_documented_precedence() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("token");
+        let ip = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 10));
+        let pinned = pinned_shared("a.example", ip);
+        let unpinned = SharedState::new(16);
+
+        let readable = || make_config(vec![make_secret("$KEY", "real-secret", "a.example")]);
+        let missing = || make_config(vec![make_file_secret("$KEY", &path, "a.example")]);
+
+        // 1. Outside the secret's hosts.
+        assert_classified(
+            SecretsHandler::new(&readable(), "b.example", true),
+            &precedence_request("b.example"),
+            (0, 1),
+            host_not_covered(&["a.example"]),
+        );
+
+        // 2. Outside the secret's hosts with the file read failed: the destination is the
+        //    reported cause, because restoring the file would still refuse.
+        assert_classified(
+            SecretsHandler::new(&missing(), "b.example", true),
+            &precedence_request("b.example"),
+            (0, 1),
+            host_not_covered(&["a.example"]),
+        );
+
+        // 3. Outside the secret's hosts with the file read failed and passthrough allowed:
+        //    restoring the file forwards the placeholder, so the credential is the cause.
+        let mut passthrough = make_file_secret("$KEY", &path, "a.example");
+        passthrough.passthrough_hosts = vec![HostPattern::Exact("b.example".into())];
+        assert_classified(
+            SecretsHandler::new(&make_config(vec![passthrough]), "b.example", true),
+            &precedence_request("b.example"),
+            (0, 1),
+            SecretDenialCause::CredentialUnavailable,
+        );
+
+        // 4. The secret's own host, plain connection, file read failed.
+        assert_classified(
+            SecretsHandler::new(&missing(), "a.example", true),
+            &precedence_request("a.example"),
+            (0, 1),
+            SecretDenialCause::CredentialUnavailable,
+        );
+
+        // 5. The same on a DNS-pinned connection.
+        assert_classified(
+            SecretsHandler::new_tls_intercepted(&missing(), "a.example", ip, &pinned),
+            &precedence_request("a.example"),
+            (0, 1),
+            SecretDenialCause::CredentialUnavailable,
+        );
+
+        // 6. The secret's own host, but the guest's IP is not bound to it.
+        assert_classified(
+            SecretsHandler::new_tls_intercepted(&readable(), "a.example", ip, &unpinned),
+            &precedence_request("a.example"),
+            (0, 1),
+            SecretDenialCause::DestinationUnverified,
+        );
+
+        // 7. The same with the file read failed: the destination is still the reported cause.
+        assert_classified(
+            SecretsHandler::new_tls_intercepted(&missing(), "a.example", ip, &unpinned),
+            &precedence_request("a.example"),
+            (0, 1),
+            SecretDenialCause::DestinationUnverified,
+        );
+
+        // 8. The same with passthrough allowed: restoring the file forwards the placeholder.
+        let mut passthrough = make_file_secret("$KEY", &path, "a.example");
+        passthrough.passthrough_hosts = vec![HostPattern::Any];
+        assert_classified(
+            SecretsHandler::new_tls_intercepted(
+                &make_config(vec![passthrough]),
+                "a.example",
+                ip,
+                &unpinned,
+            ),
+            &precedence_request("a.example"),
+            (0, 1),
+            SecretDenialCause::CredentialUnavailable,
+        );
+
+        // 9. A TLS-only secret on its own host over plain HTTP: eligible, then refused because
+        //    the connection's identity cannot be verified.
+        assert_classified(
+            SecretsHandler::new_plain_http(&readable(), "a.example", ip, &pinned),
+            &precedence_request("a.example"),
+            (1, 1),
+            SecretDenialCause::DestinationUnverified,
+        );
+
+        // 10. The same with the file read failed: restoring the file would not let the request
+        //     through, so the credential is not the reported cause.
+        assert_classified(
+            SecretsHandler::new_plain_http(&missing(), "a.example", ip, &pinned),
+            &precedence_request("a.example"),
+            (0, 1),
+            SecretDenialCause::DestinationUnverified,
+        );
+
+        // 11. No usable `Host`.
+        assert_classified(
+            SecretsHandler::new_plain_http_invalid_host(&readable()),
+            &precedence_request(""),
+            (0, 1),
+            SecretDenialCause::DestinationUnverified,
+        );
+
+        // 12. No usable `Host`, with the file read failed.
+        assert_classified(
+            SecretsHandler::new_plain_http_invalid_host(&missing()),
+            &precedence_request(""),
+            (0, 1),
+            SecretDenialCause::DestinationUnverified,
+        );
+
+        // 13. Proxy-owned CONNECT metadata.
+        assert_classified(
+            SecretsHandler::new_plain_http_untrusted_metadata(&readable()),
+            &precedence_request(""),
+            (0, 1),
+            SecretDenialCause::DestinationUnverified,
+        );
+
+        // 14. Proxy-owned CONNECT metadata, file read failed, global passthrough allowed.
+        let mut config = missing();
+        config.passthrough_hosts = Some(vec![HostPattern::Any]);
+        assert_classified(
+            SecretsHandler::new_plain_http_untrusted_metadata(&config),
+            &precedence_request(""),
+            (0, 1),
+            SecretDenialCause::CredentialUnavailable,
+        );
+
+        // Now restore every file-backed secret: each `credential-unavailable` row must let the
+        // request through, and the `destination-unverified` row must still refuse.
+        std::fs::write(&path, "tok-AAA\n").unwrap();
+
+        // 3: the placeholder is forwarded unchanged, as passthrough configured.
+        let mut forwarded = SecretsHandler::new(
+            &make_config(vec![{
+                let mut secret = make_file_secret("$KEY", &path, "a.example");
+                secret.passthrough_hosts = vec![HostPattern::Exact("b.example".into())];
+                secret
+            }]),
+            "b.example",
+            true,
+        );
+        assert_substituted(
+            &mut forwarded,
+            &precedence_request("b.example"),
+            &precedence_request("b.example"),
+        );
+
+        // 4 and 5: the real value is substituted.
+        let restored = "GET / HTTP/1.1\r\nHost: a.example\r\nAuthorization: Bearer tok-AAA\r\n\r\n";
+        let mut plain = SecretsHandler::new(&missing(), "a.example", true);
+        assert_substituted(&mut plain, &precedence_request("a.example"), restored);
+        let mut intercepted =
+            SecretsHandler::new_tls_intercepted(&missing(), "a.example", ip, &pinned);
+        assert_substituted(&mut intercepted, &precedence_request("a.example"), restored);
+
+        // 8 and 14: the placeholder is forwarded unchanged.
+        let mut passthrough_any = SecretsHandler::new_tls_intercepted(
+            &make_config(vec![{
+                let mut secret = make_file_secret("$KEY", &path, "a.example");
+                secret.passthrough_hosts = vec![HostPattern::Any];
+                secret
+            }]),
+            "a.example",
+            ip,
+            &unpinned,
+        );
+        assert_substituted(
+            &mut passthrough_any,
+            &precedence_request("a.example"),
+            &precedence_request("a.example"),
+        );
+        let mut config = missing();
+        config.passthrough_hosts = Some(vec![HostPattern::Any]);
+        let mut metadata = SecretsHandler::new_plain_http_untrusted_metadata(&config);
+        assert_substituted(
+            &mut metadata,
+            &precedence_request(""),
+            &precedence_request(""),
+        );
+
+        // 10: restoring the file is not the fix; the TLS identity is still missing.
+        let mut tls_only = SecretsHandler::new_plain_http(&missing(), "a.example", ip, &pinned);
+        assert_eq!(
+            tls_only
+                .substitute(precedence_request("a.example").as_bytes())
+                .unwrap_err(),
+            SecretViolationAction::Block
+        );
+        assert_eq!(
+            tls_only.ineligible_for_substitution[0].cause,
+            SecretDenialCause::DestinationUnverified
+        );
+    }
+
+    /// A file-backed secret whose real value cannot be read is stated as such, in the 403 and in
+    /// the record; the same handler without a DNS pin names the destination instead.
+    #[test]
+    fn http1_violation_response_states_each_reason() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("token");
+        let ip = Ipv4Addr::new(203, 0, 113, 10);
+        let config = make_config(vec![make_file_secret("$KEY", &path, "a.example")]);
+        let request = precedence_request("a.example");
+        let guest_dst = SocketAddr::new(IpAddr::V4(ip), 443);
+        let policy = PolicySnapshot::initial(Arc::new(NetworkPolicy::none()));
+
+        // DNS-pinned to the secret's own host: only the credential is wrong.
+        let (shared, sink) = crate::refusal::test_support::recording_state(16);
+        cache_host(&shared, "a.example", ip);
+        let mut handler =
+            SecretsHandler::new_tls_intercepted(&config, "a.example", IpAddr::V4(ip), &shared)
+                .with_refusal_reporting(Arc::clone(&shared), guest_dst, &policy);
+        assert_eq!(
+            handler.substitute(request.as_bytes()).unwrap_err(),
+            SecretViolationAction::Block
+        );
+        let response = handler
+            .http1_violation_response(Some("Remedy."))
+            .expect("the first HTTP/1 request is answerable");
+        assert_eq!(
+            forbidden_body(&response),
+            serde_json::json!({
+                "code": "secret_policy_denied",
+                "domain": "a.example",
+                "credential": "TEST_FILE_KEY",
+                "location": "header",
+                "reason": "credential-unavailable",
+                "message": "Blocked: TEST_FILE_KEY was sent in a request header to a.example, but the sandbox could not read its real value. Remedy.",
+            })
+        );
+        let recorded = sink.take();
+        assert_eq!(recorded.len(), 1, "{recorded:?}");
+        assert_eq!(recorded[0].credential.as_deref(), Some("TEST_FILE_KEY"));
+        assert_eq!(recorded[0].location, Some(PlaceholderLocation::Header));
+        assert_eq!(
+            recorded[0].reason,
+            Some(SecretRefusalReason::CredentialUnavailable)
+        );
+
+        // The same connection without the DNS pin: the destination is the problem.
+        let (shared, sink) = crate::refusal::test_support::recording_state(16);
+        let mut handler =
+            SecretsHandler::new_tls_intercepted(&config, "a.example", IpAddr::V4(ip), &shared)
+                .with_refusal_reporting(Arc::clone(&shared), guest_dst, &policy);
+        assert_eq!(
+            handler.substitute(request.as_bytes()).unwrap_err(),
+            SecretViolationAction::Block
+        );
+        let response = handler
+            .http1_violation_response(Some("Remedy."))
+            .expect("the first HTTP/1 request is answerable");
+        assert_eq!(
+            forbidden_body(&response),
+            serde_json::json!({
+                "code": "secret_policy_denied",
+                "domain": "a.example",
+                "credential": "TEST_FILE_KEY",
+                "location": "header",
+                "reason": "destination-unverified",
+                "message": "Blocked: TEST_FILE_KEY was sent in a request header to a.example, whose identity could not be verified. Remedy.",
+            })
+        );
+        let recorded = sink.take();
+        assert_eq!(recorded.len(), 1, "{recorded:?}");
+        assert_eq!(
+            recorded[0].reason,
+            Some(SecretRefusalReason::DestinationUnverified)
+        );
+
+        // No usable `Host`: `domain` is null and the sentence says `this host`.
+        let mut handler =
+            SecretsHandler::new_plain_http_invalid_host(&make_config(vec![make_secret(
+                "$KEY",
+                "real-secret",
+                "a.example",
+            )]));
+        assert_eq!(
+            handler
+                .substitute(precedence_request("").as_bytes())
+                .unwrap_err(),
+            SecretViolationAction::Block
+        );
+        let response = handler
+            .http1_violation_response(Some("Remedy."))
+            .expect("the first HTTP/1 request is answerable");
+        assert_eq!(
+            forbidden_body(&response),
+            serde_json::json!({
+                "code": "secret_policy_denied",
+                "domain": serde_json::Value::Null,
+                "credential": "TEST_KEY",
+                "location": "header",
+                "reason": "destination-unverified",
+                "message": "Blocked: TEST_KEY was sent in a request header to this host, whose identity could not be verified. Remedy.",
+            })
+        );
+    }
+
+    /// R4's one guest-chosen text: a placeholder the guest sends as its `Host` is echoed as the
+    /// destination, because `domain` already echoes that name. The secret's value is not echoed.
+    #[test]
+    fn a_placeholder_sent_as_host_is_echoed_as_the_destination() {
+        let placeholder = "msb-test-placeholder";
+        let ip = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 10));
+        let config = make_config(vec![make_secret(placeholder, "real-secret", "a.example")]);
+        let mut handler =
+            SecretsHandler::new_plain_http(&config, placeholder, ip, &SharedState::new(16));
+        let request = format!("GET / HTTP/1.1\r\nHost: {placeholder}\r\n\r\n");
+
+        assert_eq!(
+            handler.substitute(request.as_bytes()).unwrap_err(),
+            SecretViolationAction::Block
+        );
+        let response = handler
+            .http1_violation_response(None)
+            .expect("the first HTTP/1 request is answerable");
+        let body = forbidden_body(&response);
+
+        assert_eq!(
+            body,
+            serde_json::json!({
+                "code": "secret_policy_denied",
+                "domain": placeholder,
+                "credential": "TEST_KEY",
+                "location": "header",
+                "reason": "host-not-covered",
+                "message": format!(
+                    "Blocked: TEST_KEY was sent in a request header to {placeholder}; it is substituted only for a.example."
+                ),
+            })
+        );
+        assert!(!body.to_string().contains("real-secret"));
+    }
+
+    /// Several declarations of one placeholder are one credential to the reader: a declaration
+    /// that does not cover the name takes the reason of one that does, and the hosts list is the
+    /// union over every declaration.
+    #[test]
+    fn duplicate_declarations_read_as_one_credential() {
+        let ip = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 10));
+        let config = make_config(vec![
+            make_secret("$KEY", "v1", "a.example"),
+            make_secret("$KEY", "v2", "c.example"),
+        ]);
+        let union = host_not_covered(&["a.example", "c.example"]);
+
+        // Neither declaration covers `b.example`, but the sentence names both hosts.
+        let mut handler = SecretsHandler::new(&config, "b.example", true);
+        assert_eq!(handler.eligible_for_substitution.len(), 0);
+        assert_eq!(handler.ineligible_for_substitution.len(), 2);
+        assert_eq!(handler.ineligible_for_substitution[0].cause, union);
+        assert_eq!(handler.ineligible_for_substitution[1].cause, union);
+        let SecretDenialCause::HostNotCovered {
+            substituted_for: first,
+        } = &handler.ineligible_for_substitution[0].cause
+        else {
+            unreachable!("the cause is host-not-covered");
+        };
+        let SecretDenialCause::HostNotCovered {
+            substituted_for: second,
+        } = &handler.ineligible_for_substitution[1].cause
+        else {
+            unreachable!("the cause is host-not-covered");
+        };
+        assert!(
+            Arc::ptr_eq(first, second),
+            "the union is built once per placeholder"
+        );
+        assert_eq!(
+            handler
+                .substitute(precedence_request("b.example").as_bytes())
+                .unwrap_err(),
+            SecretViolationAction::Block
+        );
+        let response = handler
+            .http1_violation_response(None)
+            .expect("the first HTTP/1 request is answerable");
+        assert_eq!(
+            forbidden_body(&response)["message"],
+            "Blocked: TEST_KEY was sent in a request header to b.example; it is substituted only for a.example and c.example."
+        );
+
+        // `c.example` is covered by name but not bound to the guest's IP: the `a.example`
+        // declaration defers to it, and the 403 states the destination.
+        let unpinned = SharedState::new(16);
+        let mut handler = SecretsHandler::new_tls_intercepted(&config, "c.example", ip, &unpinned);
+        assert_eq!(handler.eligible_for_substitution.len(), 0);
+        assert_eq!(handler.ineligible_for_substitution.len(), 2);
+        assert_eq!(
+            handler.ineligible_for_substitution[0].cause,
+            SecretDenialCause::DestinationUnverified
+        );
+        assert_eq!(
+            handler
+                .substitute(precedence_request("c.example").as_bytes())
+                .unwrap_err(),
+            SecretViolationAction::Block
+        );
+        let response = handler
+            .http1_violation_response(None)
+            .expect("the first HTTP/1 request is answerable");
+        assert_eq!(
+            forbidden_body(&response)["reason"],
+            "destination-unverified"
+        );
+
+        // A verified destination drops the refused duplicate, as before: one credential serves.
+        let pinned = pinned_shared("c.example", ip);
+        let mut handler = SecretsHandler::new_tls_intercepted(&config, "c.example", ip, &pinned);
+        assert_eq!(handler.eligible_for_substitution.len(), 1);
+        assert_eq!(handler.ineligible_for_substitution.len(), 0);
+        let output = handler
+            .substitute(precedence_request("c.example").as_bytes())
+            .unwrap()
+            .into_owned();
+        assert!(String::from_utf8(output).unwrap().contains("Bearer v2"));
+    }
+
+    /// Each location a placeholder can be refused at states itself, and nothing a secret holds
+    /// beyond its environment variable name reaches the guest.
+    #[test]
+    fn http1_violation_response_states_the_refused_placeholder() {
+        let mut secret = make_secret("$P", "real-secret", "api.anthropic.com");
+        secret.env_var = "MSB_AGENT_VM_ANTHROPIC_UNUSED".into();
+        let config = make_config(vec![secret]);
+        let basic = BASE64.encode("user:$P");
+
+        for (request, location, phrase) in [
+            (
+                "GET / HTTP/1.1\r\nHost: api.deepseek.com\r\nAuthorization: Bearer $P\r\n\r\n"
+                    .to_owned(),
+                "header",
+                "a request header",
+            ),
+            (
+                "GET /v1?key=$P HTTP/1.1\r\nHost: api.deepseek.com\r\n\r\n".to_owned(),
+                "query",
+                "the query string",
+            ),
+            (
+                "GET /$P HTTP/1.1\r\nHost: api.deepseek.com\r\n\r\n".to_owned(),
+                "unknown",
+                "the request line",
+            ),
+            (
+                format!(
+                    "GET / HTTP/1.1\r\nHost: api.deepseek.com\r\nAuthorization: Basic {basic}\r\n\r\n"
+                ),
+                "basic-auth",
+                "a Basic auth header",
+            ),
+        ] {
+            let mut handler = SecretsHandler::new(&config, "api.deepseek.com", true);
+
+            assert_eq!(
+                handler.substitute(request.as_bytes()).unwrap_err(),
+                SecretViolationAction::Block,
+                "{request:?}"
+            );
+            let response = handler
+                .http1_violation_response(Some("Remedy."))
+                .expect("the first HTTP/1 request is answerable");
+            let body = forbidden_body(&response);
+
+            assert_eq!(
+                body,
+                serde_json::json!({
+                    "code": "secret_policy_denied",
+                    "domain": "api.deepseek.com",
+                    "credential": "MSB_AGENT_VM_ANTHROPIC_UNUSED",
+                    "location": location,
+                    "reason": "host-not-covered",
+                    "message": format!(
+                        "Blocked: MSB_AGENT_VM_ANTHROPIC_UNUSED was sent in {phrase} to api.deepseek.com; it is substituted only for api.anthropic.com. Remedy."
+                    ),
+                })
+            );
+            let text = body.to_string();
+            assert!(!text.contains("real-secret"));
+            assert!(!text.contains("$P"));
+        }
+    }
+
+    /// A `HEAD` request is refused but never answered: no body may follow it (R5).
+    #[test]
+    fn head_violation_answers_no_403() {
+        let config = make_config(vec![make_secret("$KEY", "real-secret", "a.example")]);
+        let mut handler = SecretsHandler::new(&config, "b.example", true);
+
+        assert_eq!(
+            handler
+                .substitute(
+                    b"HEAD / HTTP/1.1\r\nHost: b.example\r\nAuthorization: Bearer $KEY\r\n\r\n"
+                )
+                .unwrap_err(),
+            SecretViolationAction::Block
+        );
+        assert!(handler.http1_violation_response(None).is_none());
+    }
+
+    /// A stream that is not HTTP is refused and recorded, and answers no 403 (R8).
+    #[test]
+    fn opaque_stream_violation_records_an_unknown_location() {
+        let config = make_config(vec![make_secret("$KEY", "real-secret", "a.example")]);
+        let ip = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 10));
+        let guest_dst = SocketAddr::new(ip, 25);
+        let policy = PolicySnapshot::initial(Arc::new(NetworkPolicy::none()));
+        let (shared, sink) = crate::refusal::test_support::recording_state(16);
+        let mut handler = SecretsHandler::new_tls_intercepted(&config, "b.example", ip, &shared)
+            .with_refusal_reporting(Arc::clone(&shared), guest_dst, &policy);
+
+        assert_eq!(
+            handler.substitute(b"EHLO $KEY\r\n").unwrap_err(),
+            SecretViolationAction::Block
+        );
+        assert!(handler.http1_violation_response(None).is_none());
+
+        let recorded = sink.take();
+        let violations: Vec<_> = recorded
+            .iter()
+            .filter(|record| record.site == RefusalSite::SecretViolation)
+            .collect();
+        assert_eq!(violations.len(), 1, "{recorded:?}");
+        assert_eq!(violations[0].credential.as_deref(), Some("TEST_KEY"));
+        assert_eq!(violations[0].location, Some(PlaceholderLocation::Unknown));
+        assert_eq!(
+            violations[0].reason,
+            Some(SecretRefusalReason::HostNotCovered)
+        );
+    }
+
+    /// A refusal a 403 can state, over a recording sink, for one connection.
+    fn recorded_handler(
+        config: &SecretsConfig,
+        sni: &str,
+        ip: IpAddr,
+        shared: &Arc<SharedState>,
+    ) -> SecretsHandler {
+        let guest_dst = SocketAddr::new(ip, 443);
+        let policy = PolicySnapshot::initial(Arc::new(NetworkPolicy::none()));
+
+        SecretsHandler::new_tls_intercepted(config, sni, ip, shared).with_refusal_reporting(
+            Arc::clone(shared),
+            guest_dst,
+            &policy,
+        )
+    }
+
+    /// M1/SN-1: a declaration that takes another declaration's reason takes its name too, so the
+    /// message names the secret whose fix it reports.
+    #[test]
+    fn a_deferred_duplicate_names_the_credential_whose_fix_is_reported() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("token");
+        let ip = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 10));
+        let mut readable = make_secret("$KEY", "real-secret", "a.example");
+        readable.env_var = "A_KEY".into();
+        let mut missing = make_file_secret("$KEY", &path, "b.example");
+        missing.env_var = "B_KEY".into();
+        let config = make_config(vec![readable, missing]);
+        let (shared, sink) = crate::refusal::test_support::recording_state(16);
+        cache_host(&shared, "a.example", Ipv4Addr::new(203, 0, 113, 10));
+        cache_host(&shared, "b.example", Ipv4Addr::new(203, 0, 113, 10));
+        let mut handler = recorded_handler(&config, "b.example", ip, &shared);
+
+        assert_eq!(
+            handler
+                .substitute(precedence_request("b.example").as_bytes())
+                .unwrap_err(),
+            SecretViolationAction::Block
+        );
+        let response = handler
+            .http1_violation_response(None)
+            .expect("the first HTTP/1 request is answerable");
+        let body = forbidden_body(&response);
+
+        // `A_KEY` is the readable one: naming it would send the reader to fix the wrong secret.
+        assert_eq!(body["credential"], "B_KEY");
+        assert_eq!(body["reason"], "credential-unavailable");
+        assert_eq!(
+            body["message"],
+            "Blocked: B_KEY was sent in a request header to b.example, but the sandbox could not read its real value."
+        );
+
+        let recorded = sink.take();
+        assert_eq!(recorded.len(), 1, "{recorded:?}");
+        assert_eq!(recorded[0].credential.as_deref(), Some("B_KEY"));
+        assert_eq!(
+            recorded[0].reason,
+            Some(SecretRefusalReason::CredentialUnavailable)
+        );
+    }
+
+    /// M2/SN-2: a connection with no usable destination name reports the destination, whichever
+    /// handler was built for it and whatever the policy's domain rules.
+    #[test]
+    fn a_hostless_connection_reports_the_destination_whatever_the_handler() {
+        let config = make_config(vec![make_secret("$KEY", "real-secret", "a.example")]);
+        let hostless = b"GET / HTTP/1.1\r\nAuthorization: Bearer $KEY\r\n\r\n";
+        let opaque = b"EHLO $KEY\r\n";
+
+        // The two handlers a plain-HTTP connection with no `Host` gets without domain rules.
+        for (handler, request) in [
+            (
+                SecretsHandler::new_plain_http_invalid_host(&config),
+                hostless.as_slice(),
+            ),
+            (
+                SecretsHandler::new_plain_http_untrusted_metadata(&config),
+                hostless.as_slice(),
+            ),
+        ] {
+            let mut handler = handler;
+            assert_eq!(
+                handler.substitute(request).unwrap_err(),
+                SecretViolationAction::Block
+            );
+            assert_eq!(
+                handler.ineligible_for_substitution[0].cause,
+                SecretDenialCause::DestinationUnverified
+            );
+        }
+
+        // The handler a connection with domain rules gets: the same empty name, and an opaque
+        // stream, which is the only first flight that reaches it with no `Host`.
+        let (shared, sink) = crate::refusal::test_support::recording_state(16);
+        let policy = PolicySnapshot::initial(Arc::new(NetworkPolicy::none()));
+        let mut handler = SecretsHandler::new_plain_http_policy(
+            &config,
+            "",
+            policy_guest_dst(),
+            policy.clone(),
+            Arc::clone(&shared),
+        )
+        .with_refusal_reporting(Arc::clone(&shared), policy_guest_dst(), &policy);
+        assert_eq!(
+            handler.substitute(opaque).unwrap_err(),
+            SecretViolationAction::Block
+        );
+        assert_eq!(
+            handler.ineligible_for_substitution[0].cause,
+            SecretDenialCause::DestinationUnverified
+        );
+        let recorded = sink.take();
+        let violations: Vec<_> = recorded
+            .iter()
+            .filter(|record| record.site == RefusalSite::SecretViolation)
+            .collect();
+        assert_eq!(violations.len(), 1, "{recorded:?}");
+        assert_eq!(
+            violations[0].reason,
+            Some(SecretRefusalReason::DestinationUnverified)
+        );
+        assert_eq!(violations[0].location, Some(PlaceholderLocation::Unknown));
+    }
+
+    /// L1/SN-3: a declaration that does not cover the name defers even when its own reason would
+    /// have been `credential-unavailable` through a passthrough rule, because the covering
+    /// declaration still refuses once that file is restored.
+    #[test]
+    fn a_non_covering_declaration_defers_whatever_its_own_reason() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("token");
+        let ip = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 10));
+        let mut passing = make_file_secret("$KEY", &path, "a.example");
+        passing.env_var = "A_KEY".into();
+        passing.passthrough_hosts = vec![HostPattern::Exact("b.example".into())];
+        let mut covering = make_secret("$KEY", "real-secret", "b.example");
+        covering.env_var = "B_KEY".into();
+        let config = make_config(vec![passing, covering]);
+        let unpinned = SharedState::new(16);
+
+        let mut handler = SecretsHandler::new_tls_intercepted(&config, "b.example", ip, &unpinned);
+        assert_eq!(handler.ineligible_for_substitution.len(), 2);
+        for ineligible in &handler.ineligible_for_substitution {
+            // `A_KEY` alone would be `credential-unavailable` (it passes through this host), but
+            // its file is not the fix: `B_KEY` still refuses.
+            assert_eq!(ineligible.cause, SecretDenialCause::DestinationUnverified);
+            assert_eq!(ineligible.env_var, "B_KEY");
+        }
+        assert_eq!(
+            handler
+                .substitute(precedence_request("b.example").as_bytes())
+                .unwrap_err(),
+            SecretViolationAction::Block
+        );
+
+        std::fs::write(&path, "tok-AAA\n").unwrap();
+        let mut restored = SecretsHandler::new_tls_intercepted(&config, "b.example", ip, &unpinned);
+        assert_eq!(
+            restored
+                .substitute(precedence_request("b.example").as_bytes())
+                .unwrap_err(),
+            SecretViolationAction::Block
+        );
+    }
+
+    /// The documented R1 corner, pinned as accepted: a covering declaration whose only fix is a
+    /// passthrough rule lends `credential-unavailable` to a deferring declaration, and restoring
+    /// that file does not make the request go through.
+    #[test]
+    fn the_passthrough_only_fix_documents_its_incompleteness() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("token");
+        let ip = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 10));
+        let mut covering = make_file_secret("$KEY", &path, "c.example");
+        covering.env_var = "C_KEY".into();
+        covering.passthrough_hosts = vec![HostPattern::Any];
+        let mut deferring = make_secret("$KEY", "real-secret", "d.example");
+        deferring.env_var = "D_KEY".into();
+        let config = make_config(vec![covering, deferring]);
+        let unpinned = SharedState::new(16);
+        let request = precedence_request("c.example");
+
+        let mut handler = SecretsHandler::new_tls_intercepted(&config, "c.example", ip, &unpinned);
+        for ineligible in &handler.ineligible_for_substitution {
+            assert_eq!(ineligible.cause, SecretDenialCause::CredentialUnavailable);
+            assert_eq!(ineligible.env_var, "C_KEY");
+        }
+        assert_eq!(
+            handler.substitute(request.as_bytes()).unwrap_err(),
+            SecretViolationAction::Block
+        );
+
+        // The reported fix is incomplete: with the file restored, `C_KEY` forwards the
+        // placeholder and `D_KEY` still refuses, now as `host-not-covered`.
+        std::fs::write(&path, "tok-AAA\n").unwrap();
+        let mut restored = SecretsHandler::new_tls_intercepted(&config, "c.example", ip, &unpinned);
+        assert_eq!(restored.ineligible_for_substitution.len(), 1);
+        assert_eq!(
+            restored.ineligible_for_substitution[0].cause,
+            SecretDenialCause::HostNotCovered {
+                substituted_for: vec![
+                    HostPattern::Exact("c.example".into()),
+                    HostPattern::Exact("d.example".into()),
+                ]
+                .into(),
+            }
+        );
+        assert_eq!(
+            restored.substitute(request.as_bytes()).unwrap_err(),
+            SecretViolationAction::Block
+        );
+    }
+
+    /// R4/SN-6: a name that carries a configured placeholder is never stated, in the 403 or the
+    /// record, and the sentence says "a credential" instead.
+    #[test]
+    fn a_credential_name_that_carries_a_placeholder_is_never_stated() {
+        // The name is the placeholder itself.
+        let mut named_by_placeholder = make_secret("$KEY", "real-secret", "a.example");
+        named_by_placeholder.env_var = "$KEY".into();
+        let config = make_config(vec![named_by_placeholder]);
+        let (shared, sink) = crate::refusal::test_support::recording_state(16);
+        let mut handler = recorded_handler(
+            &config,
+            "b.example",
+            IpAddr::V4(Ipv4Addr::new(203, 0, 113, 10)),
+            &shared,
+        );
+        assert_eq!(
+            handler
+                .substitute(precedence_request("b.example").as_bytes())
+                .unwrap_err(),
+            SecretViolationAction::Block
+        );
+        let response = handler
+            .http1_violation_response(None)
+            .expect("the first HTTP/1 request is answerable");
+        let body = forbidden_body(&response);
+        assert!(body.get("credential").is_none(), "{body}");
+        assert_eq!(
+            body["message"],
+            "Blocked: a credential was sent in a request header to b.example; it is substituted only for a.example."
+        );
+        assert!(!String::from_utf8_lossy(&response).contains("$KEY"));
+        let recorded = sink.take();
+        assert_eq!(recorded.len(), 1, "{recorded:?}");
+        assert_eq!(recorded[0].credential, None);
+        assert!(
+            !serde_json::to_string(&recorded[0])
+                .unwrap()
+                .contains("$KEY")
+        );
+
+        // Another declaration's placeholder in this name: the same rule.
+        let mut carrying = make_secret("$KEY", "real-secret", "a.example");
+        carrying.env_var = "MIXED_$OTHER".into();
+        let mut other = make_secret("$OTHER", "other-secret", "b.example");
+        other.env_var = "OTHER_KEY".into();
+        let config = make_config(vec![carrying, other]);
+        let (shared, sink) = crate::refusal::test_support::recording_state(16);
+        let mut handler = recorded_handler(
+            &config,
+            "c.example",
+            IpAddr::V4(Ipv4Addr::new(203, 0, 113, 10)),
+            &shared,
+        );
+        assert_eq!(
+            handler
+                .substitute(precedence_request("c.example").as_bytes())
+                .unwrap_err(),
+            SecretViolationAction::Block
+        );
+        let response = handler
+            .http1_violation_response(None)
+            .expect("the first HTTP/1 request is answerable");
+        let text = String::from_utf8_lossy(&response).into_owned();
+        assert!(!text.contains("$KEY"), "{text}");
+        assert!(!text.contains("$OTHER"), "{text}");
+        assert_eq!(forbidden_body(&response)["message"], {
+            "Blocked: a credential was sent in a request header to c.example; it is substituted only for a.example."
+        });
+        let recorded = sink.take();
+        assert_eq!(recorded.len(), 1, "{recorded:?}");
+        assert_eq!(recorded[0].credential, None);
+    }
+
+    /// L4/SN-4: repeats in the hosts list are removed ASCII case-insensitively and the first
+    /// spelling is kept, so one host is named once.
+    #[test]
+    fn the_hosts_list_removes_case_only_repeats() {
+        let repeated = make_config(vec![
+            make_secret("$KEY", "v1", "API.example.com"),
+            make_secret("$KEY", "v2", "api.example.com"),
+        ]);
+        let mut handler = SecretsHandler::new(&repeated, "b.example", true);
+        assert_eq!(
+            handler
+                .substitute(precedence_request("b.example").as_bytes())
+                .unwrap_err(),
+            SecretViolationAction::Block
+        );
+        let response = handler
+            .http1_violation_response(None)
+            .expect("the first HTTP/1 request is answerable");
+        assert_eq!(
+            forbidden_body(&response)["message"],
+            "Blocked: TEST_KEY was sent in a request header to b.example; it is substituted only for API.example.com."
+        );
+        let SecretDenialCause::HostNotCovered { substituted_for } =
+            &handler.ineligible_for_substitution[0].cause
+        else {
+            unreachable!("the cause is host-not-covered");
+        };
+        assert_eq!(substituted_for.len(), 1);
+
+        // Five distinct hosts, one of them spelled two ways: three are named, two are counted.
+        let mut rest = make_secret("$KEY", "v3", "b.example");
+        rest.allowed_hosts = vec![
+            HostPattern::Exact("b.example".into()),
+            HostPattern::Exact("c.example".into()),
+            HostPattern::Exact("d.example".into()),
+            HostPattern::Exact("e.example".into()),
+        ];
+        let counted = make_config(vec![
+            make_secret("$KEY", "v1", "API.example.com"),
+            make_secret("$KEY", "v2", "api.example.com"),
+            rest,
+        ]);
+        let mut handler = SecretsHandler::new(&counted, "f.example", true);
+        assert_eq!(
+            handler
+                .substitute(precedence_request("f.example").as_bytes())
+                .unwrap_err(),
+            SecretViolationAction::Block
+        );
+        let response = handler
+            .http1_violation_response(None)
+            .expect("the first HTTP/1 request is answerable");
+        assert_eq!(
+            forbidden_body(&response)["message"],
+            "Blocked: TEST_KEY was sent in a request header to f.example; it is substituted only for API.example.com, b.example, c.example and 2 more."
+        );
+    }
+
+    /// R8: an HTTP/2 refusal records the same three fields and answers no 403.
+    #[test]
+    fn an_http2_refusal_records_the_credential_location_and_reason() {
+        let config = make_config(vec![make_secret("$KEY", "real-secret", "a.example")]);
+        let (shared, sink) = crate::refusal::test_support::recording_state(16);
+        let policy = PolicySnapshot::initial(Arc::new(NetworkPolicy::none()));
+        let mut handler = SecretsHandler::new(&config, "b.example", true).with_refusal_reporting(
+            Arc::clone(&shared),
+            policy_guest_dst(),
+            &policy,
+        );
+        let request = h2_request(
+            &[
+                (&b":method"[..], &b"GET"[..]),
+                (&b":scheme"[..], &b"https"[..]),
+                (&b":path"[..], &b"/v1"[..]),
+                (&b":authority"[..], &b"b.example"[..]),
+                (&b"authorization"[..], &b"Bearer $KEY"[..]),
+            ],
+            false,
+        );
+
+        assert_eq!(
+            handler.substitute(&request).unwrap_err(),
+            SecretViolationAction::Block
+        );
+        assert!(handler.http1_violation_response(None).is_none());
+
+        let recorded = sink.take();
+        assert_eq!(recorded.len(), 1, "{recorded:?}");
+        assert_eq!(recorded[0].credential.as_deref(), Some("TEST_KEY"));
+        assert_eq!(recorded[0].location, Some(PlaceholderLocation::Header));
+        assert_eq!(
+            recorded[0].reason,
+            Some(SecretRefusalReason::HostNotCovered)
+        );
+    }
+
+    /// Every location a report can name reports itself: trailers and chunk metadata included.
+    #[test]
+    fn trailer_and_chunk_metadata_refusals_report_their_own_location() {
+        let mut body_secret = make_secret("$KEY", "real-secret", "a.example");
+        body_secret.substitution.body = true;
+        let with_body = make_config(vec![body_secret]);
+        let header_only = make_config(vec![make_secret("$KEY", "real-secret", "a.example")]);
+
+        for (config, request, location) in [
+            (
+                &header_only,
+                b"POST / HTTP/1.1\r\nHost: b.example\r\nTransfer-Encoding: chunked\r\n\r\n0\r\nX-Token: $KEY\r\n\r\n".as_slice(),
+                PlaceholderLocation::Trailer,
+            ),
+            (
+                &with_body,
+                b"POST / HTTP/1.1\r\nHost: b.example\r\nTransfer-Encoding: chunked\r\n\r\n1;token=$KEY\r\nx\r\n0\r\n\r\n".as_slice(),
+                PlaceholderLocation::ChunkMetadata,
+            ),
+        ] {
+            let (shared, sink) = crate::refusal::test_support::recording_state(16);
+            let policy = PolicySnapshot::initial(Arc::new(NetworkPolicy::none()));
+            let mut handler = SecretsHandler::new(config, "b.example", true).with_refusal_reporting(
+                Arc::clone(&shared),
+                policy_guest_dst(),
+                &policy,
+            );
+
+            assert_eq!(
+                handler.substitute(request).unwrap_err(),
+                SecretViolationAction::Block,
+                "{location:?}"
+            );
+            let recorded = sink.take();
+            assert_eq!(recorded.len(), 1, "{location:?}: {recorded:?}");
+            assert_eq!(recorded[0].location, Some(location));
+            assert_eq!(
+                recorded[0].reason,
+                Some(SecretRefusalReason::HostNotCovered)
+            );
+            assert_eq!(recorded[0].credential.as_deref(), Some("TEST_KEY"));
+        }
+    }
+
+    /// AC7 at the reading side: a readable file-backed value never reaches the 403 or the record.
+    #[test]
+    fn a_read_file_value_never_appears_in_the_denial() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("token");
+        std::fs::write(&path, "tok-AAA\n").unwrap();
+        let config = make_config(vec![make_file_secret("$KEY", &path, "a.example")]);
+        let (shared, sink) = crate::refusal::test_support::recording_state(16);
+        let policy = PolicySnapshot::initial(Arc::new(NetworkPolicy::none()));
+        let mut handler = SecretsHandler::new(&config, "b.example", true).with_refusal_reporting(
+            Arc::clone(&shared),
+            policy_guest_dst(),
+            &policy,
+        );
+
+        assert_eq!(
+            handler
+                .substitute(precedence_request("b.example").as_bytes())
+                .unwrap_err(),
+            SecretViolationAction::Block
+        );
+        let response = handler
+            .http1_violation_response(None)
+            .expect("the first HTTP/1 request is answerable");
+        assert!(!String::from_utf8_lossy(&response).contains("tok-AAA"));
+        assert_eq!(forbidden_body(&response)["credential"], "TEST_FILE_KEY");
+
+        let recorded = sink.take();
+        assert_eq!(recorded.len(), 1, "{recorded:?}");
+        assert!(
+            !serde_json::to_string(&recorded[0])
+                .unwrap()
+                .contains("tok-AAA")
+        );
     }
 
     /// A placeholder in `Host` never becomes a record's `name`.
@@ -6326,6 +7585,9 @@ mod tests {
             action: BlockingAction::BlockAndLog,
             substitute_headers: true,
             substitute_body: false,
+            cause: SecretDenialCause::DestinationUnverified,
+            covers_name: false,
+            names_credential: true,
         };
         let encoded = BASE64.encode(b"user:$KEY");
         let headers = format!(
@@ -6364,6 +7626,9 @@ mod tests {
             action: BlockingAction::BlockAndLog,
             substitute_headers: true,
             substitute_body: false,
+            cause: SecretDenialCause::DestinationUnverified,
+            covers_name: false,
+            names_credential: true,
         };
         let headers =
             "GET /leak?token=abc%2Fkey&other=redacted HTTP/1.1\r\nHost: evil.example.com\r\n\r\n";
@@ -7298,6 +8563,9 @@ mod tests {
             action: BlockingAction::BlockAndLog,
             substitute_headers: true,
             substitute_body: false,
+            cause: SecretDenialCause::DestinationUnverified,
+            covers_name: false,
+            names_credential: true,
         };
         let body_only = "POST / HTTP/1.1\r\nHost: evil.com\r\nContent-Length: 4\r\n\r\n$KEY";
         let header_and_body =
@@ -7318,6 +8586,7 @@ mod tests {
         assert!(detect(body_only).is_none());
         let report = detect(header_and_body).expect("header placeholder refuses");
         assert_eq!(report.location, RequestLocation::Header);
+        assert_eq!(report.cause, secret.cause);
     }
 
     #[test]

@@ -19,6 +19,59 @@ use tokio::net::TcpListener;
 use tokio::sync::mpsc;
 
 //--------------------------------------------------------------------------------------------------
+// Functions
+//--------------------------------------------------------------------------------------------------
+
+/// One plain-HTTP guest connection towards a listener standing in for `api.example.com`.
+///
+/// Returns the upstream side, the guest→proxy sender and the proxy→guest receiver, so a test can
+/// assert both what the guest read and what reached upstream.
+async fn plain_http_connection(
+    secrets: Arc<SecretsConfig>,
+) -> (
+    tokio::net::TcpStream,
+    mpsc::Sender<Bytes>,
+    mpsc::Receiver<Bytes>,
+) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let shared = Arc::new(SharedState::new(8));
+    shared.set_http_config(HttpConfig {
+        deny_response: true,
+        deny_response_format: microsandbox_types::HttpDenyResponseFormat::Json,
+        secret_deny_message: Some("Remedy.".into()),
+        ..Default::default()
+    });
+    shared.cache_resolved_hostname(
+        "api.example.com",
+        ResolvedHostnameFamily::Ipv4,
+        [addr.ip()],
+        Duration::from_secs(60),
+    );
+
+    let (from_tx, from_rx) = mpsc::channel(8);
+    let (to_tx, to_rx) = mpsc::channel(8);
+    spawn_tcp_proxy(
+        &tokio::runtime::Handle::current(),
+        addr,
+        addr,
+        from_rx,
+        to_tx,
+        shared,
+        Arc::new(NetworkPolicy::default()),
+        secrets,
+        None,
+        false,
+        Arc::new(ProxyConnectState::new()),
+        None,
+    );
+
+    let (upstream, _) = listener.accept().await.unwrap();
+
+    (upstream, from_tx, to_rx)
+}
+
+//--------------------------------------------------------------------------------------------------
 // Tests
 //--------------------------------------------------------------------------------------------------
 
@@ -309,10 +362,27 @@ async fn secret_denials_answer_only_when_an_http_response_is_safe() {
                     let error: serde_json::Value = serde_json::from_str(body).unwrap();
                     assert_eq!(error["code"], "secret_policy_denied", "{name}");
                     assert_eq!(error["domain"], "api.example.com", "{name}");
-                    assert_eq!(
-                        error["message"],
-                        secret_message.unwrap_or("Request blocked by secret policy.")
+                    assert_eq!(error["credential"], "API_KEY", "{name}");
+                    assert_eq!(error["reason"], "host-not-covered", "{name}");
+
+                    // The engine states one facts sentence; a configured message is a literal
+                    // suffix after it, never a replacement and never interpolated.
+                    let (location, phrase) = match name {
+                        "get with leading blank line" => ("unknown", "the request line"),
+                        _ => ("body", "the request body"),
+                    };
+                    assert_eq!(error["location"], location, "{name}");
+                    let facts = format!(
+                        "Blocked: API_KEY was sent in {phrase} to api.example.com; it is \
+                         substituted only for github.com."
                     );
+                    let expected_message = match name {
+                        // The one row with a configured message: it is a literal suffix.
+                        "body" => format!("{facts} Check secret policy for {{host}}."),
+                        // No configured message, or an empty one: the facts alone.
+                        _ => facts,
+                    };
+                    assert_eq!(error["message"], expected_message, "{name}");
                     let content_length: usize = headers
                         .lines()
                         .find_map(|line| line.strip_prefix("Content-Length: "))
@@ -337,4 +407,80 @@ async fn secret_denials_answer_only_when_an_http_response_is_safe() {
     tokio::time::timeout(Duration::from_secs(10), check)
         .await
         .expect("secret denial fixture timed out");
+}
+
+/// A file-backed secret whose value cannot be read is named as such in the guest's 403, and the
+/// reported fix works: restoring the file makes the same request substitute.
+#[tokio::test]
+async fn file_backed_secret_denial_names_the_unreadable_credential() {
+    let check = async {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("token");
+        let secrets = || {
+            Arc::new(SecretsConfig {
+                violation_action: SecretViolationAction::Block,
+                secrets: vec![
+                    SecretBuilder::new()
+                        .env("API_FILE_KEY")
+                        .file(&path)
+                        .placeholder("$KEY")
+                        .allow("api.example.com")
+                        .require_tls_identity(false)
+                        .build(),
+                ],
+                ..Default::default()
+            })
+        };
+        let request =
+            b"GET / HTTP/1.1\r\nHost: api.example.com\r\nAuthorization: Bearer $KEY\r\n\r\n";
+
+        // Nothing to read: the guest learns which credential failed, not which hosts allow it.
+        let (mut upstream, from_tx, mut to_rx) = plain_http_connection(secrets()).await;
+        from_tx.send(Bytes::from_static(request)).await.unwrap();
+        let mut response = Vec::new();
+        while let Some(bytes) = to_rx.recv().await {
+            response.extend_from_slice(&bytes);
+        }
+        let text = String::from_utf8(response).unwrap();
+        let (_, body) = text.split_once("\r\n\r\n").expect("a JSON 403");
+        let error: serde_json::Value = serde_json::from_str(body).unwrap();
+        assert_eq!(
+            error,
+            serde_json::json!({
+                "code": "secret_policy_denied",
+                "domain": "api.example.com",
+                "credential": "API_FILE_KEY",
+                "location": "header",
+                "reason": "credential-unavailable",
+                "message": "Blocked: API_FILE_KEY was sent in a request header to api.example.com, but the sandbox could not read its real value. Remedy.",
+            })
+        );
+        assert!(!text.contains("tok-"));
+        drop(from_tx);
+        let mut blocked = Vec::new();
+        upstream.read_to_end(&mut blocked).await.unwrap();
+        assert!(blocked.is_empty(), "blocked bytes reached upstream");
+
+        // The fix the message names: restore the file and the request is substituted.
+        std::fs::write(&path, "tok-AAA\n").unwrap();
+        let (mut upstream, from_tx, mut to_rx) = plain_http_connection(secrets()).await;
+        from_tx.send(Bytes::from_static(request)).await.unwrap();
+        let expected =
+            b"GET / HTTP/1.1\r\nHost: api.example.com\r\nAuthorization: Bearer tok-AAA\r\n\r\n";
+        let mut forwarded = vec![0; expected.len()];
+        upstream.read_exact(&mut forwarded).await.unwrap();
+        assert_eq!(forwarded, expected);
+        drop(from_tx);
+        drop(upstream);
+        // No response within the window, or the guest side closed: either way the request was
+        // not denied.
+        if let Ok(Some(bytes)) =
+            tokio::time::timeout(Duration::from_millis(250), to_rx.recv()).await
+        {
+            panic!("a substituted request must not be denied: {bytes:?}");
+        }
+    };
+    tokio::time::timeout(Duration::from_secs(10), check)
+        .await
+        .expect("file-backed denial fixture timed out");
 }

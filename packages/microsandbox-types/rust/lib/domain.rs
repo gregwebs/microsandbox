@@ -585,7 +585,8 @@ pub enum HttpDenyResponseFormat {
     /// Legacy plain-text network denials with host substitution.
     Text,
 
-    /// JSON network and secret denials with literal messages.
+    /// JSON network and secret denials. A network message is used as written; a secret message is
+    /// appended after the engine's facts sentence.
     #[default]
     Json,
 }
@@ -614,8 +615,8 @@ pub struct HttpConfig {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub network_deny_message: Option<String>,
 
-    /// Secret-denial JSON `message`. Used as-is when `deny_response` is enabled in JSON mode.
-    /// Omission uses the default; an empty string leaves `message` empty.
+    /// Secret-denial JSON `message`: the remedy text appended after the engine's facts sentence
+    /// when `deny_response` is enabled in JSON mode. `None` or an empty string adds nothing.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub secret_deny_message: Option<String>,
 }

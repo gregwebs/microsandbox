@@ -187,8 +187,8 @@ impl HttpBuilder {
         self
     }
 
-    /// Set the literal secret-denial JSON message. Requires `deny_response(true)` and JSON mode.
-    /// Omission uses the default; an empty string leaves `message` empty.
+    /// Set the remedy text appended after the engine's facts sentence in JSON secret denials.
+    /// Requires `deny_response(true)` and JSON mode; an empty message adds nothing.
     pub fn secret_deny_message(mut self, message: impl Into<String>) -> Self {
         self.config.secret_deny_message = Some(message.into());
         self

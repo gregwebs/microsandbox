@@ -131,7 +131,8 @@ impl LogOptions {
 
 pub use microsandbox_types::{
     LogSource, NETWORK_LOG_FORMAT_VERSION, NameSource, NetworkLogEvent, NetworkLogRecord,
-    NetworkRefusal, NetworkSuppressed, RefusalLayer, RefusalSite,
+    NetworkRefusal, NetworkSuppressed, PlaceholderLocation, RefusalLayer, RefusalSite,
+    SecretRefusalReason,
 };
 
 //--------------------------------------------------------------------------------------------------

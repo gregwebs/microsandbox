@@ -1451,6 +1451,9 @@ mod tests {
                             name: Some("example.com".to_owned()),
                             name_source,
                             revision: INITIAL_NETWORK_POLICY_REVISION,
+                            credential: None,
+                            location: None,
+                            reason: None,
                         }],
                         "allowed={allowed}, strict={strict}"
                     );
@@ -1553,6 +1556,9 @@ mod tests {
                     name: Some("blocked.example".to_owned()),
                     name_source: NameSource::Sni,
                     revision: INITIAL_NETWORK_POLICY_REVISION,
+                    credential: None,
+                    location: None,
+                    reason: None,
                 }],
                 "deny_response={deny_response}: one record for the decision"
             );

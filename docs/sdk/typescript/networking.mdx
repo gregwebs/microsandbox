@@ -1818,7 +1818,7 @@ Set the network-denial JSON `message`. Custom messages are used as-is. Omission 
 secretDenyMessage(message: string): this
 ```
 
-Set the secret-denial JSON `message`. Custom messages are used as-is. Omission uses the default message; an empty string leaves `message` empty. Requires `denyResponse(true)` and JSON mode.
+Set the remedy text appended after the engine's facts sentence in JSON secret denials. The sentence names the refused credential, where its placeholder was sent, and to which host. An omitted or empty message adds nothing. Requires `denyResponse(true)` and JSON mode.
 
 ## NetworkRateLimiterBuilder
 
@@ -1981,7 +1981,9 @@ http: {
 ```
 
 `denyResponse` defaults to `true` and the format to `json`. When enabled, an omitted
-or `null` message uses the built-in message. See [HTTP denial responses](/networking/overview#http-denial-responses).
+or `null` network message uses the built-in message, and an omitted or `null` secret message
+leaves the secret denial's own facts sentence alone. See
+[HTTP denial responses](/networking/overview#http-denial-responses).
 
 ### NetworkProfile
 

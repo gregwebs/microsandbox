@@ -161,8 +161,9 @@ export interface NetworkConfig {
   /** Canonical proxy configuration for outbound connections. */
   readonly outboundProxy: OutboundProxy | null;
   /**
-   * Local HTTP denial responses use JSON by default. In JSON mode, networkDenyMessage and secretDenyMessage
-   * override their respective JSON messages without interpolation.
+   * Local HTTP denial responses use JSON by default. In JSON mode, networkDenyMessage replaces the
+   * network JSON message without interpolation, and secretDenyMessage is appended after the engine's
+   * facts sentence in a secret denial.
    */
   readonly http: { readonly denyResponse: boolean; readonly denyResponseFormat: "text" | "json"; readonly denyMessage?: string | null; readonly networkDenyMessage?: string | null; readonly secretDenyMessage?: string | null };
 }

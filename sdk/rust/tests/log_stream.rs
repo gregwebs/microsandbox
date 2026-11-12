@@ -579,7 +579,7 @@ async fn network_entry_data_is_the_whole_record_line() {
 async fn network_records_the_writer_encodes_round_trip_through_the_file_and_the_sdk() {
     use microsandbox::logs::{
         NETWORK_LOG_FORMAT_VERSION, NameSource, NetworkLogEvent, NetworkLogRecord, NetworkRefusal,
-        NetworkSuppressed, RefusalLayer, RefusalSite,
+        NetworkSuppressed, PlaceholderLocation, RefusalLayer, RefusalSite, SecretRefusalReason,
     };
 
     let name = "log-stream-network-writer-round-trip";
@@ -604,6 +604,9 @@ async fn network_records_the_writer_encodes_round_trip_through_the_file_and_the_
             name: name.map(str::to_owned),
             name_source: source,
             revision: 7,
+            credential: None,
+            location: None,
+            reason: None,
         })
     };
 
@@ -638,6 +641,20 @@ async fn network_records_the_writer_encodes_round_trip_through_the_file_and_the_
             Some("_sip._tcp.example"),
             NameSource::DnsQuery,
         ),
+        // A secret violation: the three fields the writer adds for that site alone.
+        NetworkLogEvent::Refusal(NetworkRefusal {
+            site: RefusalSite::SecretViolation,
+            layer: RefusalLayer::Tenant,
+            protocol: microsandbox_types::Protocol::Tcp,
+            dst_ip: Some("203.0.113.10".parse().unwrap()),
+            dst_port: Some(443),
+            name: Some("api.deepseek.com".to_owned()),
+            name_source: NameSource::Sni,
+            revision: 2,
+            credential: Some("MSB_AGENT_VM_ANTHROPIC_UNUSED".to_owned()),
+            location: Some(PlaceholderLocation::Header),
+            reason: Some(SecretRefusalReason::HostNotCovered),
+        }),
         NetworkLogEvent::Suppressed(NetworkSuppressed {
             site: RefusalSite::Udp,
             count: 4744,
@@ -716,7 +733,21 @@ async fn network_records_the_writer_encodes_round_trip_through_the_file_and_the_
     };
     assert_eq!(no_resolver.dst_ip, None);
     assert_eq!(no_resolver.name.as_deref(), Some("_sip._tcp.example"));
-    let NetworkLogEvent::Suppressed(suppressed) = &decoded[3].event else {
+    let NetworkLogEvent::Refusal(secret) = &decoded[3].event else {
+        panic!("expected a refusal");
+    };
+    assert_eq!(
+        secret.credential.as_deref(),
+        Some("MSB_AGENT_VM_ANTHROPIC_UNUSED")
+    );
+    assert_eq!(secret.location, Some(PlaceholderLocation::Header));
+    assert_eq!(secret.reason, Some(SecretRefusalReason::HostNotCovered));
+    // The documented line, in order, as the reader received it.
+    assert_eq!(
+        std::str::from_utf8(&snapshot[3].data).unwrap().trim_end(),
+        r#"{"v":1,"t":"2026-11-05T14:03:03.000Z","s":"network","event":"refusal","site":"secret-violation","layer":"tenant","protocol":"tcp","dst_ip":"203.0.113.10","dst_port":443,"name":"api.deepseek.com","name_source":"sni","revision":2,"credential":"MSB_AGENT_VM_ANTHROPIC_UNUSED","location":"header","reason":"host-not-covered"}"#
+    );
+    let NetworkLogEvent::Suppressed(suppressed) = &decoded[4].event else {
         panic!("expected a suppressed record");
     };
     assert_eq!(

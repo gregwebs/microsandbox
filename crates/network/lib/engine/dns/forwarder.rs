@@ -1311,6 +1311,9 @@ mod tests {
                 name: Some("example.com".to_owned()),
                 name_source: NameSource::DnsQuery,
                 revision: 1,
+                credential: None,
+                location: None,
+                reason: None,
             }
         );
 
@@ -1381,6 +1384,9 @@ mod tests {
                     name: Some("blocked.example".to_owned()),
                     name_source: NameSource::DnsQuery,
                     revision: 1,
+                    credential: None,
+                    location: None,
+                    reason: None,
                 }],
                 "one record per refused query"
             );
@@ -1444,6 +1450,9 @@ mod tests {
                 name: Some("example.com".to_owned()),
                 name_source: NameSource::DnsQuery,
                 revision: 1,
+                credential: None,
+                location: None,
+                reason: None,
             }]
         );
 
@@ -1511,6 +1520,9 @@ mod tests {
                 name: Some("example.com".to_owned()),
                 name_source: NameSource::DnsQuery,
                 revision: 4,
+                credential: None,
+                location: None,
+                reason: None,
             }]
         );
 

@@ -370,8 +370,11 @@ async fn plain_http_secret_denial_delivers_json_to_guest() {
             error,
             serde_json::json!({
                 "code": "secret_policy_denied",
-                "message": "",
-                "domain": "host.microsandbox.internal"
+                "message": "Blocked: API_KEY was sent in a request header to host.microsandbox.internal; it is substituted only for api.allowed.test.",
+                "domain": "host.microsandbox.internal",
+                "credential": "API_KEY",
+                "location": "header",
+                "reason": "host-not-covered"
             })
         );
         let auth = tokio::time::timeout(std::time::Duration::from_secs(5), server.received_auth())

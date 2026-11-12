@@ -87,7 +87,7 @@ pub use modify::{
 };
 pub use network_log::{
     NETWORK_LOG_FORMAT_VERSION, NameSource, NetworkLogEvent, NetworkLogRecord, NetworkRefusal,
-    NetworkSuppressed, RefusalLayer, RefusalSite,
+    NetworkSuppressed, PlaceholderLocation, RefusalLayer, RefusalSite, SecretRefusalReason,
 };
 pub use registry::RegistryAuth;
 pub use secret::SecretValue;

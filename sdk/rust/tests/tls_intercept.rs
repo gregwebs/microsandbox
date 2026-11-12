@@ -1763,8 +1763,11 @@ async fn tls_secret_denial_delivers_json_to_guest() {
             error,
             serde_json::json!({
                 "code": "secret_policy_denied",
-                "message": "Check secret access for {host}.",
-                "domain": "host.microsandbox.internal"
+                "message": "Blocked: API_KEY was sent in a request header to host.microsandbox.internal; it is substituted only for api.allowed.test. Check secret access for {host}.",
+                "domain": "host.microsandbox.internal",
+                "credential": "API_KEY",
+                "location": "header",
+                "reason": "host-not-covered"
             })
         );
         let received = tokio::time::timeout(Duration::from_secs(5), server.received_request())

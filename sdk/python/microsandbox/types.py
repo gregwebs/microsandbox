@@ -1802,7 +1802,11 @@ class VsockRoute:
 
 @dataclass(frozen=True, slots=True)
 class HttpConfig:
-    """HTTP denial settings. Text preserves legacy behavior; JSON uses literal messages."""
+    """HTTP denial settings. Text preserves legacy behavior.
+
+    In JSON mode, `network_deny_message` is the network message as written, and
+    `secret_deny_message` is appended after the engine's facts sentence in a secret denial.
+    """
 
     deny_response: bool = True
     """Enable readable HTTP denial responses. Enabled by default locally."""
@@ -1820,7 +1824,10 @@ class HttpConfig:
     """
 
     secret_deny_message: str | None = field(default=None, kw_only=True)
-    """Literal secret-denial message for JSON mode. None uses the default; empty stays empty."""
+    """Remedy text appended after the engine's facts sentence in JSON secret denials.
+
+    ``None`` or an empty string adds nothing.
+    """
 
 
 @dataclass(frozen=True, slots=True)
