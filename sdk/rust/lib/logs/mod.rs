@@ -10,7 +10,10 @@
 //!   local files, suitable for live-tailing or replaying a fixed range.
 //!   Uses filesystem change notifications (the `notify` crate) for
 //!   live updates with a fallback poll, and stamps each entry with
-//!   an opaque [`LogCursor`] for exact per-source resume.
+//!   an opaque [`LogCursor`] for exact per-source resume. The watch
+//!   covers the log files as well as the directory, so an appended
+//!   record reaches a follower within milliseconds; the poll only
+//!   bounds a notification the OS never delivered.
 //!
 //! # Files read
 //!

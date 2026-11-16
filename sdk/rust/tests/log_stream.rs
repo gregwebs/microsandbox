@@ -14,8 +14,10 @@
 //! (libkrunfw, kernel image, etc.) — they're pure I/O exercises
 //! against the streaming engine through its public entry points.
 
+use std::io::Write;
 use std::path::PathBuf;
 use std::sync::OnceLock;
+use std::time::Duration;
 
 use futures::TryStreamExt;
 use microsandbox::logs;
@@ -290,6 +292,88 @@ async fn log_stream_follow_picks_up_appended_entries() {
         .expect("stream not ended")
         .expect("not an error");
     assert_eq!(second.data.as_ref(), b"second");
+}
+
+/// A refusal prompt is drawn from the entry a followed stream yields, so new
+/// entries must arrive from the filesystem watcher rather than from the
+/// fallback poll. The log file already exists when the stream opens — that is
+/// the shape of a sandbox's `network.log`, followed from launch before the
+/// first refusal creates a line — and appends to it must still wake the stream.
+///
+/// Each write lands while the reader is already parked on its wake, where only a
+/// filesystem notification can answer it before the fallback poll does. The
+/// bound is well under that poll's two seconds, so a watcher that registers the
+/// directory but not the files inside it fails every round instead of passing
+/// all of them late.
+#[tokio::test]
+async fn log_stream_follow_wakes_on_an_append_to_an_existing_log_file() {
+    const APPENDS: u16 = 8;
+    const WAKE_BOUND: Duration = Duration::from_millis(800);
+
+    let name = "log-stream-follow-wake";
+    let log_dir = make_log_dir(name);
+    let path = log_dir.join("network.log");
+    write_lines(
+        &path,
+        &[network_line("2026-11-05T14:03:07.412Z", "tcp-syn", 443)],
+    );
+
+    let stream = logs::log_stream(
+        name,
+        &LogStreamOptions {
+            sources: vec![LogSource::Network],
+            follow: true,
+            ..Default::default()
+        },
+    )
+    .await
+    .expect("open follow stream");
+    let mut stream = Box::pin(stream);
+    use futures::StreamExt;
+
+    // Drain the historical line so the engine is ready to park on its wake.
+    tokio::time::timeout(WAKE_BOUND, stream.next())
+        .await
+        .expect("historical entry within the wake bound")
+        .expect("stream not ended")
+        .expect("not an error");
+
+    for index in 0..APPENDS {
+        let line = network_line("2026-11-05T14:03:07.412Z", "tcp-syn", 1000 + index);
+        let writer_path = path.clone();
+
+        // The write lands only after the reader is parked on its wake, so the
+        // stream has to be woken by the watcher; reading on the next `step` is
+        // not an option here. The write instant is taken next to the append so
+        // a slow writer does not inflate the measured latency.
+        let (wrote_tx, wrote_rx) = tokio::sync::oneshot::channel();
+        let writer = tokio::task::spawn_blocking(move || {
+            std::thread::sleep(Duration::from_millis(50));
+            let mut file = std::fs::OpenOptions::new()
+                .append(true)
+                .open(&writer_path)
+                .expect("open log for append");
+            let wrote_at = std::time::Instant::now();
+            writeln!(file, "{line}").expect("append record");
+            let _ = wrote_tx.send(wrote_at);
+        });
+
+        let entry = tokio::time::timeout(Duration::from_secs(5), stream.next())
+            .await
+            .unwrap_or_else(|_| panic!("append {index} never surfaced"))
+            .expect("stream not ended")
+            .expect("not an error");
+        let wrote_at = wrote_rx.await.expect("writer reported its append");
+        let latency = wrote_at.elapsed();
+
+        writer.await.expect("writer finished");
+        assert_eq!(entry.source, LogSource::Network);
+        assert!(
+            latency < WAKE_BOUND,
+            "append {index} took {latency:?} to surface; the stream waited for its fallback poll \
+             instead of the filesystem watcher"
+        );
+    }
 }
 
 #[tokio::test]

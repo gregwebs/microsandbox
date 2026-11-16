@@ -25,6 +25,11 @@ use super::watch::LogSubscription;
 // Constants
 //--------------------------------------------------------------------------------------------------
 
+/// Wake-up safety net, not the normal path: a followed stream is woken by the
+/// filesystem watcher within milliseconds of a write
+/// ([`FollowMode::Standalone`]). This interval only bounds the latency of an
+/// event the watcher never delivered — an unsupported filesystem, an exhausted
+/// watch limit, or a platform notification the OS dropped.
 const FALLBACK_POLL_INTERVAL: Duration = Duration::from_secs(2);
 
 //--------------------------------------------------------------------------------------------------
@@ -444,10 +449,18 @@ enum FollowMode {
 }
 
 impl FollowMode {
-    /// Build this stream's own non-recursive watcher on `log_dir`. The
-    /// callback runs on a background thread and forwards only the wake
-    /// signal so the async [`step`](LogEngine::step) loop can park
-    /// between writes.
+    /// Build this stream's own watcher on `log_dir`. The callback runs on a
+    /// background thread and forwards only the wake signal so the async
+    /// [`step`](LogEngine::step) loop can park between writes.
+    ///
+    /// The watch is recursive on purpose. A non-recursive watch reports changes
+    /// to the directory's own entry list — a log file appearing, rotating, or
+    /// being deleted — but not bytes appended to a file that is already there,
+    /// because those leave the directory entry untouched. `inotify` and `kqueue`
+    /// both behave that way, and FSEvents drops child paths outright unless the
+    /// watch is recursive. Recursing covers the log files themselves, which is
+    /// all a sandbox log directory holds, so an appended record wakes the stream
+    /// instead of waiting out [`FALLBACK_POLL_INTERVAL`].
     fn standalone(log_dir: &Path) -> MicrosandboxResult<Self> {
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         let mut watcher = notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
@@ -464,7 +477,7 @@ impl FollowMode {
         .map_err(|e| MicrosandboxError::Custom(format!("log watcher init failed: {e}")))?;
 
         watcher
-            .watch(log_dir, notify::RecursiveMode::NonRecursive)
+            .watch(log_dir, notify::RecursiveMode::Recursive)
             .map_err(|e| MicrosandboxError::Custom(format!("log watcher subscribe failed: {e}")))?;
 
         Ok(FollowMode::Standalone {

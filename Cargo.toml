@@ -133,7 +133,14 @@ ipnetwork = { version = "0.21.0", features = ["serde"] }
 libc = "0.2"
 memmap2 = "0.9"
 nix = "0.31"
-notify = "8"
+# macOS follows logs with kqueue rather than notify's FSEvents backend.
+# FSEvents reports file-level events off the volume's event journal, so
+# appends to an already-watched file arrive in delayed, coalesced batches
+# (measured: a second or more, intermittently). kqueue watches the vnodes
+# themselves and wakes within milliseconds. The feature only selects which
+# backend `recommended_watcher` returns on macOS; Linux and Windows keep
+# their native backends.
+notify = { version = "8", default-features = false, features = ["macos_kqueue"] }
 oci-client = "0.18"
 oci-spec = "0.10.0"
 rand = "0.10.1"
