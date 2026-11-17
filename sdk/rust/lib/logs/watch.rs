@@ -372,7 +372,13 @@ fn admin_loop(mut watcher: notify::RecommendedWatcher, rx: mpsc::Receiver<AdminC
     while let Ok(command) = rx.recv() {
         match command {
             AdminCommand::Watch { dir, reply } => {
-                let result = watcher.watch(&dir, notify::RecursiveMode::NonRecursive);
+                // Recursive for the same reason the standalone watcher is (see
+                // `FollowMode::standalone`): a directory watched non-recursively
+                // reports a child being created or removed, but not appended to,
+                // and the appends are the whole point. `notify` walks the
+                // directory at watch time and adds each new entry as it appears,
+                // so a sandbox log directory costs one watch per log file.
+                let result = watcher.watch(&dir, notify::RecursiveMode::Recursive);
                 let _ = reply.send(result);
             }
             AdminCommand::Unwatch { dir } => {
@@ -587,15 +593,7 @@ mod tests {
         assert_eq!(registry.stats().registered_dirs, 0);
     }
 
-    // Exercises a real OS watch via `register`. On Linux (the production
-    // target) `inotify_add_watch` is instant; on macOS `notify`'s FSEvents
-    // `watch()` can take tens of seconds on some hosts (security agents
-    // hooking stream creation), so it is skipped there by default — run
-    // with `--ignored` to include it.
-    #[cfg_attr(
-        target_os = "macos",
-        ignore = "FSEvents watch() latency; runs on Linux CI"
-    )]
+    // Exercises a real OS watch via `register`.
     #[tokio::test]
     async fn one_directory_two_registrations_share_one_descriptor() {
         let registry = LogRegistry::new().unwrap();
@@ -631,10 +629,6 @@ mod tests {
         assert_eq!(registry.stats().registered_dirs, 0);
     }
 
-    #[cfg_attr(
-        target_os = "macos",
-        ignore = "FSEvents watch() latency; runs on Linux CI"
-    )]
     #[tokio::test]
     async fn stream_keeps_directory_registered_after_logger_drops() {
         use crate::logs::LogStreamOptions;
@@ -668,5 +662,88 @@ mod tests {
         drop(stream);
         assert_eq!(registry.stats().registered_dirs, 0);
         assert_eq!(registry.stats().total_registrations, 0);
+    }
+
+    /// The registry's watcher must wake a followed stream for an append to a
+    /// file that already existed when the directory was registered. Each write
+    /// lands after the reader has parked, where only a filesystem notification
+    /// answers before the fallback poll does, and the bound is under that
+    /// poll's two seconds — so a directory-only watch fails every round.
+    #[tokio::test]
+    async fn registry_wakes_a_followed_stream_on_an_append_to_an_existing_file() {
+        use std::io::Write;
+        use std::time::{Duration, Instant};
+
+        use futures::StreamExt;
+
+        use crate::logs::LogStreamOptions;
+
+        const APPENDS: usize = 4;
+        const WAKE_BOUND: Duration = Duration::from_millis(800);
+
+        let registry = LogRegistry::new().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("exec.log");
+        std::fs::write(
+            &path,
+            "{\"t\":\"2026-05-01T10:00:00.000Z\",\"s\":\"stdout\",\"d\":\"first\",\"id\":1}\n",
+        )
+        .unwrap();
+
+        let logger = registry
+            .register(SandboxLogger::new("sbx".into(), dir.path().to_path_buf()))
+            .await
+            .unwrap();
+        let mut stream = Box::pin(
+            logger
+                .stream(&LogStreamOptions {
+                    follow: true,
+                    ..Default::default()
+                })
+                .await
+                .unwrap(),
+        );
+
+        // Drain the historical line so the engine is ready to park on its wake.
+        tokio::time::timeout(WAKE_BOUND, stream.next())
+            .await
+            .expect("historical entry within the wake bound")
+            .expect("stream not ended")
+            .expect("not an error");
+
+        for index in 0..APPENDS {
+            let line = format!(
+                "{{\"t\":\"2026-05-01T10:00:01.000Z\",\"s\":\"stdout\",\"d\":\"line {index}\",\"id\":1}}\n"
+            );
+            let writer_path = path.clone();
+
+            let (wrote_tx, wrote_rx) = tokio::sync::oneshot::channel();
+            let writer = tokio::task::spawn_blocking(move || {
+                std::thread::sleep(Duration::from_millis(50));
+                let mut file = std::fs::OpenOptions::new()
+                    .append(true)
+                    .open(&writer_path)
+                    .expect("open log for append");
+                let wrote_at = Instant::now();
+                file.write_all(line.as_bytes()).expect("append record");
+                let _ = wrote_tx.send(wrote_at);
+            });
+
+            let entry = tokio::time::timeout(Duration::from_secs(5), stream.next())
+                .await
+                .unwrap_or_else(|_| panic!("append {index} never surfaced"))
+                .expect("stream not ended")
+                .expect("not an error");
+            let wrote_at = wrote_rx.await.expect("writer reported its append");
+            let latency = wrote_at.elapsed();
+
+            writer.await.expect("writer finished");
+            assert_eq!(entry.data.as_ref(), format!("line {index}").as_bytes());
+            assert!(
+                latency < WAKE_BOUND,
+                "append {index} took {latency:?} to surface; the registry's watch missed the \
+                 append and the stream waited for its fallback poll"
+            );
+        }
     }
 }
