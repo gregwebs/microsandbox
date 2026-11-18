@@ -880,6 +880,21 @@ jobs:
         # unused imports and lint regressions reach `main` unnoticed.
         run: cargo +stable clippy --workspace --exclude microsandbox-agentd --all-targets -- -D warnings
 
+      - name: Test runtime metrics
+        # Serialised: the sampler tests block a pool thread for 40 ms per
+        # residency scan, which is scheduler-sensitive when run in parallel.
+        # libtest exits 0 when the filter matches nothing, so the step also
+        # requires its own output to report at least one passing test.
+        # `grep -E` rather than a `\+` sed pattern keeps this portable.
+        run: |
+          set -euo pipefail
+          log=/tmp/runtime-metrics-tests.log
+          cargo +stable test --no-default-features --features net,runner -p microsandbox-runtime --lib runner::metrics::tests -- --test-threads=1 2>&1 | tee "$log"
+          if ! grep -Eq '^test result: .*[1-9][0-9]* passed' "$log"; then
+            echo "::error::runner::metrics::tests selected no tests; the #654 regression guard did not run"
+            exit 1
+          fi
+
       - name: Check Rust SDK feature surfaces
         run: |
           cargo +stable test -p microsandbox --no-default-features --features cloud,net --test api_compat

@@ -30,10 +30,10 @@ pub const DEFAULT_SAMPLE_INTERVAL: Duration = Duration::from_secs(1);
 /// Minimum age after which protected upper filesystem samples are treated as stale.
 const MIN_UPPER_FILESYSTEM_STALE_AFTER: Duration = Duration::from_secs(3);
 
-/// Maximum counter/clock pairing error tolerated for a CPU sample window,
-/// as a fraction of the window's wall time. Normal pairing spread is
-/// microseconds against a 1s window; anything past this ratio means the
-/// sampler was descheduled mid-read and the window's ratio is unusable.
+/// Gross-stall backstop for counter/clock pairing of the cheap aggregate read,
+/// as a fraction of the CPU window's wall time. Residency is sampled outside
+/// this bracket, so a stall during its page walk is invisible to this guard.
+/// This is not a tolerance calibrated to normal counter-read latency.
 const MAX_PAIRING_SKEW_RATIO: f64 = 0.05;
 
 //--------------------------------------------------------------------------------------------------
@@ -203,12 +203,14 @@ pub async fn run_metrics_sampler(spec: MetricsSamplerSpec) {
 
 /// A VMM metrics snapshot paired with the wall-clock moment it describes.
 ///
-/// The counter and the clock cannot be read in one atomic step, so the
-/// snapshot is bracketed by two `Instant` reads: `at` is the bracket
-/// midpoint and `uncertainty` its width. Normally the width is microseconds;
-/// when the host deschedules this thread mid-read (observed during a
-/// concurrent VM boot) it grows to whatever the scheduler stole, and the
-/// sample window it bounds must not be trusted for rate math — pairing a
+/// Cheap aggregate counters are bracketed by two `Instant` reads. `at` is
+/// their bracket midpoint and `uncertainty` its width; host residency is
+/// sampled separately afterward and is not covered by this CPU pairing
+/// timestamp. Every cumulative counter in the sample comes from that cheap
+/// read; residency and `sampled_at` follow it. Normally the width is
+/// microseconds; when the host deschedules this thread mid-read (observed
+/// during a concurrent VM boot) it grows to whatever the scheduler stole, and
+/// the sample window it bounds must not be trusted for rate math — pairing a
 /// multi-second counter delta with a one-second wall window is exactly how
 /// a 2-vCPU sandbox once read 592% CPU.
 struct PairedSnapshot {
@@ -245,13 +247,17 @@ async fn snapshot_off_worker(
 
 fn snapshot(krun_metrics: &msb_krun::MetricsHandle, paused: bool) -> PairedSnapshot {
     let before = Instant::now();
-    let metrics = if paused {
-        krun_metrics.aggregate_snapshot_without_host_residency()
-    } else {
-        krun_metrics.aggregate_snapshot()
-    };
+    let mut metrics = krun_metrics.aggregate_snapshot_without_host_residency();
     let after = Instant::now();
     let uncertainty = after.saturating_duration_since(before);
+
+    // Residency is a separate observation: its page walk must not inflate
+    // the counter/clock pairing error used for CPU rate math.
+    if !paused {
+        metrics.memory.host_resident_bytes =
+            krun_metrics.aggregate_snapshot().memory.host_resident_bytes;
+    }
+
     PairedSnapshot {
         metrics,
         at: before + uncertainty / 2,
@@ -435,8 +441,11 @@ mod tests {
     #[cfg(unix)]
     use std::ffi::CString;
 
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+
     use super::*;
-    use microsandbox_metrics::{ActivateSlot, MetricsRegistry, ReserveSlot};
+    use microsandbox_metrics::{ActivateSlot, LiveMetric, MetricsRegistry, ReserveSlot};
     use msb_krun_utils::metrics::MetricsWriter;
 
     fn unique_shm_name(tag: &str) -> String {
@@ -458,6 +467,76 @@ mod tests {
 
         #[cfg(not(unix))]
         let _ = name;
+    }
+
+    /// Cleanup guard for the sampler fixture: aborts the sampler task, stops
+    /// and joins the vCPU injector, and unlinks the fixture's own
+    /// shared-memory name on assertion failure as well as on success.
+    struct SamplerFixture {
+        sampler: Option<tokio::task::JoinHandle<()>>,
+        stop: Arc<AtomicBool>,
+        injector: Option<std::thread::JoinHandle<()>>,
+        shm_name: String,
+    }
+
+    impl SamplerFixture {
+        /// Success-path teardown: await sampler cancellation before the caller
+        /// drops the registry, writer and VM handles.
+        async fn shutdown(mut self) {
+            if let Some(sampler) = self.sampler.take() {
+                sampler.abort();
+                let error = sampler
+                    .await
+                    .expect_err("metrics sampler should be cancelled, not finish");
+                assert!(error.is_cancelled(), "metrics sampler failed: {error}");
+            }
+            self.stop.store(true, Ordering::SeqCst);
+            if let Some(injector) = self.injector.take() {
+                injector.join().expect("vcpu injector thread panicked");
+            }
+        }
+    }
+
+    impl Drop for SamplerFixture {
+        fn drop(&mut self) {
+            if let Some(sampler) = self.sampler.take() {
+                sampler.abort();
+            }
+            self.stop.store(true, Ordering::SeqCst);
+            if let Some(injector) = self.injector.take() {
+                let _ = injector.join();
+            }
+            cleanup_shm(&self.shm_name);
+        }
+    }
+
+    /// Poll the registry until the sampler publishes a strictly newer slot
+    /// timestamp, returning that distinct publication. Bound each wait so a
+    /// stalled sampler fails the test instead of hanging it.
+    async fn next_publication(
+        registry: &MetricsRegistry,
+        previous_timestamp: chrono::DateTime<chrono::Utc>,
+    ) -> LiveMetric {
+        let wait = async {
+            loop {
+                let mut snapshot = registry.snapshot().unwrap();
+                assert!(snapshot.len() <= 1, "fixture owns at most one slot");
+                if let Some(row) = snapshot.pop() {
+                    assert_eq!(row.sandbox_id, 654);
+                    assert_eq!(row.run_id, 1);
+                    assert_eq!(row.pid, std::process::id() as i32);
+                    assert_eq!(row.name, "slow-cpu");
+                    assert_eq!(row.memory_host_resident_bytes, Some(4096));
+                    if row.timestamp > previous_timestamp {
+                        return row;
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(2)).await;
+            }
+        };
+        tokio::time::timeout(Duration::from_millis(500), wait)
+            .await
+            .expect("metrics sampler did not publish a new slot within 500 ms")
     }
 
     #[test]
@@ -835,6 +914,304 @@ mod tests {
             upper_filesystem_stale_after(Duration::from_secs(10)),
             Duration::from_secs(30)
         );
+    }
+
+    /// A residency callback as slow as the sampler's own sleep must not widen
+    /// the CPU pairing bracket, and a paused snapshot must skip it entirely.
+    /// VM-free and deterministic in its inputs: only the host clock varies.
+    ///
+    /// The uncertainty assertion is red on the unfixed body (about 40 ms of
+    /// bracket against the 1 ms bound). The counter-coherence assertion pins
+    /// that every cumulative counter comes from the cheap read; the paused
+    /// half is characterisation and passes either way.
+    #[test]
+    fn snapshot_excludes_slow_residency_from_pairing() {
+        // One entry of vCPU time, added by the walk itself: a counter read
+        // taken after the walk can see it, the cheap read before it cannot.
+        const WALK_ADVANCE_NS: u64 = 1_000_000;
+
+        let writer = MetricsWriter::default();
+        let handle = writer.handle();
+        writer.add_vcpu_time_ns(0);
+        let count = Arc::new(AtomicU64::new(0));
+        let callback_count = Arc::clone(&count);
+        let callback_writer = writer.clone();
+        writer.set_memory_host_resident_sampler(move || {
+            callback_count.fetch_add(1, Ordering::SeqCst);
+            callback_writer.add_vcpu_time_ns(WALK_ADVANCE_NS);
+            std::thread::sleep(Duration::from_millis(40));
+            Some(4096)
+        });
+
+        // Bracketed by cheap reads, so the walk's own advance is visible to the
+        // after-read and to a full read, but not to the cheap read inside.
+        let before = handle
+            .aggregate_snapshot_without_host_residency()
+            .cpu
+            .vcpu_time_ns;
+        let s = snapshot(&handle, false);
+        let after = handle
+            .aggregate_snapshot_without_host_residency()
+            .cpu
+            .vcpu_time_ns;
+
+        assert!(
+            s.uncertainty < Duration::from_millis(1),
+            "CPU pairing uncertainty must exclude the 40 ms residency scan: {:?}",
+            s.uncertainty,
+        );
+        assert_eq!(before, Some(0), "no vCPU time may precede the walk");
+        assert_eq!(
+            after,
+            Some(WALK_ADVANCE_NS),
+            "the residency walk must be the only vCPU time advance",
+        );
+        assert_eq!(
+            s.metrics.cpu.vcpu_time_ns, before,
+            "published vCPU time must be the cheap read ({before:?}) taken before \
+             the residency walk, not the full read ({after:?}) taken by it",
+        );
+        assert_eq!(s.metrics.memory.host_resident_bytes, Some(4096));
+        assert_eq!(count.load(Ordering::SeqCst), 1);
+
+        let p = snapshot(&handle, true);
+        assert_eq!(p.metrics.memory.host_resident_bytes, None);
+        assert!(p.uncertainty < Duration::from_millis(1));
+        assert_eq!(count.load(Ordering::SeqCst), 1);
+    }
+
+    /// End-to-end sampler path against the real registry: a residency callback
+    /// costing as long as the sampler's sleep must still publish fresh CPU.
+    ///
+    /// Red on the unfixed sampler only while `SAMPLER_INTERVAL_MS <
+    /// 19 * SLOW_RESIDENCY_MS` (the 40/40 pair here rejects every interval
+    /// below 760 ms). The pairing guard rejects a window whose bracket skew
+    /// exceeds `MAX_PAIRING_SKEW_RATIO` of it, and the unfixed body puts the
+    /// scan inside the bracket, so rejection needs `scan > 0.05 * (interval +
+    /// scan)`, i.e. `interval < 19 * scan`. Raise the interval towards the
+    /// production 1 s and the unfixed sampler publishes fresh-looking rates:
+    /// this test goes green on the bug.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn slow_residency_sampler_publishes_fresh_cpu_percent() {
+        const SLOW_RESIDENCY_MS: u64 = 40;
+        const SAMPLER_INTERVAL_MS: u64 = 40;
+        const RATE_25: u64 = 250;
+        const RATE_75: u64 = 750;
+        const RATE_IDLE: u64 = 0;
+        const PUBLICATIONS_PER_PHASE: usize = 8;
+        const SETTLING_PUBLICATIONS: usize = 3;
+        const FIRST_WINDOW_ROWS: usize = 3;
+
+        let shm_name = unique_shm_name("slow-cpu");
+        let mut fixture = SamplerFixture {
+            sampler: None,
+            stop: Arc::new(AtomicBool::new(false)),
+            injector: None,
+            shm_name: shm_name.clone(),
+        };
+
+        let registry = MetricsRegistry::open_or_create(&shm_name, 1).unwrap();
+        let reserved = registry
+            .reserve(ReserveSlot {
+                sandbox_id: 654,
+                name: "slow-cpu",
+                memory_limit_bytes: 1024 * 1024 * 1024,
+            })
+            .unwrap();
+        let slot_writer = registry
+            .activate_writer(ActivateSlot {
+                slot: reserved.slot,
+                generation: reserved.generation,
+                run_id: 1,
+                pid: std::process::id() as i32,
+                started_at: chrono::Utc::now(),
+            })
+            .unwrap();
+        // Constructs the control handle without booting a VM: `build()` only
+        // assembles resources, so `execution_state()` stays `None` (unpaused).
+        let vm = msb_krun::VmBuilder::new().build().unwrap();
+
+        let metrics_writer = MetricsWriter::default();
+        metrics_writer.add_vcpu_time_ns(0);
+        let residency_calls = Arc::new(AtomicU64::new(0));
+        let residency_counter = Arc::clone(&residency_calls);
+        metrics_writer.set_memory_host_resident_sampler(move || {
+            residency_counter.fetch_add(1, Ordering::SeqCst);
+            std::thread::sleep(Duration::from_millis(SLOW_RESIDENCY_MS));
+            Some(4096)
+        });
+
+        let rate_permille = Arc::new(AtomicU64::new(RATE_25));
+        fixture.injector = Some({
+            let stop = Arc::clone(&fixture.stop);
+            let rate_permille = Arc::clone(&rate_permille);
+            let vcpu_writer = metrics_writer.clone();
+            std::thread::spawn(move || {
+                let mut carry = 0_u64;
+                let mut last = Instant::now();
+                while !stop.load(Ordering::SeqCst) {
+                    let now = Instant::now();
+                    let elapsed_ns = now.saturating_duration_since(last).as_nanos();
+                    last = now;
+                    let scaled = elapsed_ns * u128::from(rate_permille.load(Ordering::SeqCst))
+                        + u128::from(carry);
+                    vcpu_writer.add_vcpu_time_ns(u64::try_from(scaled / 1000).unwrap());
+                    carry = u64::try_from(scaled % 1000).unwrap();
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+            })
+        });
+
+        fixture.sampler = Some(tokio::spawn(run_metrics_sampler(MetricsSamplerSpec {
+            writer: slot_writer,
+            sandbox_id: 654,
+            pid: std::process::id(),
+            interval_ms: NonZero::new(SAMPLER_INTERVAL_MS).unwrap(),
+            max_cpus: 2,
+            krun_metrics: metrics_writer.handle(),
+            vm_control: vm.control_handle(),
+            network_metrics: None,
+            upper_host_path: None,
+        })));
+
+        // The initial publication deliberately carries no computed rate.
+        let initial =
+            next_publication(&registry, chrono::DateTime::<chrono::Utc>::UNIX_EPOCH).await;
+        let mut previous_timestamp = initial.timestamp;
+        // Phase 1's opening rows, each kept with the window it reports over.
+        let mut first_window: Vec<(LiveMetric, f64)> = Vec::new();
+        let mut publications = 1_usize;
+        let mut phases: Vec<(f64, Vec<LiveMetric>)> = Vec::new();
+
+        for (phase, (expected, permille)) in [(25.0, RATE_25), (75.0, RATE_75), (0.0, RATE_IDLE)]
+            .into_iter()
+            .enumerate()
+        {
+            rate_permille.store(permille, Ordering::SeqCst);
+            let mut gathered = Vec::with_capacity(PUBLICATIONS_PER_PHASE);
+            for index in 0..PUBLICATIONS_PER_PHASE {
+                let row = next_publication(&registry, previous_timestamp).await;
+                let window_ms = (row.timestamp - previous_timestamp)
+                    .num_nanoseconds()
+                    .unwrap() as f64
+                    / 1_000_000.0;
+                previous_timestamp = row.timestamp;
+                publications += 1;
+                if phase == 0 && index < FIRST_WINDOW_ROWS {
+                    first_window.push((row.clone(), window_ms));
+                }
+                gathered.push(row);
+            }
+            gathered.drain(..SETTLING_PUBLICATIONS);
+            phases.push((expected, gathered));
+        }
+
+        // Phase 1's opening rate windows: this is where a carried initial
+        // `None` surfaces as a zero. Checked before the phase oracles so the
+        // integration red diagnostic is stable.
+        assert_eq!(
+            first_window.len(),
+            FIRST_WINDOW_ROWS,
+            "phase 1 must publish {FIRST_WINDOW_ROWS} opening rate windows",
+        );
+        for (index, (row, window_ms)) in first_window.iter().enumerate() {
+            // The budget below is only sound if the window it is derived from
+            // really spans at least one sampler interval.
+            assert!(
+                *window_ms >= SAMPLER_INTERVAL_MS as f64,
+                "phase 1 row {index} reports over {window_ms:.1} ms, less than one {SAMPLER_INTERVAL_MS} ms sampler interval; no lag budget can be derived from it",
+            );
+            // error ~= rate * lag / window, so at 25 % demand a 10 pp allowance
+            // buys 0.10 * window / 0.25 of differential counter lag.
+            let lag_budget_ms = (10.0 / 100.0) * window_ms / 0.25;
+            assert!(
+                (f64::from(row.cpu_percent) - 25.0).abs() <= 10.0,
+                "phase 1 row {index} must carry a freshly computed rate: expected 25.0% +/-10 pp, got {}; 0.0 means no rate was published (an absent CPU value is encoded as 0.0), which is what a carried initial None looks like, not a computed zero; measured rate window={window_ms:.1} ms, derived differential-lag budget={lag_budget_ms:.1} ms (0.10 * window / 0.25 rate fraction)",
+                row.cpu_percent,
+            );
+        }
+
+        // Primary counter oracle: cumulative-counter agreement, which the
+        // pairing guard does not affect. It re-derives the rate from the
+        // counter the injector wrote, so it sees the counter path, not the
+        // published rate. Only *variation* in the publication lag between the
+        // two endpoints charges the budget below; a constant lag cancels in
+        // the difference.
+        for (expected, rows) in &phases {
+            let a = &rows[0];
+            let b = &rows[rows.len() - 1];
+            let delta_ns = b.vcpu_time_ns.checked_sub(a.vcpu_time_ns).unwrap();
+            let wall_ns = (b.timestamp - a.timestamp).num_nanoseconds().unwrap();
+            assert!(wall_ns > 0);
+            if *expected > 0.0 {
+                assert!(
+                    delta_ns > 0,
+                    "phase {expected:.1}% must advance vcpu_time_ns"
+                );
+            }
+            let derived = 100.0 * delta_ns as f64 / wall_ns as f64;
+            let span_ms = wall_ns as f64 / 1_000_000.0;
+            let cadence_ms = (SAMPLER_INTERVAL_MS + SLOW_RESIDENCY_MS) as f64;
+            let lag_budget_ms = (10.0 / 100.0) * span_ms;
+            let diagnosis = if span_ms < 3.0 * cadence_ms {
+                "oracle too tight: the retained span covers fewer than three fixture cadences"
+            } else {
+                "sampler disagrees with injected demand, or the publication lag varied between the endpoints by more than this budget"
+            };
+            assert!(
+                (derived - *expected).abs() <= 10.0,
+                "{diagnosis}: expected {expected:.1}% +/-10 pp, got {derived:.1}%; measured retained span={span_ms:.1} ms ({:.1} fixture cadences of {cadence_ms:.0} ms); conservative differential-lag budget={lag_budget_ms:.1} ms (10/100 * span); only variation in the lag is charged to it, a constant lag cancels between endpoints",
+                span_ms / cadence_ms,
+            );
+            // Secondary, phase-level freshness evidence: at least one retained
+            // row, not every row, must reflect this phase's demand.
+            assert!(
+                rows.iter()
+                    .any(|row| (f64::from(row.cpu_percent) - expected).abs() <= 10.0),
+                "no retained CPU row matches phase demand {expected:.1}% +/-10 pp",
+            );
+        }
+
+        // At least one residency callback per publication; the injector
+        // advances the shared counter, so the callback count is a lower bound.
+        // A sampler that scanned twice per tick also passes: this pins that the
+        // scan has not stopped, not that it runs once.
+        let callbacks = residency_calls.load(Ordering::SeqCst);
+        assert!(
+            callbacks >= publications as u64,
+            "{publications} publications but {callbacks} residency callbacks",
+        );
+
+        fixture.shutdown().await;
+    }
+
+    /// Characterisation of the existing pause contract, not the #654
+    /// regression: a paused snapshot omits residency without a callback.
+    ///
+    /// Both halves pass on the unfixed body, so this is not a red receipt. It
+    /// fails once the `if !paused` check is dropped: the paused half then reads
+    /// `Some(4096)` and the callback count reaches two.
+    #[test]
+    fn snapshot_skips_residency_when_paused() {
+        let writer = MetricsWriter::default();
+        let handle = writer.handle();
+        let count = Arc::new(AtomicU64::new(0));
+        let callback_count = Arc::clone(&count);
+        writer.set_memory_host_resident_sampler(move || {
+            callback_count.fetch_add(1, Ordering::SeqCst);
+            Some(4096)
+        });
+        writer.add_vcpu_time_ns(42);
+
+        let running = snapshot(&handle, false);
+        assert_eq!(running.metrics.memory.host_resident_bytes, Some(4096));
+        assert_eq!(count.load(Ordering::SeqCst), 1);
+
+        writer.add_vcpu_time_ns(42);
+        let paused = snapshot(&handle, true);
+        assert_eq!(paused.metrics.memory.host_resident_bytes, None);
+        assert_eq!(paused.metrics.cpu.vcpu_time_ns, Some(84));
+        assert_eq!(count.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]
