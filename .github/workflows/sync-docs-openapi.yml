@@ -1,12 +1,12 @@
 name: Sync docs OpenAPI
 
 # Refresh the production API reference without making unrelated pull requests
-# depend on the live API. Scheduled workflows run from the default branch,
-# while the generated docs are proposed against the Mintlify deploy branch.
+# depend on the live API. The generator checks out the Mintlify deploy branch
+# and proposes the result against it, so this runs on demand only: a repository
+# that does not host that branch cannot run it, and a schedule would fail on
+# the checkout step every day.
 
 on:
-  schedule:
-    - cron: "23 6 * * *"
   workflow_dispatch:
 
 permissions:
