@@ -1480,22 +1480,31 @@ async fn file_backed_secret_missing_file_blocks_request() {
 body=/tmp/secret-body
 printf 'token=%s' "$API_KEY" > "$body"
 curl -k --http1.1 -m 10 -sS -o /tmp/response \
-  -w 'code=%{{http_code}}' \
+  -w 'code=%{{http_code}}\n' \
   -H 'content-type: text/plain' \
   --data-binary @"$body" \
   https://host.microsandbox.internal:{port}/secret
 status=$?
 echo "status=$status"
+printf 'refusal=%s\n' "$(cat /tmp/response)"
 "#
         ))
         .await
         .expect("curl missing file secret fixture");
 
     let stdout = out.stdout().expect("utf8 stdout");
+    // A refused placeholder is answered with the secret-policy 403 envelope, so curl
+    // completes with a status instead of a transport failure. What must not happen is a
+    // forwarded request (the upstream assertion below) or a request the guest reads as
+    // accepted, which the status code covers.
     assert!(
-        !stdout.contains("status=0"),
-        "expected curl to fail (placeholder blocked), stdout: {stdout}, stderr: {}",
+        stdout.contains("code=403"),
+        "expected a 403 refusal for the missing file secret, stdout: {stdout}, stderr: {}",
         out.stderr().unwrap_or_default()
+    );
+    assert!(
+        stdout.contains(r#""code":"secret_policy_denied""#),
+        "expected the refusal to name the secret policy, stdout: {stdout}"
     );
 
     let received = tokio::time::timeout(Duration::from_secs(5), server.received_body()).await;

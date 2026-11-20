@@ -48,6 +48,13 @@ static CAPABILITIES: LazyLock<Mutex<HashMap<PathBuf, CachedCapabilities>>> =
 const PROBE_TIMEOUT: Duration = Duration::from_secs(2);
 const MAX_VERSION_OUTPUT: u64 = 4096;
 
+// Unit fixtures cannot carry the embedded version section that makes a runtime a
+// machine contract. Locking here is a plain std mutex because the registry is
+// never held across an await; test builds only.
+#[cfg(test)]
+static TEST_CONTRACTS: LazyLock<std::sync::Mutex<HashMap<PathBuf, LaunchContract>>> =
+    LazyLock::new(|| std::sync::Mutex::new(HashMap::new()));
+
 /// Feature name used by every ambient-proxy capability diagnostic.
 const AMBIENT_PROXY_FEATURE: &str = "ambient host HTTP proxy discovery (proxy_from_env)";
 
@@ -732,8 +739,35 @@ pub(crate) async fn validate_runtime_config(
     Ok(())
 }
 
+/// Model the launch contract a unit-test fixture stands in for.
+///
+/// A `#!` wrapper has no embedded version metadata, so discovery can only ever
+/// read it as a legacy contract, however capable its probe answers are. Fixtures
+/// that must reach a machine-only gate register the contract here instead, which
+/// keeps the refusals under test the ones a real machine runtime produces.
+///
+/// Test builds only: production discovery reads the executable and never consults
+/// this registry.
+#[cfg(test)]
+pub(crate) fn install_test_contract(path: &Path, contract: LaunchContract) {
+    let path = std::fs::canonicalize(path).expect("test runtime path must resolve");
+    TEST_CONTRACTS
+        .lock()
+        .expect("test contract registry")
+        .insert(path, contract);
+}
+
 pub(crate) async fn resolve(path: &Path) -> MicrosandboxResult<LaunchContract> {
     let path = std::fs::canonicalize(path)?;
+    #[cfg(test)]
+    if let Some(contract) = TEST_CONTRACTS
+        .lock()
+        .expect("test contract registry")
+        .get(&path)
+        .copied()
+    {
+        return Ok(contract);
+    }
     // Serialize cold discovery so concurrent starts share one probe. No failed
     // or canceled discovery is cached, and the lock is released on cancellation.
     let mut contracts = CONTRACTS.lock().await;

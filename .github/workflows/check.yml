@@ -1586,7 +1586,10 @@ jobs:
     name: CLI Smoke Tests
     needs: [build-linux-x86_64, changes]
     if: needs.changes.outputs.code == 'true'
-    runs-on: self-hosted-ubuntu-2404-x64
+    # Hosted Ubuntu runners expose /dev/kvm; the enable-kvm step grants the
+    # access the KVM suites below need. CI_KVM_RUNNER pins a self-hosted KVM
+    # runner instead; leaving it unset must not mean queueing for a day.
+    runs-on: ${{ vars.CI_KVM_RUNNER || 'ubuntu-latest' }}
     # Bound a wedged run so it can't squat a shared runner for the 6h default.
     timeout-minutes: 45
     steps:
@@ -1599,6 +1602,9 @@ jobs:
 
       - name: Clean runner disk
         run: scripts/ci/clean-runner-disk.sh
+
+      - name: Enable KVM
+        run: scripts/ci/enable-kvm.sh
 
       - name: Download build artifacts
         uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
@@ -1685,8 +1691,9 @@ jobs:
   integration-test:
     name: Integration Tests
     needs: [build-linux-x86_64, rust-integration-build, changes]
+    # KVM suite: hosted runner by default; CI_KVM_RUNNER pins a self-hosted one.
     if: always() && needs.changes.outputs.code == 'true' && needs.build-linux-x86_64.result == 'success' && needs.rust-integration-build.result == 'success'
-    runs-on: self-hosted-ubuntu-2404-x64
+    runs-on: ${{ vars.CI_KVM_RUNNER || 'ubuntu-latest' }}
     # Bound a wedged run so it can't squat a shared runner for the 6h default.
     timeout-minutes: 45
     steps:
@@ -1701,6 +1708,9 @@ jobs:
 
       - name: Clean runner disk
         run: scripts/ci/clean-runner-disk.sh
+
+      - name: Enable KVM
+        run: scripts/ci/enable-kvm.sh
 
       - uses: taiki-e/install-action@5488ac5a951645ce95062214902ac4b6bc1a1037 # v2
         with:
@@ -1848,8 +1858,9 @@ jobs:
   node-sdk-test:
     name: Node.js SDK Tests (${{ matrix.runtime }})
     needs: [build-linux-x86_64, node-sdk-build, changes]
+    # KVM suite: hosted runner by default; CI_KVM_RUNNER pins a self-hosted one.
     if: always() && needs.changes.outputs.code == 'true' && needs.build-linux-x86_64.result == 'success' && needs.node-sdk-build.result == 'success'
-    runs-on: self-hosted-ubuntu-2404-x64
+    runs-on: ${{ vars.CI_KVM_RUNNER || 'ubuntu-latest' }}
     # Bound a wedged run so it can't squat a shared runner for the 6h default.
     timeout-minutes: 45
     strategy:
@@ -1872,6 +1883,9 @@ jobs:
 
       - name: Clean runner disk
         run: bash .ci-source/scripts/ci/clean-runner-disk.sh
+
+      - name: Enable KVM
+        run: bash .ci-source/scripts/ci/enable-kvm.sh
 
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
@@ -1988,8 +2002,9 @@ jobs:
   python-sdk-test:
     name: Python SDK Tests
     needs: [build-linux-x86_64, python-wheel-build, changes]
+    # KVM suite: hosted runner by default; CI_KVM_RUNNER pins a self-hosted one.
     if: always() && needs.changes.outputs.code == 'true' && needs.build-linux-x86_64.result == 'success' && needs.python-wheel-build.result == 'success'
-    runs-on: self-hosted-ubuntu-2404-x64
+    runs-on: ${{ vars.CI_KVM_RUNNER || 'ubuntu-latest' }}
     # Bound a wedged run so it can't squat a shared runner for the 6h default.
     timeout-minutes: 45
     steps:
@@ -2002,6 +2017,9 @@ jobs:
 
       - name: Clean runner disk
         run: scripts/ci/clean-runner-disk.sh
+
+      - name: Enable KVM
+        run: scripts/ci/enable-kvm.sh
 
       - uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2
         with:
@@ -2118,8 +2136,9 @@ jobs:
   go-sdk-test:
     name: Go SDK Tests (shard ${{ matrix.label }})
     needs: [build-linux-x86_64, go-ffi-build, changes]
+    # KVM suite: hosted runner by default; CI_KVM_RUNNER pins a self-hosted one.
     if: needs.changes.outputs.code == 'true'
-    runs-on: self-hosted-ubuntu-2404-x64
+    runs-on: ${{ vars.CI_KVM_RUNNER || 'ubuntu-latest' }}
     # Bound a wedged run so it can't squat a shared runner for the 6h default.
     timeout-minutes: 45
     strategy:
@@ -2143,6 +2162,9 @@ jobs:
 
       - name: Clean runner disk
         run: scripts/ci/clean-runner-disk.sh
+
+      - name: Enable KVM
+        run: scripts/ci/enable-kvm.sh
 
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
