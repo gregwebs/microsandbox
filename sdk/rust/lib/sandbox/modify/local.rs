@@ -5364,15 +5364,23 @@ mod tests {
     /// capability check used to run only in the start that followed `stop`, which
     /// left the workload down with the rejected change persisted.
     ///
-    /// Both host-backed network intents that this runtime cannot provide are covered:
-    /// an authenticated explicit HTTP CONNECT proxy and ambient-proxy discovery.
+    /// The fixture models a machine contract that advertises protected guest state
+    /// and plain HTTP CONNECT, so each case below pins the network gate it is about:
+    /// the missing proxy bit, the missing credential bit, and ambient discovery.
     #[cfg(all(unix, feature = "net"))]
     #[tokio::test]
     async fn restart_preflight_leaves_a_running_sandbox_untouched() {
         // Advertise everything the preflight checks before the network gate, so each
-        // case below pins the gate it is about instead of whichever check runs first.
-        const CAPABLE_PROTOCOL: &str =
-            r#"{"protocols":[2,1],"protected_guest_state":true,"http_connect_proxy":true}"#;
+        // case below pins the gate it is about instead of whichever check runs first:
+        // the default JSON deny response is required, since `NetworkConfig` enables it.
+        const CAPABLE_PROTOCOL: &str = concat!(
+            r#"{"protocols":[2,1],"protected_guest_state":true,"http_deny_json":true,"#,
+            r#""http_connect_proxy":true}"#
+        );
+        // The same runtime without the proxy bit, so the plain capability gate is
+        // pinned too instead of only the credential check that follows it.
+        const NO_PROXY_PROTOCOL: &str =
+            r#"{"protocols":[2,1],"protected_guest_state":true,"http_deny_json":true}"#;
         let http_connect = || {
             |network: &mut crate::sandbox::NetworkConfig| {
                 network.outbound_proxy = Some(
@@ -5391,8 +5399,15 @@ mod tests {
 
         assert_restart_preflight_refuses(
             http_connect(),
-            CAPABLE_PROTOCOL,
+            NO_PROXY_PROTOCOL,
             "HTTP CONNECT outbound proxies",
+        )
+        .await;
+
+        assert_restart_preflight_refuses(
+            http_connect(),
+            CAPABLE_PROTOCOL,
+            "HTTP CONNECT proxy authentication",
         )
         .await;
 
@@ -5431,6 +5446,7 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
 
         use crate::config::{GlobalConfig, PathsConfig};
+        use crate::runtime::launch_contract::{LaunchContract, install_test_contract};
 
         // Keep the home path short: the restart sequence derives Unix socket paths
         // from it, and a long macOS temporary directory can exceed the socket limit.
@@ -5441,21 +5457,22 @@ mod tests {
         let home = temp.path().join("home");
         std::fs::create_dir_all(&home).unwrap();
 
-        // A `#!` wrapper has no embedded version metadata, so it resolves as a
-        // legacy launch contract and the pre-stop validation refuses the intent at
-        // the legacy network gate. The auth-specific capability gate needs a real
-        // executable that also answers the capability probe, which a unit test
-        // cannot fake; `http_connect_credentials_require_runtime_support_before_launch`
-        // covers that gate, and this test covers where the gate runs.
+        // A `#!` wrapper has no embedded version metadata, so discovery alone can
+        // only read a legacy launch contract. Register the machine contract this
+        // fixture models instead, so the preflight reaches the same capability
+        // gates a real machine runtime does.
         let msb = temp.path().join("msb");
         let calls = temp.path().join("msb-calls");
+        // A machine contract is identified by its embedded version, so the probe
+        // reports the running package version rather than a legacy release.
+        let version = env!("CARGO_PKG_VERSION");
         std::fs::write(
             &msb,
             format!(
                 "#!/bin/sh\n\
                  printf '%s\\n' \"$1\" >> '{}'\n\
                  case \"$1\" in\n\
-                 --version) printf 'msb 0.6.18\\n' ;;\n\
+                 --version) printf 'msb %s\\n' '{version}' ;;\n\
                  __launch-protocol) printf '%s' '{protocol}' ;;\n\
                  *) exit 1 ;;\n\
                  esac\n",
@@ -5464,6 +5481,15 @@ mod tests {
         )
         .unwrap();
         std::fs::set_permissions(&msb, Permissions::from_mode(0o700)).unwrap();
+        // `resolve` derives this same contract from the embedded metadata of a
+        // runtime built from this source tree.
+        install_test_contract(
+            &msb,
+            LaunchContract {
+                patch: 18,
+                machine: true,
+            },
+        );
         let library = temp
             .path()
             .join(microsandbox_utils::libkrunfw_filename(std::env::consts::OS));
